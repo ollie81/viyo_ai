@@ -126,6 +126,10 @@ class AnalyzePostRequest(BaseModel):
     post_type: str = Field(..., pattern="^(text|photo|video)$")
     caption: str = Field(default="", max_length=2000)
     niche: str = Field(default="", max_length=100)
+    # Public URL of the photo, or a video thumbnail/frame for video posts.
+    # Optional — if omitted, feedback falls back to caption-only analysis
+    # (e.g. text posts have no image to look at).
+    image_url: str | None = Field(default=None, max_length=2000)
 
 
 class AnalyzePostResponse(BaseModel):
@@ -133,6 +137,7 @@ class AnalyzePostResponse(BaseModel):
     what_to_improve: str
     content_ideas: list[str]
     engagement_tip: str
+    visual_analysis: bool  # true if this feedback actually looked at the image, not just the caption
 
 
 # ---------------------------------------------------------------------------
@@ -240,31 +245,58 @@ async def analyze_post(
     The AI Creator Coach. Runs right after a creator posts, and gives
     structured feedback framed as coaching, not grading — the goal is
     "help this person get better," not "score this post."
+
+    When `image_url` is provided (a photo, or a video thumbnail/frame),
+    the coach actually looks at the image via GPT-4o's vision input —
+    composition, lighting, framing, what's in the shot — instead of
+    only reacting to the caption text. This is what lets feedback say
+    something like "the subject is off-center and half-cropped" rather
+    than generic caption advice.
     """
     _check_rate_limit(user_id)
 
     niche_context = f" Their content niche is '{req.niche}'." if req.niche else ""
+    has_image = bool(req.image_url)
 
-    prompt = (
+    instruction = (
         "You are a warm, encouraging creator coach — think a supportive mentor, "
         "not a critic. A creator just posted the following content.\n\n"
         f"Post type: {req.post_type}\n"
         f"Caption: {req.caption or '(no caption)'}\n"
         f"{niche_context}\n\n"
+    )
+
+    if has_image:
+        instruction += (
+            "An image is attached below — this is either the actual photo posted, "
+            "or a representative frame from the video posted. Look at it directly: "
+            "composition, framing, lighting, color, what's in focus, what's happening "
+            "in the shot. Ground your feedback in what you actually see, not generic "
+            "advice that could apply to any post.\n\n"
+        )
+
+    instruction += (
         "Respond with exactly 4 sections, each on its own line, in this exact format "
         "(no markdown, no extra commentary):\n"
-        "WORKED: <one encouraging sentence about something genuinely good here>\n"
-        "IMPROVE: <one specific, actionable thing they could do better next time>\n"
+        "WORKED: <one encouraging sentence about something genuinely good here"
+        + (", grounded in what's visible in the image" if has_image else "") + ">\n"
+        "IMPROVE: <one specific, actionable thing they could do better next time"
+        + (" — reference the actual framing/lighting/composition if relevant" if has_image else "")
+        + ">\n"
         "IDEAS: <three short content ideas separated by ' | ', related to this post/niche>\n"
         "ENGAGEMENT: <one specific tip to get more engagement on posts like this>"
     )
 
+    user_content: list[dict] = [{"type": "text", "text": instruction}]
+    if has_image:
+        user_content.append({"type": "image_url", "image_url": {"url": req.image_url}})
+
     try:
         completion = client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": user_content}],
             temperature=0.8,
-            max_tokens=350,
+            max_tokens=400,
         )
         text = (completion.choices[0].message.content or "").strip()
     except Exception:
@@ -274,7 +306,7 @@ async def analyze_post(
     if parsed is None:
         raise HTTPException(status_code=502, detail="AI returned an unexpected format")
 
-    return AnalyzePostResponse(**parsed)
+    return AnalyzePostResponse(**parsed, visual_analysis=has_image)
 
 
 def _parse_coach_response(text: str) -> dict | None:
@@ -324,3 +356,12 @@ def _parse_numbered_list(text: str, limit: int) -> list[str]:
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ========================================================================
+# SERVER STARTUP BLOCK - REQUIRED FOR RAILWAY DEPLOYMENT
+# ========================================================================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
