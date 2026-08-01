@@ -39,8 +39,27 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+
+def _call_openai_with_retry(**kwargs):
+    """One retry on transient OpenAI errors (timeouts, momentary 5xx) before
+    giving up — cuts down on "AI service unavailable" for blips that would
+    have succeeded a second later."""
+    last_err = None
+    for attempt in range(2):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.5)
+    raise last_err
+
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+# The Creator Coach is the flagship, vision-based feature — worth the extra
+# cost of the full model instead of mini, since image analysis quality is
+# what makes its feedback feel specific instead of generic.
+COACH_MODEL = os.environ.get("OPENAI_COACH_MODEL", "gpt-4o")
 
 # ---------------------------------------------------------------------------
 # Simple in-memory per-user rate limiter (swap for Redis in production —
@@ -64,6 +83,20 @@ def _check_rate_limit(user_id: str):
 # ---------------------------------------------------------------------------
 # Auth: verify Supabase JWT and extract user id
 # ---------------------------------------------------------------------------
+# Only allow the unverified-signature fallback when explicitly opted into
+# for local dev. If this isn't set, a missing SUPABASE_JWT_SECRET in
+# production (e.g. a forgotten Railway env var) fails loudly at startup
+# instead of silently accepting forged tokens.
+ALLOW_INSECURE_AUTH = os.environ.get("ALLOW_INSECURE_AUTH", "").lower() == "true"
+
+if not SUPABASE_JWT_SECRET and not ALLOW_INSECURE_AUTH:
+    raise RuntimeError(
+        "SUPABASE_JWT_SECRET is not set. Refusing to start with unverified "
+        "auth in what looks like a production environment. If this really is "
+        "local development, set ALLOW_INSECURE_AUTH=true explicitly."
+    )
+
+
 async def get_current_user_id(authorization: str = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -71,8 +104,8 @@ async def get_current_user_id(authorization: str = Header(None)) -> str:
     token = authorization.removeprefix("Bearer ").strip()
 
     if not SUPABASE_JWT_SECRET:
-        # Local dev fallback: decode without verifying signature.
-        # NEVER do this in production — set SUPABASE_JWT_SECRET.
+        # Local dev fallback only — reached only if ALLOW_INSECURE_AUTH=true,
+        # enforced by the startup check above. NEVER do this in production.
         try:
             payload = jwt.decode(token, options={"verify_signature": False})
         except Exception:
@@ -157,7 +190,7 @@ async def content_ideas(
     )
 
     try:
-        completion = client.chat.completions.create(
+        completion = _call_openai_with_retry(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.9,
@@ -189,7 +222,7 @@ async def improve_caption(
     )
 
     try:
-        completion = client.chat.completions.create(
+        completion = _call_openai_with_retry(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
@@ -219,7 +252,7 @@ async def post_feedback(
     )
 
     try:
-        completion = client.chat.completions.create(
+        completion = _call_openai_with_retry(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
@@ -292,8 +325,8 @@ async def analyze_post(
         user_content.append({"type": "image_url", "image_url": {"url": req.image_url}})
 
     try:
-        completion = client.chat.completions.create(
-            model=MODEL,
+        completion = _call_openai_with_retry(
+            model=COACH_MODEL,
             messages=[{"role": "user", "content": user_content}],
             temperature=0.8,
             max_tokens=400,
