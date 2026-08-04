@@ -3,6 +3,8 @@ Viyo AI Backend — FastAPI service providing:
   POST /content-ideas    -> 5 content ideas based on user's niche
   POST /improve-caption   -> improves a caption
   POST /post-feedback     -> short positive feedback + 1 improvement tip
+  POST /analyze-post      -> AI Creator Coach with vision capabilities
+  POST /repurpose         -> Video repurposing (if repurpose.py is available)
 
 Auth: expects a Supabase JWT in the Authorization header. Verified against
 Supabase's JWKS endpoint so this service never needs the Supabase service
@@ -30,6 +32,16 @@ from openai import OpenAI
 
 app = FastAPI(title="Viyo AI Backend", version="1.0.0")
 
+# Video repurposing lives in its own file (repurpose.py) so a bug there
+# can't take down the working endpoints above. If this import fails
+# (e.g. missing SUPABASE_SERVICE_ROLE_KEY dependency not installed yet),
+# main.py still runs — /repurpose just won't exist until it's fixed.
+try:
+    from repurpose import router as repurpose_router
+    app.include_router(repurpose_router)
+except Exception as _repurpose_import_error:
+    print(f"[WARN] Video repurposing endpoint not loaded: {_repurpose_import_error}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten to your app's domain(s) in production
@@ -56,10 +68,6 @@ def _call_openai_with_retry(**kwargs):
 
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-# The Creator Coach is the flagship, vision-based feature — worth the extra
-# cost of the full model instead of mini, since image analysis quality is
-# what makes its feedback feel specific instead of generic.
-COACH_MODEL = os.environ.get("OPENAI_COACH_MODEL", "gpt-4o")
 
 # ---------------------------------------------------------------------------
 # Simple in-memory per-user rate limiter (swap for Redis in production —
@@ -326,7 +334,7 @@ async def analyze_post(
 
     try:
         completion = _call_openai_with_retry(
-            model=COACH_MODEL,
+            model=MODEL,  # Using gpt-4o-mini for cost savings
             messages=[{"role": "user", "content": user_content}],
             temperature=0.8,
             max_tokens=400,
@@ -391,6 +399,11 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+def root():
+    return {"message": "API is running! Visit /docs for Swagger UI"}
+
+
 # ========================================================================
 # SERVER STARTUP BLOCK - REQUIRED FOR RAILWAY DEPLOYMENT
 # ========================================================================
@@ -398,9 +411,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-@app.get("/")
-def root():
-    return {"message": "API is running! Visit /docs for Swagger UI"}
-
