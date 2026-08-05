@@ -129,9 +129,15 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
                 algorithms=["HS256"],
             )
     except jwt.PyJWTError as e:
-    print("JWT ERROR:", e)
-    print("JWT SECRET SET:", bool(secret))
-    raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
+        print("========= = JWT DEBUG ==========")
+        print("Authorization:", authorization[:30] + "...")
+        print("Secret exists:", bool(secret))
+        print("JWT ERROR:", repr(e))
+        print("===============================")
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid or expired token: {e}",
+        )
    
     user_id = payload.get("sub")
     if not user_id:
@@ -345,7 +351,7 @@ async def repurpose_video(
 
     return RepurposeResponse(
         status="success",
-        processed_video_url=public_url,
+        processd_video_url=public_url,
         transcript=transcript_text,
         highlight=highlight,
     )
