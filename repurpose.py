@@ -129,8 +129,10 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
                 algorithms=["HS256"],
             )
     except jwt.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
-
+    print("JWT ERROR:", e)
+    print("JWT SECRET SET:", bool(secret))
+    raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
+   
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Token missing subject")
