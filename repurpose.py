@@ -9,23 +9,36 @@ What changed from the original version, and why:
    request. This version calls OpenAI's Whisper API instead (a normal
    HTTP request), so the server itself stays lightweight.
 
-2. Output is uploaded to Supabase Storage, not saved to local disk.
+2. Accepts a Supabase Storage URL instead of a raw file upload.
+   Previously Flutter uploaded the video file directly to Railway —
+   this hit Railway's proxy timeout on anything longer than ~30s
+   (upload + Whisper + FFmpeg easily exceeds that), causing the
+   "Broken pipe" error. Now Flutter uploads to Supabase Storage first
+   (no Railway timeout involved), then sends just the URL here.
+   The backend downloads it over a server-to-server connection that
+   isn't subject to Railway's inbound proxy timeout.
+
+3. Output is uploaded to Supabase Storage, not saved to local disk.
    Railway's filesystem is ephemeral — anything written to disk is
    wiped on every redeploy or restart. This version uploads the final
-   clip straight to a new "processed-videos" Supabase bucket and
-   returns a permanent public URL instead.
+   clip straight to a "processed-videos" Supabase bucket and returns
+   a permanent public URL instead.
 
-3. Hard limits on input size/duration. Video processing (transcribe +
+4. Hard limits on input size/duration. Video processing (transcribe +
    AI analysis + FFmpeg render) is slow and memory-heavy. Without a
    cap, a long video would likely time out the request or exceed
    Railway's memory limit. This version rejects anything over 3
    minutes / 60MB up front with a clear error, rather than trying and
    silently failing or crashing.
 
-4. Uses the same JWT auth + rate limiting pattern as the rest of
+5. Uses the same JWT auth + rate limiting pattern as the rest of
    main.py, instead of being wide open.
 
-5. Registered as a FastAPI router, imported into main.py — kept in its
+6. Fixed PyJWT "alg not allowed" error: the verify_signature=False
+   fallback now explicitly passes algorithms=["HS256"] as required
+   by PyJWT 2.x.
+
+7. Registered as a FastAPI router, imported into main.py — kept in its
    own file so it can't accidentally break the endpoints that are
    already working.
 """
@@ -36,11 +49,11 @@ import json
 import time
 import tempfile
 import subprocess
+import urllib.request
 from collections import defaultdict, deque
-from typing import List, Optional
+from typing import Optional
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Header
-from fastapi.concurrency import run_in_threadpool
+from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
@@ -89,7 +102,13 @@ def _check_repurpose_rate_limit(user_id: str):
 async def _get_current_user_id(authorization: str = Header(None)) -> str:
     """Same JWT-verification pattern as main.py's get_current_user_id —
     duplicated here rather than imported to keep this module fully
-    self-contained and safe to add without touching main.py's imports."""
+    self-contained and safe to add without touching main.py's imports.
+
+    Fix: the verify_signature=False fallback now passes algorithms=["HS256"]
+    explicitly. PyJWT 2.x requires this even when not verifying the
+    signature — without it, certain alg header values are rejected with
+    "The specified alg value is not allowed".
+    """
     import jwt
 
     if not authorization or not authorization.startswith("Bearer "):
@@ -101,24 +120,29 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
         if secret:
             payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
         else:
-            payload = jwt.decode(token, options={"verify_signature": False})
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token expired — log out and back in on the app, then try again.",
-        )
-    except jwt.InvalidSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token signature invalid — SUPABASE_JWT_SECRET on the server doesn't match this Supabase project's JWT secret.",
-        )
+            # Local dev fallback only — ALLOW_INSECURE_AUTH=true must be set
+            # for main.py to even start without a secret.
+            # algorithms= is required by PyJWT 2.x even when verify_signature=False.
+            payload = jwt.decode(
+                token,
+                options={"verify_signature": False},
+                algorithms=["HS256"],
+            )
     except jwt.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
 
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Token missing subject")
     return user_id
+
+
+class RepurposeRequest(BaseModel):
+    # Flutter uploads the video to Supabase Storage first, then sends
+    # us the public URL. This avoids streaming a large file through
+    # Railway's inbound proxy, which has a hard timeout that caused
+    # the "Broken pipe" error on the previous multipart approach.
+    video_url: str = Field(..., description="Public Supabase Storage URL of the source video")
 
 
 class HighlightSegment(BaseModel):
@@ -211,8 +235,6 @@ def _generate_srt(segments: list, srt_path: str, clip_start: float, clip_end: fl
         idx = 1
         for seg in segments:
             s, e = seg.get("start", 0), seg.get("end", 0)
-            # Only include captions that fall inside the chosen clip window,
-            # re-timed relative to the clip's own start.
             if e < clip_start or s > clip_end:
                 continue
             rel_start = max(0, s - clip_start)
@@ -247,13 +269,18 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str],
 
 @router.post("/repurpose", response_model=RepurposeResponse)
 async def repurpose_video(
-    file: UploadFile = File(...),
+    req: RepurposeRequest,
     user_id: str = Depends(_get_current_user_id),
 ):
     """
-    Uploads a longer video, transcribes it, finds the single best highlight
-    (capped at MAX_OUTPUT_CLIP_SECONDS), crops it to 9:16, burns in
-    captions, and returns a public URL of the finished clip.
+    Accepts a Supabase Storage URL for a longer video, transcribes it,
+    finds the single best highlight (capped at MAX_OUTPUT_CLIP_SECONDS),
+    crops it to 9:16, burns in captions, and returns a public URL of
+    the finished clip.
+
+    Flutter uploads the raw video to Supabase Storage first, then calls
+    this endpoint with just the URL — this keeps large file data off the
+    Railway inbound proxy and avoids the broken-pipe timeout.
     """
     if supabase_admin is None:
         raise HTTPException(
@@ -261,67 +288,56 @@ async def repurpose_video(
             detail="Video repurposing isn't configured yet — SUPABASE_SERVICE_ROLE_KEY is missing on the server.",
         )
 
-    if not file.filename.lower().endswith((".mp4", ".mov", ".mkv")):
-        raise HTTPException(status_code=400, detail="Upload MP4, MOV, or MKV only.")
-
     _check_repurpose_rate_limit(user_id)
 
     with tempfile.TemporaryDirectory() as tmp:
-        source_path = os.path.join(tmp, f"source_{file.filename}")
-        size = 0
-        with open(source_path, "wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_INPUT_SIZE_BYTES:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024*1024)}MB for now.",
-                    )
-                out.write(chunk)
+        source_path = os.path.join(tmp, "source.mp4")
 
-        # Every call below is blocking (subprocess, sync HTTP, sync I/O).
-        # Running them directly in this async route would freeze
-        # uvicorn's entire event loop for the whole duration — including
-        # Railway's health checks — which is what was causing Railway to
-        # kill/restart the container mid-request ("Broken pipe" on the
-        # client side). run_in_threadpool moves each one to a worker
-        # thread so the event loop stays responsive throughout.
-        duration = await run_in_threadpool(_run_ffprobe_duration, source_path)
+        # Download the video from Supabase Storage.
+        # This is a server-to-server download (Railway → Supabase CDN)
+        # and is not subject to Railway's inbound request timeout.
+        try:
+            urllib.request.urlretrieve(req.video_url, source_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not download video from URL: {e}")
+
+        size = os.path.getsize(source_path)
+        if size > MAX_INPUT_SIZE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)}MB.",
+            )
+
+        duration = _run_ffprobe_duration(source_path)
         if duration > MAX_INPUT_DURATION_SECONDS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s for now.",
+                detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s.",
             )
 
-        whisper_result = await run_in_threadpool(_transcribe_with_openai, source_path)
+        whisper_result = _transcribe_with_openai(source_path)
         transcript_text = whisper_result.get("text", "")
         segments = whisper_result.get("segments", [])
 
-        highlight = await run_in_threadpool(_find_best_highlight, transcript_text, duration)
+        highlight = _find_best_highlight(transcript_text, duration)
         clip_duration = highlight.end_time - highlight.start_time
 
         srt_path = os.path.join(tmp, "captions.srt")
         _generate_srt(segments, srt_path, highlight.start_time, highlight.end_time)
 
         output_path = os.path.join(tmp, "output.mp4")
-        await run_in_threadpool(
-            _render_clip, source_path, output_path, srt_path, highlight.start_time, clip_duration
-        )
+        _render_clip(source_path, output_path, srt_path, highlight.start_time, clip_duration)
 
-        # Upload the finished clip to Supabase Storage — this is what
-        # survives Railway's ephemeral filesystem across redeploys.
+        # Upload the finished clip to Supabase Storage — survives Railway's
+        # ephemeral filesystem across redeploys.
         storage_path = f"{user_id}/{int(time.time())}.mp4"
-
-        def _upload():
-            with open(output_path, "rb") as f:
+        with open(output_path, "rb") as f:
+            try:
                 supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
                     storage_path, f, file_options={"content-type": "video/mp4"}
                 )
-
-        try:
-            await run_in_threadpool(_upload)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
 
         public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
 
