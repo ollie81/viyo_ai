@@ -40,6 +40,7 @@ from collections import defaultdict, deque
 from typing import List, Optional
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Header
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
@@ -101,8 +102,18 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
             payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
         else:
             payload = jwt.decode(token, options={"verify_signature": False})
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token expired — log out and back in on the app, then try again.",
+        )
+    except jwt.InvalidSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token signature invalid — SUPABASE_JWT_SECRET on the server doesn't match this Supabase project's JWT secret.",
+        )
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
 
     user_id = payload.get("sub")
     if not user_id:
@@ -268,36 +279,49 @@ async def repurpose_video(
                     )
                 out.write(chunk)
 
-        duration = _run_ffprobe_duration(source_path)
+        # Every call below is blocking (subprocess, sync HTTP, sync I/O).
+        # Running them directly in this async route would freeze
+        # uvicorn's entire event loop for the whole duration — including
+        # Railway's health checks — which is what was causing Railway to
+        # kill/restart the container mid-request ("Broken pipe" on the
+        # client side). run_in_threadpool moves each one to a worker
+        # thread so the event loop stays responsive throughout.
+        duration = await run_in_threadpool(_run_ffprobe_duration, source_path)
         if duration > MAX_INPUT_DURATION_SECONDS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s for now.",
             )
 
-        whisper_result = _transcribe_with_openai(source_path)
+        whisper_result = await run_in_threadpool(_transcribe_with_openai, source_path)
         transcript_text = whisper_result.get("text", "")
         segments = whisper_result.get("segments", [])
 
-        highlight = _find_best_highlight(transcript_text, duration)
+        highlight = await run_in_threadpool(_find_best_highlight, transcript_text, duration)
         clip_duration = highlight.end_time - highlight.start_time
 
         srt_path = os.path.join(tmp, "captions.srt")
         _generate_srt(segments, srt_path, highlight.start_time, highlight.end_time)
 
         output_path = os.path.join(tmp, "output.mp4")
-        _render_clip(source_path, output_path, srt_path, highlight.start_time, clip_duration)
+        await run_in_threadpool(
+            _render_clip, source_path, output_path, srt_path, highlight.start_time, clip_duration
+        )
 
         # Upload the finished clip to Supabase Storage — this is what
         # survives Railway's ephemeral filesystem across redeploys.
         storage_path = f"{user_id}/{int(time.time())}.mp4"
-        with open(output_path, "rb") as f:
-            try:
+
+        def _upload():
+            with open(output_path, "rb") as f:
                 supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
                     storage_path, f, file_options={"content-type": "video/mp4"}
                 )
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
+
+        try:
+            await run_in_threadpool(_upload)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
 
         public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
 
