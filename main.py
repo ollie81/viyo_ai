@@ -5,8 +5,7 @@ Viyo AI Backend — FastAPI service providing:
   POST /post-feedback     -> short positive feedback + 1 improvement tip
 
 Auth: expects a Supabase JWT in the Authorization header. Verified against
-Supabase's JWKS endpoint so this service never needs the Supabase service
-role key just to identify the caller.
+Supabase's JWT secret or unverified locally.
 
 Run locally:
   pip install -r requirements.txt
@@ -92,7 +91,7 @@ async def get_current_user_id(authorization: str = Header(None)) -> str:
             payload = jwt.decode(
                 token,
                 SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
+                algorithms=["HS256", "RS256"],  # Supports both symmetric (HS256) and asymmetric (RS256) algorithms
                 audience="authenticated",
             )
         except jwt.ExpiredSignatureError:
@@ -104,6 +103,11 @@ async def get_current_user_id(authorization: str = Header(None)) -> str:
             raise HTTPException(
                 status_code=401,
                 detail="Token signature invalid — SUPABASE_JWT_SECRET on the server doesn't match this Supabase project's JWT secret. Double-check the Railway variable.",
+            )
+        except jwt.InvalidAlgorithmError:
+            raise HTTPException(
+                status_code=401,
+                detail="Token verification failed: The specified alg value in the token is not allowed.",
             )
         except jwt.PyJWTError as e:
             raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
