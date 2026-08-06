@@ -16,13 +16,16 @@ Run locally:
 
 Environment variables required (see .env.example):
   OPENAI_API_KEY
-  SUPABASE_URL
-  SUPABASE_JWT_SECRET   (Project Settings -> API -> JWT Secret)
+  SUPABASE_URL          (e.g. https://xyzxyz.supabase.co)
+  ALLOW_INSECURE_AUTH   set to "true" for local dev only (skips JWKS verification)
 """
 
+import json
 import os
 import time
+import urllib.request
 from collections import defaultdict, deque
+from typing import Optional
 
 import jwt
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -66,7 +69,7 @@ def _call_openai_with_retry(**kwargs):
                 time.sleep(0.5)
     raise last_err
 
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # ---------------------------------------------------------------------------
@@ -89,20 +92,101 @@ def _check_rate_limit(user_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Auth: verify Supabase JWT and extract user id
+# Auth: verify Supabase JWT via JWKS (ES256 / P-256)
 # ---------------------------------------------------------------------------
-# Only allow the unverified-signature fallback when explicitly opted into
-# for local dev. If this isn't set, a missing SUPABASE_JWT_SECRET in
-# production (e.g. a forgotten Railway env var) fails loudly at startup
-# instead of silently accepting forged tokens.
+# Supabase projects using ECC signing publish their public keys at:
+#   {SUPABASE_URL}/auth/v1/.well-known/jwks.json
+# We fetch those keys once, cache them for 1 hour, and verify tokens
+# locally using PyJWT — no JWT secret needed on this server at all.
+#
+# The only way to disable verification is ALLOW_INSECURE_AUTH=true, which
+# is intended for local dev only. A missing SUPABASE_URL in production
+# fails loudly at startup instead of silently accepting forged tokens.
+
 ALLOW_INSECURE_AUTH = os.environ.get("ALLOW_INSECURE_AUTH", "").lower() == "true"
 
-if not SUPABASE_JWT_SECRET and not ALLOW_INSECURE_AUTH:
+if not SUPABASE_URL and not ALLOW_INSECURE_AUTH:
     raise RuntimeError(
-        "SUPABASE_JWT_SECRET is not set. Refusing to start with unverified "
-        "auth in what looks like a production environment. If this really is "
-        "local development, set ALLOW_INSECURE_AUTH=true explicitly."
+        "SUPABASE_URL is not set. Refusing to start — cannot fetch JWKS for "
+        "token verification. Set SUPABASE_URL in your Railway environment "
+        "variables (e.g. https://xyzxyz.supabase.co). For local dev without "
+        "a Supabase project, set ALLOW_INSECURE_AUTH=true explicitly."
     )
+
+# JWKS cache — avoids a network round-trip on every request.
+# Refreshed automatically after TTL, or immediately on unknown kid.
+_jwks_cache: Optional[dict] = None
+_jwks_fetched_at: float = 0.0
+_JWKS_TTL = 3600  # seconds
+
+
+def _fetch_jwks(force: bool = False) -> dict:
+    """Return the cached JWKS, refreshing if stale or forced."""
+    global _jwks_cache, _jwks_fetched_at
+    now = time.time()
+    if not force and _jwks_cache and now - _jwks_fetched_at < _JWKS_TTL:
+        return _jwks_cache
+    url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            _jwks_cache = json.loads(resp.read())
+            _jwks_fetched_at = now
+            return _jwks_cache
+    except Exception as exc:
+        if _jwks_cache:
+            # Serve stale cache on transient network errors — better than
+            # rejecting every user because of a momentary DNS blip.
+            return _jwks_cache
+        raise HTTPException(
+            status_code=503,
+            detail=f"Auth service unavailable — could not fetch JWKS: {exc}",
+        )
+
+
+def _public_key_for_token(token: str):
+    """
+    Extract the kid from the token header, look it up in the JWKS, and
+    return a cryptography public-key object that PyJWT can verify against.
+
+    On an unknown kid we force-refresh the JWKS once (Supabase may have
+    rotated keys) before giving up.
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Malformed token header: {exc}")
+
+    kid = header.get("kid")
+    alg = header.get("alg", "ES256")
+
+    def _find_key(jwks: dict, kid: Optional[str]):
+        keys = jwks.get("keys", [])
+        if kid:
+            matches = [k for k in keys if k.get("kid") == kid]
+        else:
+            # No kid in header — fall back to the first EC key.
+            matches = [k for k in keys if k.get("kty") == "EC"]
+        return matches[0] if matches else None
+
+    jwks = _fetch_jwks()
+    key_data = _find_key(jwks, kid)
+
+    if key_data is None and kid:
+        # kid not in cache — try a forced refresh (key rotation).
+        jwks = _fetch_jwks(force=True)
+        key_data = _find_key(jwks, kid)
+
+    if key_data is None:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Token signed with unknown key (kid={kid!r}). "
+                   "If you just rotated Supabase keys, wait up to 1 hour or restart the server.",
+        )
+
+    try:
+        return jwt.algorithms.ECAlgorithm.from_jwk(json.dumps(key_data))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load public key: {exc}")
 
 
 async def get_current_user_id(authorization: str = Header(None)) -> str:
@@ -111,26 +195,25 @@ async def get_current_user_id(authorization: str = Header(None)) -> str:
 
     token = authorization.removeprefix("Bearer ").strip()
 
-    if not SUPABASE_JWT_SECRET:
-        # Local dev fallback only — reached only if ALLOW_INSECURE_AUTH=true,
-        # enforced by the startup check above. NEVER do this in production.
-        # algorithms= is required by PyJWT 2.x even with verify_signature=False —
-        # without it, certain alg header values are rejected with
-        # "The specified alg value is not allowed".
+    if not SUPABASE_URL:
+        # Local dev fallback — only reachable when ALLOW_INSECURE_AUTH=true,
+        # enforced by the startup check above. NEVER in production.
+        # algorithms= required by PyJWT 2.x even with verify_signature=False.
         try:
             payload = jwt.decode(
                 token,
                 options={"verify_signature": False},
-                algorithms=["HS256"],
+                algorithms=["ES256"],
             )
-        except Exception as e:
-            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        except Exception as exc:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
     else:
+        public_key = _public_key_for_token(token)
         try:
             payload = jwt.decode(
                 token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256", "RS256"],
+                public_key,
+                algorithms=["ES256"],
                 audience="authenticated",
             )
         except jwt.ExpiredSignatureError:
@@ -141,11 +224,10 @@ async def get_current_user_id(authorization: str = Header(None)) -> str:
         except jwt.InvalidSignatureError:
             raise HTTPException(
                 status_code=401,
-                detail="Token signature invalid — SUPABASE_JWT_SECRET on the server doesn't match "
-                       "this Supabase project's JWT secret. Double-check the Railway variable.",
+                detail="Token signature invalid — the token may have been tampered with.",
             )
-        except jwt.PyJWTError as e:
-            raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=401, detail=f"Token verification failed: {exc}")
 
     user_id = payload.get("sub")
     if not user_id:
