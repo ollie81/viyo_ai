@@ -19,19 +19,7 @@ Environment variables required (see .env.example):
   SUPABASE_URL          (e.g. https://xyzxyz.supabase.co)
   ALLOW_INSECURE_AUTH   set to "true" for local dev only (skips JWKS verification)
 """
-from fastapi.responses import JSONResponse
-import traceback
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    traceback.print_exc()
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": str(exc),
-            "traceback": traceback.format_exc()
-        }
-    )
 import json
 import os
 import time
@@ -291,7 +279,20 @@ class AnalyzePostResponse(BaseModel):
     content_ideas: list[str]
     engagement_tip: str
     visual_analysis: bool  # true if this feedback actually looked at the image, not just the caption
+# ---------------------------------------------------------------------------
+from fastapi.responses import JSONResponse
+import traceback
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "traceback": traceback.format_exc()
+        }
+    )
 
 # ---------------------------------------------------------------------------
 # Endpoints
