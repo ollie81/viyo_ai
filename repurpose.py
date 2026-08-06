@@ -34,9 +34,9 @@ What changed from the original version, and why:
 5. Uses the same JWT auth + rate limiting pattern as the rest of
    main.py, instead of being wide open.
 
-6. Fixed PyJWT "alg not allowed" error: the verify_signature=False
-   fallback now explicitly passes algorithms=["HS256"] as required
-   by PyJWT 2.x.
+6. Auth is handled by delegating to main.py's get_current_user_id
+   (ES256 / JWKS verification) via a lazy import, avoiding duplication
+   and the circular-import problem.
 
 7. Registered as a FastAPI router, imported into main.py — kept in its
    own file so it can't accidentally break the endpoints that are
@@ -100,49 +100,15 @@ def _check_repurpose_rate_limit(user_id: str):
 
 
 async def _get_current_user_id(authorization: str = Header(None)) -> str:
-    """Same JWT-verification pattern as main.py's get_current_user_id —
-    duplicated here rather than imported to keep this module fully
-    self-contained and safe to add without touching main.py's imports.
+    """Delegates to main.py's get_current_user_id (ES256 / JWKS verification).
 
-    Fix: the verify_signature=False fallback now passes algorithms=["HS256"]
-    explicitly. PyJWT 2.x requires this even when not verifying the
-    signature — without it, certain alg header values are rejected with
-    "The specified alg value is not allowed".
+    We use a lazy import instead of a module-level one to avoid a circular
+    import — main.py imports repurpose at startup, so repurpose must not
+    import main at module load time. Importing inside the function body is
+    fine: it only runs at request time, by which point main is fully loaded.
     """
-    import jwt
-
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.removeprefix("Bearer ").strip()
-    secret = os.environ.get("SUPABASE_JWT_SECRET", "")
-
-    try:
-        if secret:
-            payload = jwt.decode(token, secret, algorithms=["HS256"], audience="authenticated")
-        else:
-            # Local dev fallback only — ALLOW_INSECURE_AUTH=true must be set
-            # for main.py to even start without a secret.
-            # algorithms= is required by PyJWT 2.x even when verify_signature=False.
-            payload = jwt.decode(
-                token,
-                options={"verify_signature": False},
-                algorithms=["HS256"],
-            )
-    except jwt.PyJWTError as e:
-        print("========= = JWT DEBUG ==========")
-        print("Authorization:", authorization[:30] + "...")
-        print("Secret exists:", bool(secret))
-        print("JWT ERROR:", repr(e))
-        print("===============================")
-        raise HTTPException(
-            status_code=401,
-            detail=f"Invalid or expired token: {e}",
-        )
-   
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Token missing subject")
-    return user_id
+    from main import get_current_user_id
+    return await get_current_user_id(authorization)
 
 
 class RepurposeRequest(BaseModel):
@@ -351,7 +317,7 @@ async def repurpose_video(
 
     return RepurposeResponse(
         status="success",
-        processd_video_url=public_url,
+        processed_video_url=public_url,
         transcript=transcript_text,
         highlight=highlight,
     )
