@@ -40,8 +40,11 @@ app = FastAPI(title="Viyo AI Backend", version="1.0.0")
 # (e.g. missing SUPABASE_SERVICE_ROLE_KEY dependency not installed yet),
 # main.py still runs — /repurpose just won't exist until it's fixed.
 try:
-    from repurpose import router as repurpose_router
-    app.include_router(repurpose_router)
+   from repurpose import router as repurpose_router
+from coach import router as coach_router
+
+app.include_router(repurpose_router)
+app.include_router(coach_router)
 except Exception as _repurpose_import_error:
     print(f"[WARN] Video repurposing endpoint not loaded: {_repurpose_import_error}")
 
