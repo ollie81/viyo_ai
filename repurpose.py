@@ -24,12 +24,9 @@ What changed from the original version, and why:
    clip straight to a "processed-videos" Supabase bucket and returns
    a permanent public URL instead.
 
-4. Hard limits on input size/duration. Video processing (transcribe +
-   AI analysis + FFmpeg render) is slow and memory-heavy. Without a
-   cap, a long video would likely time out the request or exceed
-   Railway's memory limit. This version rejects anything over 3
-   minutes / 60MB up front with a clear error, rather than trying and
-   silently failing or crashing.
+4. Long-video limits are configurable. The default is 33 minutes / 500MB,
+   while Whisper transcription is performed in small audio chunks so the
+   OpenAI per-file audio limit is not exceeded.
 
 5. Uses the same JWT auth + rate limiting pattern as the rest of
    main.py, instead of being wide open.
@@ -75,8 +72,12 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Hard limits — tune down further if Railway's plan is small.
-MAX_INPUT_DURATION_SECONDS = 180   # 3 minutes of source video
-MAX_INPUT_SIZE_BYTES = 60 * 1024 * 1024  # 60 MB
+# Long-video limits. Override with environment variables if needed.
+
+    MAX_INPUT_DURATION_SECONDS = int(os.environ.get("MAX_INPUT_DURATION_SECONDS", "1980"))  # 33 minutes
+
+    MAX_INPUT_SIZE_BYTES = int(os.environ.get("MAX_INPUT_SIZE_MB", "500")) * 1024 * 1024
+
 MAX_OUTPUT_CLIP_SECONDS = 60
 
 # Separate, stricter rate limit from the other AI endpoints — this is
@@ -146,19 +147,87 @@ def _run_ffprobe_duration(path: str) -> float:
 
 
 def _transcribe_with_openai(path: str) -> dict:
-    """Whisper via the OpenAI API — no local model, no GPU/RAM needed on
-    the server itself."""
-    with open(path, "rb") as f:
-        try:
-            result = ai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json",
-            )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Transcription failed: {e}")
-    return result.model_dump() if hasattr(result, "model_dump") else dict(result)
+    """
+    Transcribe long videos safely.
 
+    OpenAI's audio upload endpoint has a per-file size limit, so a long
+    video's audio is split into small MP3 chunks first. Each chunk is
+    transcribed separately and the timestamps are shifted back into the
+    original video's timeline.
+    """
+    with tempfile.TemporaryDirectory() as audio_tmp:
+        audio_pattern = os.path.join(audio_tmp, "audio_%03d.mp3")
+
+        # 64 kbps mono MP3 keeps each chunk comfortably below the API limit.
+        # 600 seconds (10 minutes) is intentionally conservative.
+        extract_cmd = [
+            "ffmpeg", "-y",
+            "-i", path,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-c:a", "libmp3lame",
+            "-b:a", "64k",
+            "-f", "segment",
+            "-segment_time", "600",
+            "-reset_timestamps", "1",
+            audio_pattern,
+        ]
+        result = subprocess.run(
+            extract_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Audio extraction failed: {result.stderr[-500:]}"
+            )
+
+        chunks = sorted(
+            os.path.join(audio_tmp, n)
+            for n in os.listdir(audio_tmp)
+            if n.endswith(".mp3")
+        )
+
+        all_segments = []
+        all_text = []
+        offset = 0.0
+
+        for chunk in chunks:
+            chunk_duration = _run_ffprobe_duration(chunk)
+
+            with open(chunk, "rb") as f:
+                try:
+                    result = ai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="verbose_json",
+                    )
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Transcription failed: {e}"
+                    )
+
+            data = result.model_dump() if hasattr(result, "model_dump") else dict(result)
+            text = (data.get("text") or "").strip()
+            if text:
+                all_text.append(text)
+
+            for seg in data.get("segments", []) or []:
+                seg = dict(seg)
+                seg["start"] = float(seg.get("start", 0)) + offset
+                seg["end"] = float(seg.get("end", 0)) + offset
+                all_segments.append(seg)
+
+            offset += chunk_duration
+
+        return {
+            "text": " ".join(all_text).strip(),
+            "segments": all_segments,
+        }
 
 def _find_best_highlight(transcript_text: str, max_duration: float) -> HighlightSegment:
     prompt = (
