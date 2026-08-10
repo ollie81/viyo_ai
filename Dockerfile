@@ -1,7 +1,7 @@
-    # Railway's default Python builder (railpack/nixpacks) does not include
+# Railway's default Python builder (railpack/nixpacks) does not include
 # FFmpeg, which the video repurposing feature requires for cropping and
 # caption burn-in. A Dockerfile is the reliable way to get FFmpeg into
-# the container — Railway auto-detects and uses this instead of its
+# the container â€” Railway auto-detects and uses this instead of its
 # default builder once it's present in the repo.
 FROM python:3.11-slim
 
@@ -14,5 +14,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-# $PORT is injected by Railway at runtime — never hardcode a port number here.
+# $PORT is injected by Railway at runtime â€” never hardcode a port number here.
 CMD uvicorn main:app --host 0.0.0.0 --port $PORT
