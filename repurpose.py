@@ -74,9 +74,9 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 # Hard limits — tune down further if Railway's plan is small.
 # Long-video limits. Override with environment variables if needed.
 
-    MAX_INPUT_DURATION_SECONDS = int(os.environ.get("MAX_INPUT_DURATION_SECONDS", "1980"))  # 33 minutes
+MAX_INPUT_DURATION_SECONDS = int(os.environ.get("MAX_INPUT_DURATION_SECONDS", "1980"))  # 33 minutes
 
-    MAX_INPUT_SIZE_BYTES = int(os.environ.get("MAX_INPUT_SIZE_MB", "500")) * 1024 * 1024
+MAX_INPUT_SIZE_BYTES = int(os.environ.get("MAX_INPUT_SIZE_MB", "500")) * 1024 * 1024
 
 MAX_OUTPUT_CLIP_SECONDS = 60
 
