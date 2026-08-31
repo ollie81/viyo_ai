@@ -264,6 +264,64 @@ def _maybe_add_outcome_followup(
 
 
 # ---------------------------------------------------------
+# Account deletion
+#
+# Nothing in this codebase could previously delete a creator's account
+# or the content they uploaded — the Flutter app has no service-role
+# key (by design, see main.py's auth comments), so this has to live on
+# the backend, which already holds one for the Coach's Supabase admin
+# client.
+#
+# This is a best-effort cascade across the tables this backend knows
+# about (coach history, posts, profile), followed by the Supabase auth
+# user itself — not a guarantee that every row everywhere is gone.
+# There are no migration files in this repo to confirm foreign-key
+# cascade behavior for other tables (coins/transactions, missions,
+# follows, likes, comments), so verify that directly in Supabase before
+# relying on this alone for a compliance/GDPR "right to erasure" claim.
+# ---------------------------------------------------------
+
+_DELETE_TABLES = {
+    "video_coach_messages": "user_id",
+    "posts": "user_id",
+    "profiles": "id",
+}
+
+
+@router.delete("/account")
+async def delete_account(
+    user_id: str = Depends(_get_current_user_id),
+):
+    if supabase_admin is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Account service is not configured.",
+        )
+
+    cleanup_errors = []
+    for table, column in _DELETE_TABLES.items():
+        try:
+            supabase_admin.table(table).delete().eq(column, user_id).execute()
+        except Exception as e:
+            cleanup_errors.append(f"{table}: {e}")
+
+    try:
+        supabase_admin.auth.admin.delete_user(user_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Could not delete account: {e}. "
+                f"Partial cleanup errors before this: {cleanup_errors}"
+                if cleanup_errors
+                else f"Could not delete account: {e}"
+            ),
+        )
+
+    return {"deleted": True, "partial_cleanup_errors": cleanup_errors}
+
+
+# ---------------------------------------------------------
 # Get Coach history for one video
 # ---------------------------------------------------------
 
