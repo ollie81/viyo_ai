@@ -1,0 +1,46 @@
+name: PR Checks
+
+# Runs on every pull request against main. This repo has no automated
+# checks at all today (no .github/workflows) — this adds a fast sanity
+# gate: dependencies install cleanly, every module compiles, and every
+# module actually imports (catching real bugs a pure syntax check
+# would miss — missing packages, bad attribute access, etc.) without
+# needing real Supabase/OpenAI credentials.
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  compile-and-import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches the Dockerfile's python:3.11-slim base image.
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m compileall -q .
+
+      - name: Import smoke test
+        # ALLOW_INSECURE_AUTH lets main.py's startup check pass without a
+        # real Supabase project. OPENAI_API_KEY only needs to be present
+        # for the OpenAI client constructor — no request is ever made.
+        # main.py catches import errors in coach.py/repurpose.py itself
+        # (so a broken router doesn't take down the whole API), which
+        # means importing main alone wouldn't catch a bug in either file
+        # — so each module is imported explicitly here too.
+        env:
+          ALLOW_INSECURE_AUTH: "true"
+          OPENAI_API_KEY: "sk-test-placeholder"
+        run: |
+          python -c "import main"
+          python -c "import coach"
+          python -c "import repurpose"
