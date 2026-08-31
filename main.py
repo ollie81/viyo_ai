@@ -18,6 +18,11 @@ Environment variables required (see .env.example):
   OPENAI_API_KEY
   SUPABASE_URL          (e.g. https://xyzxyz.supabase.co)
   ALLOW_INSECURE_AUTH   set to "true" for local dev only (skips JWKS verification)
+  ALLOWED_ORIGINS       comma-separated browser origins allowed to call this API
+                        (e.g. https://app.viyo.com,https://viyo.com). Only
+                        matters for browser clients (Flutter web); native
+                        mobile clients aren't subject to CORS. Defaults to
+                        no cross-origin browser access if unset.
 """
 
 import json
@@ -48,9 +53,15 @@ try:
 except Exception as _router_import_error:
     print(f"[WARN] Video/Coach router not loaded: {_router_import_error}")
 
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your app's domain(s) in production
+    allow_origins=ALLOWED_ORIGINS,  # set via ALLOWED_ORIGINS env var — no wildcard
     allow_methods=["POST"],
     allow_headers=["*"],
 )
@@ -288,13 +299,12 @@ import traceback
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    # Log the full traceback server-side only — never expose it to the
+    # client, since it can leak internals (paths, env values, request data).
     traceback.print_exc()
     return JSONResponse(
         status_code=500,
-        content={
-            "error": str(exc),
-            "traceback": traceback.format_exc()
-        }
+        content={"error": "Internal server error"},
     )
 
 # ---------------------------------------------------------------------------
