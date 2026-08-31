@@ -1,3 +1,4 @@
+import datetime
 import os
 import time
 from typing import Optional
@@ -114,6 +115,155 @@ def _save_message(
 
 
 # ---------------------------------------------------------
+# Outcome follow-up: close the loop between coaching and what
+# actually happened to the post.
+#
+# The Coach previously only ever gave an opinion (a score + advice)
+# with nothing to check it against. This adds a lazy, on-demand check
+# — triggered by the creator reopening a coached video's chat, since
+# this deploy has no background worker/cron to run it proactively —
+# that compares the post's actual in-app engagement (likes + comments,
+# the only performance data Viyo has without a TikTok/Instagram/YouTube
+# integration) against the creator's own recent average, and appends a
+# coach message closing the loop.
+# ---------------------------------------------------------
+
+_OUTCOME_PREFIX = "\U0001F4CA How this one did:"
+_OUTCOME_DELAY_HOURS = 24
+_BASELINE_POST_COUNT = 10
+_MIN_BASELINE_POSTS = 3
+
+
+def _has_outcome_followup(history: list[dict], video_version: int) -> bool:
+    return any(
+        item.get("video_version") == video_version
+        and str(item.get("message", "")).startswith(_OUTCOME_PREFIX)
+        for item in history
+    )
+
+
+def _parse_timestamp(value: str) -> Optional[datetime.datetime]:
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _maybe_add_outcome_followup(
+    user_id: str,
+    video_id: str,
+    history: list[dict],
+) -> list[dict]:
+    """
+    If the creator got scored coaching on this video at least
+    _OUTCOME_DELAY_HOURS ago and hasn't seen an outcome follow-up yet,
+    append a coach message comparing the post's actual engagement to
+    the creator's own baseline. Returns the newly saved message(s) as a
+    list (empty if nothing was added), so callers can just concatenate.
+
+    Deliberately best-effort: any failure here (missing data, a query
+    error, not enough post history yet) just skips the follow-up rather
+    than breaking the coach history the creator is trying to load.
+    """
+    if supabase_admin is None:
+        return []
+
+    scored = [item for item in history if item.get("score") is not None]
+    if not scored:
+        return []
+
+    latest = scored[-1]
+    video_version = latest.get("video_version", 1)
+    if _has_outcome_followup(history, video_version):
+        return []
+
+    scored_at = _parse_timestamp(latest.get("created_at", ""))
+    if scored_at is None:
+        return []
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if now - scored_at < datetime.timedelta(hours=_OUTCOME_DELAY_HOURS):
+        return []
+
+    try:
+        post_result = (
+            supabase_admin
+            .table("posts")
+            .select("id,like_count,comment_count")
+            .eq("id", video_id)
+            .limit(1)
+            .execute()
+        )
+        posts = post_result.data or []
+        if not posts:
+            return []
+        post = posts[0]
+
+        recent_result = (
+            supabase_admin
+            .table("posts")
+            .select("like_count,comment_count")
+            .eq("user_id", user_id)
+            .neq("id", video_id)
+            .order("created_at", desc=True)
+            .limit(_BASELINE_POST_COUNT)
+            .execute()
+        )
+        recent = recent_result.data or []
+    except Exception:
+        return []
+
+    if len(recent) < _MIN_BASELINE_POSTS:
+        return []
+
+    baseline = sum(
+        (p.get("like_count") or 0) + (p.get("comment_count") or 0) for p in recent
+    ) / len(recent)
+    actual = (post.get("like_count") or 0) + (post.get("comment_count") or 0)
+
+    if baseline <= 0:
+        comparison = f"it picked up {actual} likes and comments combined"
+        takeaway = "Not enough history yet to compare that against — keep posting."
+    else:
+        delta_pct = round((actual - baseline) / baseline * 100)
+        if delta_pct >= 10:
+            comparison = (
+                f"it's running {delta_pct}% above your last {len(recent)} posts' "
+                f"average ({actual} vs. an average of {baseline:.0f})"
+            )
+            takeaway = "That lines up with the feedback above — keep doing what worked here."
+        elif delta_pct <= -10:
+            comparison = (
+                f"it's running {abs(delta_pct)}% below your last {len(recent)} posts' "
+                f"average ({actual} vs. an average of {baseline:.0f})"
+            )
+            takeaway = "Worth comparing this one against the feedback above to see what to change next time."
+        else:
+            comparison = (
+                f"it's about in line with your last {len(recent)} posts' average "
+                f"({actual} vs. an average of {baseline:.0f})"
+            )
+            takeaway = "Consistent is fine, but the feedback above still has ideas for pushing it higher."
+
+    score = latest.get("score")
+    score_line = f"you scored {score}/100 on this one, and " if score is not None else ""
+    message_text = f"{_OUTCOME_PREFIX} {score_line}{comparison}. {takeaway}"
+
+    try:
+        saved = _save_message(
+            user_id=user_id,
+            video_id=video_id,
+            role="coach",
+            message=message_text,
+            video_version=video_version,
+            score=None,
+        )
+        return saved or []
+    except HTTPException:
+        return []
+
+
+# ---------------------------------------------------------
 # Get Coach history for one video
 # ---------------------------------------------------------
 
@@ -142,9 +292,12 @@ async def get_coach_history(
             .execute()
         )
 
+        messages = result.data or []
+        messages += _maybe_add_outcome_followup(user_id, video_id, messages)
+
         return {
             "video_id": video_id,
-            "messages": result.data or [],
+            "messages": messages,
         }
 
     except Exception as e:
