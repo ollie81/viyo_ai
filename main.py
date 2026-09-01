@@ -293,6 +293,21 @@ class AnalyzePostResponse(BaseModel):
     content_ideas: list[str]
     engagement_tip: str
     visual_analysis: bool  # true if this feedback actually looked at the image, not just the caption
+
+
+class AnalyzeHookRequest(BaseModel):
+    # The caption's first line, or the first ~3 seconds of spoken/on-screen
+    # content for a video — whatever a scroller sees/hears first.
+    hook_text: str = Field(..., min_length=1, max_length=500)
+    niche: str = Field(default="", max_length=100)
+    # Optional first-frame image for a video's opening shot.
+    image_url: str | None = Field(default=None, max_length=2000)
+
+
+class AnalyzeHookResponse(BaseModel):
+    verdict: str  # "strong" | "average" | "weak"
+    reason: str
+    rewrites: list[str]
 # ---------------------------------------------------------------------------
 from fastapi.responses import JSONResponse
 import traceback
@@ -474,6 +489,94 @@ async def analyze_post(
         raise HTTPException(status_code=502, detail="AI returned an unexpected format")
 
     return AnalyzePostResponse(**parsed, visual_analysis=has_image)
+
+
+@app.post("/analyze-hook", response_model=AnalyzeHookResponse)
+async def analyze_hook(
+    req: AnalyzeHookRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Scores just the opening — the single biggest lever on whether a
+    short-form post gets watched past the first moment — instead of the
+    whole post. Deliberately narrow and fast: a quick pre-post check,
+    not the full /analyze-post Coach review.
+    """
+    _check_rate_limit(user_id)
+
+    niche_context = f" Their content niche is '{req.niche}'." if req.niche else ""
+    has_image = bool(req.image_url)
+
+    instruction = (
+        "You are a short-form video hook specialist. A creator is about to "
+        "post with this opening — either a caption's first line, or the "
+        "first ~3 seconds of spoken/on-screen content in a video.\n\n"
+        f"Opening: {req.hook_text}\n"
+        f"{niche_context}\n\n"
+        "Judge ONLY whether this opening would stop someone mid-scroll in "
+        "the first 3 seconds — not the post as a whole.\n\n"
+    )
+
+    if has_image:
+        instruction += (
+            "An image is attached — the video's first frame. Factor in what's "
+            "actually visible: is the subject framed well immediately, is "
+            "there visual intrigue, or is it a dead/static opening shot?\n\n"
+        )
+
+    instruction += (
+        "Respond with exactly this format, no markdown, no extra commentary:\n"
+        "VERDICT: <strong|average|weak>\n"
+        "REASON: <one specific sentence explaining the verdict>\n"
+        "REWRITE_1: <a stronger opening line>\n"
+        "REWRITE_2: <a different stronger opening line, different angle>\n"
+        "REWRITE_3: <a third option, different angle again>"
+    )
+
+    user_content: list[dict] = [{"type": "text", "text": instruction}]
+    if has_image:
+        user_content.append({"type": "image_url", "image_url": {"url": req.image_url}})
+
+    try:
+        completion = _call_openai_with_retry(
+            model=MODEL,
+            messages=[{"role": "user", "content": user_content}],
+            temperature=0.7,
+            max_tokens=300,
+        )
+        text = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        raise HTTPException(status_code=502, detail="AI service unavailable")
+
+    parsed = _parse_hook_response(text)
+    if parsed is None:
+        raise HTTPException(status_code=502, detail="AI returned an unexpected format")
+
+    return AnalyzeHookResponse(**parsed)
+
+
+def _parse_hook_response(text: str) -> dict | None:
+    lines = {}
+    for line in text.splitlines():
+        line = line.strip()
+        for key in ("VERDICT", "REASON", "REWRITE_1", "REWRITE_2", "REWRITE_3"):
+            prefix = f"{key}:"
+            if line.upper().startswith(prefix):
+                lines[key] = line[len(prefix):].strip()
+                break
+
+    if not all(k in lines for k in ("VERDICT", "REASON", "REWRITE_1", "REWRITE_2", "REWRITE_3")):
+        return None
+
+    verdict = lines["VERDICT"].strip().lower()
+    if verdict not in ("strong", "average", "weak"):
+        verdict = "average"
+
+    return {
+        "verdict": verdict,
+        "reason": lines["REASON"],
+        "rewrites": [lines["REWRITE_1"], lines["REWRITE_2"], lines["REWRITE_3"]],
+    }
 
 
 def _parse_coach_response(text: str) -> dict | None:
