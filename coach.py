@@ -1,6 +1,9 @@
 import datetime
+import json
 import os
+import re
 import time
+from collections import defaultdict, deque
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Header
@@ -261,6 +264,162 @@ def _maybe_add_outcome_followup(
         return saved or []
     except HTTPException:
         return []
+
+
+# ---------------------------------------------------------
+# Personalized caption/title variants
+#
+# The existing /content-ideas endpoint (main.py) suggests WHAT to post
+# — this suggests HOW to caption something the creator already has in
+# mind, grounded in what has actually gotten this specific creator
+# above-their-own-average engagement before, using the same
+# "likes + comments" signal as the outcome follow-up above. A creator
+# with no post history yet just gets a solid generic set of variants
+# instead of a personalization step that has nothing to work from.
+# ---------------------------------------------------------
+
+_CAPTION_HISTORY_LOOKBACK = 30
+_MIN_CAPTIONS_FOR_PERSONALIZATION = 3
+_MAX_EXAMPLE_CAPTIONS = 5
+
+_CAPTION_VARIANTS_RATE_LIMIT = 20
+_CAPTION_VARIANTS_RATE_WINDOW = 60 * 60 * 24  # per day
+_caption_variants_requests: dict = defaultdict(deque)
+
+
+def _check_caption_variants_rate_limit(user_id: str):
+    now = time.time()
+    q = _caption_variants_requests[user_id]
+    while q and now - q[0] > _CAPTION_VARIANTS_RATE_WINDOW:
+        q.popleft()
+    if len(q) >= _CAPTION_VARIANTS_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Limit reached: {_CAPTION_VARIANTS_RATE_LIMIT} caption generations per day. Try again tomorrow.",
+        )
+    q.append(now)
+
+
+class CaptionVariantsRequest(BaseModel):
+    draft: str = Field(..., min_length=1, max_length=500)
+    niche: str = Field(default="", max_length=100)
+
+
+class CaptionVariantsResponse(BaseModel):
+    variants: list[str]
+    # False when the creator doesn't have enough post history yet for
+    # personalization to mean anything — lets the UI say so honestly
+    # instead of implying every set of variants is tailored to them.
+    personalized: bool
+
+
+def _get_top_performing_captions(user_id: str) -> list[str]:
+    """
+    Pulls captions from this creator's own past posts that performed
+    above their own average engagement, so new variants can be grounded
+    in a voice that has actually worked for THEM rather than a generic
+    tone. Never raises — any failure or lack of history just means the
+    caller falls back to non-personalized generation.
+    """
+    if supabase_admin is None:
+        return []
+
+    try:
+        result = (
+            supabase_admin
+            .table("posts")
+            .select("caption,like_count,comment_count")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(_CAPTION_HISTORY_LOOKBACK)
+            .execute()
+        )
+        posts = result.data or []
+    except Exception:
+        return []
+
+    scored = [
+        (p, (p.get("like_count") or 0) + (p.get("comment_count") or 0))
+        for p in posts
+        if (p.get("caption") or "").strip()
+    ]
+    if len(scored) < _MIN_CAPTIONS_FOR_PERSONALIZATION:
+        return []
+
+    baseline = sum(engagement for _, engagement in scored) / len(scored)
+    above_baseline = [p for p, engagement in scored if engagement > baseline]
+    if len(above_baseline) < _MIN_CAPTIONS_FOR_PERSONALIZATION:
+        # Too few posts clearly beat their own baseline to treat that as
+        # a real signal — fall back to plain top-performers-by-engagement
+        # instead of forcing a comparison that isn't meaningful yet.
+        above_baseline = [p for p, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
+
+    return [p["caption"].strip() for p in above_baseline[:_MAX_EXAMPLE_CAPTIONS]]
+
+
+def _parse_variant_list(raw: str) -> list[str]:
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return []
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(v).strip() for v in parsed if str(v).strip()][:6]
+
+
+@router.post("/caption-variants", response_model=CaptionVariantsResponse)
+async def caption_variants(
+    req: CaptionVariantsRequest,
+    user_id: str = Depends(_get_current_user_id),
+):
+    _check_caption_variants_rate_limit(user_id)
+
+    top_captions = _get_top_performing_captions(user_id)
+    personalized = bool(top_captions)
+
+    niche_context = f" in the {req.niche} niche" if req.niche else ""
+
+    if personalized:
+        examples = "\n".join(f'- "{c}"' for c in top_captions)
+        instruction = (
+            f"A content creator{niche_context} has this rough idea for their next post:\n"
+            f'"{req.draft}"\n\n'
+            "Here are captions from THIS creator's own past posts that performed above "
+            "their usual engagement — study their voice, tone, length, emoji/hashtag use:\n"
+            f"{examples}\n\n"
+            "Write 4 new caption/title variants for the idea above that sound like they "
+            "came from this same creator — borrow whatever made those captions work, don't "
+            'copy them verbatim. Respond with ONLY a JSON array of 4 strings, like '
+            '["variant one", "variant two", "variant three", "variant four"] — no other text.'
+        )
+    else:
+        instruction = (
+            f"A content creator{niche_context} has this rough idea for their next post:\n"
+            f'"{req.draft}"\n\n'
+            "Write 4 punchy, scroll-stopping caption/title variants for a short-form video "
+            'post. Respond with ONLY a JSON array of 4 strings, like '
+            '["variant one", "variant two", "variant three", "variant four"] — no other text.'
+        )
+
+    try:
+        completion = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": instruction}],
+            temperature=0.9,
+            max_tokens=400,
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        raise HTTPException(status_code=502, detail="AI service unavailable")
+
+    variants = _parse_variant_list(raw)
+    if not variants:
+        raise HTTPException(status_code=502, detail="AI returned an unexpected format")
+
+    return CaptionVariantsResponse(variants=variants, personalized=personalized)
 
 
 # ---------------------------------------------------------
