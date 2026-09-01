@@ -5,8 +5,15 @@
 # default builder once it's present in the repo.
 FROM python:3.11-slim
 
+# fonts-dejavu-core is required, not optional: ffmpeg/libass depend on
+# libfontconfig1 (the font-lookup *library*) but that pulls in zero
+# actual font files with --no-install-recommends. Without a real font
+# installed, both the existing subtitle burn-in (FontName=Arial-Bold,
+# which doesn't exist here either — fontconfig just substitutes
+# whatever default it can find) and the drawtext-based quote card
+# feature fail to render any text at all.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
