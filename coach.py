@@ -273,12 +273,14 @@ def _maybe_add_outcome_followup(
 # client.
 #
 # This is a best-effort cascade across the tables this backend knows
-# about (coach history, posts, profile), followed by the Supabase auth
-# user itself — not a guarantee that every row everywhere is gone.
-# There are no migration files in this repo to confirm foreign-key
-# cascade behavior for other tables (coins/transactions, missions,
-# follows, likes, comments), so verify that directly in Supabase before
-# relying on this alone for a compliance/GDPR "right to erasure" claim.
+# about (coach history, posts, profile) and the Storage buckets those
+# tables reference (uploaded posts/videos, avatars, repurposed clips),
+# followed by the Supabase auth user itself — not a guarantee that
+# every row everywhere is gone. There are no migration files in this
+# repo to confirm foreign-key cascade behavior for other tables
+# (coins/transactions, missions, follows, likes, comments), so verify
+# that directly in Supabase before relying on this alone for a
+# compliance/GDPR "right to erasure" claim.
 # ---------------------------------------------------------
 
 _DELETE_TABLES = {
@@ -286,6 +288,33 @@ _DELETE_TABLES = {
     "posts": "user_id",
     "profiles": "id",
 }
+
+# Every Storage bucket the app uploads user content into, all keyed by
+# a "{user_id}/..." path prefix (confirmed against the Flutter upload
+# call sites: post_service.dart, edit_profile.dart, and repurpose.py's
+# PROCESSED_BUCKET). This previously deleted DB rows referencing this
+# content but left the actual files in Storage forever — a real gap in
+# what the app's Privacy screen claims about deleting your data.
+_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos"]
+
+
+def _purge_storage(user_id: str) -> list[str]:
+    """Removes every file under this user's prefix in each bucket above.
+
+    Best-effort per bucket: a failure on one doesn't stop the others,
+    and the caller doesn't fail the whole deletion over a storage
+    cleanup issue — errors are collected and returned instead.
+    """
+    errors = []
+    for bucket in _STORAGE_BUCKETS_TO_PURGE:
+        try:
+            files = supabase_admin.storage.from_(bucket).list(user_id)
+            paths = [f"{user_id}/{f['name']}" for f in files if f.get("name")]
+            if paths:
+                supabase_admin.storage.from_(bucket).remove(paths)
+        except Exception as e:
+            errors.append(f"storage:{bucket}: {e}")
+    return errors
 
 
 @router.delete("/account")
@@ -304,6 +333,8 @@ async def delete_account(
             supabase_admin.table(table).delete().eq(column, user_id).execute()
         except Exception as e:
             cleanup_errors.append(f"{table}: {e}")
+
+    cleanup_errors += _purge_storage(user_id)
 
     try:
         supabase_admin.auth.admin.delete_user(user_id)

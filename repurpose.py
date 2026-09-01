@@ -46,6 +46,7 @@ import json
 import time
 import tempfile
 import subprocess
+import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
 from typing import Optional
@@ -79,6 +80,9 @@ MAX_INPUT_DURATION_SECONDS = int(os.environ.get("MAX_INPUT_DURATION_SECONDS", "1
 MAX_INPUT_SIZE_BYTES = int(os.environ.get("MAX_INPUT_SIZE_MB", "500")) * 1024 * 1024
 
 MAX_OUTPUT_CLIP_SECONDS = 60
+
+DOWNLOAD_TIMEOUT_SECONDS = 30
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 # Separate, stricter rate limit from the other AI endpoints — this is
 # far more expensive per call (Whisper + GPT + FFmpeg render).
@@ -132,6 +136,69 @@ class RepurposeResponse(BaseModel):
     processed_video_url: str
     transcript: str
     highlight: HighlightSegment
+
+
+def _validate_storage_url(url: str) -> None:
+    """
+    Rejects anything that isn't an HTTPS URL on this project's own
+    Supabase host.
+
+    Without this, video_url was passed straight to urlretrieve with no
+    checks at all — any authenticated caller could point it at an
+    internal address (cloud metadata endpoints, other Railway/internal
+    services, localhost) and use this endpoint as a server-side request
+    forgery proxy. Comparing against SUPABASE_URL's own host, which is
+    already known server-side, closes the actual threat here.
+    """
+    parsed = urllib.parse.urlparse(url)
+    expected_host = urllib.parse.urlparse(SUPABASE_URL).hostname
+    if parsed.scheme != "https" or not expected_host or parsed.hostname != expected_host:
+        raise HTTPException(
+            status_code=400,
+            detail="video_url must be an HTTPS Supabase Storage URL for this project.",
+        )
+
+
+def _download_video(url: str, dest_path: str) -> None:
+    """
+    Downloads the source video with a hard size cap enforced while
+    streaming, not after the fact — the previous version downloaded the
+    entire file with urlretrieve before ever checking MAX_INPUT_SIZE_BYTES,
+    so a large or slow-drip remote file would be fully pulled down
+    (bandwidth/disk/cost) before being rejected. A timeout guards against
+    a remote server that simply hangs.
+    """
+    _validate_storage_url(url)
+    try:
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
+            # Re-validate after following any redirects — the initial URL
+            # passing the check doesn't guarantee the final one does.
+            _validate_storage_url(resp.geturl())
+
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_INPUT_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)}MB.",
+                )
+
+            written = 0
+            with open(dest_path, "wb") as out:
+                while True:
+                    chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_INPUT_SIZE_BYTES:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)}MB.",
+                        )
+                    out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not download video from URL: {e}")
 
 
 def _run_ffprobe_duration(path: str) -> float:
@@ -339,17 +406,7 @@ async def repurpose_video(
         # Download the video from Supabase Storage.
         # This is a server-to-server download (Railway → Supabase CDN)
         # and is not subject to Railway's inbound request timeout.
-        try:
-            urllib.request.urlretrieve(req.video_url, source_path)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not download video from URL: {e}")
-
-        size = os.path.getsize(source_path)
-        if size > MAX_INPUT_SIZE_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)}MB.",
-            )
+        _download_video(req.video_url, source_path)
 
         duration = _run_ffprobe_duration(source_path)
         if duration > MAX_INPUT_DURATION_SECONDS:
