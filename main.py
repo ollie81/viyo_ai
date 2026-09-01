@@ -203,7 +203,13 @@ def _public_key_for_token(token: str):
         raise HTTPException(status_code=500, detail=f"Failed to load public key: {exc}")
 
 
-async def get_current_user_id(authorization: str = Header(None)) -> str:
+def _decode_token(authorization: str | None) -> dict:
+    """
+    Shared JWT verification behind both get_current_user_id and
+    get_current_user_id_no_guest — same ES256/JWKS check either way, just
+    returning the full payload instead of only the subject, so callers can
+    also read claims like `is_anonymous`.
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
@@ -214,38 +220,64 @@ async def get_current_user_id(authorization: str = Header(None)) -> str:
         # enforced by the startup check above. NEVER in production.
         # algorithms= required by PyJWT 2.x even with verify_signature=False.
         try:
-            payload = jwt.decode(
+            return jwt.decode(
                 token,
                 options={"verify_signature": False},
                 algorithms=["ES256"],
             )
         except Exception as exc:
             raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
-    else:
-        public_key = _public_key_for_token(token)
-        try:
-            payload = jwt.decode(
-                token,
-                public_key,
-                algorithms=["ES256"],
-                audience="authenticated",
-            )
-        except jwt.ExpiredSignatureError:
-            raise HTTPException(
-                status_code=401,
-                detail="Token expired — log out and back in on the app, then try again.",
-            )
-        except jwt.InvalidSignatureError:
-            raise HTTPException(
-                status_code=401,
-                detail="Token signature invalid — the token may have been tampered with.",
-            )
-        except jwt.PyJWTError as exc:
-            raise HTTPException(status_code=401, detail=f"Token verification failed: {exc}")
 
+    public_key = _public_key_for_token(token)
+    try:
+        return jwt.decode(
+            token,
+            public_key,
+            algorithms=["ES256"],
+            audience="authenticated",
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token expired — log out and back in on the app, then try again.",
+        )
+    except jwt.InvalidSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token signature invalid — the token may have been tampered with.",
+        )
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {exc}")
+
+
+async def get_current_user_id(authorization: str = Header(None)) -> str:
+    payload = _decode_token(authorization)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Token missing subject")
+    return user_id
+
+
+async def get_current_user_id_no_guest(authorization: str = Header(None)) -> str:
+    """
+    Same as get_current_user_id, but rejects a guest (anonymous Supabase
+    session) session outright. Supabase's anonymous sign-in issues a
+    normal, fully-verifiable JWT (this app's ES256/JWKS check accepts it
+    unchanged) — the only difference is an `is_anonymous: true` claim, so
+    without this check a guest could call any AI endpoint directly and
+    spin up unlimited anonymous sessions to route around the per-account
+    rate limiter entirely. Used on every endpoint that calls OpenAI;
+    read-only or non-AI endpoints keep using get_current_user_id.
+    """
+    payload = _decode_token(authorization)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token missing subject")
+    if payload.get("is_anonymous"):
+        raise HTTPException(
+            status_code=403,
+            detail="Create an account to use this feature.",
+        )
     return user_id
 
 
@@ -328,7 +360,7 @@ async def global_exception_handler(request, exc):
 @app.post("/content-ideas", response_model=ContentIdeasResponse)
 async def content_ideas(
     req: ContentIdeasRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_no_guest),
 ):
     _check_rate_limit(user_id)
 
@@ -359,7 +391,7 @@ async def content_ideas(
 @app.post("/improve-caption", response_model=ImproveCaptionResponse)
 async def improve_caption(
     req: ImproveCaptionRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_no_guest),
 ):
     _check_rate_limit(user_id)
 
@@ -387,7 +419,7 @@ async def improve_caption(
 @app.post("/post-feedback", response_model=PostFeedbackResponse)
 async def post_feedback(
     req: PostFeedbackRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_no_guest),
 ):
     _check_rate_limit(user_id)
 
@@ -421,7 +453,7 @@ async def post_feedback(
 @app.post("/analyze-post", response_model=AnalyzePostResponse)
 async def analyze_post(
     req: AnalyzePostRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_no_guest),
 ):
     """
     The AI Creator Coach. Runs right after a creator posts, and gives
@@ -494,7 +526,7 @@ async def analyze_post(
 @app.post("/analyze-hook", response_model=AnalyzeHookResponse)
 async def analyze_hook(
     req: AnalyzeHookRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_no_guest),
 ):
     """
     Scores just the opening — the single biggest lever on whether a
