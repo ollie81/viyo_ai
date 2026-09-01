@@ -84,6 +84,12 @@ MAX_OUTPUT_CLIP_SECONDS = 60
 DOWNLOAD_TIMEOUT_SECONDS = 30
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
+QUOTE_CARD_SIZE = "1080x1080"
+# Requires fonts-dejavu-core installed in the Dockerfile — ffmpeg/libass
+# only depend on the fontconfig *library*, not any actual font files, so
+# without this package drawtext has nothing to render text with at all.
+QUOTE_CARD_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
 # Separate, stricter rate limit from the other AI endpoints — this is
 # far more expensive per call (Whisper + GPT + FFmpeg render).
 REPURPOSE_RATE_LIMIT = 5
@@ -141,6 +147,10 @@ class RepurposeClipResult(BaseModel):
     processed_video_url: str
     highlight: HighlightSegment
     dead_air_removed_seconds: float = 0.0
+    # None if the quote-card render/upload failed — never fails the
+    # whole request over the extra format, since the video clip itself
+    # is the part that actually matters.
+    quote_card_url: Optional[str] = None
 
 
 class RepurposeResponse(BaseModel):
@@ -547,6 +557,58 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
         raise HTTPException(status_code=500, detail=f"Video render failed: {result.stderr[-500:]}")
 
 
+def _wrap_quote_text(text: str, max_chars_per_line: int = 22) -> str:
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > max_chars_per_line and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
+
+
+def _render_quote_card(text: str, output_path: str) -> None:
+    """
+    Renders a static, shareable 1080x1080 quote-card image using the
+    clip's own suggested_title as the headline — reusing a field that's
+    already generated per clip rather than an extra GPT call. One upload
+    now produces a video AND a postable image, not just the one format.
+
+    Text goes through a temp file (drawtext's textfile= option) rather
+    than being inlined into the filter string, which sidesteps ffmpeg
+    filter-syntax escaping entirely for quotes/colons/apostrophes in
+    AI-generated titles — verified against exactly that kind of text.
+    """
+    wrapped = _wrap_quote_text(text)
+    fd, text_file_path = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(wrapped)
+
+        filter_graph = (
+            f"drawtext=textfile={text_file_path}:fontfile={QUOTE_CARD_FONT_PATH}:"
+            "fontcolor=white:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=14"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x13132B:s={QUOTE_CARD_SIZE}",
+            "-vf", filter_graph,
+            "-frames:v", "1",
+            output_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Quote card render failed: {result.stderr[-500:]}")
+    finally:
+        os.unlink(text_file_path)
+
+
 @router.post("/repurpose", response_model=RepurposeResponse)
 async def repurpose_video(
     req: RepurposeRequest,
@@ -621,10 +683,31 @@ async def repurpose_video(
 
             public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
 
+            # A second, cheap format from the same upload — a shareable
+            # quote card, not just the video. Never fails the request:
+            # the video clip is what actually matters, so a render or
+            # upload problem here (e.g. a stricter bucket MIME policy)
+            # just means this one clip has no quote card, not a 502.
+            quote_card_url = None
+            try:
+                quote_card_path = os.path.join(tmp, f"quote_{i}.png")
+                _render_quote_card(highlight.suggested_title, quote_card_path)
+                quote_card_storage_path = f"{user_id}/{int(time.time())}_{i}_quote.png"
+                with open(quote_card_path, "rb") as qf:
+                    supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+                        quote_card_storage_path, qf, file_options={"content-type": "image/png"}
+                    )
+                quote_card_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
+                    quote_card_storage_path
+                )
+            except Exception as e:
+                print(f"[WARN] Quote card failed for clip {i}: {e}")
+
             clips.append(RepurposeClipResult(
                 processed_video_url=public_url,
                 highlight=highlight,
                 dead_air_removed_seconds=dead_air_removed,
+                quote_card_url=quote_card_url,
             ))
 
     return RepurposeResponse(
