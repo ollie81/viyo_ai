@@ -119,15 +119,18 @@ def _check_repurpose_rate_limit(user_id: str):
 
 
 async def _get_current_user_id(authorization: str = Header(None)) -> str:
-    """Delegates to main.py's get_current_user_id (ES256 / JWKS verification).
+    """Delegates to main.py's get_current_user_id_no_guest (ES256 / JWKS
+    verification, plus rejecting an anonymous guest session — this
+    endpoint is entirely AI-driven (Whisper + GPT), same reasoning as
+    every other OpenAI-calling endpoint in this backend).
 
     We use a lazy import instead of a module-level one to avoid a circular
     import — main.py imports repurpose at startup, so repurpose must not
     import main at module load time. Importing inside the function body is
     fine: it only runs at request time, by which point main is fully loaded.
     """
-    from main import get_current_user_id
-    return await get_current_user_id(authorization)
+    from main import get_current_user_id_no_guest
+    return await get_current_user_id_no_guest(authorization)
 
 
 class RepurposeRequest(BaseModel):

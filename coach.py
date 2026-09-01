@@ -48,6 +48,19 @@ async def _get_current_user_id(
     return await get_current_user_id(authorization)
 
 
+async def _get_current_user_id_no_guest(
+    authorization: str = Header(None),
+) -> str:
+    """
+    Same as _get_current_user_id but rejects a guest (anonymous Supabase
+    session). Used on every endpoint in this file that calls OpenAI —
+    see main.get_current_user_id_no_guest for why.
+    """
+    from main import get_current_user_id_no_guest
+
+    return await get_current_user_id_no_guest(authorization)
+
+
 # ---------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------
@@ -373,7 +386,7 @@ def _parse_variant_list(raw: str) -> list[str]:
 @router.post("/caption-variants", response_model=CaptionVariantsResponse)
 async def caption_variants(
     req: CaptionVariantsRequest,
-    user_id: str = Depends(_get_current_user_id),
+    user_id: str = Depends(_get_current_user_id_no_guest),
 ):
     _check_caption_variants_rate_limit(user_id)
 
@@ -460,7 +473,7 @@ def _week_boundaries() -> tuple[datetime.datetime, datetime.datetime, datetime.d
 
 @router.get("/weekly-report", response_model=WeeklyReportResponse)
 async def weekly_report(
-    user_id: str = Depends(_get_current_user_id),
+    user_id: str = Depends(_get_current_user_id_no_guest),
 ):
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Report service is not configured.")
@@ -677,7 +690,7 @@ def _parse_voice_response(raw: str) -> Optional[dict]:
 @router.post("/voice-check", response_model=VoiceCheckResponse)
 async def voice_check(
     req: VoiceCheckRequest,
-    user_id: str = Depends(_get_current_user_id),
+    user_id: str = Depends(_get_current_user_id_no_guest),
 ):
     _check_voice_check_rate_limit(user_id)
 
@@ -841,7 +854,7 @@ def _parse_trending_response(raw: str) -> Optional[dict]:
 @router.get("/trending", response_model=TrendingResponse)
 async def trending(
     niche: str = Query(..., min_length=1, max_length=100),
-    user_id: str = Depends(_get_current_user_id),
+    user_id: str = Depends(_get_current_user_id_no_guest),
 ):
     _check_trending_rate_limit(user_id)
 
@@ -1032,7 +1045,7 @@ async def get_coach_history(
 )
 async def coach_message(
     req: CoachMessageRequest,
-    user_id: str = Depends(_get_current_user_id),
+    user_id: str = Depends(_get_current_user_id_no_guest),
 ):
 
     if supabase_admin is None:
