@@ -581,6 +581,145 @@ async def weekly_report(
 
 
 # ---------------------------------------------------------
+# Voice/style consistency check
+#
+# Every other AI feature in this file looks at ONE post in isolation.
+# This is the first one that looks across a creator's post history to
+# answer a different question: not "is this caption good," but "does
+# this sound like ME" — catching a draft that reads noticeably more
+# formal, more sarcastic, or otherwise off-brand versus everything
+# else they've posted, before it goes out under their name.
+# ---------------------------------------------------------
+
+_VOICE_PROFILE_LOOKBACK = 20
+_MIN_CAPTIONS_FOR_VOICE_PROFILE = 5
+_MAX_VOICE_EXAMPLE_CAPTIONS = 8
+
+_VOICE_CHECK_RATE_LIMIT = 20
+_VOICE_CHECK_RATE_WINDOW = 60 * 60 * 24  # per day
+_voice_check_requests: dict = defaultdict(deque)
+
+
+def _check_voice_check_rate_limit(user_id: str):
+    now = time.time()
+    q = _voice_check_requests[user_id]
+    while q and now - q[0] > _VOICE_CHECK_RATE_WINDOW:
+        q.popleft()
+    if len(q) >= _VOICE_CHECK_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Limit reached: {_VOICE_CHECK_RATE_LIMIT} voice checks per day. Try again tomorrow.",
+        )
+    q.append(now)
+
+
+class VoiceCheckRequest(BaseModel):
+    draft: str = Field(..., min_length=1, max_length=500)
+
+
+class VoiceCheckResponse(BaseModel):
+    # False when there isn't enough caption history yet to know what
+    # this creator's voice even is — everything below is None in that case.
+    has_voice_profile: bool
+    consistent: Optional[bool] = None
+    reason: Optional[str] = None
+    # Only set when consistent is False — a rewrite in their established voice.
+    suggested_rewrite: Optional[str] = None
+
+
+def _get_recent_captions(user_id: str) -> list[str]:
+    """
+    Pulls this creator's most recent captions to build a voice profile —
+    deliberately NOT filtered/ranked by engagement like
+    _get_top_performing_captions: voice consistency is about how they
+    usually write, not what happened to perform best.
+    """
+    if supabase_admin is None:
+        return []
+    try:
+        result = (
+            supabase_admin
+            .table("posts")
+            .select("caption,created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(_VOICE_PROFILE_LOOKBACK)
+            .execute()
+        )
+        posts = result.data or []
+    except Exception:
+        return []
+    return [c for p in posts if (c := (p.get("caption") or "").strip())]
+
+
+def _parse_voice_response(raw: str) -> Optional[dict]:
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception:
+        return None
+    if "consistent" not in parsed:
+        return None
+
+    consistent = bool(parsed.get("consistent"))
+    reason = str(parsed.get("reason") or "").strip() or None
+    suggested_rewrite = parsed.get("suggested_rewrite")
+    suggested_rewrite = str(suggested_rewrite).strip() if suggested_rewrite else None
+    if consistent:
+        # A rewrite only makes sense when something was flagged as off-brand.
+        suggested_rewrite = None
+
+    return {"consistent": consistent, "reason": reason, "suggested_rewrite": suggested_rewrite}
+
+
+@router.post("/voice-check", response_model=VoiceCheckResponse)
+async def voice_check(
+    req: VoiceCheckRequest,
+    user_id: str = Depends(_get_current_user_id),
+):
+    _check_voice_check_rate_limit(user_id)
+
+    captions = _get_recent_captions(user_id)
+    if len(captions) < _MIN_CAPTIONS_FOR_VOICE_PROFILE:
+        return VoiceCheckResponse(has_voice_profile=False)
+
+    examples = "\n".join(f'- "{c}"' for c in captions[:_MAX_VOICE_EXAMPLE_CAPTIONS])
+    instruction = (
+        "A content creator has an established voice, shown by their past captions "
+        "below. Study the tone, formality, length, emoji/hashtag habits, and typical "
+        "phrasing:\n"
+        f"{examples}\n\n"
+        f'Here is a NEW draft caption they\'re considering posting:\n"{req.draft}"\n\n'
+        "Does this draft sound consistent with their established voice, or does it read "
+        "noticeably off-brand (a different tone, much more/less formal, out of character)? "
+        "A different topic is fine on its own — focus on VOICE, not subject matter.\n\n"
+        'Respond with ONLY a JSON object like {"consistent": true, "reason": "one short '
+        'sentence", "suggested_rewrite": null} — suggested_rewrite should be a version '
+        "rewritten in their established voice ONLY when consistent is false, otherwise "
+        "null. No other text."
+    )
+
+    try:
+        completion = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": instruction}],
+            temperature=0.3,
+            max_tokens=250,
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        raise HTTPException(status_code=502, detail="AI service unavailable")
+
+    parsed = _parse_voice_response(raw)
+    if parsed is None:
+        raise HTTPException(status_code=502, detail="AI returned an unexpected format")
+
+    return VoiceCheckResponse(has_voice_profile=True, **parsed)
+
+
+# ---------------------------------------------------------
 # Account deletion
 #
 # Nothing in this codebase could previously delete a creator's account
