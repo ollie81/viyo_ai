@@ -129,14 +129,29 @@ class HighlightSegment(BaseModel):
     end_time: float
     reason: str
     suggested_title: str
+    # Deliberately no ge/le bounds here: an LLM-returned value outside
+    # [0, 100] must not raise at construction time (that would discard
+    # the whole batch of otherwise-valid candidates before the clamping
+    # below ever runs) — same reasoning as start_time/end_time not being
+    # bounded at the field level.
+    score: int = 70
+
+
+class RepurposeClipResult(BaseModel):
+    processed_video_url: str
+    highlight: HighlightSegment
+    dead_air_removed_seconds: float = 0.0
 
 
 class RepurposeResponse(BaseModel):
     status: str
-    processed_video_url: str
     transcript: str
-    highlight: HighlightSegment
-    dead_air_removed_seconds: float = 0.0
+    # Ranked best first. Previously this endpoint rendered a single
+    # "best" clip and made that call for the creator — now it returns
+    # several genuinely different candidates (deduped by overlap) so
+    # they can pick, which is what people actually want from an editor
+    # rather than one AI verdict with no alternative.
+    clips: list[RepurposeClipResult]
 
 
 def _validate_storage_url(url: str) -> None:
@@ -297,13 +312,45 @@ def _transcribe_with_openai(path: str) -> dict:
             "segments": all_segments,
         }
 
-def _find_best_highlight(transcript_text: str, max_duration: float) -> HighlightSegment:
+MAX_HIGHLIGHT_CANDIDATES = 3
+
+
+def _overlap_fraction(a: HighlightSegment, b: HighlightSegment) -> float:
+    overlap = max(0.0, min(a.end_time, b.end_time) - max(a.start_time, b.start_time))
+    shorter = min(a.end_time - a.start_time, b.end_time - b.start_time)
+    return overlap / shorter if shorter > 0 else 0.0
+
+
+def _fallback_highlight(max_duration: float) -> HighlightSegment:
+    return HighlightSegment(
+        start_time=0.0,
+        end_time=min(30.0, max_duration),
+        reason="Default clip (AI highlight detection unavailable)",
+        suggested_title="Featured Clip",
+        score=50,
+    )
+
+
+def _find_highlights(
+    transcript_text: str,
+    max_duration: float,
+    count: int = MAX_HIGHLIGHT_CANDIDATES,
+) -> list:
+    """
+    Returns up to `count` ranked, non-overlapping highlight candidates
+    instead of a single "best" pick — the point of multiple options is
+    that they're genuinely different moments, so a candidate that mostly
+    overlaps an already-accepted one is skipped rather than counted.
+    """
     prompt = (
-        "Analyze this video transcript and identify the single most "
-        "engaging, viral-worthy clip segment, no longer than "
-        f"{MAX_OUTPUT_CLIP_SECONDS} seconds. Return ONLY a raw JSON object "
+        f"Analyze this video transcript and identify the {count} most "
+        "engaging, viral-worthy clip segments, each no longer than "
+        f"{MAX_OUTPUT_CLIP_SECONDS} seconds, ranked best first. The segments "
+        "should be genuinely different moments, not overlapping variations "
+        "of the same one. Return ONLY a raw JSON array, each item an object "
         "with keys: start_time (seconds), end_time (seconds), reason, "
-        "suggested_title.\n\n"
+        "suggested_title, score (0-100, how engaging/viral-worthy this "
+        "specific clip is on its own).\n\n"
         f"TRANSCRIPT:\n{transcript_text}"
     )
     try:
@@ -318,22 +365,29 @@ def _find_best_highlight(transcript_text: str, max_duration: float) -> Highlight
         raw = response.choices[0].message.content.strip()
         clean = re.sub(r"```json|```", "", raw).strip()
         data = json.loads(clean)
-        seg = HighlightSegment(**data)
+        if not isinstance(data, list):
+            data = [data]
+        candidates = [HighlightSegment(**item) for item in data]
     except Exception:
-        seg = HighlightSegment(
-            start_time=0.0,
-            end_time=min(30.0, max_duration),
-            reason="Default clip (AI highlight detection unavailable)",
-            suggested_title="Featured Clip",
-        )
+        return [_fallback_highlight(max_duration)]
 
-    # Clamp to the source video's real bounds and our max clip length —
-    # never trust the model's numbers blindly.
-    seg.start_time = max(0.0, min(seg.start_time, max_duration))
-    seg.end_time = max(seg.start_time + 1, min(seg.end_time, max_duration))
-    if seg.end_time - seg.start_time > MAX_OUTPUT_CLIP_SECONDS:
-        seg.end_time = seg.start_time + MAX_OUTPUT_CLIP_SECONDS
-    return seg
+    accepted: list[HighlightSegment] = []
+    for seg in candidates:
+        # Clamp to the source video's real bounds and our max clip
+        # length — never trust the model's numbers blindly.
+        seg.start_time = max(0.0, min(seg.start_time, max_duration))
+        seg.end_time = max(seg.start_time + 1, min(seg.end_time, max_duration))
+        if seg.end_time - seg.start_time > MAX_OUTPUT_CLIP_SECONDS:
+            seg.end_time = seg.start_time + MAX_OUTPUT_CLIP_SECONDS
+        seg.score = max(0, min(seg.score, 100))
+
+        if any(_overlap_fraction(seg, a) > 0.5 for a in accepted):
+            continue
+        accepted.append(seg)
+        if len(accepted) >= count:
+            break
+
+    return accepted or [_fallback_highlight(max_duration)]
 
 
 # A gap between Whisper segments longer than this, inside the chosen
@@ -535,37 +589,46 @@ async def repurpose_video(
         transcript_text = whisper_result.get("text", "")
         segments = whisper_result.get("segments", [])
 
-        highlight = _find_best_highlight(transcript_text, duration)
+        # Transcription (the slow, expensive part) happens once no matter
+        # how many candidate clips come out of it — only the render/upload
+        # step below repeats per clip, which is cheap by comparison.
+        highlights = _find_highlights(transcript_text, duration)
 
-        # Cut dead air out of the chosen window instead of rendering it
-        # as one continuous clip — this is what actually edits the clip
-        # rather than just picking where to cut it.
-        blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
-        dead_air_removed = _dead_air_removed_seconds(blocks)
+        clips = []
+        for i, highlight in enumerate(highlights):
+            # Cut dead air out of the chosen window instead of rendering
+            # it as one continuous clip — this is what actually edits the
+            # clip rather than just picking where to cut it.
+            blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
+            dead_air_removed = _dead_air_removed_seconds(blocks)
 
-        srt_path = os.path.join(tmp, "captions.srt")
-        _generate_srt(segments, srt_path, blocks)
+            srt_path = os.path.join(tmp, f"captions_{i}.srt")
+            _generate_srt(segments, srt_path, blocks)
 
-        output_path = os.path.join(tmp, "output.mp4")
-        _render_clip(source_path, output_path, srt_path, blocks)
+            output_path = os.path.join(tmp, f"output_{i}.mp4")
+            _render_clip(source_path, output_path, srt_path, blocks)
 
-        # Upload the finished clip to Supabase Storage — survives Railway's
-        # ephemeral filesystem across redeploys.
-        storage_path = f"{user_id}/{int(time.time())}.mp4"
-        with open(output_path, "rb") as f:
-            try:
-                supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                    storage_path, f, file_options={"content-type": "video/mp4"}
-                )
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
+            # Upload the finished clip to Supabase Storage — survives
+            # Railway's ephemeral filesystem across redeploys.
+            storage_path = f"{user_id}/{int(time.time())}_{i}.mp4"
+            with open(output_path, "rb") as f:
+                try:
+                    supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+                        storage_path, f, file_options={"content-type": "video/mp4"}
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
 
-        public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
+            public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
+
+            clips.append(RepurposeClipResult(
+                processed_video_url=public_url,
+                highlight=highlight,
+                dead_air_removed_seconds=dead_air_removed,
+            ))
 
     return RepurposeResponse(
         status="success",
-        processed_video_url=public_url,
         transcript=transcript_text,
-        highlight=highlight,
-        dead_air_removed_seconds=dead_air_removed,
+        clips=clips,
     )
