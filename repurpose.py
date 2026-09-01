@@ -44,6 +44,7 @@ import os
 import re
 import json
 import time
+import base64
 import tempfile
 import subprocess
 import urllib.parse
@@ -89,6 +90,13 @@ QUOTE_CARD_SIZE = "1080x1080"
 # only depend on the fontconfig *library*, not any actual font files, so
 # without this package drawtext has nothing to render text with at all.
 QUOTE_CARD_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# How many evenly-spaced frames to pull from a rendered clip as thumbnail
+# candidates. 5 is enough spread to catch a genuinely different moment
+# (talking head vs. a reaction vs. a b-roll cutaway) without ballooning
+# the vision call's cost/latency — each candidate is one more image token
+# block in the same GPT-4o-mini request.
+THUMBNAIL_CANDIDATE_COUNT = 5
 
 # Separate, stricter rate limit from the other AI endpoints — this is
 # far more expensive per call (Whisper + GPT + FFmpeg render).
@@ -151,6 +159,9 @@ class RepurposeClipResult(BaseModel):
     # whole request over the extra format, since the video clip itself
     # is the part that actually matters.
     quote_card_url: Optional[str] = None
+    # None if thumbnail extraction/selection/upload failed — same
+    # never-fail-the-request reasoning as quote_card_url.
+    thumbnail_url: Optional[str] = None
 
 
 class RepurposeResponse(BaseModel):
@@ -609,6 +620,93 @@ def _render_quote_card(text: str, output_path: str) -> None:
         os.unlink(text_file_path)
 
 
+def _extract_thumbnail_candidates(clip_path: str, out_dir: str, count: int) -> list[str]:
+    """
+    Pulls `count` evenly-spaced frames from the rendered (already cropped
+    9:16) clip as thumbnail candidates. Spaced across [10%, 90%] of the
+    clip rather than [0%, 100%] — the very first/last frames are the most
+    likely to be a mid-cut or fade artifact, so this avoids wasting a
+    candidate slot on one of those.
+    """
+    duration = _run_ffprobe_duration(clip_path)
+    if duration <= 0:
+        return []
+
+    if count == 1:
+        timestamps = [duration / 2]
+    else:
+        lo, hi = duration * 0.1, duration * 0.9
+        step = (hi - lo) / (count - 1)
+        timestamps = [lo + i * step for i in range(count)]
+
+    paths = []
+    for i, ts in enumerate(timestamps):
+        frame_path = os.path.join(out_dir, f"thumb_candidate_{i}.jpg")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(ts), "-i", clip_path,
+            "-frames:v", "1", "-q:v", "3",
+            frame_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0 and os.path.exists(frame_path):
+            paths.append(frame_path)
+    return paths
+
+
+def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
+    """
+    Sends every candidate frame to GPT-4o-mini's vision input in one call
+    and asks it to pick the single most scroll-stopping one — the same
+    "look at the actual pixels" pattern already used by /analyze-post,
+    just choosing among frames instead of critiquing one. Frames go in as
+    base64 data URLs since these are local temp files, never uploaded
+    anywhere unless they win — no need to touch Storage for the 4 that lose.
+
+    Falls back to the middle candidate (index len // 2, a reasonable
+    "probably not a blank intro/outro frame" guess) on any parse failure
+    or out-of-range answer, so a flaky/malformed model response degrades
+    to a plausible thumbnail rather than raising.
+    """
+    fallback_index = len(candidate_paths) // 2
+
+    content: list[dict] = [{
+        "type": "text",
+        "text": (
+            "These are candidate thumbnail frames from one short vertical video, "
+            "in order, labeled Frame 0 through Frame "
+            f"{len(candidate_paths) - 1}. Pick the single frame that would work best "
+            "as a scroll-stopping thumbnail: a clear, in-focus, expressive moment "
+            "(a face mid-expression, a striking visual) rather than a blurry, "
+            "transitional, or blank-looking frame. "
+            'Respond with ONLY a JSON object like {"best_frame": 2} — no other text.'
+        ),
+    }]
+    for path in candidate_paths:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+
+    try:
+        completion = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": content}],
+            temperature=0,
+            max_tokens=50,
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return fallback_index
+        parsed = json.loads(match.group(0))
+        index = int(parsed.get("best_frame"))
+        if 0 <= index < len(candidate_paths):
+            return index
+        return fallback_index
+    except Exception:
+        return fallback_index
+
+
 @router.post("/repurpose", response_model=RepurposeResponse)
 async def repurpose_video(
     req: RepurposeRequest,
@@ -703,11 +801,34 @@ async def repurpose_video(
             except Exception as e:
                 print(f"[WARN] Quote card failed for clip {i}: {e}")
 
+            # A GPT-4o-mini vision pick of the most scroll-stopping frame
+            # from the clip itself, uploaded as the poster image — most
+            # feed UIs show the thumbnail before anyone presses play, so
+            # this is the single biggest lever on whether a clip gets a
+            # first tap at all. Same never-fail-the-request pattern as
+            # the quote card above.
+            thumbnail_url = None
+            try:
+                candidates = _extract_thumbnail_candidates(output_path, tmp, THUMBNAIL_CANDIDATE_COUNT)
+                if candidates:
+                    best_index = _pick_best_thumbnail(candidates)
+                    thumbnail_storage_path = f"{user_id}/{int(time.time())}_{i}_thumb.jpg"
+                    with open(candidates[best_index], "rb") as tf:
+                        supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+                            thumbnail_storage_path, tf, file_options={"content-type": "image/jpeg"}
+                        )
+                    thumbnail_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
+                        thumbnail_storage_path
+                    )
+            except Exception as e:
+                print(f"[WARN] Thumbnail selection failed for clip {i}: {e}")
+
             clips.append(RepurposeClipResult(
                 processed_video_url=public_url,
                 highlight=highlight,
                 dead_air_removed_seconds=dead_air_removed,
                 quote_card_url=quote_card_url,
+                thumbnail_url=thumbnail_url,
             ))
 
     return RepurposeResponse(
