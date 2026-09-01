@@ -423,6 +423,164 @@ async def caption_variants(
 
 
 # ---------------------------------------------------------
+# Weekly report card
+#
+# Coach feedback and the outcome follow-up above both live at the
+# per-post level — nothing previously rolled them up into "how is this
+# week going overall," which is the shape creators actually think in
+# ("am I improving?", not "how did Tuesday's post do?"). This computes
+# real stats first (never invented by the model) and only uses
+# GPT-4o-mini to phrase them as a short, encouraging note — the same
+# coaching voice as the rest of the app, not a numbers dashboard.
+# ---------------------------------------------------------
+
+_REPORT_WINDOW_DAYS = 7
+_REPORT_LOOKBACK_ROWS = 200  # generous cap so two weeks of an active creator's data always fits
+
+
+class WeeklyReportResponse(BaseModel):
+    posts_this_week: int
+    avg_score_this_week: Optional[float] = None
+    avg_score_last_week: Optional[float] = None
+    # 'up' / 'down' / 'flat' — only set when both weeks have a score to
+    # compare; None means there isn't enough history for a trend yet.
+    score_trend: Optional[str] = None
+    total_likes: int
+    total_comments: int
+    best_post_caption: Optional[str] = None
+    summary: str
+
+
+def _week_boundaries() -> tuple[datetime.datetime, datetime.datetime, datetime.datetime]:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    this_week_start = now - datetime.timedelta(days=_REPORT_WINDOW_DAYS)
+    last_week_start = now - datetime.timedelta(days=_REPORT_WINDOW_DAYS * 2)
+    return last_week_start, this_week_start, now
+
+
+@router.get("/weekly-report", response_model=WeeklyReportResponse)
+async def weekly_report(
+    user_id: str = Depends(_get_current_user_id),
+):
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Report service is not configured.")
+
+    last_week_start, this_week_start, now = _week_boundaries()
+
+    try:
+        scored_result = (
+            supabase_admin
+            .table("video_coach_messages")
+            .select("score,created_at")
+            .eq("user_id", user_id)
+            .not_.is_("score", "null")
+            .order("created_at", desc=True)
+            .limit(_REPORT_LOOKBACK_ROWS)
+            .execute()
+        )
+        scored_messages = scored_result.data or []
+
+        posts_result = (
+            supabase_admin
+            .table("posts")
+            .select("caption,like_count,comment_count,created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(_REPORT_LOOKBACK_ROWS)
+            .execute()
+        )
+        posts = posts_result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load report data: {e}")
+
+    def _in_range(created_at: str, start: datetime.datetime, end: datetime.datetime) -> bool:
+        ts = _parse_timestamp(created_at or "")
+        return ts is not None and start <= ts < end
+
+    scores_this_week = [
+        m["score"] for m in scored_messages if _in_range(m.get("created_at", ""), this_week_start, now)
+    ]
+    scores_last_week = [
+        m["score"] for m in scored_messages
+        if _in_range(m.get("created_at", ""), last_week_start, this_week_start)
+    ]
+    posts_this_week = [
+        p for p in posts if _in_range(p.get("created_at", ""), this_week_start, now)
+    ]
+
+    avg_this_week = round(sum(scores_this_week) / len(scores_this_week), 1) if scores_this_week else None
+    avg_last_week = round(sum(scores_last_week) / len(scores_last_week), 1) if scores_last_week else None
+
+    score_trend = None
+    if avg_this_week is not None and avg_last_week is not None:
+        if avg_this_week - avg_last_week >= 2:
+            score_trend = "up"
+        elif avg_last_week - avg_this_week >= 2:
+            score_trend = "down"
+        else:
+            score_trend = "flat"
+
+    total_likes = sum(p.get("like_count") or 0 for p in posts_this_week)
+    total_comments = sum(p.get("comment_count") or 0 for p in posts_this_week)
+
+    best_post_caption = None
+    if posts_this_week:
+        best_post = max(
+            posts_this_week, key=lambda p: (p.get("like_count") or 0) + (p.get("comment_count") or 0)
+        )
+        caption = (best_post.get("caption") or "").strip()
+        best_post_caption = caption or None
+
+    if not posts_this_week and avg_this_week is None:
+        summary = "No activity yet this week — post something and your coach will start tracking it here."
+    else:
+        stats_lines = [f"Posts this week: {len(posts_this_week)}"]
+        if avg_this_week is not None:
+            stats_lines.append(f"Average Coach score this week: {avg_this_week}/100")
+        if avg_last_week is not None:
+            stats_lines.append(f"Average Coach score last week: {avg_last_week}/100")
+        stats_lines.append(f"Total likes + comments this week: {total_likes + total_comments}")
+        if best_post_caption:
+            stats_lines.append(f"Best-performing post's caption: \"{best_post_caption}\"")
+
+        instruction = (
+            "You are a warm, encouraging creator coach writing a short weekly report card "
+            "for a content creator. Here are their real stats for the week — use ONLY these "
+            "numbers, don't invent anything:\n" + "\n".join(stats_lines) + "\n\n"
+            "Write 2-3 sentences: acknowledge the effort, call out the trend if there's a "
+            "clear one (improving, dipping, or steady), and end with one specific, encouraging "
+            "nudge for next week. No markdown, no headers, just the sentences."
+        )
+        try:
+            completion = ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": instruction}],
+                temperature=0.8,
+                max_tokens=200,
+            )
+            summary = (completion.choices[0].message.content or "").strip()
+        except Exception:
+            summary = (
+                f"You posted {len(posts_this_week)} time(s) this week"
+                + (f" and averaged {avg_this_week}/100 on Coach feedback" if avg_this_week is not None else "")
+                + ". Keep it up."
+            )
+        if not summary:
+            summary = "Keep posting — your coach will have more to say once there's more to look at."
+
+    return WeeklyReportResponse(
+        posts_this_week=len(posts_this_week),
+        avg_score_this_week=avg_this_week,
+        avg_score_last_week=avg_last_week,
+        score_trend=score_trend,
+        total_likes=total_likes,
+        total_comments=total_comments,
+        best_post_caption=best_post_caption,
+        summary=summary,
+    )
+
+
+# ---------------------------------------------------------
 # Account deletion
 #
 # Nothing in this codebase could previously delete a creator's account
