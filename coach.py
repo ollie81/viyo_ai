@@ -6,7 +6,7 @@ import time
 from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Query
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
@@ -717,6 +717,176 @@ async def voice_check(
         raise HTTPException(status_code=502, detail="AI returned an unexpected format")
 
     return VoiceCheckResponse(has_voice_profile=True, **parsed)
+
+
+# ---------------------------------------------------------
+# Trend matching against the app's own aggregated engagement data
+#
+# Every other feature in this file only ever looks at ONE creator's
+# own history. This is the first one that looks ACROSS creators —
+# there's no TikTok/Instagram/YouTube trends API integration here, so
+# the only "what's trending" signal this app can honestly offer is its
+# own: which recent posts, from other creators in the same niche, are
+# actually getting engagement right now. Captions are already public
+# content shown across the feed to every user regardless (see
+# video_feed_screen.dart / post_card.dart) — this surfaces them
+# anonymously (no user_id, no way to trace a caption back to who
+# posted it) as inspiration rather than attributed examples.
+# ---------------------------------------------------------
+
+_TRENDING_WINDOW_DAYS = 7
+_TRENDING_LOOKBACK_ROWS = 300
+_MIN_POSTS_FOR_TREND = 5
+_TOP_TREND_POSTS = 8
+
+_TRENDING_RATE_LIMIT = 20
+_TRENDING_RATE_WINDOW = 60 * 60 * 24  # per day
+_trending_requests: dict = defaultdict(deque)
+
+
+def _check_trending_rate_limit(user_id: str):
+    now = time.time()
+    q = _trending_requests[user_id]
+    while q and now - q[0] > _TRENDING_RATE_WINDOW:
+        q.popleft()
+    if len(q) >= _TRENDING_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Limit reached: {_TRENDING_RATE_LIMIT} trend checks per day. Try again tomorrow.",
+        )
+    q.append(now)
+
+
+class TrendingResponse(BaseModel):
+    has_data: bool
+    niche: str
+    sample_size: int
+    themes: list[str] = []
+    # Real captions from the niche's top-performing recent posts —
+    # anonymous (no user_id attached), shown as inspiration.
+    example_captions: list[str] = []
+    idea: str = ""
+
+
+def _get_trending_posts(niche: str) -> list[dict]:
+    """
+    Pulls the top-performing recent posts from OTHER creators sharing
+    this niche. Two-step lookup (profiles -> posts) since there's no
+    niche column on posts itself — service-role client bypasses RLS
+    here the same way every other admin query in this file does.
+    Never raises: any failure or lack of data just means no trend.
+    """
+    if supabase_admin is None or not niche.strip():
+        return []
+
+    try:
+        profiles_result = (
+            supabase_admin
+            .table("profiles")
+            .select("id")
+            .eq("niche", niche)
+            .limit(500)
+            .execute()
+        )
+        user_ids = [p["id"] for p in (profiles_result.data or []) if p.get("id")]
+        if not user_ids:
+            return []
+
+        cutoff = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=_TRENDING_WINDOW_DAYS)
+        ).isoformat()
+        posts_result = (
+            supabase_admin
+            .table("posts")
+            .select("caption,like_count,comment_count,created_at")
+            .in_("user_id", user_ids)
+            .gte("created_at", cutoff)
+            .order("created_at", desc=True)
+            .limit(_TRENDING_LOOKBACK_ROWS)
+            .execute()
+        )
+        posts = posts_result.data or []
+    except Exception:
+        return []
+
+    scored = sorted(
+        (p for p in posts if (p.get("caption") or "").strip()),
+        key=lambda p: (p.get("like_count") or 0) + (p.get("comment_count") or 0),
+        reverse=True,
+    )
+    return scored[:_TOP_TREND_POSTS]
+
+
+def _parse_trending_response(raw: str) -> Optional[dict]:
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception:
+        return None
+
+    themes = parsed.get("themes")
+    idea = parsed.get("idea")
+    if not isinstance(themes, list) or not idea:
+        return None
+
+    themes = [str(t).strip() for t in themes if str(t).strip()][:4]
+    if not themes:
+        return None
+
+    return {"themes": themes, "idea": str(idea).strip()}
+
+
+@router.get("/trending", response_model=TrendingResponse)
+async def trending(
+    niche: str = Query(..., min_length=1, max_length=100),
+    user_id: str = Depends(_get_current_user_id),
+):
+    _check_trending_rate_limit(user_id)
+
+    top_posts = _get_trending_posts(niche)
+    if len(top_posts) < _MIN_POSTS_FOR_TREND:
+        return TrendingResponse(has_data=False, niche=niche, sample_size=len(top_posts))
+
+    example_captions = [p["caption"].strip() for p in top_posts[:3]]
+    all_captions = [p["caption"].strip() for p in top_posts]
+    examples = "\n".join(f'- "{c}"' for c in all_captions)
+
+    instruction = (
+        f"Here are the top-performing recent post captions from creators in the "
+        f"'{niche}' niche on this app, ranked by engagement:\n{examples}\n\n"
+        "Identify 2-3 short common THEMES or angles across these (e.g. 'before/after "
+        "transformations', 'quick daily tips', 'personal storytelling') and suggest ONE "
+        f"concrete new post idea for a creator in the '{niche}' niche that rides one of "
+        "these trends.\n\n"
+        'Respond with ONLY a JSON object like {"themes": ["theme one", "theme two"], '
+        '"idea": "one sentence post idea"} — no other text.'
+    )
+
+    try:
+        completion = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": instruction}],
+            temperature=0.7,
+            max_tokens=250,
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        raise HTTPException(status_code=502, detail="AI service unavailable")
+
+    parsed = _parse_trending_response(raw)
+    if parsed is None:
+        raise HTTPException(status_code=502, detail="AI returned an unexpected format")
+
+    return TrendingResponse(
+        has_data=True,
+        niche=niche,
+        sample_size=len(top_posts),
+        themes=parsed["themes"],
+        example_captions=example_captions,
+        idea=parsed["idea"],
+    )
 
 
 # ---------------------------------------------------------
