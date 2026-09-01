@@ -136,6 +136,7 @@ class RepurposeResponse(BaseModel):
     processed_video_url: str
     transcript: str
     highlight: HighlightSegment
+    dead_air_removed_seconds: float = 0.0
 
 
 def _validate_storage_url(url: str) -> None:
@@ -335,11 +336,91 @@ def _find_best_highlight(transcript_text: str, max_duration: float) -> Highlight
     return seg
 
 
-def _generate_srt(segments: list, srt_path: str, clip_start: float, clip_end: float):
+# A gap between Whisper segments longer than this, inside the chosen
+# highlight window, is dead air worth cutting rather than a natural
+# conversational pause. Padding keeps a small buffer around each kept
+# block so a cut doesn't clip the start/end of a word.
+DEAD_AIR_GAP_THRESHOLD_SECONDS = 0.7
+DEAD_AIR_PADDING_SECONDS = 0.15
+
+
+def _find_speech_blocks(segments: list, clip_start: float, clip_end: float) -> list:
+    """
+    Groups the Whisper segments inside [clip_start, clip_end] into
+    contiguous speech blocks, treating any gap between segments longer
+    than DEAD_AIR_GAP_THRESHOLD_SECONDS as dead air to cut out of the
+    render. Returns a list of (start, end) tuples in the ORIGINAL
+    video's timeline — a single-item list means nothing was worth
+    trimming (no transcript in range, or no gap crossed the threshold).
+    """
+    relevant = sorted(
+        (s for s in segments if s.get("end", 0) > clip_start and s.get("start", 0) < clip_end),
+        key=lambda s: s.get("start", 0),
+    )
+    if not relevant:
+        return [(clip_start, clip_end)]
+
+    def clamp(t):
+        return max(clip_start, min(t, clip_end))
+
+    blocks = []
+    block_start = clamp(relevant[0]["start"] - DEAD_AIR_PADDING_SECONDS)
+    block_end = clamp(relevant[0]["end"] + DEAD_AIR_PADDING_SECONDS)
+
+    for seg in relevant[1:]:
+        seg_start = clamp(seg["start"] - DEAD_AIR_PADDING_SECONDS)
+        seg_end = clamp(seg["end"] + DEAD_AIR_PADDING_SECONDS)
+        if seg_start - block_end > DEAD_AIR_GAP_THRESHOLD_SECONDS:
+            blocks.append((block_start, block_end))
+            block_start, block_end = seg_start, seg_end
+        else:
+            block_end = max(block_end, seg_end)
+
+    blocks.append((block_start, block_end))
+    return blocks
+
+
+def _dead_air_removed_seconds(blocks: list) -> float:
+    if len(blocks) < 2:
+        return 0.0
+    kept = sum(b_end - b_start for b_start, b_end in blocks)
+    return round((blocks[-1][1] - blocks[0][0]) - kept, 2)
+
+
+def _build_time_remap(blocks: list):
+    """
+    Returns a function mapping a timestamp in the ORIGINAL video's
+    timeline to where it lands in the concatenated, dead-air-removed
+    output — needed because burning in captions generated from the
+    original timeline would otherwise drift out of sync with the trimmed
+    video as soon as more than one block exists. A timestamp that falls
+    inside a removed gap is clamped to the nearest kept boundary.
+    """
+    cumulative = []
+    total = 0.0
+    for b_start, b_end in blocks:
+        cumulative.append(total)
+        total += b_end - b_start
+
+    def remap(t: float) -> float:
+        for i, (b_start, b_end) in enumerate(blocks):
+            if t < b_start:
+                return cumulative[i]
+            if t <= b_end:
+                return cumulative[i] + (t - b_start)
+        return total
+
+    return remap
+
+
+def _generate_srt(segments: list, srt_path: str, blocks: list):
     def fmt(seconds: float) -> str:
         h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
         ms = int((seconds - int(seconds)) * 1000)
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    remap = _build_time_remap(blocks)
+    clip_start, clip_end = blocks[0][0], blocks[-1][1]
 
     with open(srt_path, "w", encoding="utf-8") as f:
         idx = 1
@@ -347,8 +428,8 @@ def _generate_srt(segments: list, srt_path: str, clip_start: float, clip_end: fl
             s, e = seg.get("start", 0), seg.get("end", 0)
             if e < clip_start or s > clip_end:
                 continue
-            rel_start = max(0, s - clip_start)
-            rel_end = max(rel_start + 0.3, e - clip_start)
+            rel_start = remap(s)
+            rel_end = max(rel_start + 0.3, remap(e))
             text = seg.get("text", "").strip().upper()
             if not text:
                 continue
@@ -356,22 +437,57 @@ def _generate_srt(segments: list, srt_path: str, clip_start: float, clip_end: fl
             idx += 1
 
 
-def _render_clip(input_path: str, output_path: str, srt_path: Optional[str],
-                  start: float, duration: float):
-    filter_graph = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blocks: list):
+    """
+    Renders the highlight window, cutting out any dead-air gaps found
+    between blocks (see _find_speech_blocks) instead of a single
+    continuous cut — this is the actual editing step; picking a good
+    highlight window alone doesn't remove the pauses/filler air inside it.
+
+    Single-block case (nothing to trim) uses the same fast input-seek
+    approach as before. The multi-block case still seeks to the first
+    block before decoding — filter-based trims only skip frames *after*
+    decode, so without this the whole video up to that point would be
+    decoded for nothing.
+    """
+    seek_offset = blocks[0][0]
+    rel_blocks = [(b_start - seek_offset, b_end - seek_offset) for b_start, b_end in blocks]
+
+    post_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     if srt_path and os.path.exists(srt_path):
         safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
         style = "FontName=Arial-Bold,FontSize=24,PrimaryColour=&H00FFFF00,Outline=2,Bold=1,Alignment=2"
-        filter_graph += f",subtitles='{safe_srt}':force_style='{style}'"
+        post_filter += f",subtitles='{safe_srt}':force_style='{style}'"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start), "-i", input_path, "-t", str(duration),
-        "-vf", filter_graph,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path,
-    ]
+    if len(rel_blocks) == 1:
+        start, end = rel_blocks[0]
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seek_offset), "-i", input_path, "-t", str(end - start),
+            "-vf", post_filter,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+    else:
+        filter_parts = []
+        for i, (b_start, b_end) in enumerate(rel_blocks):
+            filter_parts.append(f"[0:v]trim=start={b_start}:end={b_end},setpts=PTS-STARTPTS[v{i}]")
+            filter_parts.append(f"[0:a]atrim=start={b_start}:end={b_end},asetpts=PTS-STARTPTS[a{i}]")
+        concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(rel_blocks)))
+        filter_parts.append(f"{concat_inputs}concat=n={len(rel_blocks)}:v=1:a=1[vcat][acat]")
+        filter_parts.append(f"[vcat]{post_filter}[vout]")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seek_offset), "-i", input_path,
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[vout]", "-map", "[acat]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Video render failed: {result.stderr[-500:]}")
@@ -420,13 +536,18 @@ async def repurpose_video(
         segments = whisper_result.get("segments", [])
 
         highlight = _find_best_highlight(transcript_text, duration)
-        clip_duration = highlight.end_time - highlight.start_time
+
+        # Cut dead air out of the chosen window instead of rendering it
+        # as one continuous clip — this is what actually edits the clip
+        # rather than just picking where to cut it.
+        blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
+        dead_air_removed = _dead_air_removed_seconds(blocks)
 
         srt_path = os.path.join(tmp, "captions.srt")
-        _generate_srt(segments, srt_path, highlight.start_time, highlight.end_time)
+        _generate_srt(segments, srt_path, blocks)
 
         output_path = os.path.join(tmp, "output.mp4")
-        _render_clip(source_path, output_path, srt_path, highlight.start_time, clip_duration)
+        _render_clip(source_path, output_path, srt_path, blocks)
 
         # Upload the finished clip to Supabase Storage — survives Railway's
         # ephemeral filesystem across redeploys.
@@ -446,4 +567,5 @@ async def repurpose_video(
         processed_video_url=public_url,
         transcript=transcript_text,
         highlight=highlight,
+        dead_air_removed_seconds=dead_air_removed,
     )
