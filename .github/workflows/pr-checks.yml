@@ -45,3 +45,4 @@ jobs:
           python -c "import coach"
           python -c "import repurpose"
           python -c "import coins"
+          python -c "import leaderboard"

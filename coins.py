@@ -40,6 +40,7 @@ FEATURE_COSTS: dict[str, dict] = {
     "improve_caption": {"cost": 5, "free_per_day": 1, "label": "Improve Caption"},
     "coach_message": {"cost": 10, "free_per_day": 1, "label": "Coach Message"},
     "repurpose": {"cost": 40, "free_per_day": 0, "label": "AI Repurposer"},
+    "post_insight": {"cost": 5, "free_per_day": 1, "label": "Why This Worked"},
 }
 
 _FREE_TASTE_WINDOW_SECONDS = 24 * 60 * 60

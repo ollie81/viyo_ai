@@ -50,11 +50,13 @@ app = FastAPI(title="Viyo AI Backend", version="1.0.0")
 try:
     from repurpose import router as repurpose_router
     from coach import router as coach_router
+    from leaderboard import router as leaderboard_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
+    app.include_router(leaderboard_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()

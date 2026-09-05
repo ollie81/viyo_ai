@@ -597,6 +597,135 @@ async def weekly_report(
 
 
 # ---------------------------------------------------------
+# "Why This Worked" — post performance insight
+#
+# Grounded ONLY in this creator's own real numbers (this post's likes +
+# comments vs. the average of their own other recent posts) and the
+# post's own caption text — deliberately not framed as "the algorithm"
+# or reach, since Viyo doesn't track view/impression counts at all
+# today and claiming otherwise would just be inventing data.
+# ---------------------------------------------------------
+
+_POST_INSIGHT_BASELINE_LOOKBACK = 30
+_MIN_POSTS_FOR_BASELINE = 3
+
+
+class PostInsightResponse(BaseModel):
+    post_id: str
+    engagement: int
+    baseline_avg_engagement: Optional[float] = None
+    # 'above' / 'about' / 'below' this creator's own average — only set
+    # once there's enough post history to compare against.
+    performance: Optional[str] = None
+    explanation: str
+
+
+@router.get("/post-insight/{post_id}", response_model=PostInsightResponse)
+async def post_insight(
+    post_id: str,
+    user_id: str = Depends(_get_current_user_id_no_guest),
+):
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Insight service is not configured.")
+
+    try:
+        post_result = (
+            supabase_admin
+            .table("posts")
+            .select("id,user_id,caption,like_count,comment_count")
+            .eq("id", post_id)
+            .limit(1)
+            .execute()
+        )
+        rows = post_result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load post: {e}")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    post = rows[0]
+    if post.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="You can only see insights for your own posts.")
+
+    spend_on_feature(supabase_admin, user_id, "post_insight")
+
+    engagement = (post.get("like_count") or 0) + (post.get("comment_count") or 0)
+    caption = (post.get("caption") or "").strip()
+
+    try:
+        others_result = (
+            supabase_admin
+            .table("posts")
+            .select("like_count,comment_count")
+            .eq("user_id", user_id)
+            .neq("id", post_id)
+            .order("created_at", desc=True)
+            .limit(_POST_INSIGHT_BASELINE_LOOKBACK)
+            .execute()
+        )
+        other_posts = others_result.data or []
+    except Exception:
+        other_posts = []
+
+    baseline_avg = None
+    performance = None
+    if len(other_posts) >= _MIN_POSTS_FOR_BASELINE:
+        others_engagement = [
+            (p.get("like_count") or 0) + (p.get("comment_count") or 0) for p in other_posts
+        ]
+        baseline_avg = round(sum(others_engagement) / len(others_engagement), 1)
+        if baseline_avg > 0:
+            ratio = engagement / baseline_avg
+            performance = "above" if ratio >= 1.2 else "below" if ratio <= 0.8 else "about"
+        else:
+            performance = "above" if engagement > 0 else "about"
+
+    stats_lines = [f"This post's likes + comments: {engagement}"]
+    if baseline_avg is not None:
+        stats_lines.append(f"This creator's average likes + comments per post: {baseline_avg}")
+        stats_lines.append(f"Performance vs. their own average: {performance}")
+    if caption:
+        stats_lines.append(f'Caption: "{caption}"')
+
+    instruction = (
+        "You are a creator coach explaining, in plain language, why one specific post "
+        "performed the way it did — grounded ONLY in the numbers and caption text given "
+        "below. Never invent metrics, view/reach counts, or claims about a recommendation "
+        "algorithm that aren't in this data. If there isn't enough history to compare "
+        "against, say so honestly instead of guessing.\n\n"
+        + "\n".join(stats_lines) + "\n\n"
+        "Write 2-3 sentences: name one or two concrete things about the caption itself "
+        "(hook, length, question, call-to-action, tone) that plausibly helped or hurt, "
+        "reference the real comparison number if there is one, and end with one specific "
+        "thing to try next time. No markdown, no headers, just the sentences."
+    )
+
+    try:
+        completion = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": instruction}],
+            temperature=0.6,
+            max_tokens=200,
+        )
+        explanation = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        explanation = (
+            f"This post got {engagement} likes and comments combined"
+            + (f", vs. your usual average of {baseline_avg}." if baseline_avg is not None else ".")
+        )
+    if not explanation:
+        explanation = "Not enough to go on yet — keep posting and this will get sharper."
+
+    return PostInsightResponse(
+        post_id=post_id,
+        engagement=engagement,
+        baseline_avg_engagement=baseline_avg,
+        performance=performance,
+        explanation=explanation,
+    )
+
+
+# ---------------------------------------------------------
 # Voice/style consistency check
 #
 # Every other AI feature in this file looks at ONE post in isolation.
