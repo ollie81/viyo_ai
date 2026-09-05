@@ -37,6 +37,9 @@ from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from openai import OpenAI
+from supabase import create_client
+
+from coins import spend_on_feature
 
 app = FastAPI(title="Viyo AI Backend", version="1.0.0")
 
@@ -85,6 +88,18 @@ def _call_openai_with_retry(**kwargs):
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+# Service-role client for coin spend checks only (coins.py) — separate
+# from the JWKS-based auth below, which never needed a Supabase client
+# at all until AI features started costing coins. None if the key
+# isn't set, in which case coins.spend_on_feature fails closed (503)
+# rather than letting every AI call through for free.
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+supabase_admin = (
+    create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+    else None
+)
 
 # ---------------------------------------------------------------------------
 # Simple in-memory per-user rate limiter (swap for Redis in production —
@@ -363,6 +378,10 @@ async def content_ideas(
     user_id: str = Depends(get_current_user_id_no_guest),
 ):
     _check_rate_limit(user_id)
+    # Not coin-gated: this only ever fires automatically from the
+    # dashboard's Daily Idea card (see daily_idea_card.dart), never a
+    # deliberate button press — charging coins for ambient dashboard
+    # content would just silently drain a balance from opening the app.
 
     prompt = (
         f"Give 5 short, punchy content ideas for a creator whose niche is "
@@ -394,6 +413,7 @@ async def improve_caption(
     user_id: str = Depends(get_current_user_id_no_guest),
 ):
     _check_rate_limit(user_id)
+    spend_on_feature(supabase_admin, user_id, "improve_caption")
 
     prompt = (
         "Improve this social media caption to be more engaging, keep the "
@@ -535,6 +555,7 @@ async def analyze_hook(
     not the full /analyze-post Coach review.
     """
     _check_rate_limit(user_id)
+    spend_on_feature(supabase_admin, user_id, "hook_check")
 
     niche_context = f" Their content niche is '{req.niche}'." if req.niche else ""
     has_image = bool(req.image_url)
