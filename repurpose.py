@@ -57,6 +57,8 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
+from coins import spend_on_feature
+
 router = APIRouter(prefix="/api/v1", tags=["repurpose"])
 
 ai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -732,6 +734,11 @@ async def repurpose_video(
         )
 
     _check_repurpose_rate_limit(user_id)
+    # Charged upfront, before the download/duration checks below — no
+    # refund path if a later step fails (e.g. video too long). Simpler
+    # than partial-completion accounting for a first pass, and this is
+    # already the rarest, most rate-limited call in the app.
+    spend_on_feature(supabase_admin, user_id, "repurpose")
 
     with tempfile.TemporaryDirectory() as tmp:
         source_path = os.path.join(tmp, "source.mp4")

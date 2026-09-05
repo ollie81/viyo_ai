@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
+from coins import spend_on_feature
+
 
 router = APIRouter(
     prefix="/api/v1",
@@ -389,6 +391,7 @@ async def caption_variants(
     user_id: str = Depends(_get_current_user_id_no_guest),
 ):
     _check_caption_variants_rate_limit(user_id)
+    spend_on_feature(supabase_admin, user_id, "caption_variants")
 
     top_captions = _get_top_performing_captions(user_id)
     personalized = bool(top_captions)
@@ -1053,6 +1056,8 @@ async def coach_message(
             status_code=503,
             detail="Coach database is not configured.",
         )
+
+    spend_on_feature(supabase_admin, user_id, "coach_message")
 
     # -----------------------------------------------------
     # Load previous conversation for THIS video only
