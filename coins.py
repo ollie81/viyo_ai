@@ -154,3 +154,56 @@ def spend_on_feature(admin, user_id: str, feature: str) -> None:
         )
 
     _log_spend(admin, user_id, feature, cost)
+
+
+def credit_coins(admin, user_id: str, amount: int, type_: str, description: str) -> None:
+    """
+    Adds coins to a balance — the mirror image of spend_on_feature's
+    compare-and-swap deduction, used when coins are created rather than
+    spent (currently: payments.py, after a Stripe purchase is confirmed
+    server-side). `amount` must already be a trusted, server-decided
+    number; never pass through a client-supplied value.
+
+    Raises HTTPException(409) on a lost compare-and-swap race — callers
+    driven by a webhook can just let that surface as a non-2xx response,
+    since the webhook sender will retry.
+    """
+    if admin is None:
+        raise HTTPException(status_code=503, detail="Coin service is not configured.")
+
+    try:
+        profile = (
+            admin.table("profiles")
+            .select("points_balance")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not check coin balance: {e}")
+
+    balance = (profile.data or {}).get("points_balance") or 0
+
+    try:
+        result = (
+            admin.table("profiles")
+            .update({"points_balance": balance + amount})
+            .eq("id", user_id)
+            .eq("points_balance", balance)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not credit coins: {e}")
+
+    if not result.data:
+        raise HTTPException(status_code=409, detail={"error": "balance_changed"})
+
+    try:
+        admin.table("transactions").insert({
+            "user_id": user_id,
+            "amount": amount,
+            "type": type_,
+            "description": description,
+        }).execute()
+    except Exception as e:
+        print(f"[WARN] Could not log coin credit for {user_id}: {e}")

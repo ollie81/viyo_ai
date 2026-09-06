@@ -23,6 +23,14 @@ Environment variables required (see .env.example):
                         matters for browser clients (Flutter web); native
                         mobile clients aren't subject to CORS. Defaults to
                         no cross-origin browser access if unset.
+  STRIPE_SECRET_KEY     Stripe secret key, for creating PaymentIntents
+                        (see payments.py).
+  STRIPE_PUBLISHABLE_KEY  Stripe publishable key, handed to the client
+                        to confirm the PaymentIntent.
+  STRIPE_WEBHOOK_SECRET   Signing secret for the /api/v1/coins/webhook
+                        endpoint (Stripe dashboard -> Webhooks). Coins
+                        are only ever credited from this webhook, never
+                        from the client-facing create-intent call.
 """
 
 import json
@@ -53,14 +61,16 @@ try:
     from leaderboard import router as leaderboard_router
     from posts import router as posts_router
     from discover import router as discover_router
+    from payments import router as payments_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
     app.include_router(leaderboard_router)
     app.include_router(posts_router)
     app.include_router(discover_router)
+    app.include_router(payments_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()
