@@ -49,10 +49,11 @@ import tempfile
 import subprocess
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
@@ -178,6 +179,43 @@ class RepurposeResponse(BaseModel):
     # they can pick, which is what people actually want from an editor
     # rather than one AI verdict with no alternative.
     clips: list[RepurposeClipResult]
+
+
+class RepurposeJobStartResponse(BaseModel):
+    job_id: str
+    status: str  # always "processing" — a job was just created
+
+
+class RepurposeJobStatusResponse(BaseModel):
+    status: str  # "processing" | "done" | "failed"
+    result: Optional[RepurposeResponse] = None
+    error: Optional[str] = None
+
+
+class _RepurposeJob:
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        self.status = "processing"
+        self.result: Optional[RepurposeResponse] = None
+        self.error: Optional[str] = None
+        self.created_at = time.time()
+
+
+# In-memory job store — same tradeoff already accepted by every rate
+# limiter in this file (resets on restart, doesn't share state across
+# instances). A real queue (Celery/Redis) would survive a restart, but
+# that's new infrastructure this app doesn't have; jobs only need to
+# live long enough for one client to poll them to completion, which an
+# hour comfortably covers.
+_REPURPOSE_JOB_TTL_SECONDS = 60 * 60
+_repurpose_jobs: dict[str, _RepurposeJob] = {}
+
+
+def _cleanup_expired_repurpose_jobs() -> None:
+    cutoff = time.time() - _REPURPOSE_JOB_TTL_SECONDS
+    expired = [jid for jid, job in _repurpose_jobs.items() if job.created_at < cutoff]
+    for jid in expired:
+        del _repurpose_jobs[jid]
 
 
 def _validate_storage_url(url: str) -> None:
@@ -773,21 +811,161 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
         return fallback_index
 
 
-@router.post("/repurpose", response_model=RepurposeResponse)
+def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
+    """
+    The actual transcribe → find-highlights → render-per-clip pipeline,
+    run outside the request/response cycle (see repurpose_video below for
+    why). Every step here used to run inline in the POST handler and
+    raise HTTPException straight into FastAPI's own error handling; there
+    is no request to raise into from a background task, so this catches
+    everything itself and records it on the job instead.
+    """
+    job = _repurpose_jobs.get(job_id)
+    if job is None:
+        return  # shouldn't happen — the job is created right before this is scheduled
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = os.path.join(tmp, "source.mp4")
+
+            # Download the video from Supabase Storage.
+            # This is a server-to-server download (Railway → Supabase CDN)
+            # and is not subject to Railway's inbound request timeout.
+            _download_video(video_url, source_path)
+
+            duration = _run_ffprobe_duration(source_path)
+            if duration > MAX_INPUT_DURATION_SECONDS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s.",
+                )
+
+            whisper_result = _transcribe_with_openai(source_path)
+            transcript_text = whisper_result.get("text", "")
+            segments = whisper_result.get("segments", [])
+
+            # Transcription (the slow, expensive part) happens once no matter
+            # how many candidate clips come out of it — only the render/upload
+            # step below repeats per clip, which is cheap by comparison.
+            highlight_count = _highlight_count_for_duration(duration)
+            highlights = _find_highlights(segments, duration, count=highlight_count)
+
+            clips = []
+            for i, highlight in enumerate(highlights):
+                # Cut dead air out of the chosen window instead of rendering
+                # it as one continuous clip — this is what actually edits the
+                # clip rather than just picking where to cut it.
+                blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
+                dead_air_removed = _dead_air_removed_seconds(blocks)
+
+                srt_path = os.path.join(tmp, f"captions_{i}.srt")
+                _generate_srt(segments, srt_path, blocks)
+
+                output_path = os.path.join(tmp, f"output_{i}.mp4")
+                _render_clip(source_path, output_path, srt_path, blocks)
+
+                # Upload the finished clip to Supabase Storage — survives
+                # Railway's ephemeral filesystem across redeploys.
+                storage_path = f"{user_id}/{int(time.time())}_{i}.mp4"
+                with open(output_path, "rb") as f:
+                    try:
+                        supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+                            storage_path, f, file_options={"content-type": "video/mp4"}
+                        )
+                    except Exception as e:
+                        raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
+
+                public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
+
+                # A second, cheap format from the same upload — a shareable
+                # quote card, not just the video. Never fails the request:
+                # the video clip is what actually matters, so a render or
+                # upload problem here (e.g. a stricter bucket MIME policy)
+                # just means this one clip has no quote card, not a 502.
+                quote_card_url = None
+                try:
+                    quote_card_path = os.path.join(tmp, f"quote_{i}.png")
+                    _render_quote_card(highlight.suggested_title, quote_card_path)
+                    quote_card_storage_path = f"{user_id}/{int(time.time())}_{i}_quote.png"
+                    with open(quote_card_path, "rb") as qf:
+                        supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+                            quote_card_storage_path, qf, file_options={"content-type": "image/png"}
+                        )
+                    quote_card_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
+                        quote_card_storage_path
+                    )
+                except Exception as e:
+                    print(f"[WARN] Quote card failed for clip {i}: {e}")
+
+                # A GPT-4o-mini vision pick of the most scroll-stopping frame
+                # from the clip itself, uploaded as the poster image — most
+                # feed UIs show the thumbnail before anyone presses play, so
+                # this is the single biggest lever on whether a clip gets a
+                # first tap at all. Same never-fail-the-request pattern as
+                # the quote card above.
+                thumbnail_url = None
+                try:
+                    candidates = _extract_thumbnail_candidates(output_path, tmp, THUMBNAIL_CANDIDATE_COUNT)
+                    if candidates:
+                        best_index = _pick_best_thumbnail(candidates)
+                        thumbnail_storage_path = f"{user_id}/{int(time.time())}_{i}_thumb.jpg"
+                        with open(candidates[best_index], "rb") as tf:
+                            supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+                                thumbnail_storage_path, tf, file_options={"content-type": "image/jpeg"}
+                            )
+                        thumbnail_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
+                            thumbnail_storage_path
+                        )
+                except Exception as e:
+                    print(f"[WARN] Thumbnail selection failed for clip {i}: {e}")
+
+                clips.append(RepurposeClipResult(
+                    processed_video_url=public_url,
+                    highlight=highlight,
+                    dead_air_removed_seconds=dead_air_removed,
+                    quote_card_url=quote_card_url,
+                    thumbnail_url=thumbnail_url,
+                ))
+
+        job.result = RepurposeResponse(
+            status="success",
+            transcript=transcript_text,
+            clips=clips,
+        )
+        job.status = "done"
+    except HTTPException as e:
+        job.error = str(e.detail)
+        job.status = "failed"
+    except Exception as e:
+        job.error = f"Unexpected error: {e}"
+        job.status = "failed"
+
+
+@router.post("/repurpose", response_model=RepurposeJobStartResponse)
 async def repurpose_video(
     req: RepurposeRequest,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(_get_current_user_id),
 ):
     """
-    Accepts a Supabase Storage URL for a longer video, transcribes it,
-    finds several ranked highlight candidates (count scaled to the
-    source video's length, each capped at MAX_OUTPUT_CLIP_SECONDS),
-    crops each to 9:16, burns in captions, and returns public URLs of
-    the finished clips.
+    Starts video repurposing as a background job and returns immediately
+    with a job_id, instead of processing everything inline and holding
+    the connection open until it's done.
 
-    Flutter uploads the raw video to Supabase Storage first, then calls
-    this endpoint with just the URL — this keeps large file data off the
-    Railway inbound proxy and avoids the broken-pipe timeout.
+    Why: with clip count now scaled to source length (up to
+    MAX_HIGHLIGHT_CANDIDATES), a long video's total pipeline —
+    transcription plus one render + thumbnail-selection + quote-card
+    pass per clip — can take several minutes. The old synchronous
+    version had to fit that entire pipeline inside one HTTP round trip;
+    if it ran past Railway's request-handling limit, the connection was
+    killed and the client got nothing back even if the work would have
+    finished. Returning a job_id immediately means the slow work no
+    longer has to fit inside one request — the client polls
+    GET /repurpose/{job_id} instead (see below).
+
+    Flutter still uploads the raw video to Supabase Storage first and
+    sends only the URL here, for the same reason as before: this keeps
+    large file data off the Railway inbound proxy.
     """
     if supabase_admin is None:
         raise HTTPException(
@@ -796,116 +974,39 @@ async def repurpose_video(
         )
 
     _check_repurpose_rate_limit(user_id)
-    # Charged upfront, before the download/duration checks below — no
-    # refund path if a later step fails (e.g. video too long). Simpler
-    # than partial-completion accounting for a first pass, and this is
-    # already the rarest, most rate-limited call in the app.
+    # Fail fast on a malformed/malicious URL before spending any coins
+    # or creating a job for it.
+    _validate_storage_url(req.video_url)
+
+    # Charged upfront — no refund path if a later step fails (e.g. video
+    # too long). Simpler than partial-completion accounting for a first
+    # pass, and this is already the rarest, most rate-limited call in the app.
     spend_on_feature(supabase_admin, user_id, "repurpose")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        source_path = os.path.join(tmp, "source.mp4")
+    job_id = str(uuid.uuid4())
+    _repurpose_jobs[job_id] = _RepurposeJob(user_id)
+    _cleanup_expired_repurpose_jobs()
 
-        # Download the video from Supabase Storage.
-        # This is a server-to-server download (Railway → Supabase CDN)
-        # and is not subject to Railway's inbound request timeout.
-        _download_video(req.video_url, source_path)
+    background_tasks.add_task(_run_repurpose_job, job_id, req.video_url, user_id)
 
-        duration = _run_ffprobe_duration(source_path)
-        if duration > MAX_INPUT_DURATION_SECONDS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s.",
-            )
+    return RepurposeJobStartResponse(job_id=job_id, status="processing")
 
-        whisper_result = _transcribe_with_openai(source_path)
-        transcript_text = whisper_result.get("text", "")
-        segments = whisper_result.get("segments", [])
 
-        # Transcription (the slow, expensive part) happens once no matter
-        # how many candidate clips come out of it — only the render/upload
-        # step below repeats per clip, which is cheap by comparison.
-        highlight_count = _highlight_count_for_duration(duration)
-        highlights = _find_highlights(segments, duration, count=highlight_count)
+@router.get("/repurpose/{job_id}", response_model=RepurposeJobStatusResponse)
+async def get_repurpose_job(
+    job_id: str,
+    user_id: str = Depends(_get_current_user_id),
+):
+    """Polled by the client until status is "done" or "failed" — see
+    repurpose_video above for why this is a separate step instead of one
+    long blocking POST."""
+    job = _repurpose_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found or expired — repurpose jobs are only kept for about an hour.",
+        )
+    if job.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not your job.")
 
-        clips = []
-        for i, highlight in enumerate(highlights):
-            # Cut dead air out of the chosen window instead of rendering
-            # it as one continuous clip — this is what actually edits the
-            # clip rather than just picking where to cut it.
-            blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
-            dead_air_removed = _dead_air_removed_seconds(blocks)
-
-            srt_path = os.path.join(tmp, f"captions_{i}.srt")
-            _generate_srt(segments, srt_path, blocks)
-
-            output_path = os.path.join(tmp, f"output_{i}.mp4")
-            _render_clip(source_path, output_path, srt_path, blocks)
-
-            # Upload the finished clip to Supabase Storage — survives
-            # Railway's ephemeral filesystem across redeploys.
-            storage_path = f"{user_id}/{int(time.time())}_{i}.mp4"
-            with open(output_path, "rb") as f:
-                try:
-                    supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                        storage_path, f, file_options={"content-type": "video/mp4"}
-                    )
-                except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
-
-            public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
-
-            # A second, cheap format from the same upload — a shareable
-            # quote card, not just the video. Never fails the request:
-            # the video clip is what actually matters, so a render or
-            # upload problem here (e.g. a stricter bucket MIME policy)
-            # just means this one clip has no quote card, not a 502.
-            quote_card_url = None
-            try:
-                quote_card_path = os.path.join(tmp, f"quote_{i}.png")
-                _render_quote_card(highlight.suggested_title, quote_card_path)
-                quote_card_storage_path = f"{user_id}/{int(time.time())}_{i}_quote.png"
-                with open(quote_card_path, "rb") as qf:
-                    supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                        quote_card_storage_path, qf, file_options={"content-type": "image/png"}
-                    )
-                quote_card_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
-                    quote_card_storage_path
-                )
-            except Exception as e:
-                print(f"[WARN] Quote card failed for clip {i}: {e}")
-
-            # A GPT-4o-mini vision pick of the most scroll-stopping frame
-            # from the clip itself, uploaded as the poster image — most
-            # feed UIs show the thumbnail before anyone presses play, so
-            # this is the single biggest lever on whether a clip gets a
-            # first tap at all. Same never-fail-the-request pattern as
-            # the quote card above.
-            thumbnail_url = None
-            try:
-                candidates = _extract_thumbnail_candidates(output_path, tmp, THUMBNAIL_CANDIDATE_COUNT)
-                if candidates:
-                    best_index = _pick_best_thumbnail(candidates)
-                    thumbnail_storage_path = f"{user_id}/{int(time.time())}_{i}_thumb.jpg"
-                    with open(candidates[best_index], "rb") as tf:
-                        supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                            thumbnail_storage_path, tf, file_options={"content-type": "image/jpeg"}
-                        )
-                    thumbnail_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
-                        thumbnail_storage_path
-                    )
-            except Exception as e:
-                print(f"[WARN] Thumbnail selection failed for clip {i}: {e}")
-
-            clips.append(RepurposeClipResult(
-                processed_video_url=public_url,
-                highlight=highlight,
-                dead_air_removed_seconds=dead_air_removed,
-                quote_card_url=quote_card_url,
-                thumbnail_url=thumbnail_url,
-            ))
-
-    return RepurposeResponse(
-        status="success",
-        transcript=transcript_text,
-        clips=clips,
-    )
+    return RepurposeJobStatusResponse(status=job.status, result=job.result, error=job.error)
