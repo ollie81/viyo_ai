@@ -338,7 +338,21 @@ def _transcribe_with_openai(path: str) -> dict:
             "segments": all_segments,
         }
 
-MAX_HIGHLIGHT_CANDIDATES = 3
+MAX_HIGHLIGHT_CANDIDATES = 5
+
+# Roughly one additional highlight candidate per 6 minutes of source video —
+# a 3-minute video and a 30-minute video obviously don't contain the same
+# number of genuinely distinct highlight-worthy moments. Capped at
+# MAX_HIGHLIGHT_CANDIDATES so a near-max-length (33-minute) upload still
+# renders in a bounded amount of time (each extra candidate means another
+# full render + thumbnail-selection + quote-card pass below).
+_MINUTES_PER_ADDITIONAL_CLIP = 6
+
+
+def _highlight_count_for_duration(duration_seconds: float) -> int:
+    minutes = duration_seconds / 60
+    count = 1 + int(minutes // _MINUTES_PER_ADDITIONAL_CLIP)
+    return max(1, min(MAX_HIGHLIGHT_CANDIDATES, count))
 
 
 def _overlap_fraction(a: HighlightSegment, b: HighlightSegment) -> float:
@@ -357,8 +371,27 @@ def _fallback_highlight(max_duration: float) -> HighlightSegment:
     )
 
 
+def _format_timestamped_transcript(segments: list) -> str:
+    """
+    Renders Whisper's own per-segment timestamps as `[start -> end] text`
+    lines. _find_highlights previously received only the flat concatenated
+    transcript text with no timing information at all, yet was asked to
+    return start_time/end_time in seconds — meaning every clip boundary
+    was effectively a guess based on word count and assumed speaking
+    pace, not grounded in the real audio. This gives the model actual
+    numbers to point to instead.
+    """
+    lines = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[{seg.get('start', 0):.1f}s -> {seg.get('end', 0):.1f}s] {text}")
+    return "\n".join(lines)
+
+
 def _find_highlights(
-    transcript_text: str,
+    segments: list,
     max_duration: float,
     count: int = MAX_HIGHLIGHT_CANDIDATES,
 ) -> list:
@@ -367,23 +400,51 @@ def _find_highlights(
     instead of a single "best" pick — the point of multiple options is
     that they're genuinely different moments, so a candidate that mostly
     overlaps an already-accepted one is skipped rather than counted.
+
+    Two things this asks for beyond "find something engaging": clip
+    boundaries grounded in Whisper's real timestamps (see
+    _format_timestamped_transcript) rather than guessed, and an opening
+    line that actually hooks a viewer — the single biggest lever on
+    whether a short-form clip gets watched past the first second, which
+    the previous prompt never asked for at all.
     """
+    if not segments:
+        return [_fallback_highlight(max_duration)]
+
+    timestamped_transcript = _format_timestamped_transcript(segments)
+
     prompt = (
-        f"Analyze this video transcript and identify the {count} most "
-        "engaging, viral-worthy clip segments, each no longer than "
-        f"{MAX_OUTPUT_CLIP_SECONDS} seconds, ranked best first. The segments "
-        "should be genuinely different moments, not overlapping variations "
-        "of the same one. Return ONLY a raw JSON array, each item an object "
-        "with keys: start_time (seconds), end_time (seconds), reason, "
-        "suggested_title, score (0-100, how engaging/viral-worthy this "
-        "specific clip is on its own).\n\n"
-        f"TRANSCRIPT:\n{transcript_text}"
+        f"Below is a timestamped transcript of a video, {max_duration:.0f} seconds "
+        "long. Each line is tagged with its EXACT start and end time in the source "
+        "video — use these real timestamps for start_time/end_time. Never estimate "
+        "or invent a time that isn't grounded in the lines below.\n\n"
+        f"Identify the {count} best short-form clip candidates, each no longer than "
+        f"{MAX_OUTPUT_CLIP_SECONDS} seconds, ranked best first. They must be "
+        "genuinely different moments, not overlapping variations of the same one.\n\n"
+        "For each candidate:\n"
+        "- start_time must land on (or immediately before) a line that is itself a "
+        "strong hook — a bold claim, a question, a surprising statement, or the "
+        "single most interesting sentence in that moment. Never start on a slow "
+        "warm-up or mid-thought: the first couple of seconds decide whether anyone "
+        "keeps watching.\n"
+        "- end_time should land at a natural end of thought (a punchline, a payoff, "
+        "a conclusion) so the clip feels complete rather than cut off.\n"
+        "- score (0-100) should weigh the strength of the opening hook specifically, "
+        "not just whether the topic is generally interesting.\n\n"
+        "Return ONLY a raw JSON array, each item an object with keys: start_time "
+        "(seconds), end_time (seconds), reason (explain both why the moment is "
+        "compelling and why the opening line hooks a viewer), suggested_title, "
+        "score.\n\n"
+        f"TRANSCRIPT:\n{timestamped_transcript}"
     )
     try:
         response = ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are an expert short-form content editor."},
+                {
+                    "role": "system",
+                    "content": "You are an expert short-form content editor who specializes in retention-optimized hooks.",
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
@@ -719,9 +780,10 @@ async def repurpose_video(
 ):
     """
     Accepts a Supabase Storage URL for a longer video, transcribes it,
-    finds the single best highlight (capped at MAX_OUTPUT_CLIP_SECONDS),
-    crops it to 9:16, burns in captions, and returns a public URL of
-    the finished clip.
+    finds several ranked highlight candidates (count scaled to the
+    source video's length, each capped at MAX_OUTPUT_CLIP_SECONDS),
+    crops each to 9:16, burns in captions, and returns public URLs of
+    the finished clips.
 
     Flutter uploads the raw video to Supabase Storage first, then calls
     this endpoint with just the URL — this keeps large file data off the
@@ -762,7 +824,8 @@ async def repurpose_video(
         # Transcription (the slow, expensive part) happens once no matter
         # how many candidate clips come out of it — only the render/upload
         # step below repeats per clip, which is cheap by comparison.
-        highlights = _find_highlights(transcript_text, duration)
+        highlight_count = _highlight_count_for_duration(duration)
+        highlights = _find_highlights(segments, duration, count=highlight_count)
 
         clips = []
         for i, highlight in enumerate(highlights):
