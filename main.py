@@ -52,13 +52,15 @@ try:
     from coach import router as coach_router
     from leaderboard import router as leaderboard_router
     from posts import router as posts_router
+    from discover import router as discover_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
     app.include_router(leaderboard_router)
     app.include_router(posts_router)
+    app.include_router(discover_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()

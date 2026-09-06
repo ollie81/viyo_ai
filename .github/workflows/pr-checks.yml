@@ -47,3 +47,4 @@ jobs:
           python -c "import coins"
           python -c "import leaderboard"
           python -c "import posts"
+          python -c "import discover"
