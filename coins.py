@@ -42,6 +42,7 @@ FEATURE_COSTS: dict[str, dict] = {
     "repurpose": {"cost": 40, "free_per_day": 0, "label": "AI Repurposer"},
     "post_insight": {"cost": 5, "free_per_day": 1, "label": "Why This Worked"},
     "boost_post": {"cost": 30, "free_per_day": 0, "label": "Boost Post"},
+    "spotlight": {"cost": 25, "free_per_day": 0, "label": "Discover Spotlight"},
 }
 
 _FREE_TASTE_WINDOW_SECONDS = 24 * 60 * 60
@@ -67,12 +68,18 @@ def _consume_free_taste(user_id: str, feature: str) -> None:
 
 def _log_spend(admin, user_id: str, feature: str, cost: int) -> None:
     """Best-effort — a failed history log never blocks the feature the
-    creator already paid for."""
+    creator already paid for.
+
+    `type` is the feature key itself (e.g. "spotlight"), not a flat
+    "ai_feature_spend" constant — Discover Spotlight's "am I currently
+    spotlighted" check (discover.py) needs to query transactions by
+    feature, since there's no dedicated column/table for that state.
+    """
     try:
         admin.table("transactions").insert({
             "user_id": user_id,
             "amount": -cost,
-            "type": "ai_feature_spend",
+            "type": feature,
             "description": f"Used {FEATURE_COSTS[feature]['label']}",
         }).execute()
     except Exception as e:
