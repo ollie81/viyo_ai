@@ -46,3 +46,4 @@ jobs:
           python -c "import repurpose"
           python -c "import coins"
           python -c "import leaderboard"
+          python -c "import posts"
