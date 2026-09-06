@@ -4,6 +4,7 @@ openai==2.35.1
 
 supabase==2.15.3
 stripe==15.6.1
+sentry-sdk[fastapi]==2.68.1
 
 PyJWT[cryptography]==2.10.1
 cryptography>=43.0.0

@@ -31,6 +31,13 @@ Environment variables required (see .env.example):
                         endpoint (Stripe dashboard -> Webhooks). Coins
                         are only ever credited from this webhook, never
                         from the client-facing create-intent call.
+  SENTRY_DSN            Crash/error reporting (sentry.io -> Create
+                        Project -> FastAPI). Unset = no-op, nothing
+                        sent anywhere.
+  ADMIN_API_KEY         Shared secret required in the X-Admin-Key
+                        header to read /api/v1/admin/analytics/summary
+                        (see analytics.py). Unset = that endpoint is
+                        disabled entirely.
 """
 
 import json
@@ -41,6 +48,7 @@ from collections import defaultdict, deque
 from typing import Optional
 
 import jwt
+import sentry_sdk
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -48,6 +56,13 @@ from openai import OpenAI
 from supabase import create_client
 
 from coins import spend_on_feature
+
+# No-ops cleanly when SENTRY_DSN is unset (sentry_sdk's own documented
+# behavior for an empty/missing dsn) — every unhandled exception in any
+# endpoint gets reported automatically via the FastAPI integration
+# once a real DSN is set, instead of only ever reaching a `print()`
+# that's lost the moment the container restarts.
+sentry_sdk.init(dsn=os.environ.get("SENTRY_DSN", ""), traces_sample_rate=0.2)
 
 app = FastAPI(title="Viyo AI Backend", version="1.0.0")
 
@@ -62,6 +77,7 @@ try:
     from posts import router as posts_router
     from discover import router as discover_router
     from payments import router as payments_router
+    from analytics import router as analytics_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -69,8 +85,9 @@ try:
     app.include_router(posts_router)
     app.include_router(discover_router)
     app.include_router(payments_router)
+    app.include_router(analytics_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()
