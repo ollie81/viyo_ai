@@ -79,6 +79,7 @@ try:
     from payments import router as payments_router
     from analytics import router as analytics_router
     from interactions import router as interactions_router
+    from gifting import router as gifting_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -88,8 +89,9 @@ try:
     app.include_router(payments_router)
     app.include_router(analytics_router)
     app.include_router(interactions_router)
+    app.include_router(gifting_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()

@@ -51,3 +51,4 @@ jobs:
           python -c "import payments"
           python -c "import analytics"
           python -c "import interactions"
+          python -c "import gifting"
