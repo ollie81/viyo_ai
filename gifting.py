@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
 from coins import credit_coins, debit_coins
+from push import send_push_to_user
 
 router = APIRouter(prefix="/api/v1", tags=["gifting"])
 
@@ -115,14 +116,20 @@ async def gift_coins(
             pass
         raise HTTPException(status_code=500, detail=f"Gift failed and was refunded: {e}")
 
+    gift_message = f"@{sender_username} gifted you {req.amount} coins!"
     try:
         supabase_admin.table("notifications").insert({
             "user_id": req.receiver_id,
             "actor_id": user_id,
             "type": "gift",
-            "message": f"@{sender_username} gifted you {req.amount} coins!",
+            "message": gift_message,
         }).execute()
     except Exception:
         pass  # best-effort — never block a gift that already went through
+
+    send_push_to_user(
+        supabase_admin, req.receiver_id, "Coins gifted to you! 🪙", gift_message,
+        {"type": "gift", "actor_id": user_id, "amount": req.amount},
+    )
 
     return GiftCoinsResponse(sent=True, amount=req.amount, receiver_id=req.receiver_id)

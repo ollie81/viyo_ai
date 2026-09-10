@@ -38,6 +38,11 @@ Environment variables required (see .env.example):
                         header to read /api/v1/admin/analytics/summary
                         (see analytics.py). Unset = that endpoint is
                         disabled entirely.
+  FIREBASE_SERVICE_ACCOUNT_JSON  The full Firebase service account key
+                        (Firebase Console -> Project settings ->
+                        Service accounts -> Generate new private key),
+                        pasted as one JSON string. Unset = push
+                        notifications silently no-op (see push.py).
 """
 
 import json
@@ -80,6 +85,7 @@ try:
     from analytics import router as analytics_router
     from interactions import router as interactions_router
     from gifting import router as gifting_router
+    from push import router as push_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -90,8 +96,9 @@ try:
     app.include_router(analytics_router)
     app.include_router(interactions_router)
     app.include_router(gifting_router)
+    app.include_router(push_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()

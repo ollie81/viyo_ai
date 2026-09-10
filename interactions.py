@@ -28,6 +28,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
+from push import send_push_to_user
+
 router = APIRouter(prefix="/api/v1", tags=["interactions"])
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -42,6 +44,47 @@ async def _get_current_user_id_no_guest(authorization: str = Header(None)) -> st
     from main import get_current_user_id_no_guest
 
     return await get_current_user_id_no_guest(authorization)
+
+
+def _notify_post_owner(post_owner_id: str, actor_id: str, notif_type: str, message_template: str, push_title: str) -> None:
+    """
+    Best-effort in-app notification + push about `actor_id`'s action on
+    a post owned by `post_owner_id` — never blocks the action itself.
+    `message_template` gets `{actor_name}` filled in for both the
+    in-app notification row and the push body.
+    """
+    if post_owner_id == actor_id:
+        return
+
+    try:
+        actor = (
+            supabase_admin.table("profiles")
+            .select("display_name,username")
+            .eq("id", actor_id)
+            .maybe_single()
+            .execute()
+        )
+        actor_data = actor.data or {}
+        actor_name = actor_data.get("display_name") or actor_data.get("username") or "Someone"
+    except Exception:
+        actor_name = "Someone"
+
+    message = message_template.format(actor_name=actor_name)
+
+    try:
+        supabase_admin.table("notifications").insert({
+            "user_id": post_owner_id,
+            "actor_id": actor_id,
+            "type": notif_type,
+            "message": message,
+        }).execute()
+    except Exception:
+        pass  # best-effort — never block the action that earned this
+
+    send_push_to_user(
+        supabase_admin, post_owner_id, push_title, message,
+        {"type": notif_type, "actor_id": actor_id},
+    )
 
 
 def _get_post(post_id: str) -> dict:
@@ -99,25 +142,7 @@ async def like_post(post_id: str, user_id: str = Depends(_get_current_user_id_no
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Liked, but could not update like count: {e}")
 
-    if post.get("user_id") != user_id:
-        try:
-            actor = (
-                supabase_admin.table("profiles")
-                .select("display_name,username")
-                .eq("id", user_id)
-                .maybe_single()
-                .execute()
-            )
-            actor_data = actor.data or {}
-            actor_name = actor_data.get("display_name") or actor_data.get("username") or "Someone"
-            supabase_admin.table("notifications").insert({
-                "user_id": post["user_id"],
-                "actor_id": user_id,
-                "type": "like",
-                "message": f"{actor_name} liked your post",
-            }).execute()
-        except Exception:
-            pass  # best-effort — never block the like itself over this
+    _notify_post_owner(post["user_id"], user_id, "like", "{actor_name} liked your post", "New like ❤️")
 
     return LikeResponse(liked=True, like_count=new_count)
 
@@ -174,7 +199,7 @@ async def add_comment(
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Interactions service is not configured.")
 
-    _get_post(post_id)  # 404s if the post doesn't exist
+    post = _get_post(post_id)  # 404s if the post doesn't exist
 
     try:
         result = (
@@ -187,5 +212,9 @@ async def add_comment(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not add comment: {e}")
+
+    # Previously missing entirely — a comment never notified the post
+    # owner at all, in-app or push.
+    _notify_post_owner(post["user_id"], user_id, "comment", "{actor_name} commented on your post", "New comment 💬")
 
     return CommentResponse(**result.data)
