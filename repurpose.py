@@ -84,6 +84,11 @@ MAX_INPUT_DURATION_SECONDS = int(os.environ.get("MAX_INPUT_DURATION_SECONDS", "1
 MAX_INPUT_SIZE_BYTES = int(os.environ.get("MAX_INPUT_SIZE_MB", "500")) * 1024 * 1024
 
 MAX_OUTPUT_CLIP_SECONDS = 60
+# Clip length is chosen per moment rather than padded to a fixed
+# duration: a tight 18-second point lands harder than the same point
+# stretched to 60. Below ~12 seconds there's rarely a complete thought,
+# so that's the floor rather than a target.
+MIN_OUTPUT_CLIP_SECONDS = 12
 
 DOWNLOAD_TIMEOUT_SECONDS = 30
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
@@ -161,6 +166,30 @@ class HighlightSegment(BaseModel):
     # empty so an older/partial model response can't fail the batch.
     caption: str = ""
     hashtags: list[str] = []
+    # The exact words the clip opens on. Used to burn the hook across
+    # the opening seconds (see _generate_ass) and to show the creator
+    # what the AI thinks is doing the work in the first 2 seconds.
+    hook_line: str = ""
+
+
+class VideoFeedback(BaseModel):
+    """
+    An honest read on the SOURCE video, not the clips cut from it.
+
+    Every other tool in this space quietly returns weak clips when the
+    footage is weak, leaving the creator to guess why nothing lands.
+    Grounded in measured signals (see _measure_video_signals) as well as
+    the transcript, so the advice cites what actually happened rather
+    than generic content-coaching filler.
+    """
+    verdict: str = ""              # one-line overall read
+    issues: list[str] = []         # concrete, fixable problems
+    strengths: list[str] = []      # what genuinely worked, if anything
+    score: int = 0                 # 0-100, how well this footage cuts down
+    # Raw measurements the verdict was based on, so the UI can show the
+    # numbers rather than asking the creator to trust a vibe.
+    words_per_minute: float = 0.0
+    silence_percent: float = 0.0
 
 
 class RepurposeClipResult(BaseModel):
@@ -185,6 +214,9 @@ class RepurposeResponse(BaseModel):
     # they can pick, which is what people actually want from an editor
     # rather than one AI verdict with no alternative.
     clips: list[RepurposeClipResult]
+    # None only if the feedback pass itself failed — a missing critique
+    # never fails a job that produced usable clips.
+    feedback: Optional[VideoFeedback] = None
 
 
 class RepurposeJobStartResponse(BaseModel):
@@ -417,6 +449,60 @@ def _highlight_count_for_duration(duration_seconds: float) -> int:
 # at post time.
 MAX_CAPTION_CHARS = 300
 MAX_HASHTAGS = 6
+# Burned across the opening seconds, so it has to fit a phone screen
+# without covering the video.
+MAX_HOOK_LINE_CHARS = 70
+
+# Words that carry no hook on their own. A clip opening on these burns
+# the two seconds that decide whether anyone keeps watching, so the
+# start is nudged past them — the prompt asks the model to avoid this,
+# this is what actually guarantees it.
+_FILLER_OPENERS = {
+    "so", "um", "uh", "erm", "ah", "oh", "eh", "hmm", "mm", "mhm",
+    "and", "but", "or", "then", "well", "like", "okay", "ok", "right",
+    "yeah", "yep", "yes", "no", "now", "just", "basically", "actually",
+    "anyway", "anyways", "literally", "obviously", "honestly", "look",
+    "listen", "i", "you", "it", "we", "they", "that", "this", "the",
+    "a", "an", "is", "was", "know", "mean", "think", "guess",
+}
+# Never chase a hook further than this into the clip — past it, the
+# model's chosen moment has effectively been abandoned.
+_MAX_HOOK_SKIP_SECONDS = 2.5
+
+
+def _tighten_hook_start(words: list, start_time: float, end_time: float) -> float:
+    """
+    Moves start_time forward past any filler the clip would otherwise
+    open on, landing on the first word that can actually carry a hook.
+
+    Returns start_time unchanged when there are no word timings, when
+    the opening is already strong, or when skipping would eat more than
+    _MAX_HOOK_SKIP_SECONDS or leave too short a clip.
+    """
+    if not words:
+        return start_time
+
+    in_clip = sorted(
+        (w for w in words if float(w.get("start", 0)) >= start_time - 0.15
+         and float(w.get("start", 0)) < end_time),
+        key=lambda w: float(w.get("start", 0)),
+    )
+    if not in_clip:
+        return start_time
+
+    for word in in_clip:
+        token = re.sub(r"[^a-z']", "", str(word.get("word", "")).lower())
+        if token and token not in _FILLER_OPENERS:
+            candidate = float(word.get("start", 0))
+            # Small lead-in so the first syllable isn't clipped.
+            candidate = max(start_time, candidate - 0.1)
+            if candidate - start_time > _MAX_HOOK_SKIP_SECONDS:
+                return start_time
+            if end_time - candidate < MIN_OUTPUT_CLIP_SECONDS:
+                return start_time
+            return candidate
+
+    return start_time
 
 
 def _clean_hashtags(tags: list) -> list:
@@ -474,6 +560,7 @@ def _find_highlights(
     segments: list,
     max_duration: float,
     count: int = MAX_HIGHLIGHT_CANDIDATES,
+    words: Optional[list] = None,
 ) -> list:
     """
     Returns up to `count` ranked, non-overlapping highlight candidates
@@ -498,15 +585,22 @@ def _find_highlights(
         "long. Each line is tagged with its EXACT start and end time in the source "
         "video — use these real timestamps for start_time/end_time. Never estimate "
         "or invent a time that isn't grounded in the lines below.\n\n"
-        f"Identify the {count} best short-form clip candidates, each no longer than "
-        f"{MAX_OUTPUT_CLIP_SECONDS} seconds, ranked best first. They must be "
-        "genuinely different moments, not overlapping variations of the same one.\n\n"
+        f"Identify the {count} best short-form clip candidates, ranked best first. "
+        "They must be genuinely different moments, not overlapping variations of "
+        "the same one.\n\n"
+        "CLIP LENGTH: let each moment decide its own length, between "
+        f"{MIN_OUTPUT_CLIP_SECONDS} and {MAX_OUTPUT_CLIP_SECONDS} seconds. Do NOT "
+        "stretch a clip toward the maximum. A punchy 15-second exchange is a better "
+        "clip than the same exchange padded to 45 seconds with lead-in and wind-down. "
+        "Cut the moment where the idea genuinely completes.\n\n"
         "For each candidate:\n"
-        "- start_time must land on (or immediately before) a line that is itself a "
-        "strong hook — a bold claim, a question, a surprising statement, or the "
-        "single most interesting sentence in that moment. Never start on a slow "
-        "warm-up or mid-thought: the first couple of seconds decide whether anyone "
-        "keeps watching.\n"
+        "- THE FIRST 2 SECONDS DECIDE EVERYTHING. start_time must land exactly on the "
+        "first word of a hook — a bold claim, a question, a number, a contradiction, "
+        "or a surprising statement. Never start on filler ('so', 'um', 'yeah', 'and "
+        "then', 'basically'), on a greeting, or mid-sentence. If the strongest hook "
+        "sits a few seconds into a thought, start there and let the setup go.\n"
+        "- hook_line: quote the exact opening words (roughly the first 2 seconds of "
+        "speech) that do the hooking, copied verbatim from the transcript.\n"
         "- end_time should land at a natural end of thought (a punchline, a payoff, "
         "a conclusion) so the clip feels complete rather than cut off.\n"
         "- score (0-100) should weigh the strength of the opening hook specifically, "
@@ -520,7 +614,7 @@ def _find_highlights(
         "Return ONLY a raw JSON array, each item an object with keys: start_time "
         "(seconds), end_time (seconds), reason (explain both why the moment is "
         "compelling and why the opening line hooks a viewer), suggested_title, "
-        "score, caption, hashtags (array of strings).\n\n"
+        "score, caption, hashtags (array of strings), hook_line.\n\n"
         f"TRANSCRIPT:\n{timestamped_transcript}"
     )
     try:
@@ -544,17 +638,33 @@ def _find_highlights(
     except Exception:
         return [_fallback_highlight(max_duration)]
 
+    # A very short source can't yield a minimum-length clip; never
+    # stretch past what actually exists.
+    min_length = min(MIN_OUTPUT_CLIP_SECONDS, max_duration)
+
     accepted: list[HighlightSegment] = []
     for seg in candidates:
-        # Clamp to the source video's real bounds and our max clip
-        # length — never trust the model's numbers blindly.
+        # Clamp to the source video's real bounds and our length range
+        # — never trust the model's numbers blindly.
         seg.start_time = max(0.0, min(seg.start_time, max_duration))
         seg.end_time = max(seg.start_time + 1, min(seg.end_time, max_duration))
         if seg.end_time - seg.start_time > MAX_OUTPUT_CLIP_SECONDS:
             seg.end_time = seg.start_time + MAX_OUTPUT_CLIP_SECONDS
+        # Extend a too-short clip toward the end of the source, then
+        # backwards if there's no room left — a 4-second fragment is
+        # not a clip regardless of how the model timed it.
+        if seg.end_time - seg.start_time < min_length:
+            seg.end_time = min(max_duration, seg.start_time + min_length)
+            seg.start_time = max(0.0, seg.end_time - min_length)
+
+        # Guarantee the opening two seconds actually hook, rather than
+        # trusting the prompt to have done it.
+        seg.start_time = _tighten_hook_start(words, seg.start_time, seg.end_time)
+
         seg.score = max(0, min(seg.score, 100))
         seg.caption = seg.caption.strip()[:MAX_CAPTION_CHARS]
         seg.hashtags = _clean_hashtags(seg.hashtags)
+        seg.hook_line = seg.hook_line.strip()[:MAX_HOOK_LINE_CHARS]
 
         if any(_overlap_fraction(seg, a) > 0.5 for a in accepted):
             continue
@@ -563,6 +673,104 @@ def _find_highlights(
             break
 
     return accepted or [_fallback_highlight(max_duration)]
+
+
+def _measure_video_signals(words: list, segments: list, duration: float) -> dict:
+    """
+    Objective numbers about the source footage, measured rather than
+    guessed, so the critique below can cite real evidence instead of
+    generic advice.
+    """
+    speech_seconds = 0.0
+    for seg in segments or []:
+        speech_seconds += max(0.0, float(seg.get("end", 0)) - float(seg.get("start", 0)))
+    speech_seconds = min(speech_seconds, duration)
+
+    word_count = len(words or [])
+    if not word_count:
+        word_count = sum(len(str(s.get("text", "")).split()) for s in segments or [])
+
+    wpm = (word_count / speech_seconds * 60) if speech_seconds > 0 else 0.0
+    silence_percent = ((duration - speech_seconds) / duration * 100) if duration > 0 else 0.0
+
+    return {
+        "words_per_minute": round(wpm, 1),
+        "silence_percent": round(max(0.0, min(silence_percent, 100.0)), 1),
+        "word_count": word_count,
+        "duration": round(duration, 1),
+    }
+
+
+def _critique_video(
+    transcript: str, signals: dict, highlights: list
+) -> Optional[VideoFeedback]:
+    """
+    Tells the creator what's actually wrong with their footage.
+
+    Deliberately grounded in `signals` (measured) and the scores the
+    highlight pass already assigned, so "your pacing drags" is backed
+    by a real words-per-minute figure rather than being an opinion the
+    creator has no way to check. Returns None on any failure — a
+    missing critique must never fail a job that produced good clips.
+    """
+    if not transcript.strip():
+        return None
+
+    best_score = max((h.score for h in highlights), default=0)
+    # Long transcripts get trimmed: the critique is about delivery and
+    # structure, both of which are legible from a generous sample.
+    sample = transcript[:6000]
+
+    prompt = (
+        "You are reviewing a creator's raw video so they can make the next one "
+        "better. Be specific and honest, never flattering, and never generic. "
+        "Every point must be something they could actually change next time.\n\n"
+        "MEASURED FROM THE FOOTAGE:\n"
+        f"- Length: {signals['duration']}s\n"
+        f"- Speaking pace: {signals['words_per_minute']} words/minute "
+        "(short-form delivery usually lands between 150 and 190; under 120 drags, "
+        "over 220 is hard to follow)\n"
+        f"- Silence/dead air: {signals['silence_percent']}% of the video\n"
+        f"- Best hook score found anywhere in the video: {best_score}/100\n\n"
+        "Judge these specific things: how strong the opening is, whether the "
+        "delivery has energy, whether points land or ramble, and whether there "
+        "are quotable moments worth clipping.\n\n"
+        "Return ONLY raw JSON with keys: verdict (one honest sentence on whether "
+        "this footage cuts down well), issues (array of 2-4 specific problems, each "
+        "naming what to do differently — say nothing generic like 'add more energy'), "
+        "strengths (array of 1-3 things that genuinely worked; empty array if "
+        "nothing did), score (0-100 for how well this footage works as short-form "
+        "source material).\n\n"
+        f"TRANSCRIPT:\n{sample}"
+    )
+
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a blunt, experienced short-form video coach. You "
+                               "tell creators the truth about their footage.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+        raw = response.choices[0].message.content.strip()
+        data = json.loads(re.sub(r"```json|```", "", raw).strip())
+
+        return VideoFeedback(
+            verdict=str(data.get("verdict", "")).strip()[:300],
+            issues=[str(i).strip()[:200] for i in (data.get("issues") or [])][:4],
+            strengths=[str(s).strip()[:200] for s in (data.get("strengths") or [])][:3],
+            score=max(0, min(int(data.get("score", 0) or 0), 100)),
+            words_per_minute=signals["words_per_minute"],
+            silence_percent=signals["silence_percent"],
+        )
+    except Exception as e:
+        print(f"[WARN] Video critique failed: {e}")
+        return None
 
 
 # A gap between Whisper segments longer than this, inside the chosen
@@ -720,7 +928,38 @@ def _group_words_into_phrases(words: list) -> list:
     return phrases
 
 
-def _generate_ass(words: list, ass_path: str, blocks: list) -> bool:
+# How long the hook banner stays burned across the top of a clip.
+# Long enough to read, short enough to be gone before it competes with
+# the payoff.
+HOOK_OVERLAY_SECONDS = 2.5
+_HOOK_OVERLAY_COLOUR = "&H0000E5FF"  # Viyo gold (#FFE500) in BGR
+
+
+# Roughly what fits across 1080px at the Hook style's 64px bold, inside
+# its side margins. WrapStyle 2 means libass will NOT wrap for us — an
+# unwrapped hook runs straight off both edges of the frame.
+_HOOK_CHARS_PER_LINE = 24
+
+
+def _hook_overlay_dialogue(hook_line: str) -> Optional[str]:
+    """
+    One ASS Dialogue line pinning the hook across the top of the
+    opening seconds — the on-screen promise that earns the next two
+    seconds of attention, which captions alone don't do.
+    """
+    text = _ass_escape(hook_line).upper()
+    if not text:
+        return None
+    # \N is ASS's hard line break; reusing the quote-card wrapper keeps
+    # one wrapping implementation rather than two that drift apart.
+    wrapped = _wrap_quote_text(text, _HOOK_CHARS_PER_LINE).replace("\n", "\\N")
+    return (
+        f"Dialogue: 0,{_ass_timestamp(0)},{_ass_timestamp(HOOK_OVERLAY_SECONDS)},"
+        f"Hook,,0,0,0,,{wrapped}"
+    )
+
+
+def _generate_ass(words: list, ass_path: str, blocks: list, hook_line: str = "") -> bool:
     """
     Writes karaoke-style captions: the whole short phrase stays on
     screen while the word currently being spoken is recoloured and
@@ -734,12 +973,15 @@ def _generate_ass(words: list, ass_path: str, blocks: list) -> bool:
     clip_start, clip_end = blocks[0][0], blocks[-1][1]
 
     in_range = [
-        w for w in words
+        w for w in (words or [])
         if float(w.get("end", 0)) >= clip_start
         and float(w.get("start", 0)) <= clip_end
         and _ass_escape(str(w.get("word", "")))
     ]
-    if not in_range:
+    # Word timings drive the karaoke captions, but a hook overlay alone
+    # is still worth burning in — losing it too because Whisper returned
+    # no word data would drop the more valuable of the two.
+    if not in_range and not _ass_escape(hook_line):
         return False
 
     lines = [
@@ -756,12 +998,21 @@ def _generate_ass(words: list, ass_path: str, blocks: list) -> bool:
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Karaoke,{_ASS_FONT},72,{_ASS_IDLE_COLOUR},{_ASS_ACTIVE_COLOUR},"
         "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,2,2,80,80,260,1",
+        # Top-anchored (Alignment 8) so it never collides with the
+        # karaoke captions running along the bottom.
+        f"Style: Hook,{_ASS_FONT},64,{_HOOK_OVERLAY_COLOUR},{_HOOK_OVERLAY_COLOUR},"
+        "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,2,8,70,70,180,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
     wrote_any = False
+    hook_dialogue = _hook_overlay_dialogue(hook_line)
+    if hook_dialogue:
+        lines.append(hook_dialogue)
+        wrote_any = True
+
     for phrase in _group_words_into_phrases(in_range):
         texts = [_ass_escape(str(w.get("word", ""))).upper() for w in phrase]
         for i, word in enumerate(phrase):
@@ -1034,7 +1285,9 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
             # how many candidate clips come out of it — only the render/upload
             # step below repeats per clip, which is cheap by comparison.
             highlight_count = _highlight_count_for_duration(duration)
-            highlights = _find_highlights(segments, duration, count=highlight_count)
+            highlights = _find_highlights(
+                segments, duration, count=highlight_count, words=words
+            )
 
             clips = []
             for i, highlight in enumerate(highlights):
@@ -1048,7 +1301,7 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
                 # line-at-a-time SRT when they didn't — burning in the
                 # simpler captions beats burning in none at all.
                 captions_path = os.path.join(tmp, f"captions_{i}.ass")
-                if not (words and _generate_ass(words, captions_path, blocks)):
+                if not _generate_ass(words, captions_path, blocks, highlight.hook_line):
                     captions_path = os.path.join(tmp, f"captions_{i}.srt")
                     _generate_srt(segments, captions_path, blocks)
 
@@ -1118,10 +1371,17 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
                     thumbnail_url=thumbnail_url,
                 ))
 
+        # Runs after the clips so it can cite the best hook score found,
+        # and never blocks them: _critique_video returns None on failure
+        # rather than raising.
+        signals = _measure_video_signals(words, segments, duration)
+        feedback = _critique_video(transcript_text, signals, highlights)
+
         job.result = RepurposeResponse(
             status="success",
             transcript=transcript_text,
             clips=clips,
+            feedback=feedback,
         )
         job.status = "done"
     except HTTPException as e:
