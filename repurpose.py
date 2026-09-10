@@ -155,6 +155,12 @@ class HighlightSegment(BaseModel):
     # below ever runs) — same reasoning as start_time/end_time not being
     # bounded at the field level.
     score: int = 70
+    # Ready-to-post copy. A rendered clip still leaves the creator
+    # writing the caption themselves, which is the step that actually
+    # stalls posting — these make it paste-and-publish. Both default
+    # empty so an older/partial model response can't fail the batch.
+    caption: str = ""
+    hashtags: list[str] = []
 
 
 class RepurposeClipResult(BaseModel):
@@ -339,6 +345,7 @@ def _transcribe_with_openai(path: str) -> dict:
         )
 
         all_segments = []
+        all_words = []
         all_text = []
         offset = 0.0
 
@@ -351,6 +358,11 @@ def _transcribe_with_openai(path: str) -> dict:
                         model="whisper-1",
                         file=f,
                         response_format="verbose_json",
+                        # Word timings drive the karaoke-style captions
+                        # (see _generate_ass). Segment timings alone can
+                        # only light up a whole line at a time, which is
+                        # what makes auto-captions look auto-generated.
+                        timestamp_granularities=["segment", "word"],
                     )
                 except Exception as e:
                     raise HTTPException(
@@ -369,11 +381,18 @@ def _transcribe_with_openai(path: str) -> dict:
                 seg["end"] = float(seg.get("end", 0)) + offset
                 all_segments.append(seg)
 
+            for word in data.get("words", []) or []:
+                word = dict(word)
+                word["start"] = float(word.get("start", 0)) + offset
+                word["end"] = float(word.get("end", 0)) + offset
+                all_words.append(word)
+
             offset += chunk_duration
 
         return {
             "text": " ".join(all_text).strip(),
             "segments": all_segments,
+            "words": all_words,
         }
 
 MAX_HIGHLIGHT_CANDIDATES = 5
@@ -391,6 +410,29 @@ def _highlight_count_for_duration(duration_seconds: float) -> int:
     minutes = duration_seconds / 60
     count = 1 + int(minutes // _MINUTES_PER_ADDITIONAL_CLIP)
     return max(1, min(MAX_HIGHLIGHT_CANDIDATES, count))
+
+
+# Caption/hashtag limits. Kept well under every short-form platform's
+# own cap so a generated caption is never the thing that gets rejected
+# at post time.
+MAX_CAPTION_CHARS = 300
+MAX_HASHTAGS = 6
+
+
+def _clean_hashtags(tags: list) -> list:
+    """
+    Normalises whatever the model returned into plain, postable tags:
+    no '#', no spaces, lowercase, deduped, capped. The model is asked
+    for this format already — this is the guarantee, not the request.
+    """
+    cleaned = []
+    for tag in tags or []:
+        tag = re.sub(r"[^a-z0-9]", "", str(tag).lower())
+        if tag and tag not in cleaned:
+            cleaned.append(tag)
+        if len(cleaned) >= MAX_HASHTAGS:
+            break
+    return cleaned
 
 
 def _overlap_fraction(a: HighlightSegment, b: HighlightSegment) -> float:
@@ -468,11 +510,17 @@ def _find_highlights(
         "- end_time should land at a natural end of thought (a punchline, a payoff, "
         "a conclusion) so the clip feels complete rather than cut off.\n"
         "- score (0-100) should weigh the strength of the opening hook specifically, "
-        "not just whether the topic is generally interesting.\n\n"
+        "not just whether the topic is generally interesting.\n"
+        "- caption is the ready-to-post caption for this clip: 1-2 short lines in the "
+        "creator's own voice, opening with a hook line, no hashtags inside it, and no "
+        "quotation marks around it.\n"
+        "- hashtags is 3-6 lowercase tags relevant to THIS clip's actual subject, "
+        "without the # symbol. Prefer specific tags a real audience searches over "
+        "generic filler like fyp or viral.\n\n"
         "Return ONLY a raw JSON array, each item an object with keys: start_time "
         "(seconds), end_time (seconds), reason (explain both why the moment is "
         "compelling and why the opening line hooks a viewer), suggested_title, "
-        "score.\n\n"
+        "score, caption, hashtags (array of strings).\n\n"
         f"TRANSCRIPT:\n{timestamped_transcript}"
     )
     try:
@@ -505,6 +553,8 @@ def _find_highlights(
         if seg.end_time - seg.start_time > MAX_OUTPUT_CLIP_SECONDS:
             seg.end_time = seg.start_time + MAX_OUTPUT_CLIP_SECONDS
         seg.score = max(0, min(seg.score, 100))
+        seg.caption = seg.caption.strip()[:MAX_CAPTION_CHARS]
+        seg.hashtags = _clean_hashtags(seg.hashtags)
 
         if any(_overlap_fraction(seg, a) > 0.5 for a in accepted):
             continue
@@ -616,6 +666,132 @@ def _generate_srt(segments: list, srt_path: str, blocks: list):
             idx += 1
 
 
+# Karaoke caption styling. ASS colours are &HAABBGGRR (BGR, not RGB).
+# DejaVu Sans is the font actually installed in the image
+# (fonts-dejavu-core in the Dockerfile) — the old SRT path asked for
+# Arial-Bold, which doesn't exist here, so fontconfig silently
+# substituted whatever it could find.
+_ASS_FONT = "DejaVu Sans"
+_ASS_IDLE_COLOUR = "&H00FFFFFF"          # white
+_ASS_ACTIVE_COLOUR = "&H00FFE500"        # Viyo cyan (#00E5FF) in BGR
+_ASS_WORDS_PER_PHRASE = 4
+# A pause longer than this starts a new caption phrase, so a phrase
+# never spans a natural break in speech.
+_ASS_PHRASE_GAP_SECONDS = 0.6
+
+
+def _ass_timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs == 100:  # rounding up a whole second must carry, not print ":60.100"
+        cs = 0
+        s += 1
+        if s == 60:
+            s = 0
+            m += 1
+            if m == 60:
+                m = 0
+                h += 1
+    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _ass_escape(text: str) -> str:
+    # Braces delimit override tags in ASS, and a literal newline ends the
+    # Dialogue line — neither can survive inside caption text.
+    return text.replace("{", "(").replace("}", ")").replace("\n", " ").strip()
+
+
+def _group_words_into_phrases(words: list) -> list:
+    """Consecutive words chunked into short on-screen phrases."""
+    phrases = []
+    current = []
+    for word in words:
+        if current:
+            gap = float(word.get("start", 0)) - float(current[-1].get("end", 0))
+            if len(current) >= _ASS_WORDS_PER_PHRASE or gap > _ASS_PHRASE_GAP_SECONDS:
+                phrases.append(current)
+                current = []
+        current.append(word)
+    if current:
+        phrases.append(current)
+    return phrases
+
+
+def _generate_ass(words: list, ass_path: str, blocks: list) -> bool:
+    """
+    Writes karaoke-style captions: the whole short phrase stays on
+    screen while the word currently being spoken is recoloured and
+    bumped up in size, the way hand-edited short-form captions work.
+
+    Returns False when there's nothing usable to write (no word
+    timings in range), so the caller can fall back to the plain
+    line-at-a-time SRT path rather than burning in nothing.
+    """
+    remap = _build_time_remap(blocks)
+    clip_start, clip_end = blocks[0][0], blocks[-1][1]
+
+    in_range = [
+        w for w in words
+        if float(w.get("end", 0)) >= clip_start
+        and float(w.get("start", 0)) <= clip_end
+        and _ass_escape(str(w.get("word", "")))
+    ]
+    if not in_range:
+        return False
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Karaoke,{_ASS_FONT},72,{_ASS_IDLE_COLOUR},{_ASS_ACTIVE_COLOUR},"
+        "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,2,2,80,80,260,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    wrote_any = False
+    for phrase in _group_words_into_phrases(in_range):
+        texts = [_ass_escape(str(w.get("word", ""))).upper() for w in phrase]
+        for i, word in enumerate(phrase):
+            start = remap(float(word.get("start", 0)))
+            # Hold each word until the next one starts so the phrase
+            # doesn't flicker off during the gaps between words.
+            if i + 1 < len(phrase):
+                end = remap(float(phrase[i + 1].get("start", 0)))
+            else:
+                end = remap(float(word.get("end", 0)))
+            end = max(start + 0.08, end)
+
+            rendered = " ".join(
+                f"{{\\c{_ASS_ACTIVE_COLOUR}\\fscx112\\fscy112}}{t}{{\\r}}" if j == i else t
+                for j, t in enumerate(texts)
+            )
+            lines.append(
+                f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},"
+                f"Karaoke,,0,0,0,,{rendered}"
+            )
+            wrote_any = True
+
+    if not wrote_any:
+        return False
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
 def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blocks: list):
     """
     Renders the highlight window, cutting out any dead-air gaps found
@@ -634,9 +810,18 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
 
     post_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     if srt_path and os.path.exists(srt_path):
-        safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
-        style = "FontName=Arial-Bold,FontSize=24,PrimaryColour=&H00FFFF00,Outline=2,Bold=1,Alignment=2"
-        post_filter += f",subtitles='{safe_srt}':force_style='{style}'"
+        safe_path = srt_path.replace("\\", "/").replace(":", "\\:")
+        if srt_path.endswith(".ass"):
+            # ASS carries its own styling (see _generate_ass) — passing
+            # force_style here would flatten the per-word highlighting
+            # back into one uniform colour.
+            post_filter += f",subtitles='{safe_path}'"
+        else:
+            style = (
+                f"FontName={_ASS_FONT},FontSize=24,PrimaryColour={_ASS_ACTIVE_COLOUR},"
+                "Outline=2,Bold=1,Alignment=2"
+            )
+            post_filter += f",subtitles='{safe_path}':force_style='{style}'"
 
     if len(rel_blocks) == 1:
         start, end = rel_blocks[0]
@@ -843,6 +1028,7 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
             whisper_result = _transcribe_with_openai(source_path)
             transcript_text = whisper_result.get("text", "")
             segments = whisper_result.get("segments", [])
+            words = whisper_result.get("words", [])
 
             # Transcription (the slow, expensive part) happens once no matter
             # how many candidate clips come out of it — only the render/upload
@@ -858,11 +1044,16 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
                 blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
                 dead_air_removed = _dead_air_removed_seconds(blocks)
 
-                srt_path = os.path.join(tmp, f"captions_{i}.srt")
-                _generate_srt(segments, srt_path, blocks)
+                # Karaoke captions when word timings came back, plain
+                # line-at-a-time SRT when they didn't — burning in the
+                # simpler captions beats burning in none at all.
+                captions_path = os.path.join(tmp, f"captions_{i}.ass")
+                if not (words and _generate_ass(words, captions_path, blocks)):
+                    captions_path = os.path.join(tmp, f"captions_{i}.srt")
+                    _generate_srt(segments, captions_path, blocks)
 
                 output_path = os.path.join(tmp, f"output_{i}.mp4")
-                _render_clip(source_path, output_path, srt_path, blocks)
+                _render_clip(source_path, output_path, captions_path, blocks)
 
                 # Upload the finished clip to Supabase Storage — survives
                 # Railway's ephemeral filesystem across redeploys.
