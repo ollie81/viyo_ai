@@ -48,3 +48,8 @@ jobs:
           python -c "import leaderboard"
           python -c "import posts"
           python -c "import discover"
+          python -c "import payments"
+          python -c "import analytics"
+          python -c "import interactions"
+          python -c "import gifting"
+          python -c "import push"

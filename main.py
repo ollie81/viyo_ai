@@ -23,6 +23,26 @@ Environment variables required (see .env.example):
                         matters for browser clients (Flutter web); native
                         mobile clients aren't subject to CORS. Defaults to
                         no cross-origin browser access if unset.
+  STRIPE_SECRET_KEY     Stripe secret key, for creating PaymentIntents
+                        (see payments.py).
+  STRIPE_PUBLISHABLE_KEY  Stripe publishable key, handed to the client
+                        to confirm the PaymentIntent.
+  STRIPE_WEBHOOK_SECRET   Signing secret for the /api/v1/coins/webhook
+                        endpoint (Stripe dashboard -> Webhooks). Coins
+                        are only ever credited from this webhook, never
+                        from the client-facing create-intent call.
+  SENTRY_DSN            Crash/error reporting (sentry.io -> Create
+                        Project -> FastAPI). Unset = no-op, nothing
+                        sent anywhere.
+  ADMIN_API_KEY         Shared secret required in the X-Admin-Key
+                        header to read /api/v1/admin/analytics/summary
+                        (see analytics.py). Unset = that endpoint is
+                        disabled entirely.
+  FIREBASE_SERVICE_ACCOUNT_JSON  The full Firebase service account key
+                        (Firebase Console -> Project settings ->
+                        Service accounts -> Generate new private key),
+                        pasted as one JSON string. Unset = push
+                        notifications silently no-op (see push.py).
 """
 
 import json
@@ -33,6 +53,7 @@ from collections import defaultdict, deque
 from typing import Optional
 
 import jwt
+import sentry_sdk
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -40,6 +61,13 @@ from openai import OpenAI
 from supabase import create_client
 
 from coins import spend_on_feature
+
+# No-ops cleanly when SENTRY_DSN is unset (sentry_sdk's own documented
+# behavior for an empty/missing dsn) — every unhandled exception in any
+# endpoint gets reported automatically via the FastAPI integration
+# once a real DSN is set, instead of only ever reaching a `print()`
+# that's lost the moment the container restarts.
+sentry_sdk.init(dsn=os.environ.get("SENTRY_DSN", ""), traces_sample_rate=0.2)
 
 app = FastAPI(title="Viyo AI Backend", version="1.0.0")
 
@@ -53,14 +81,24 @@ try:
     from leaderboard import router as leaderboard_router
     from posts import router as posts_router
     from discover import router as discover_router
+    from payments import router as payments_router
+    from analytics import router as analytics_router
+    from interactions import router as interactions_router
+    from gifting import router as gifting_router
+    from push import router as push_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
     app.include_router(leaderboard_router)
     app.include_router(posts_router)
     app.include_router(discover_router)
+    app.include_router(payments_router)
+    app.include_router(analytics_router)
+    app.include_router(interactions_router)
+    app.include_router(gifting_router)
+    app.include_router(push_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()

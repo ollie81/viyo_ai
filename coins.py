@@ -15,7 +15,7 @@ instead of relying on an atomic database-side function. A lost race
 (two requests from the same user at the same instant) just means the
 second one sees a 409 and can retry — never a double-spend.
 """
-import time
+import datetime
 from typing import Optional
 
 from fastapi import HTTPException
@@ -45,25 +45,54 @@ FEATURE_COSTS: dict[str, dict] = {
     "spotlight": {"cost": 25, "free_per_day": 0, "label": "Discover Spotlight"},
 }
 
-_FREE_TASTE_WINDOW_SECONDS = 24 * 60 * 60
-# In-memory only — same tradeoff already accepted by every rate limiter
-# in this codebase (main._check_rate_limit, repurpose's per-day limiter):
-# resets on restart, doesn't share state across instances. Fine until
-# this backend needs a real cache/DB-backed limiter.
-_last_free_use: dict[tuple, float] = {}
+_FREE_TASTE_WINDOW_HOURS = 24
+
+# Previously an in-memory dict — meant every backend restart (any
+# Railway redeploy) silently forgot who had already used their free
+# daily taste, effectively handing out unlimited free AI feature use
+# to everyone between deploys. Coins are the core of this app's
+# economy, so that's not an acceptable "fine for now" tradeoff the way
+# it might be for a pure rate limiter. Persisted the same way Discover
+# Spotlight derives its state — a dated row in the existing
+# `transactions` ledger — so it survives restarts and is shared across
+# instances, with no schema/migration access needed for a new table.
 
 
-def _has_free_taste(user_id: str, feature: str) -> bool:
+def _free_taste_window_start() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=_FREE_TASTE_WINDOW_HOURS)
+
+
+def _has_free_taste(admin, user_id: str, feature: str) -> bool:
     cfg = FEATURE_COSTS[feature]
     if cfg["free_per_day"] <= 0:
         return False
-    key = (user_id, feature)
-    last = _last_free_use.get(key)
-    return last is None or (time.time() - last) >= _FREE_TASTE_WINDOW_SECONDS
+    try:
+        existing = (
+            admin.table("transactions")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("type", f"free_taste_{feature}")
+            .gte("created_at", _free_taste_window_start().isoformat())
+            .limit(1)
+            .execute()
+        )
+        return not existing.data
+    except Exception:
+        # Can't verify eligibility — fail closed (charge coins) rather
+        # than risk handing out an unlogged freebie on a DB hiccup.
+        return False
 
 
-def _consume_free_taste(user_id: str, feature: str) -> None:
-    _last_free_use[(user_id, feature)] = time.time()
+def _consume_free_taste(admin, user_id: str, feature: str) -> None:
+    try:
+        admin.table("transactions").insert({
+            "user_id": user_id,
+            "amount": 0,
+            "type": f"free_taste_{feature}",
+            "description": f"Free daily use of {FEATURE_COSTS[feature]['label']}",
+        }).execute()
+    except Exception as e:
+        print(f"[WARN] Could not log free-taste use for {user_id}/{feature}: {e}")
 
 
 def _log_spend(admin, user_id: str, feature: str, cost: int) -> None:
@@ -86,12 +115,17 @@ def _log_spend(admin, user_id: str, feature: str, cost: int) -> None:
         print(f"[WARN] Could not log coin spend for {feature}: {e}")
 
 
-def spend_on_feature(admin, user_id: str, feature: str) -> None:
+def spend_on_feature(admin, user_id: str, feature: str) -> int:
     """
     Call before running the OpenAI call for a gated feature — raises
-    if the creator can't use it right now, returns normally (no
-    return value) if they can, having already spent the coins (or
-    consumed a free taste) as a side effect.
+    if the creator can't use it right now, returns normally if they
+    can, having already spent the coins (or consumed a free taste) as
+    a side effect.
+
+    Returns how many coins were actually taken: 0 when the creator's
+    free daily taste covered it. Callers that want to refund a failed
+    AI call need that number — handing back 10 coins for a request
+    that cost nothing would mint currency out of a network error.
 
     Raises:
         HTTPException(402) — no free taste left and balance < cost.
@@ -107,9 +141,9 @@ def spend_on_feature(admin, user_id: str, feature: str) -> None:
     if admin is None:
         raise HTTPException(status_code=503, detail="Coin service is not configured.")
 
-    if _has_free_taste(user_id, feature):
-        _consume_free_taste(user_id, feature)
-        return
+    if _has_free_taste(admin, user_id, feature):
+        _consume_free_taste(admin, user_id, feature)
+        return 0
 
     cost = FEATURE_COSTS[feature]["cost"]
 
@@ -154,3 +188,139 @@ def spend_on_feature(admin, user_id: str, feature: str) -> None:
         )
 
     _log_spend(admin, user_id, feature, cost)
+    return cost
+
+
+def refund_feature(admin, user_id: str, feature: str, charged: int) -> None:
+    """
+    Gives back coins spent_on_feature took for work that then failed.
+
+    Coins are the whole economy of this app, so "the AI provider 502'd
+    and you're out 10 coins" is not an acceptable outcome. Deliberately
+    best-effort and silent: the caller is already on an error path and
+    is about to surface the real failure — a refund that itself fails
+    must not replace that with a confusing second error. A free taste
+    (charged == 0) refunds nothing, since nothing was taken.
+    """
+    if charged <= 0 or admin is None:
+        return
+
+    try:
+        credit_coins(
+            admin,
+            user_id,
+            charged,
+            f"refund_{feature}",
+            f"Refund — {FEATURE_COSTS.get(feature, {}).get('label', feature)} failed",
+        )
+    except Exception as e:
+        print(f"[WARN] Could not refund {charged} coins for {feature}: {e}")
+
+
+def credit_coins(admin, user_id: str, amount: int, type_: str, description: str) -> None:
+    """
+    Adds coins to a balance — the mirror image of spend_on_feature's
+    compare-and-swap deduction, used when coins are created rather than
+    spent (currently: payments.py, after a Stripe purchase is confirmed
+    server-side). `amount` must already be a trusted, server-decided
+    number; never pass through a client-supplied value.
+
+    Raises HTTPException(409) on a lost compare-and-swap race — callers
+    driven by a webhook can just let that surface as a non-2xx response,
+    since the webhook sender will retry.
+    """
+    if admin is None:
+        raise HTTPException(status_code=503, detail="Coin service is not configured.")
+
+    try:
+        profile = (
+            admin.table("profiles")
+            .select("points_balance")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not check coin balance: {e}")
+
+    balance = (profile.data or {}).get("points_balance") or 0
+
+    try:
+        result = (
+            admin.table("profiles")
+            .update({"points_balance": balance + amount})
+            .eq("id", user_id)
+            .eq("points_balance", balance)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not credit coins: {e}")
+
+    if not result.data:
+        raise HTTPException(status_code=409, detail={"error": "balance_changed"})
+
+    try:
+        admin.table("transactions").insert({
+            "user_id": user_id,
+            "amount": amount,
+            "type": type_,
+            "description": description,
+        }).execute()
+    except Exception as e:
+        print(f"[WARN] Could not log coin credit for {user_id}: {e}")
+
+
+def debit_coins(admin, user_id: str, amount: int, type_: str, description: str) -> None:
+    """
+    Removes coins from a balance outside the feature-gating system (no
+    free-taste allowance, no fixed FEATURE_COSTS entry) — for a
+    user-chosen amount like a gift, rather than a fixed feature cost.
+    Same compare-and-swap pattern as spend_on_feature/credit_coins.
+
+    Raises HTTPException(402) if the balance is too low, 409 on a lost
+    compare-and-swap race.
+    """
+    if admin is None:
+        raise HTTPException(status_code=503, detail="Coin service is not configured.")
+
+    try:
+        profile = (
+            admin.table("profiles")
+            .select("points_balance")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not check coin balance: {e}")
+
+    balance = (profile.data or {}).get("points_balance") or 0
+    if balance < amount:
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "insufficient_coins", "balance": balance, "needed": amount},
+        )
+
+    try:
+        result = (
+            admin.table("profiles")
+            .update({"points_balance": balance - amount})
+            .eq("id", user_id)
+            .eq("points_balance", balance)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not debit coins: {e}")
+
+    if not result.data:
+        raise HTTPException(status_code=409, detail={"error": "balance_changed"})
+
+    try:
+        admin.table("transactions").insert({
+            "user_id": user_id,
+            "amount": -amount,
+            "type": type_,
+            "description": description,
+        }).execute()
+    except Exception as e:
+        print(f"[WARN] Could not log coin debit for {user_id}: {e}")
