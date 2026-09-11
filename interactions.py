@@ -202,19 +202,28 @@ async def add_comment(
     post = _get_post(post_id)  # 404s if the post doesn't exist
 
     try:
+        # PostgREST returns the inserted row(s) by default (supabase-py's
+        # default Prefer: return=representation) — no .select()/.single()
+        # to chain here, unlike a plain query. Every other insert in this
+        # codebase already does it this way; this one didn't, and
+        # supabase-py 2.x's insert builder only exposes .execute(), so
+        # the extra chaining raised AttributeError before the comment
+        # ever reached the database.
         result = (
             supabase_admin
             .table("comments")
             .insert({"post_id": post_id, "user_id": user_id, "content": req.content})
-            .select()
-            .single()
             .execute()
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not add comment: {e}")
 
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=500, detail="Comment insert returned no row")
+
     # Previously missing entirely — a comment never notified the post
     # owner at all, in-app or push.
     _notify_post_owner(post["user_id"], user_id, "comment", "{actor_name} commented on your post", "New comment 💬")
 
-    return CommentResponse(**result.data)
+    return CommentResponse(**rows[0])
