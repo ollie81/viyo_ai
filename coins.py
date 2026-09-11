@@ -115,12 +115,17 @@ def _log_spend(admin, user_id: str, feature: str, cost: int) -> None:
         print(f"[WARN] Could not log coin spend for {feature}: {e}")
 
 
-def spend_on_feature(admin, user_id: str, feature: str) -> None:
+def spend_on_feature(admin, user_id: str, feature: str) -> int:
     """
     Call before running the OpenAI call for a gated feature — raises
-    if the creator can't use it right now, returns normally (no
-    return value) if they can, having already spent the coins (or
-    consumed a free taste) as a side effect.
+    if the creator can't use it right now, returns normally if they
+    can, having already spent the coins (or consumed a free taste) as
+    a side effect.
+
+    Returns how many coins were actually taken: 0 when the creator's
+    free daily taste covered it. Callers that want to refund a failed
+    AI call need that number — handing back 10 coins for a request
+    that cost nothing would mint currency out of a network error.
 
     Raises:
         HTTPException(402) — no free taste left and balance < cost.
@@ -138,7 +143,7 @@ def spend_on_feature(admin, user_id: str, feature: str) -> None:
 
     if _has_free_taste(admin, user_id, feature):
         _consume_free_taste(admin, user_id, feature)
-        return
+        return 0
 
     cost = FEATURE_COSTS[feature]["cost"]
 
@@ -183,6 +188,33 @@ def spend_on_feature(admin, user_id: str, feature: str) -> None:
         )
 
     _log_spend(admin, user_id, feature, cost)
+    return cost
+
+
+def refund_feature(admin, user_id: str, feature: str, charged: int) -> None:
+    """
+    Gives back coins spent_on_feature took for work that then failed.
+
+    Coins are the whole economy of this app, so "the AI provider 502'd
+    and you're out 10 coins" is not an acceptable outcome. Deliberately
+    best-effort and silent: the caller is already on an error path and
+    is about to surface the real failure — a refund that itself fails
+    must not replace that with a confusing second error. A free taste
+    (charged == 0) refunds nothing, since nothing was taken.
+    """
+    if charged <= 0 or admin is None:
+        return
+
+    try:
+        credit_coins(
+            admin,
+            user_id,
+            charged,
+            f"refund_{feature}",
+            f"Refund — {FEATURE_COSTS.get(feature, {}).get('label', feature)} failed",
+        )
+    except Exception as e:
+        print(f"[WARN] Could not refund {charged} coins for {feature}: {e}")
 
 
 def credit_coins(admin, user_id: str, amount: int, type_: str, description: str) -> None:

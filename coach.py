@@ -7,11 +7,12 @@ from collections import defaultdict, deque
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Header, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
-from coins import spend_on_feature
+from coins import spend_on_feature, refund_feature
 
 
 router = APIRouter(
@@ -67,6 +68,44 @@ async def _get_current_user_id_no_guest(
 # Request / Response models
 # ---------------------------------------------------------
 
+class VideoContext(BaseModel):
+    """
+    What the Coach can actually see about the video being discussed.
+
+    Until this existed the Coach was blind: it received a video_id and
+    used it for exactly one thing — partitioning chat history — so every
+    answer was generic content-coaching filler about a video it had
+    never seen, charged at real coins per message.
+
+    Two sources fill this in, and they are not equally trusted:
+
+      * A posted video resolves server-side from the `posts` row
+        (see _load_post_context) — authoritative, ownership-checked.
+      * A clip that only exists in the AI repurposer has no post row
+        yet, so the client passes what the repurposer returned. That is
+        the creator describing their own video to their own coach, so
+        there is nothing to escalate here; it is still clamped in
+        length and clearly labelled in the prompt as creator-supplied.
+    """
+
+    # Straight from the repurposer's RepurposeResponse / VideoFeedback.
+    # Generous, not tight: a 30-minute upload transcribes to roughly
+    # 25,000 characters, and a coach that 422s on a long video is worse
+    # than one that reads an abridged version of it. The prompt-side
+    # clamp below is what actually keeps the token bill bounded.
+    transcript: str = Field(default="", max_length=60000)
+    duration_seconds: Optional[float] = Field(default=None, ge=0)
+    hook_line: str = Field(default="", max_length=500)
+    caption: str = Field(default="", max_length=1000)
+    hashtags: list[str] = Field(default_factory=list)
+    verdict: str = Field(default="", max_length=1000)
+    issues: list[str] = Field(default_factory=list)
+    strengths: list[str] = Field(default_factory=list)
+    footage_score: Optional[int] = Field(default=None, ge=0, le=100)
+    words_per_minute: Optional[float] = Field(default=None, ge=0)
+    silence_percent: Optional[float] = Field(default=None, ge=0, le=100)
+
+
 class CoachMessageRequest(BaseModel):
     video_id: str = Field(..., min_length=1)
     message: str = Field(..., min_length=1, max_length=4000)
@@ -81,12 +120,19 @@ class CoachMessageRequest(BaseModel):
         le=100,
     )
 
+    # What the client knows about the video. Ignored when the video is
+    # a real post, since the database is the better source.
+    video_context: Optional[VideoContext] = None
+
 
 class CoachMessageResponse(BaseModel):
     video_id: str
     response: str
     video_version: int
     score: Optional[int] = None
+    # Three short follow-ups the creator can tap instead of typing.
+    # Empty if the model didn't emit a usable set.
+    suggestions: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------
@@ -1168,73 +1214,264 @@ async def get_coach_history(
 
 
 # ---------------------------------------------------------
+# Giving the Coach eyes
+#
+# The Coach used to receive a video_id and use it for exactly one
+# thing: partitioning chat history. It never loaded the caption, the
+# stats, or a word of what was actually said — so it answered with
+# generic advice about a video it had never seen, at real coins per
+# message, while its own prompt told it to admit when it lacked
+# information. These two helpers are what it looks at now.
+# ---------------------------------------------------------
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+_MAX_CONTEXT_TRANSCRIPT_CHARS = 6000
+_MAX_CONTEXT_COMMENTS = 8
+
+
+def _abridge_transcript(transcript: str) -> str:
+    """
+    Keeps a long transcript inside a sane token budget without throwing
+    away the two parts the Coach is most often asked about.
+
+    A naive head-truncation on a 30-minute upload would leave the Coach
+    able to discuss the opening and literally nothing else — so it can't
+    answer "does my ending land?", which is one of the things it is
+    explicitly asked to critique. Keeping the head AND the tail costs
+    the same tokens and preserves both the hook and the payoff.
+    """
+    if len(transcript) <= _MAX_CONTEXT_TRANSCRIPT_CHARS:
+        return transcript
+
+    head_chars = int(_MAX_CONTEXT_TRANSCRIPT_CHARS * 0.6)
+    tail_chars = _MAX_CONTEXT_TRANSCRIPT_CHARS - head_chars
+    skipped = len(transcript) - head_chars - tail_chars
+
+    return (
+        transcript[:head_chars]
+        + f"\n\n[... roughly {skipped // 6} words from the middle omitted "
+        f"— you have the opening and the ending, not the middle ...]\n\n"
+        + transcript[-tail_chars:]
+    )
+
+
+def _load_post_context(user_id: str, video_id: str) -> Optional[dict]:
+    """
+    Resolves video_id as one of the creator's own posts.
+
+    Returns None when video_id isn't a post at all — which is the normal
+    case for a clip that only exists in the AI repurposer and hasn't
+    been posted yet. Scoped to user_id so a creator can only ever pull
+    context for their own video, and best-effort: a query failure means
+    the Coach answers with less context, never that the chat breaks.
+    """
+    if supabase_admin is None or not _UUID_RE.match(video_id):
+        return None
+
+    try:
+        result = (
+            supabase_admin
+            .table("posts")
+            .select(
+                "id,caption,duration_seconds,like_count,comment_count,"
+                "post_type,is_boosted,created_at"
+            )
+            .eq("id", video_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    post = rows[0]
+
+    # Real viewer comments are the single most useful thing the Coach
+    # can read: they are the audience reacting in their own words,
+    # rather than the model guessing how an audience might react.
+    try:
+        comment_result = (
+            supabase_admin
+            .table("comments")
+            .select("content,created_at")
+            .eq("post_id", video_id)
+            .order("created_at", desc=True)
+            .limit(_MAX_CONTEXT_COMMENTS)
+            .execute()
+        )
+        post["recent_comments"] = [
+            (c.get("content") or "").strip()
+            for c in (comment_result.data or [])
+            if (c.get("content") or "").strip()
+        ]
+    except Exception:
+        post["recent_comments"] = []
+
+    return post
+
+
+def _render_video_context(
+    post: Optional[dict],
+    client_ctx: Optional[VideoContext],
+) -> Optional[str]:
+    """
+    Turns whatever context we managed to gather into one system message.
+
+    Returns None when there is genuinely nothing to show, so the Coach
+    keeps its old honest "I can't see this video" behaviour instead of
+    being handed an empty form to hallucinate into.
+    """
+    lines: list[str] = []
+
+    if post:
+        lines.append("THIS VIDEO, AS POSTED ON VIYO (from the database — reliable):")
+        caption = (post.get("caption") or "").strip()
+        if caption:
+            lines.append(f'- Caption: "{caption}"')
+        if post.get("duration_seconds"):
+            lines.append(f"- Length: {post['duration_seconds']} seconds")
+        lines.append(
+            f"- Engagement so far: {post.get('like_count') or 0} likes, "
+            f"{post.get('comment_count') or 0} comments"
+        )
+        posted_at = _parse_timestamp(post.get("created_at") or "")
+        if posted_at:
+            age_hours = (
+                datetime.datetime.now(datetime.timezone.utc) - posted_at
+            ).total_seconds() / 3600
+            if age_hours < 48:
+                lines.append(f"- Posted about {max(1, round(age_hours))} hours ago")
+            else:
+                lines.append(f"- Posted about {round(age_hours / 24)} days ago")
+        if post.get("is_boosted"):
+            lines.append("- The creator paid coins to boost this post")
+
+        comments = post.get("recent_comments") or []
+        if comments:
+            lines.append("- What viewers actually commented:")
+            lines.extend(f'    * "{c}"' for c in comments)
+
+    if client_ctx:
+        ctx_lines: list[str] = []
+
+        if client_ctx.duration_seconds:
+            ctx_lines.append(f"- Clip length: {client_ctx.duration_seconds:.0f} seconds")
+        if client_ctx.hook_line.strip():
+            ctx_lines.append(f'- Opening hook on screen: "{client_ctx.hook_line.strip()}"')
+        if client_ctx.caption.strip():
+            ctx_lines.append(f'- Generated caption: "{client_ctx.caption.strip()}"')
+        if client_ctx.hashtags:
+            ctx_lines.append("- Hashtags: " + " ".join(client_ctx.hashtags[:12]))
+        if client_ctx.footage_score is not None:
+            ctx_lines.append(
+                f"- Viyo's automated footage score: {client_ctx.footage_score}/100"
+            )
+        if client_ctx.verdict.strip():
+            ctx_lines.append(f"- Automated verdict: {client_ctx.verdict.strip()}")
+        if client_ctx.issues:
+            ctx_lines.append("- Problems the analyzer measured:")
+            ctx_lines.extend(f"    * {i}" for i in client_ctx.issues[:8])
+        if client_ctx.strengths:
+            ctx_lines.append("- What the analyzer said worked:")
+            ctx_lines.extend(f"    * {i}" for i in client_ctx.strengths[:8])
+        if client_ctx.words_per_minute:
+            ctx_lines.append(
+                f"- Speaking pace: {client_ctx.words_per_minute:.0f} words per minute"
+            )
+        if client_ctx.silence_percent:
+            ctx_lines.append(
+                f"- Dead air: {client_ctx.silence_percent:.0f}% of the video is silence"
+            )
+
+        transcript = _abridge_transcript(client_ctx.transcript.strip())
+        if transcript:
+            ctx_lines.append(f"- Word-for-word transcript:\n\"\"\"{transcript}\"\"\"")
+
+        if ctx_lines:
+            if lines:
+                lines.append("")
+            lines.append(
+                "WHAT VIYO'S VIDEO ANALYZER MEASURED ON THIS VIDEO "
+                "(supplied by the creator's own app session):"
+            )
+            lines.extend(ctx_lines)
+
+    if not lines:
+        return None
+
+    return (
+        "You CAN see this video. Here is everything Viyo knows about it. "
+        "Ground every piece of advice in these specifics — quote the "
+        "creator's own words back to them, name the actual caption, cite "
+        "the real numbers. Never invent a detail that is not listed here, "
+        "and if something you need is missing (for example you have stats "
+        "but no transcript), say which part you cannot see rather than "
+        "guessing.\n\n" + "\n".join(lines)
+    )
+
+
+# ---------------------------------------------------------
+# Tappable follow-ups
+#
+# The model is asked to end its reply with a machine-readable block so
+# the app can offer three next questions as chips. It is stripped out
+# of the text before anything is stored or shown — a creator should
+# never see the plumbing, and the stored history stays clean for the
+# next turn's context.
+# ---------------------------------------------------------
+
+_SUGGESTIONS_RE = re.compile(
+    r"\[\[SUGGESTIONS:(.*?)\]\]", re.DOTALL | re.IGNORECASE
+)
+
+_SUGGESTIONS_INSTRUCTION = (
+    "\n\nAfter your reply, on its own final line, list exactly three short "
+    "follow-up questions the creator could ask you next, in their own "
+    "voice, each under 45 characters, in this exact format and nothing "
+    "after it:\n"
+    "[[SUGGESTIONS: first question | second question | third question]]"
+)
+
+
+def _split_suggestions(raw: str) -> tuple[str, list[str]]:
+    """
+    Returns (clean reply, suggestions). A reply with no block — or a
+    malformed one — just comes back untouched with no suggestions,
+    since chips are a nicety and must never cost the creator the
+    answer they paid coins for.
+    """
+    match = _SUGGESTIONS_RE.search(raw)
+    if not match:
+        return raw.strip(), []
+
+    suggestions = [
+        part.strip().strip('"').strip()
+        for part in match.group(1).split("|")
+    ]
+    suggestions = [s for s in suggestions if s][:3]
+
+    clean = _SUGGESTIONS_RE.sub("", raw).strip()
+    # A model that emitted ONLY the block gave us nothing to show, so
+    # keep the raw text rather than handing back an empty bubble.
+    if not clean:
+        return raw.strip(), []
+
+    return clean, suggestions
+
+
+# ---------------------------------------------------------
 # AI Coach
 # ---------------------------------------------------------
 
-@router.post(
-    "/coach/message",
-    response_model=CoachMessageResponse,
-)
-async def coach_message(
-    req: CoachMessageRequest,
-    user_id: str = Depends(_get_current_user_id_no_guest),
-):
-
-    if supabase_admin is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Coach database is not configured.",
-        )
-
-    spend_on_feature(supabase_admin, user_id, "coach_message")
-
-    # -----------------------------------------------------
-    # Load previous conversation for THIS video only
-    # -----------------------------------------------------
-
-    try:
-        history_result = (
-            supabase_admin
-            .table("video_coach_messages")
-            .select(
-                "role,message,video_version,score,created_at"
-            )
-            .eq("user_id", user_id)
-            .eq("video_id", req.video_id)
-            .order("created_at", desc=False)
-            .limit(30)
-            .execute()
-        )
-
-        history = history_result.data or []
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not load Coach history: {e}",
-        )
-
-    # -----------------------------------------------------
-    # Save creator's new message first
-    # -----------------------------------------------------
-
-    _save_message(
-        user_id=user_id,
-        video_id=req.video_id,
-        role="user",
-        message=req.message,
-        video_version=req.video_version,
-        score=req.score,
-    )
-
-    # -----------------------------------------------------
-    # Build conversation
-    # -----------------------------------------------------
-
-    messages = [
-        {
-            "role": "system",
-            "content": """
+_COACH_SYSTEM_PROMPT = """
 You are Viyo Coach, a professional AI coach for content creators.
 
 Your job is NOT simply to compliment the creator.
@@ -1278,6 +1515,13 @@ IMPORTANT RULES:
 13. Do not automatically translate their content unless they request it.
 14. Be encouraging but honest.
 
+FORMATTING:
+
+Write for a phone screen. Keep paragraphs to two or three lines. Use
+**bold** for the thing that matters most, and `- ` bullets for lists of
+fixes. Do not use headings larger than `## `. Do not write a wall of
+text.
+
 When appropriate, give a score from 0 to 100.
 
 A score should reflect the current version of the video, not the creator
@@ -1285,12 +1529,60 @@ as a person.
 
 You are a coach, not a judge.
 """
-        }
+
+_COACH_HISTORY_LIMIT = 30
+
+
+def _load_coach_history(user_id: str, video_id: str) -> list[dict]:
+    try:
+        history_result = (
+            supabase_admin
+            .table("video_coach_messages")
+            .select(
+                "role,message,video_version,score,created_at"
+            )
+            .eq("user_id", user_id)
+            .eq("video_id", video_id)
+            .order("created_at", desc=False)
+            .limit(_COACH_HISTORY_LIMIT)
+            .execute()
+        )
+
+        return history_result.data or []
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not load Coach history: {e}",
+        )
+
+
+def _build_coach_messages(
+    user_id: str,
+    req: CoachMessageRequest,
+    history: list[dict],
+) -> list[dict]:
+    """
+    Assembles the full prompt: the coaching persona, then everything
+    Viyo actually knows about this specific video, then the chat so far.
+
+    The video-context block is rebuilt on every turn rather than stored,
+    so a post's engagement numbers are always current — the creator who
+    asks "how is it doing now?" gets now, not whatever was true when the
+    conversation started.
+    """
+    messages: list[dict] = [
+        {"role": "system", "content": _COACH_SYSTEM_PROMPT}
     ]
 
-    # Add previous history
-    for item in history:
+    video_context = _render_video_context(
+        _load_post_context(user_id, req.video_id),
+        req.video_context,
+    )
+    if video_context:
+        messages.append({"role": "system", "content": video_context})
 
+    for item in history:
         role = item.get("role")
 
         if role not in ("user", "coach"):
@@ -1301,15 +1593,57 @@ You are a coach, not a judge.
             "content": item.get("message", ""),
         })
 
-    # Add current message
     messages.append({
         "role": "user",
-        "content": req.message,
+        "content": req.message + _SUGGESTIONS_INSTRUCTION,
     })
 
-    # -----------------------------------------------------
-    # Ask OpenAI
-    # -----------------------------------------------------
+    return messages
+
+
+def _prepare_coach_turn(
+    user_id: str, req: CoachMessageRequest
+) -> tuple[list[dict], int]:
+    """
+    Everything both the blocking and the streaming endpoint do before a
+    single token is generated: charge the coins, load the history, save
+    the creator's message, build the prompt.
+
+    Returns the prompt and how many coins were actually taken, so that
+    a turn which then fails can hand them straight back.
+    """
+    if supabase_admin is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Coach database is not configured.",
+        )
+
+    charged = spend_on_feature(supabase_admin, user_id, "coach_message")
+
+    history = _load_coach_history(user_id, req.video_id)
+
+    _save_message(
+        user_id=user_id,
+        video_id=req.video_id,
+        role="user",
+        message=req.message,
+        video_version=req.video_version,
+        score=req.score,
+    )
+
+    return _build_coach_messages(user_id, req, history), charged
+
+
+@router.post(
+    "/coach/message",
+    response_model=CoachMessageResponse,
+)
+async def coach_message(
+    req: CoachMessageRequest,
+    user_id: str = Depends(_get_current_user_id_no_guest),
+):
+
+    messages, charged = _prepare_coach_turn(user_id, req)
 
     try:
 
@@ -1319,7 +1653,7 @@ You are a coach, not a judge.
             temperature=0.4,
         )
 
-        coach_response = (
+        raw_response = (
             response.choices[0]
             .message
             .content
@@ -1328,14 +1662,15 @@ You are a coach, not a judge.
 
     except Exception as e:
 
+        # The creator got no coaching, so they keep their coins.
+        refund_feature(supabase_admin, user_id, "coach_message", charged)
+
         raise HTTPException(
             status_code=502,
             detail=f"Coach AI request failed: {e}",
         )
 
-    # -----------------------------------------------------
-    # Save Coach response
-    # -----------------------------------------------------
+    coach_response, suggestions = _split_suggestions(raw_response)
 
     _save_message(
         user_id=user_id,
@@ -1351,4 +1686,135 @@ You are a coach, not a judge.
         response=coach_response,
         video_version=req.video_version,
         score=req.score,
+        suggestions=suggestions,
+    )
+
+
+# ---------------------------------------------------------
+# Streaming version of the same turn
+#
+# A coach that takes eight silent seconds and then dumps a paragraph
+# feels broken; one that starts talking immediately feels alive. Same
+# charge, same history, same saved result — only the delivery differs,
+# so the blocking endpoint above stays as the fallback for any client
+# that can't read a stream.
+#
+# Server-Sent Events, one JSON object per `data:` line:
+#   {"delta": "..."}                      incremental text
+#   {"done": true, "suggestions": [...]}  end of a successful turn
+#   {"error": "..."}                      generation failed mid-stream
+# ---------------------------------------------------------
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+@router.post("/coach/message/stream")
+async def coach_message_stream(
+    req: CoachMessageRequest,
+    user_id: str = Depends(_get_current_user_id_no_guest),
+):
+    # Deliberately outside the generator: coins, history and validation
+    # must fail as a normal HTTP error the client can show, not as an
+    # error frame inside a 200 response that has already started.
+    messages, charged = _prepare_coach_turn(user_id, req)
+
+    def generate():
+        collected: list[str] = []
+
+        # The suggestions block arrives at the very end, one token at a
+        # time. Holding back a small tail means the creator never sees
+        # "[[SUGGES" flicker onto the screen before it gets stripped.
+        pending = ""
+        emitted = ""
+
+        try:
+            stream = ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.4,
+                stream=True,
+            )
+
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+
+                collected.append(delta)
+                pending += delta
+
+                # Never emit anything from the marker onward — and drop
+                # the blank line the model puts before it, so the text
+                # already on screen matches the text that gets stored
+                # and no reply ends in a needless full-bubble redraw.
+                marker_at = pending.find("[[")
+                if marker_at == -1:
+                    # Hold back two characters in case "[[" itself is
+                    # split across chunk boundaries.
+                    safe_until = len(pending) - 2
+                else:
+                    safe_until = len(pending[:marker_at].rstrip())
+
+                if safe_until > len(emitted):
+                    delta_out = pending[len(emitted):safe_until]
+                    emitted += delta_out
+                    yield _sse({"delta": delta_out})
+
+        except Exception as e:
+            refund_feature(supabase_admin, user_id, "coach_message", charged)
+            yield _sse({"error": f"Coach AI request failed: {e}"})
+            return
+
+        raw_response = "".join(collected)
+        if not raw_response.strip():
+            refund_feature(supabase_admin, user_id, "coach_message", charged)
+            yield _sse({"error": "Coach returned an empty response."})
+            return
+
+        coach_response, suggestions = _split_suggestions(raw_response)
+
+        # Flush whatever the tail-holding above kept back, so the client
+        # ends up with exactly the text that gets stored. If stripping
+        # moved the text out from under what was already sent (a model
+        # that opened with whitespace), replace the bubble outright
+        # rather than leave the creator with a mismatched answer.
+        if coach_response.startswith(emitted):
+            remainder = coach_response[len(emitted):]
+            if remainder:
+                yield _sse({"delta": remainder})
+        else:
+            yield _sse({"replace": coach_response})
+
+        try:
+            _save_message(
+                user_id=user_id,
+                video_id=req.video_id,
+                role="coach",
+                message=coach_response,
+                video_version=req.video_version,
+                score=req.score,
+            )
+        except HTTPException as e:
+            # The creator already paid and already read the answer, so
+            # the turn is not a failure — but they need to know it won't
+            # be there when they come back.
+            yield _sse({
+                "done": True,
+                "suggestions": suggestions,
+                "warning": f"This reply could not be saved: {e.detail}",
+            })
+            return
+
+        yield _sse({"done": True, "suggestions": suggestions})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # stops nginx-style proxies buffering the stream
+        },
     )
