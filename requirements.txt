@@ -18,3 +18,9 @@ pydantic==2.7.4
 
 moviepy==1.0.3
 ffmpeg-python==0.2.0
+
+# Speaker-tracking crop (repurpose.py) — pinned to 4.10.0.84 rather than
+# latest because opencv-python-headless 5.x stopped bundling the Haar
+# cascade XML data files this feature depends on (cv2.data.haarcascades
+# is an empty directory on 5.x); 4.10.0.84 still ships them.
+opencv-python-headless==4.10.0.84

@@ -61,6 +61,17 @@ from supabase import create_client, Client
 
 from coins import spend_on_feature
 
+# Speaker-tracking crop is optional: this app runs fine without it (the
+# reframe just falls back to a fixed center crop, same as before this
+# existed), so a deploy that hasn't picked up the new opencv-python-headless
+# dependency yet degrades instead of breaking every repurpose job.
+try:
+    import cv2
+    _FACE_TRACKING_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    _FACE_TRACKING_AVAILABLE = False
+
 router = APIRouter(prefix="/api/v1", tags=["repurpose"])
 
 ai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -968,6 +979,211 @@ def _build_time_remap(blocks: list):
     return remap
 
 
+# ---------------------------------------------------------
+# Speaker-tracking crop
+#
+# The 9:16 reframe below this has always been a fixed center crop —
+# fine for a subject who stays put, but anyone who moves (walks, turns
+# to something off to the side, isn't centered in the original shot to
+# begin with) drifts toward the edge of frame or out of it entirely.
+# This samples face position across the clip and, when detection is
+# reliable enough, generates a crop that pans to follow it instead.
+#
+# Deliberately conservative: a full computer-vision pipeline this is
+# not — it's a Haar cascade (opencv's classic, dependency-light face
+# detector) sampled every _FACE_SAMPLE_INTERVAL_SECONDS, smoothed, and
+# turned into a piecewise-linear ffmpeg crop expression. When detection
+# is too sparse or unreliable to trust, this falls back to the exact
+# same static center crop used before it existed — never worse than
+# the old behavior, only sometimes better.
+# ---------------------------------------------------------
+
+# 1.0s rather than a finer interval: detection cost scales linearly
+# with clip duration (confirmed ~0.12s of processing per clip-second
+# at this interval on real hardware), and a pan-based crop is meant to
+# catch gradual drift over several seconds, not sub-second jitter —
+# which the smoothing pass would flatten out anyway. Halving this to
+# 0.5s roughly doubles processing time for detection this app
+# measurably doesn't need.
+_FACE_SAMPLE_INTERVAL_SECONDS = 1.0
+# Below this fraction of samples actually finding a face, the detected
+# positions are too sparse to build a trustworthy pan from — a couple
+# of lucky hits scattered across a mostly-blank clip would produce a
+# crop path that lurches between them rather than following anyone.
+_MIN_DETECTION_RATIO = 0.4
+_MIN_DETECTIONS = 3
+# Exponential smoothing on raw detections before they become a pan
+# path — frame-to-frame face-box jitter is real even on a still
+# subject, and panning to every wobble would be worse than not
+# tracking at all.
+_SMOOTHING_ALPHA = 0.35
+
+_face_cascade = None
+
+
+def _get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None and _FACE_TRACKING_AVAILABLE:
+        _face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+    return _face_cascade
+
+
+def _detect_face_centers(
+    source_path: str, start_time: float, end_time: float
+) -> tuple[list, int, int]:
+    """
+    Samples frames in [start_time, end_time] of the ORIGINAL video and
+    returns (detections, source_width, source_height), where detections
+    is [(original_timestamp, face_center_x_in_original_px), ...] for
+    every sample that found a face. Never raises — any failure (a
+    corrupt frame, cv2 erroring on a particular codec) just means fewer
+    or zero detections, which the caller already treats as "not
+    reliable enough to track."
+    """
+    cascade = _get_face_cascade()
+    if cascade is None:
+        return [], 0, 0
+
+    cap = cv2.VideoCapture(source_path)
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            return [], 0, 0
+
+        detections = []
+        t = start_time
+        while t < end_time:
+            try:
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                ok, frame = cap.read()
+                if ok:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = cascade.detectMultiScale(
+                        gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
+                    )
+                    if len(faces):
+                        # Largest box = most likely the actual subject,
+                        # not a smaller face in the background.
+                        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+                        detections.append((t, fx + fw / 2))
+            except Exception:
+                pass  # this sample just doesn't contribute a detection
+            t += _FACE_SAMPLE_INTERVAL_SECONDS
+
+        return detections, width, height
+    finally:
+        cap.release()
+
+
+def _smooth_detections(detections: list) -> list:
+    """Exponential moving average over raw (t, x) detections, in time order."""
+    if not detections:
+        return []
+    smoothed = [(detections[0][0], detections[0][1])]
+    for t, x in detections[1:]:
+        prev_x = smoothed[-1][1]
+        smoothed.append((t, _SMOOTHING_ALPHA * x + (1 - _SMOOTHING_ALPHA) * prev_x))
+    return smoothed
+
+
+def _build_pan_expression(points: list, min_x: float, max_x: float) -> str:
+    """
+    A piecewise-linear ffmpeg expression for crop x as a function of
+    `t`, interpolating between consecutive (t, x) points and holding
+    the nearest value's clamped position before the first / after the
+    last point. `points` must be sorted by time and non-empty.
+    """
+    def clamp(x):
+        return max(min_x, min(max_x, x))
+
+    if len(points) == 1:
+        return f"{clamp(points[0][1]):.1f}"
+
+    expr = f"{clamp(points[-1][1]):.1f}"
+    for i in range(len(points) - 2, -1, -1):
+        t0, x0 = points[i]
+        t1, x1 = points[i + 1]
+        x0c, x1c = clamp(x0), clamp(x1)
+        if t1 == t0:
+            interp = f"{x1c:.1f}"
+        else:
+            slope = (x1c - x0c) / (t1 - t0)
+            interp = f"({x0c:.1f}+{slope:.3f}*(t-{t0:.2f}))"
+        expr = f"if(lt(t,{t1:.2f}),{interp},{expr})"
+    t0, x0 = points[0]
+    return f"if(lt(t,{t0:.2f}),{clamp(x0):.1f},{expr})"
+
+
+def _speaker_crop_x_expr(
+    source_path: str,
+    highlight_start: float,
+    highlight_end: float,
+    blocks: list,
+    target_width: int,
+    target_height: int,
+) -> Optional[str]:
+    """
+    Returns an ffmpeg crop-x expression that pans to follow the
+    detected speaker, or None when tracking isn't reliable enough —
+    the caller should fall back to a plain static center crop on None,
+    exactly as if this function didn't exist.
+
+    target_width/target_height are the fixed output frame size (1080x1920
+    for this app's 9:16 clips) — the crop's own width, and along with
+    the source dimensions this discovers, enough to reproduce the exact
+    scale factor ffmpeg's own `scale=...:force_original_aspect_ratio=
+    increase` computes at render time, without asking the caller to
+    already know a number only ffmpeg would otherwise compute.
+    """
+    if not _FACE_TRACKING_AVAILABLE:
+        return None
+
+    try:
+        detections, source_width, source_height = _detect_face_centers(
+            source_path, highlight_start, highlight_end
+        )
+    except Exception:
+        return None
+
+    if source_width <= 0 or source_height <= 0:
+        return None
+
+    total_samples = max(1, round((highlight_end - highlight_start) / _FACE_SAMPLE_INTERVAL_SECONDS))
+    if len(detections) < _MIN_DETECTIONS or len(detections) / total_samples < _MIN_DETECTION_RATIO:
+        return None
+
+    # Original-video timestamps -> final edited-clip timestamps, same
+    # remap already used for captions — a detection inside a cut gap
+    # (dead air or a removed filler word) isn't a real, current
+    # position, so it's dropped rather than clamped to a boundary and
+    # treated as fresh data.
+    remap = _build_time_remap(blocks)
+    kept = [
+        (remap(t), x) for t, x in detections
+        if _word_overlaps_blocks(t, t + 0.01, blocks)
+    ]
+    if len(kept) < _MIN_DETECTIONS:
+        return None
+
+    kept.sort(key=lambda p: p[0])
+    smoothed = _smooth_detections(kept)
+
+    # Original-video pixel positions -> the scaled space the crop
+    # filter actually operates in (it runs after `scale=...increase`,
+    # which uniformly enlarges by whichever axis needs it more — the
+    # same "increase" factor computed here).
+    scale_factor = max(target_width / source_width, target_height / source_height)
+    scaled_width = source_width * scale_factor
+    scaled_points = [(t, x * scale_factor - target_width / 2) for t, x in smoothed]
+
+    min_x = 0.0
+    max_x = max(0.0, scaled_width - target_width)
+    return _build_pan_expression(scaled_points, min_x, max_x)
+
+
 def _generate_srt(segments: list, srt_path: str, blocks: list):
     def fmt(seconds: float) -> str:
         h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
@@ -1196,7 +1412,13 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
     seek_offset = blocks[0][0]
     rel_blocks = [(b_start - seek_offset, b_end - seek_offset) for b_start, b_end in blocks]
 
-    post_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    # Pans the crop to follow the detected speaker when tracking is
+    # reliable enough; falls back to the plain static center crop
+    # (unchanged from before this existed) on anything less than that —
+    # a wrong guess about where to pan is worse than not panning.
+    crop_x_expr = _speaker_crop_x_expr(input_path, blocks[0][0], blocks[-1][1], blocks, 1080, 1920)
+    crop_filter = f"crop=1080:1920:x='{crop_x_expr}'" if crop_x_expr else "crop=1080:1920"
+    post_filter = f"scale=1080:1920:force_original_aspect_ratio=increase,{crop_filter}"
     if srt_path and os.path.exists(srt_path):
         safe_path = srt_path.replace("\\", "/").replace(":", "\\:")
         if srt_path.endswith(".ass"):
