@@ -86,6 +86,8 @@ try:
     from interactions import router as interactions_router
     from gifting import router as gifting_router
     from push import router as push_router
+    from moderation import router as moderation_router
+    from messaging import router as messaging_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -97,8 +99,10 @@ try:
     app.include_router(interactions_router)
     app.include_router(gifting_router)
     app.include_router(push_router)
+    app.include_router(moderation_router)
+    app.include_router(messaging_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()
