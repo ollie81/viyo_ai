@@ -45,6 +45,7 @@ import re
 import json
 import time
 import base64
+import string
 import tempfile
 import subprocess
 import urllib.parse
@@ -196,6 +197,12 @@ class RepurposeClipResult(BaseModel):
     processed_video_url: str
     highlight: HighlightSegment
     dead_air_removed_seconds: float = 0.0
+    # Separate from dead_air_removed_seconds on purpose — they're
+    # different edits with different causes, and folding them into one
+    # number would make "dead air removed" a label that's no longer
+    # accurate.
+    filler_words_removed_seconds: float = 0.0
+    filler_words_removed_count: int = 0
     # None if the quote-card render/upload failed — never fails the
     # whole request over the extra format, since the video clip itself
     # is the part that actually matters.
@@ -824,6 +831,117 @@ def _dead_air_removed_seconds(blocks: list) -> float:
     return round((blocks[-1][1] - blocks[0][0]) - kept, 2)
 
 
+# ---------------------------------------------------------
+# Filler-word removal
+#
+# Dead-air removal above cuts silence between segments, but a filler
+# word ("um", "uh") has actual sound — it sits inside otherwise-
+# continuous speech, so no silence gap ever catches it. This is a
+# second, finer pass over the same blocks that cuts the filler words
+# themselves out of the audio and video.
+#
+# Deliberately narrow: only pure interjections that never carry
+# meaning on their own. Words like "like" or "so" are just as often
+# real content as they are filler ("I like pizza" vs. "it's, like,
+# really good"), and getting that wrong silently deletes something the
+# creator actually said. This only touches words that are filler in
+# every context they appear in.
+# ---------------------------------------------------------
+
+_PURE_FILLER_WORDS = {
+    "um", "umm", "ummm", "uh", "uhh", "uhhh", "erm", "err",
+    "hmm", "hmmm", "mm", "mhm", "uh-huh", "uhhuh",
+}
+
+# Kept around a removed filler so the cut doesn't clip the tail of a
+# breath or the leading edge of the next real word — much smaller than
+# DEAD_AIR_PADDING_SECONDS, since a filler sits inside continuous
+# speech rather than at a natural pause.
+_FILLER_CUT_PADDING_SECONDS = 0.05
+
+# Never leave a fragment shorter than this after cutting fillers out of
+# a block — a sliver this short is more likely mistimed word data than
+# a genuine piece of speech worth its own hard cut.
+_MIN_FRAGMENT_SECONDS = 0.15
+
+
+def _is_pure_filler(word_text: str) -> bool:
+    cleaned = word_text.strip().strip(string.punctuation).lower()
+    return cleaned in _PURE_FILLER_WORDS
+
+
+def _remove_filler_words(blocks: list, words: list) -> tuple[list, int]:
+    """
+    Punches filler-word intervals out of speech blocks that
+    _find_speech_blocks already produced. Returns (new_blocks, count) —
+    count is how many filler words were actually cut, surfaced to the
+    creator so "3 filler words removed" means what it says.
+
+    Returns (blocks, 0) unchanged when there's nothing to work from (no
+    word timings) or nothing to cut, so a video with no word-level data
+    degrades to dead-air removal only instead of raising.
+    """
+    if not words:
+        return blocks, 0
+
+    filler_words = [w for w in words if _is_pure_filler(str(w.get("word", "")))]
+    if not filler_words:
+        return blocks, 0
+
+    cut_intervals = sorted(
+        (max(0.0, float(w.get("start", 0)) - _FILLER_CUT_PADDING_SECONDS),
+         float(w.get("end", 0)) + _FILLER_CUT_PADDING_SECONDS)
+        for w in filler_words
+    )
+
+    # Merge overlapping/adjacent cuts so back-to-back fillers ("um,
+    # uh...") don't leave an unnecessary sliver of near-silence between
+    # them.
+    merged_cuts = [cut_intervals[0]]
+    for start, end in cut_intervals[1:]:
+        last_start, last_end = merged_cuts[-1]
+        if start <= last_end:
+            merged_cuts[-1] = (last_start, max(last_end, end))
+        else:
+            merged_cuts.append((start, end))
+
+    new_blocks = []
+    for block_start, block_end in blocks:
+        pieces = [(block_start, block_end)]
+        for cut_start, cut_end in merged_cuts:
+            if cut_end <= block_start or cut_start >= block_end:
+                continue  # this cut doesn't touch this block at all
+            next_pieces = []
+            for piece_start, piece_end in pieces:
+                if cut_end <= piece_start or cut_start >= piece_end:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+                if cut_start > piece_start:
+                    next_pieces.append((piece_start, cut_start))
+                if cut_end < piece_end:
+                    next_pieces.append((cut_end, piece_end))
+            pieces = next_pieces
+        new_blocks.extend((s, e) for s, e in pieces if e - s >= _MIN_FRAGMENT_SECONDS)
+
+    if not new_blocks:
+        # Cutting every filler out would leave nothing — keep the
+        # original blocks rather than hand back an empty clip.
+        return blocks, 0
+
+    return new_blocks, len(filler_words)
+
+
+def _word_overlaps_blocks(word_start: float, word_end: float, blocks: list) -> bool:
+    """
+    Whether a word survives in the edited clip at all — not just
+    whether it falls within the clip's overall start/end span, which a
+    word sitting inside a removed dead-air or filler gap also does.
+    Without this check, a cut filler word would still flash on screen
+    as a caption for a beat at the exact point the video jumps over it.
+    """
+    return any(word_end > b_start and word_start < b_end for b_start, b_end in blocks)
+
+
 def _build_time_remap(blocks: list):
     """
     Returns a function mapping a timestamp in the ORIGINAL video's
@@ -970,12 +1088,10 @@ def _generate_ass(words: list, ass_path: str, blocks: list, hook_line: str = "")
     line-at-a-time SRT path rather than burning in nothing.
     """
     remap = _build_time_remap(blocks)
-    clip_start, clip_end = blocks[0][0], blocks[-1][1]
 
     in_range = [
         w for w in (words or [])
-        if float(w.get("end", 0)) >= clip_start
-        and float(w.get("start", 0)) <= clip_end
+        if _word_overlaps_blocks(float(w.get("start", 0)), float(w.get("end", 0)), blocks)
         and _ass_escape(str(w.get("word", "")))
     ]
     # Word timings drive the karaoke captions, but a hook overlay alone
@@ -1052,6 +1168,18 @@ def _generate_ass(words: list, ass_path: str, blocks: list, hook_line: str = "")
     return True
 
 
+# Streaming-style loudness target so a clip pulled from a quiet section
+# of the source doesn't play noticeably quieter than one pulled from a
+# loud section — quiet audio is one of the more common reasons a short
+# gets scrolled past. -1.5dB true-peak headroom avoids clipping on
+# playback. Single-pass rather than ffmpeg's two-pass loudnorm
+# measure-then-apply: less precise, but doesn't require decoding the
+# clip twice, and "close to -16 LUFS" already fixes the actual problem
+# (silence vs. speech loudness), which matters far more than being
+# exact.
+_LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
 def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blocks: list):
     """
     Renders the highlight window, cutting out any dead-air gaps found
@@ -1089,6 +1217,7 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
             "ffmpeg", "-y",
             "-ss", str(seek_offset), "-i", input_path, "-t", str(end - start),
             "-vf", post_filter,
+            "-af", _LOUDNORM_FILTER,
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             output_path,
@@ -1101,12 +1230,13 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
         concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(rel_blocks)))
         filter_parts.append(f"{concat_inputs}concat=n={len(rel_blocks)}:v=1:a=1[vcat][acat]")
         filter_parts.append(f"[vcat]{post_filter}[vout]")
+        filter_parts.append(f"[acat]{_LOUDNORM_FILTER}[aout]")
 
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(seek_offset), "-i", input_path,
             "-filter_complex", ";".join(filter_parts),
-            "-map", "[vout]", "-map", "[acat]",
+            "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             output_path,
@@ -1306,6 +1436,14 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
                 blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
                 dead_air_removed = _dead_air_removed_seconds(blocks)
 
+                # Second, finer pass: cuts filler words ("um", "uh") out
+                # of the same blocks — these have actual sound, so no
+                # silence gap above ever catches them.
+                kept_before_filler = sum(b_end - b_start for b_start, b_end in blocks)
+                blocks, filler_words_removed_count = _remove_filler_words(blocks, words)
+                kept_after_filler = sum(b_end - b_start for b_start, b_end in blocks)
+                filler_words_removed_seconds = round(kept_before_filler - kept_after_filler, 2)
+
                 # Karaoke captions when word timings came back, plain
                 # line-at-a-time SRT when they didn't — burning in the
                 # simpler captions beats burning in none at all.
@@ -1376,6 +1514,8 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
                     processed_video_url=public_url,
                     highlight=highlight,
                     dead_air_removed_seconds=dead_air_removed,
+                    filler_words_removed_seconds=filler_words_removed_seconds,
+                    filler_words_removed_count=filler_words_removed_count,
                     quote_card_url=quote_card_url,
                     thumbnail_url=thumbnail_url,
                 ))
