@@ -935,10 +935,10 @@ HOOK_OVERLAY_SECONDS = 2.5
 _HOOK_OVERLAY_COLOUR = "&H0000E5FF"  # Viyo gold (#FFE500) in BGR
 
 
-# Roughly what fits across 1080px at the Hook style's 64px bold, inside
+# Roughly what fits across 1080px at the Hook style's 50px bold, inside
 # its side margins. WrapStyle 2 means libass will NOT wrap for us — an
 # unwrapped hook runs straight off both edges of the frame.
-_HOOK_CHARS_PER_LINE = 24
+_HOOK_CHARS_PER_LINE = 30
 
 
 def _hook_overlay_dialogue(hook_line: str) -> Optional[str]:
@@ -996,12 +996,18 @@ def _generate_ass(words: list, ass_path: str, blocks: list, hook_line: str = "")
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Karaoke,{_ASS_FONT},72,{_ASS_IDLE_COLOUR},{_ASS_ACTIVE_COLOUR},"
-        "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,2,2,80,80,260,1",
+        # Fontsize 54, not the 72 this started at — full-width karaoke
+        # text at 72pt was covering enough of the frame to be a real
+        # problem on any clip where what's actually on screen matters
+        # (a plate of food, a product, hands doing something), not just
+        # a talking head. Outline/shadow trimmed to match so the smaller
+        # text doesn't look proportionally heavier than before.
+        f"Style: Karaoke,{_ASS_FONT},54,{_ASS_IDLE_COLOUR},{_ASS_ACTIVE_COLOUR},"
+        "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,1,2,80,80,260,1",
         # Top-anchored (Alignment 8) so it never collides with the
-        # karaoke captions running along the bottom.
-        f"Style: Hook,{_ASS_FONT},64,{_HOOK_OVERLAY_COLOUR},{_HOOK_OVERLAY_COLOUR},"
-        "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,2,8,70,70,180,1",
+        # karaoke captions running along the bottom. Shrunk to match.
+        f"Style: Hook,{_ASS_FONT},50,{_HOOK_OVERLAY_COLOUR},{_HOOK_OVERLAY_COLOUR},"
+        "&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,1,8,70,70,180,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -1026,7 +1032,10 @@ def _generate_ass(words: list, ass_path: str, blocks: list, hook_line: str = "")
             end = max(start + 0.08, end)
 
             rendered = " ".join(
-                f"{{\\c{_ASS_ACTIVE_COLOUR}\\fscx112\\fscy112}}{t}{{\\r}}" if j == i else t
+                # 106%, not 112% — proportional to the smaller base size
+                # above; the point is the active word still visibly pops,
+                # not that it balloons.
+                f"{{\\c{_ASS_ACTIVE_COLOUR}\\fscx106\\fscy106}}{t}{{\\r}}" if j == i else t
                 for j, t in enumerate(texts)
             )
             lines.append(
