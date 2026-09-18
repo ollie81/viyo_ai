@@ -59,7 +59,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
-from coins import spend_on_feature
+from coins import spend_on_feature, refund_feature
 
 # Speaker-tracking crop is optional: this app runs fine without it (the
 # reframe just falls back to a fixed center crop, same as before this
@@ -349,6 +349,27 @@ def _run_ffprobe_duration(path: str) -> float:
         raise HTTPException(status_code=400, detail="Could not read video — file may be corrupt.")
 
 
+def _has_audio_stream(path: str) -> bool:
+    """
+    Whether the source video has any audio track at all.
+
+    Confirmed by direct reproduction: a silent video run through the
+    extraction command below (ffmpeg's segment muxer, -vn dropping the
+    video stream) fails with a bare "Output file does not contain any
+    stream" / "Invalid argument" — there's nothing left to write once
+    the one stream that existed is dropped. That's a real, ordinary
+    case (a muted recording, a video edited elsewhere with its audio
+    stripped), not a corrupt file, so it gets caught here and reported
+    as what it actually is instead of surfacing raw ffmpeg internals.
+    """
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index", "-of", "csv=p=0", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return bool(result.stdout.strip())
+
+
 def _transcribe_with_openai(path: str) -> dict:
     """
     Transcribe long videos safely.
@@ -358,6 +379,13 @@ def _transcribe_with_openai(path: str) -> dict:
     transcribed separately and the timestamps are shifted back into the
     original video's timeline.
     """
+    if not _has_audio_stream(path):
+        raise HTTPException(
+            status_code=400,
+            detail="This video has no audio track — the AI Repurposer needs "
+            "spoken audio to find highlights. Try a video with sound.",
+        )
+
     with tempfile.TemporaryDirectory() as audio_tmp:
         audio_pattern = os.path.join(audio_tmp, "audio_%03d.mp3")
 
@@ -1608,7 +1636,7 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
         return fallback_index
 
 
-def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
+def _run_repurpose_job(job_id: str, video_url: str, user_id: str, charged: int) -> None:
     """
     The actual transcribe → find-highlights → render-per-clip pipeline,
     run outside the request/response cycle (see repurpose_video below for
@@ -1616,6 +1644,13 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
     raise HTTPException straight into FastAPI's own error handling; there
     is no request to raise into from a background task, so this catches
     everything itself and records it on the job instead.
+
+    `charged` is what spend_on_feature already took for this job (0 for
+    a free daily taste) — any failure below refunds it. This is the
+    single most expensive action in the app (40 coins, no free taste)
+    charged upfront before any processing happens; a creator whose job
+    fails on something as ordinary as a silent video must not just be
+    out the coins with nothing to show for it.
     """
     job = _repurpose_jobs.get(job_id)
     if job is None:
@@ -1756,9 +1791,11 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str) -> None:
         )
         job.status = "done"
     except HTTPException as e:
+        refund_feature(supabase_admin, user_id, "repurpose", charged)
         job.error = str(e.detail)
         job.status = "failed"
     except Exception as e:
+        refund_feature(supabase_admin, user_id, "repurpose", charged)
         job.error = f"Unexpected error: {e}"
         job.status = "failed"
 
@@ -1800,16 +1837,17 @@ async def repurpose_video(
     # or creating a job for it.
     _validate_storage_url(req.video_url)
 
-    # Charged upfront — no refund path if a later step fails (e.g. video
-    # too long). Simpler than partial-completion accounting for a first
-    # pass, and this is already the rarest, most rate-limited call in the app.
-    spend_on_feature(supabase_admin, user_id, "repurpose")
+    # Charged upfront, before the background job even starts — any
+    # failure inside _run_repurpose_job refunds this same amount rather
+    # than leaving the creator out 40 coins for a job that never
+    # produced anything.
+    charged = spend_on_feature(supabase_admin, user_id, "repurpose")
 
     job_id = str(uuid.uuid4())
     _repurpose_jobs[job_id] = _RepurposeJob(user_id)
     _cleanup_expired_repurpose_jobs()
 
-    background_tasks.add_task(_run_repurpose_job, job_id, req.video_url, user_id)
+    background_tasks.add_task(_run_repurpose_job, job_id, req.video_url, user_id, charged)
 
     return RepurposeJobStartResponse(job_id=job_id, status="processing")
 
