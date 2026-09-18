@@ -159,6 +159,14 @@ class RepurposeRequest(BaseModel):
     # Railway's inbound proxy, which has a hard timeout that caused
     # the "Broken pipe" error on the previous multipart approach.
     video_url: str = Field(..., description="Public Supabase Storage URL of the source video")
+    # Optional. Normal videos with speech never need this — highlights,
+    # captions and hook lines all come from the transcript as before.
+    # It only does anything when there's no speech to work with (a
+    # silent video, or one with music/ambient sound Whisper can't
+    # transcribe): the creator can describe what they want the clip to
+    # look like instead of the upload being rejected outright. See
+    # _highlights_from_prompt.
+    creative_prompt: Optional[str] = Field(None, max_length=500)
 
 
 class HighlightSegment(BaseModel):
@@ -581,6 +589,70 @@ def _fallback_highlight(max_duration: float) -> HighlightSegment:
         suggested_title="Featured Clip",
         score=50,
     )
+
+
+def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
+    """
+    Builds the single highlight for a video with no usable speech (no
+    audio track at all, or audio — like music — Whisper found nothing
+    to transcribe in), driven by the creator's own description instead
+    of a transcript.
+
+    There's no speech to time a cut against, so unlike _find_highlights
+    this never returns more than one candidate: the whole video, capped
+    at MAX_OUTPUT_CLIP_SECONDS same as any other clip. Only the title,
+    caption, hashtags and hook overlay come from the model, grounded in
+    what the creator actually asked for rather than guessed.
+    """
+    clip_length = min(max_duration, MAX_OUTPUT_CLIP_SECONDS)
+    fallback = HighlightSegment(
+        start_time=0.0,
+        end_time=clip_length,
+        reason="Based on your description — no spoken audio to find highlights in.",
+        suggested_title="Featured Clip",
+        score=50,
+    )
+
+    prompt = (
+        "A creator uploaded a video with no usable spoken audio (silent, or "
+        "music/ambient sound with nothing to transcribe) and described what "
+        f'they want the clip to look like: "{creative_prompt.strip()}"\n\n'
+        "Write short-form packaging for this clip based on that description. "
+        "Return ONLY raw JSON with keys: suggested_title (short, punchy), "
+        "caption (1-2 short lines in the creator's own voice, no hashtags "
+        "inside it, no quotation marks), hashtags (3-6 lowercase tags "
+        "relevant to the description, without the # symbol), hook_line (a "
+        "short on-screen text overlay for the opening seconds matching the "
+        "vibe described, under 12 words)."
+    )
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert short-form content editor who "
+                               "specializes in retention-optimized hooks.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+        )
+        raw = response.choices[0].message.content.strip()
+        clean = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(clean)
+        return [HighlightSegment(
+            start_time=0.0,
+            end_time=clip_length,
+            reason="Based on your description — no spoken audio to find highlights in.",
+            suggested_title=str(data.get("suggested_title", "")).strip() or "Featured Clip",
+            score=60,
+            caption=str(data.get("caption", "")).strip()[:MAX_CAPTION_CHARS],
+            hashtags=_clean_hashtags(data.get("hashtags") or []),
+            hook_line=str(data.get("hook_line", "")).strip()[:MAX_HOOK_LINE_CHARS],
+        )]
+    except Exception:
+        return [fallback]
 
 
 def _format_timestamped_transcript(segments: list) -> str:
@@ -1636,7 +1708,10 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
         return fallback_index
 
 
-def _run_repurpose_job(job_id: str, video_url: str, user_id: str, charged: int) -> None:
+def _run_repurpose_job(
+    job_id: str, video_url: str, user_id: str, charged: int,
+    creative_prompt: Optional[str] = None,
+) -> None:
     """
     The actual transcribe → find-highlights → render-per-clip pipeline,
     run outside the request/response cycle (see repurpose_video below for
@@ -1651,6 +1726,11 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str, charged: int) 
     charged upfront before any processing happens; a creator whose job
     fails on something as ordinary as a silent video must not just be
     out the coins with nothing to show for it.
+
+    `creative_prompt` is the optional escape hatch for a video with no
+    usable speech — see RepurposeRequest.creative_prompt and
+    _highlights_from_prompt. Every video with real speech in it ignores
+    this entirely and goes through the normal transcript-driven path.
     """
     job = _repurpose_jobs.get(job_id)
     if job is None:
@@ -1672,7 +1752,20 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str, charged: int) 
                     detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s.",
                 )
 
-            whisper_result = _transcribe_with_openai(source_path)
+            if _has_audio_stream(source_path):
+                whisper_result = _transcribe_with_openai(source_path)
+            elif creative_prompt:
+                # No audio track at all, but the creator opted into
+                # describing the clip instead — see _highlights_from_prompt
+                # below. Nothing to transcribe either way.
+                whisper_result = {"text": "", "segments": [], "words": []}
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This video has no audio track — the AI Repurposer needs "
+                    "spoken audio to find highlights. Try a video with sound, or "
+                    "describe what you want the clip to look like instead.",
+                )
             transcript_text = whisper_result.get("text", "")
             segments = whisper_result.get("segments", [])
             words = whisper_result.get("words", [])
@@ -1681,9 +1774,16 @@ def _run_repurpose_job(job_id: str, video_url: str, user_id: str, charged: int) 
             # how many candidate clips come out of it — only the render/upload
             # step below repeats per clip, which is cheap by comparison.
             highlight_count = _highlight_count_for_duration(duration)
-            highlights = _find_highlights(
-                segments, duration, count=highlight_count, words=words
-            )
+            if not segments and creative_prompt:
+                # No speech anywhere to find highlights in — either no
+                # audio track, or audio (e.g. music) Whisper found
+                # nothing to transcribe. Use the creator's own
+                # description instead of the generic fallback clip.
+                highlights = _highlights_from_prompt(creative_prompt, duration)
+            else:
+                highlights = _find_highlights(
+                    segments, duration, count=highlight_count, words=words
+                )
 
             clips = []
             for i, highlight in enumerate(highlights):
@@ -1847,7 +1947,9 @@ async def repurpose_video(
     _repurpose_jobs[job_id] = _RepurposeJob(user_id)
     _cleanup_expired_repurpose_jobs()
 
-    background_tasks.add_task(_run_repurpose_job, job_id, req.video_url, user_id, charged)
+    background_tasks.add_task(
+        _run_repurpose_job, job_id, req.video_url, user_id, charged, req.creative_prompt
+    )
 
     return RepurposeJobStartResponse(job_id=job_id, status="processing")
 
