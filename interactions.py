@@ -46,6 +46,20 @@ async def _get_current_user_id_no_guest(authorization: str = Header(None)) -> st
     return await get_current_user_id_no_guest(authorization)
 
 
+async def _get_current_user_id(authorization: str = Header(None)) -> str:
+    """
+    Unlike every other endpoint here, watching a post shouldn't require
+    a real account — only liking/commenting/gifting do. A guest's
+    anonymous Supabase session still carries a real, verifiable JWT
+    (see get_current_user_id_no_guest's own docstring), so this is
+    still a genuine, attributable request — just not gated on having
+    signed up for one.
+    """
+    from main import get_current_user_id
+
+    return await get_current_user_id(authorization)
+
+
 def _notify_post_owner(post_owner_id: str, actor_id: str, notif_type: str, message_template: str, push_title: str) -> None:
     """
     Best-effort in-app notification + push about `actor_id`'s action on
@@ -92,7 +106,7 @@ def _get_post(post_id: str) -> dict:
         result = (
             supabase_admin
             .table("posts")
-            .select("id,user_id,like_count")
+            .select("id,user_id,like_count,view_count")
             .eq("id", post_id)
             .limit(1)
             .execute()
@@ -176,6 +190,46 @@ async def unlike_post(post_id: str, user_id: str = Depends(_get_current_user_id_
         raise HTTPException(status_code=500, detail=f"Unliked, but could not update like count: {e}")
 
     return LikeResponse(liked=False, like_count=new_count)
+
+
+class ViewResponse(BaseModel):
+    view_count: int
+
+
+@router.post("/posts/{post_id}/view", response_model=ViewResponse)
+async def view_post(post_id: str, user_id: str = Depends(_get_current_user_id)):
+    """
+    Records one view of a post. No auth gate beyond having a session at
+    all (see _get_current_user_id above) — watching shouldn't require
+    an account the way liking/commenting do.
+
+    Deliberately no server-side dedup (no "has this user already viewed
+    this post today" table) — that's real state this codebase has
+    nowhere cheap to keep without a new table, and the Flutter client
+    already only calls this once per post per app session. A refresh
+    or a second session recounts, the same tradeoff every other
+    lightweight view-counter makes; this is a rough engagement signal,
+    not a billing-grade metric.
+    """
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Interactions service is not configured.")
+
+    post = _get_post(post_id)
+    current = int(post.get("view_count") or 0)
+
+    try:
+        result = (
+            supabase_admin.table("posts")
+            .update({"view_count": current + 1})
+            .eq("id", post_id)
+            .eq("view_count", current)
+            .execute()
+        )
+        new_count = current + 1 if result.data else current
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not update view count: {e}")
+
+    return ViewResponse(view_count=new_count)
 
 
 class AddCommentRequest(BaseModel):
