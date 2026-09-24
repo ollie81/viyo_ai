@@ -31,6 +31,18 @@ Environment variables required (see .env.example):
                         endpoint (Stripe dashboard -> Webhooks). Coins
                         are only ever credited from this webhook, never
                         from the client-facing create-intent call.
+  PAYSTACK_SECRET_KEY   Paystack secret key (see paystack_payments.py) —
+                        same "never trust the client, only the webhook"
+                        rule as Stripe above.
+  FLUTTERWAVE_SECRET_KEY  Flutterwave secret key (see flutterwave_payments.py).
+  FLUTTERWAVE_WEBHOOK_SECRET_HASH  The arbitrary "secret hash" string set
+                        in the Flutterwave dashboard under Settings ->
+                        Webhooks — echoed back verbatim in every webhook
+                        request as the verif-hash header.
+  BACKEND_PUBLIC_URL    This service's own public URL, used only as the
+                        redirect_url Flutterwave's hosted checkout sends
+                        the browser back to. Defaults to the Railway
+                        production URL.
   SENTRY_DSN            Crash/error reporting (sentry.io -> Create
                         Project -> FastAPI). Unset = no-op, nothing
                         sent anywhere.
@@ -88,6 +100,10 @@ try:
     from push import router as push_router
     from moderation import router as moderation_router
     from messaging import router as messaging_router
+    from episodes import router as episodes_router
+    from wallet import router as wallet_router
+    from paystack_payments import router as paystack_router
+    from flutterwave_payments import router as flutterwave_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -101,8 +117,12 @@ try:
     app.include_router(push_router)
     app.include_router(moderation_router)
     app.include_router(messaging_router)
+    app.include_router(episodes_router)
+    app.include_router(wallet_router)
+    app.include_router(paystack_router)
+    app.include_router(flutterwave_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging/Episodes/Wallet/Paystack/Flutterwave router not loaded: {_router_import_error}")
 
 ALLOWED_ORIGINS = [
     origin.strip()
