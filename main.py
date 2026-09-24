@@ -48,6 +48,20 @@ Environment variables required (see .env.example):
   LEMONSQUEEZY_WEBHOOK_SECRET  Signing secret set when creating the
                         webhook (Settings -> Webhooks) — verified
                         against the X-Signature header (HMAC-SHA256).
+  GOOGLE_PLAY_SERVICE_ACCOUNT_JSON  The full JSON key of a Google Cloud
+                        service account granted access to this app in
+                        Play Console (Setup -> API access), used to call
+                        the Android Publisher API and verify/acknowledge
+                        coin purchases made through Google Play Billing
+                        (see google_play_payments.py) — required for
+                        Android coin purchases to comply with Google
+                        Play's policy that in-app digital goods be sold
+                        through Play Billing, not Stripe/Paystack/
+                        Flutterwave/Lemon Squeezy.
+  GOOGLE_PLAY_PACKAGE_NAME  The Android app's applicationId (see
+                        android/app/build.gradle in the Viyo- repo),
+                        e.g. com.viyo.app — the Android Publisher API
+                        is scoped per package name.
   BACKEND_PUBLIC_URL    This service's own public URL, used only as the
                         redirect_url Flutterwave's hosted checkout sends
                         the browser back to. Defaults to the Railway
@@ -114,6 +128,7 @@ try:
     from paystack_payments import router as paystack_router
     from flutterwave_payments import router as flutterwave_router
     from lemonsqueezy_payments import router as lemonsqueezy_router
+    from google_play_payments import router as google_play_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -132,6 +147,7 @@ try:
     app.include_router(paystack_router)
     app.include_router(flutterwave_router)
     app.include_router(lemonsqueezy_router)
+    app.include_router(google_play_router)
 except Exception as _router_import_error:
     print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging/Episodes/Wallet/Paystack/Flutterwave router not loaded: {_router_import_error}")
 
