@@ -39,6 +39,15 @@ Environment variables required (see .env.example):
                         in the Flutterwave dashboard under Settings ->
                         Webhooks — echoed back verbatim in every webhook
                         request as the verif-hash header.
+  LEMONSQUEEZY_API_KEY  Lemon Squeezy API key (Settings -> API), for
+                        creating checkouts (see lemonsqueezy_payments.py).
+  LEMONSQUEEZY_STORE_ID  The numeric store id checkouts are created under.
+  LEMONSQUEEZY_VARIANT_ID  One generic "Viyo Coins" product variant's id
+                        — its price is overridden per coin package via
+                        custom_price, so only one variant is needed.
+  LEMONSQUEEZY_WEBHOOK_SECRET  Signing secret set when creating the
+                        webhook (Settings -> Webhooks) — verified
+                        against the X-Signature header (HMAC-SHA256).
   BACKEND_PUBLIC_URL    This service's own public URL, used only as the
                         redirect_url Flutterwave's hosted checkout sends
                         the browser back to. Defaults to the Railway
@@ -104,6 +113,7 @@ try:
     from wallet import router as wallet_router
     from paystack_payments import router as paystack_router
     from flutterwave_payments import router as flutterwave_router
+    from lemonsqueezy_payments import router as lemonsqueezy_router
 
     app.include_router(repurpose_router)
     app.include_router(coach_router)
@@ -121,6 +131,7 @@ try:
     app.include_router(wallet_router)
     app.include_router(paystack_router)
     app.include_router(flutterwave_router)
+    app.include_router(lemonsqueezy_router)
 except Exception as _router_import_error:
     print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging/Episodes/Wallet/Paystack/Flutterwave router not loaded: {_router_import_error}")
 
