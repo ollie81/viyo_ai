@@ -14,6 +14,7 @@ docs call this out as the safer pattern (belt-and-suspenders against a
 webhook payload that matched the hash but doesn't reflect the real,
 fully-settled charge).
 """
+import hmac
 import os
 import uuid
 from typing import Optional
@@ -149,7 +150,14 @@ def _verify_transaction(transaction_id) -> dict:
 async def flutterwave_webhook(request: Request, verif_hash: str = Header(None, alias="verif-hash")):
     if supabase_admin is None or not FLUTTERWAVE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Flutterwave payments are not configured.")
-    if not FLUTTERWAVE_WEBHOOK_SECRET_HASH or verif_hash != FLUTTERWAVE_WEBHOOK_SECRET_HASH:
+    # Constant-time comparison, same posture as every other provider's
+    # signature check here (Paystack/Lemon Squeezy use hmac.compare_digest
+    # on an HMAC digest) — this secret is a static shared value rather
+    # than a per-request HMAC, but comparing it with plain `!=` still
+    # leaks timing information about how many leading bytes matched.
+    if not FLUTTERWAVE_WEBHOOK_SECRET_HASH or not verif_hash or not hmac.compare_digest(
+        verif_hash, FLUTTERWAVE_WEBHOOK_SECRET_HASH
+    ):
         raise HTTPException(status_code=400, detail="Invalid Flutterwave webhook signature.")
 
     event = await request.json()
