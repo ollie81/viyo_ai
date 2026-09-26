@@ -234,6 +234,13 @@ async def view_post(post_id: str, user_id: str = Depends(_get_current_user_id)):
 
 class AddCommentRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=2000)
+    # Phase 2 fields — threaded replies and a real spoiler flag,
+    # replacing the client-only ||text|| markup convention from Phase 1.
+    # Both optional/falsy-default so an older client (or this endpoint
+    # itself, before the migration below has run) behaves exactly as
+    # it did before either existed.
+    parent_id: Optional[str] = None
+    is_spoiler: bool = False
 
 
 class CommentResponse(BaseModel):
@@ -242,6 +249,12 @@ class CommentResponse(BaseModel):
     user_id: str
     content: str
     created_at: str
+    # Defaulted rather than required: a pre-migration `comments` row
+    # (or one fetched before the Phase 2 columns existed) simply won't
+    # have these keys, and **rows[0] below must still validate.
+    parent_id: Optional[str] = None
+    is_pinned: bool = False
+    is_spoiler: bool = False
 
 
 @router.post("/posts/{post_id}/comments", response_model=CommentResponse)
@@ -255,6 +268,12 @@ async def add_comment(
 
     post = _get_post(post_id)  # 404s if the post doesn't exist
 
+    insert_data = {"post_id": post_id, "user_id": user_id, "content": req.content}
+    if req.parent_id:
+        insert_data["parent_id"] = req.parent_id
+    if req.is_spoiler:
+        insert_data["is_spoiler"] = req.is_spoiler
+
     try:
         # PostgREST returns the inserted row(s) by default (supabase-py's
         # default Prefer: return=representation) — no .select()/.single()
@@ -263,14 +282,22 @@ async def add_comment(
         # supabase-py 2.x's insert builder only exposes .execute(), so
         # the extra chaining raised AttributeError before the comment
         # ever reached the database.
-        result = (
-            supabase_admin
-            .table("comments")
-            .insert({"post_id": post_id, "user_id": user_id, "content": req.content})
-            .execute()
-        )
+        result = supabase_admin.table("comments").insert(insert_data).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not add comment: {e}")
+        # A PostgREST error over parent_id/is_spoiler not existing yet
+        # (migration not run) must not turn into "commenting is broken"
+        # — retry with just the fields that have always existed.
+        if len(insert_data) > 3:
+            try:
+                result = (
+                    supabase_admin.table("comments")
+                    .insert({"post_id": post_id, "user_id": user_id, "content": req.content})
+                    .execute()
+                )
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"Could not add comment: {e2}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Could not add comment: {e}")
 
     rows = result.data or []
     if not rows:
@@ -281,3 +308,44 @@ async def add_comment(
     _notify_post_owner(post["user_id"], user_id, "comment", "{actor_name} commented on your post", "New comment 💬")
 
     return CommentResponse(**rows[0])
+
+
+class PinCommentRequest(BaseModel):
+    pinned: bool
+
+
+@router.post("/posts/{post_id}/comments/{comment_id}/pin")
+async def pin_comment(
+    post_id: str,
+    comment_id: str,
+    req: PinCommentRequest,
+    user_id: str = Depends(_get_current_user_id_no_guest),
+):
+    """Pinning is the post's creator's call, not the commenter's — a
+    creator surfacing a favorite/important reply on their own post,
+    same "content owner moderates" reasoning as moderation.py's
+    remove_post. Phase 2 endpoint: 500s with a real error if
+    `comments.is_pinned` doesn't exist yet, since there's no pre-Phase-2
+    pin behavior to fall back to."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Interactions service is not configured.")
+
+    post = _get_post(post_id)
+    if post["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Only the post's creator can pin comments.")
+
+    try:
+        result = (
+            supabase_admin.table("comments")
+            .update({"is_pinned": req.pinned})
+            .eq("id", comment_id)
+            .eq("post_id", post_id)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not update comment: {e}")
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Comment not found.")
+
+    return {"pinned": req.pinned}
