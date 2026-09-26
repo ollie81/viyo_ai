@@ -1,6 +1,13 @@
 """
-New-episode notifications — fanning out to a creator's followers when
-they publish another episode of a series.
+New-episode notifications — fanning out when a creator publishes
+another episode of a series, to the union of two audiences: everyone
+following that series specifically (series_follows, a Phase 2 table —
+following just one show without following everything else the creator
+makes), and everyone following the creator generally (the existing
+`follows` table — someone who follows the creator broadly still wants
+to know about a new series episode even if they haven't explicitly
+followed this particular show). Deduped so a viewer who follows both
+only gets one notification.
 
 Episodes are published by a direct Supabase insert from Flutter
 (PostService.createPost), never through this backend, so there's no
@@ -14,9 +21,10 @@ This is the first one-to-many notification in the app — every existing
 trigger (like/comment in interactions.py, gift in gifting.py, follow in
 push.py) notifies exactly one recipient. `notifications.type` is a free
 string with no server-side enum, so "new_episode" needs no schema
-change; neither does reading `follows`, which every other write in this
-file mirrors from Flutter's own column names (follower_id/following_id)
-since this backend has never touched that table before.
+change; neither does reading `follows`/`series_follows`, both mirrored
+from Flutter's own column names since this backend has never touched
+either table before. A missing `series_follows` (migration not run
+yet) degrades to creator-followers only, not a failure.
 """
 import os
 from typing import Optional
@@ -104,21 +112,37 @@ async def notify_new_episode(
     except Exception:
         pass
 
+    follower_ids: set[str] = set()
+
     try:
-        follows_result = (
+        creator_follows = (
             supabase_admin.table("follows")
             .select("follower_id")
             .eq("following_id", user_id)
             .execute()
         )
+        follower_ids.update(
+            r["follower_id"] for r in (creator_follows.data or []) if r.get("follower_id")
+        )
     except Exception as e:
-        # Nothing was actually published-notified, but the episode
-        # itself already exists — this must not read as a failed
-        # upload to the caller.
-        print(f"[WARN] Could not load followers for new-episode notify: {e}")
-        return {"notified": 0}
+        print(f"[WARN] Could not load creator followers for new-episode notify: {e}")
 
-    follower_ids = [r["follower_id"] for r in (follows_result.data or []) if r.get("follower_id")]
+    try:
+        series_follows = (
+            supabase_admin.table("series_follows")
+            .select("follower_id")
+            .eq("series_id", series_id)
+            .execute()
+        )
+        follower_ids.update(
+            r["follower_id"] for r in (series_follows.data or []) if r.get("follower_id")
+        )
+    except Exception as e:
+        # Expected until the Phase 2 migration runs (series_follows
+        # doesn't exist yet) — falls back to creator-followers only,
+        # not a failure.
+        print(f"[INFO] series_follows not available for new-episode notify: {e}")
+
     if not follower_ids:
         return {"notified": 0}
 
