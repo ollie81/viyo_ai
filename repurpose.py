@@ -45,6 +45,7 @@ import re
 import json
 import time
 import base64
+import datetime
 import string
 import tempfile
 import subprocess
@@ -111,11 +112,24 @@ QUOTE_CARD_SIZE = "1080x1080"
 # without this package drawtext has nothing to render text with at all.
 QUOTE_CARD_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Text/vision model for the four gpt-4o-mini call sites below (highlight
+# selection, video critique, prompt-driven fallback, thumbnail pick) —
+# NOT the transcription call, which stays on whisper-1 (see its own
+# comment in _transcribe_with_openai for why). Luna is the direct,
+# cheaper successor to gpt-4o-mini's role: none of these four calls do
+# multi-step reasoning, so reasoning_effort="none" is passed at every
+# call site to keep behavior/cost/latency close to the old model rather
+# than paying for reasoning tokens on straightforward extraction and
+# generation tasks — Luna rejects `temperature` outright unless that's
+# set, and separately requires `max_completion_tokens` in place of the
+# older `max_tokens`.
+REPURPOSE_TEXT_MODEL = "gpt-6-luna"
+
 # How many evenly-spaced frames to pull from a rendered clip as thumbnail
 # candidates. 5 is enough spread to catch a genuinely different moment
 # (talking head vs. a reaction vs. a b-roll cutaway) without ballooning
 # the vision call's cost/latency — each candidate is one more image token
-# block in the same GPT-4o-mini request.
+# block in the same request.
 THUMBNAIL_CANDIDATE_COUNT = 5
 
 # Separate, stricter rate limit from the other AI endpoints — this is
@@ -256,30 +270,98 @@ class RepurposeJobStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
-class _RepurposeJob:
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-        self.status = "processing"
-        self.result: Optional[RepurposeResponse] = None
-        self.error: Optional[str] = None
-        self.created_at = time.time()
-
-
-# In-memory job store — same tradeoff already accepted by every rate
-# limiter in this file (resets on restart, doesn't share state across
-# instances). A real queue (Celery/Redis) would survive a restart, but
-# that's new infrastructure this app doesn't have; jobs only need to
-# live long enough for one client to poll them to completion, which an
-# hour comfortably covers.
+# Job state lives in Supabase Storage, not an in-memory dict. This app
+# has no schema/migration access to add a proper jobs table (same
+# constraint coins.py hit for free-taste tracking — see its module
+# docstring — solved there by reusing the transactions table; there's
+# no similarly-shaped existing table for a job's full result payload,
+# but there is already a bucket this exact endpoint uploads clips to).
+# A dict is wiped by every Railway restart/redeploy, which silently
+# strands any client mid-poll with a job_id that suddenly 404s and no
+# way to know whether the coins it was charged got refunded. A JSON
+# object per job in the same bucket the clips already land in survives
+# restarts and is shared across instances, at the cost of one Storage
+# round trip per status write/read instead of a dict access.
 _REPURPOSE_JOB_TTL_SECONDS = 60 * 60
-_repurpose_jobs: dict[str, _RepurposeJob] = {}
+_JOB_PREFIX = "_jobs"
+
+
+def _job_path(job_id: str) -> str:
+    return f"{_JOB_PREFIX}/{job_id}.json"
+
+
+def _write_job(job_id: str, data: dict) -> None:
+    supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
+        _job_path(job_id),
+        json.dumps(data).encode("utf-8"),
+        file_options={"content-type": "application/json", "upsert": "true"},
+    )
+
+
+def _read_job(job_id: str) -> Optional[dict]:
+    try:
+        raw = supabase_admin.storage.from_(PROCESSED_BUCKET).download(_job_path(job_id))
+        return json.loads(raw)
+    except Exception:
+        # Covers both "genuinely doesn't exist" (404 from Storage) and
+        # a transient Storage hiccup — either way the client sees the
+        # same "not found or expired" the TTL case already produces,
+        # since there's nothing more specific to tell them.
+        return None
+
+
+def _finish_job(
+    job_id: str, user_id: str, created_at: float, status: str,
+    result: Optional[dict] = None, error: Optional[str] = None,
+) -> None:
+    """Best-effort terminal write — this runs from inside an already-
+    failing except block in some callers, so a Storage hiccup here must
+    log rather than raise and mask the real error."""
+    try:
+        _write_job(job_id, {
+            "user_id": user_id,
+            "status": status,
+            "result": result,
+            "error": error,
+            "created_at": created_at,
+        })
+    except Exception as e:
+        print(f"[WARN] Could not persist repurpose job {job_id} result: {e}")
 
 
 def _cleanup_expired_repurpose_jobs() -> None:
+    """Best-effort sweep of job records past their TTL. Never raises —
+    a failed listing/delete here must not block the new job that
+    triggered it."""
+    try:
+        entries = supabase_admin.storage.from_(PROCESSED_BUCKET).list(
+            _JOB_PREFIX, {"limit": 1000}
+        )
+    except Exception as e:
+        print(f"[WARN] Could not list repurpose jobs for cleanup: {e}")
+        return
+
     cutoff = time.time() - _REPURPOSE_JOB_TTL_SECONDS
-    expired = [jid for jid, job in _repurpose_jobs.items() if job.created_at < cutoff]
-    for jid in expired:
-        del _repurpose_jobs[jid]
+    stale_paths = []
+    for entry in entries:
+        name = entry.get("name")
+        created_at_raw = entry.get("created_at")
+        if not name or not created_at_raw:
+            continue
+        try:
+            created_at = datetime.datetime.fromisoformat(
+                created_at_raw.replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, AttributeError):
+            continue
+        if created_at < cutoff:
+            stale_paths.append(f"{_JOB_PREFIX}/{name}")
+
+    if stale_paths:
+        try:
+            supabase_admin.storage.from_(PROCESSED_BUCKET).remove(stale_paths)
+        except Exception as e:
+            print(f"[WARN] Could not remove expired repurpose jobs: {e}")
 
 
 def _validate_storage_url(url: str) -> None:
@@ -627,16 +709,25 @@ def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
     )
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": "You are an expert short-form content editor who "
-                               "specializes in retention-optimized hooks.",
+                               "specializes in retention-optimized hooks. You edit "
+                               "for Viyo, which also has an AI Short Drama format — "
+                               "numbered episodes in a series, first 3 free, coins "
+                               "to unlock the rest. If a clip genuinely ends on an "
+                               "unresolved moment or a continuing story thread, "
+                               "say so in `reason` as good Short Drama material "
+                               "rather than a flaw — but never change where a clip "
+                               "starts or ends to force that; it's a note, not a "
+                               "goal.",
                 },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.5,
+            reasoning_effort="none",
         )
         raw = response.choices[0].message.content.strip()
         clean = re.sub(r"```json|```", "", raw).strip()
@@ -737,15 +828,23 @@ def _find_highlights(
     )
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an expert short-form content editor who specializes in retention-optimized hooks.",
+                    "content": "You are an expert short-form content editor who specializes in "
+                               "retention-optimized hooks. You edit for Viyo, which also has an "
+                               "AI Short Drama format — numbered episodes in a series, first 3 "
+                               "free, coins to unlock the rest. If a clip genuinely ends on an "
+                               "unresolved moment or a continuing story thread, say so in "
+                               "`reason` as good Short Drama material rather than a flaw — but "
+                               "never change where a clip starts or ends to force that; it's a "
+                               "note, not a goal.",
                 },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
+            reasoning_effort="none",
         )
         raw = response.choices[0].message.content.strip()
         clean = re.sub(r"```json|```", "", raw).strip()
@@ -864,16 +963,24 @@ def _critique_video(
 
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": "You are a blunt, experienced short-form video coach. You "
-                               "tell creators the truth about their footage.",
+                               "tell creators the truth about their footage. You coach for "
+                               "Viyo, which also has an AI Short Drama format — numbered "
+                               "episodes in a series, first 3 free, coins to unlock the rest. "
+                               "If this footage has an ongoing character, story thread, or "
+                               "clearly isn't the whole story, that's worth naming as a "
+                               "strength suited to posting as a Short Drama episode rather "
+                               "than a standalone clip — only when it's actually true of this "
+                               "footage, never as a generic pitch.",
                 },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
+            reasoning_effort="none",
         )
         raw = response.choices[0].message.content.strip()
         data = json.loads(re.sub(r"```json|```", "", raw).strip())
@@ -1690,10 +1797,11 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
 
     try:
         completion = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[{"role": "user", "content": content}],
             temperature=0,
-            max_tokens=50,
+            reasoning_effort="none",
+            max_completion_tokens=50,
         )
         raw = (completion.choices[0].message.content or "").strip()
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -1709,7 +1817,7 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
 
 
 def _run_repurpose_job(
-    job_id: str, video_url: str, user_id: str, charged: int,
+    job_id: str, video_url: str, user_id: str, charged: int, created_at: float,
     creative_prompt: Optional[str] = None,
 ) -> None:
     """
@@ -1718,7 +1826,7 @@ def _run_repurpose_job(
     why). Every step here used to run inline in the POST handler and
     raise HTTPException straight into FastAPI's own error handling; there
     is no request to raise into from a background task, so this catches
-    everything itself and records it on the job instead.
+    everything itself and records it in the job's Storage record instead.
 
     `charged` is what spend_on_feature already took for this job (0 for
     a free daily taste) — any failure below refunds it. This is the
@@ -1727,15 +1835,15 @@ def _run_repurpose_job(
     fails on something as ordinary as a silent video must not just be
     out the coins with nothing to show for it.
 
+    `created_at` is carried through from the job's initial write rather
+    than re-read from Storage, both to save a round trip and so the
+    TTL clock starts at job creation, not completion.
+
     `creative_prompt` is the optional escape hatch for a video with no
     usable speech — see RepurposeRequest.creative_prompt and
     _highlights_from_prompt. Every video with real speech in it ignores
     this entirely and goes through the normal transcript-driven path.
     """
-    job = _repurpose_jobs.get(job_id)
-    if job is None:
-        return  # shouldn't happen — the job is created right before this is scheduled
-
     try:
         with tempfile.TemporaryDirectory() as tmp:
             source_path = os.path.join(tmp, "source.mp4")
@@ -1883,21 +1991,19 @@ def _run_repurpose_job(
         signals = _measure_video_signals(words, segments, duration)
         feedback = _critique_video(transcript_text, signals, highlights)
 
-        job.result = RepurposeResponse(
+        result = RepurposeResponse(
             status="success",
             transcript=transcript_text,
             clips=clips,
             feedback=feedback,
         )
-        job.status = "done"
+        _finish_job(job_id, user_id, created_at, "done", result=result.model_dump(mode="json"))
     except HTTPException as e:
         refund_feature(supabase_admin, user_id, "repurpose", charged)
-        job.error = str(e.detail)
-        job.status = "failed"
+        _finish_job(job_id, user_id, created_at, "failed", error=str(e.detail))
     except Exception as e:
         refund_feature(supabase_admin, user_id, "repurpose", charged)
-        job.error = f"Unexpected error: {e}"
-        job.status = "failed"
+        _finish_job(job_id, user_id, created_at, "failed", error=f"Unexpected error: {e}")
 
 
 @router.post("/repurpose", response_model=RepurposeJobStartResponse)
@@ -1944,11 +2050,25 @@ async def repurpose_video(
     charged = spend_on_feature(supabase_admin, user_id, "repurpose")
 
     job_id = str(uuid.uuid4())
-    _repurpose_jobs[job_id] = _RepurposeJob(user_id)
+    created_at = time.time()
+    try:
+        _write_job(job_id, {
+            "user_id": user_id,
+            "status": "processing",
+            "result": None,
+            "error": None,
+            "created_at": created_at,
+        })
+    except Exception as e:
+        # The job record itself never made it to Storage — nothing was
+        # actually started, so this must not be a silent 40-coin charge.
+        refund_feature(supabase_admin, user_id, "repurpose", charged)
+        raise HTTPException(status_code=502, detail=f"Could not start job: {e}")
+
     _cleanup_expired_repurpose_jobs()
 
     background_tasks.add_task(
-        _run_repurpose_job, job_id, req.video_url, user_id, charged, req.creative_prompt
+        _run_repurpose_job, job_id, req.video_url, user_id, charged, created_at, req.creative_prompt
     )
 
     return RepurposeJobStartResponse(job_id=job_id, status="processing")
@@ -1962,13 +2082,24 @@ async def get_repurpose_job(
     """Polled by the client until status is "done" or "failed" — see
     repurpose_video above for why this is a separate step instead of one
     long blocking POST."""
-    job = _repurpose_jobs.get(job_id)
+    if supabase_admin is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Video repurposing isn't configured yet — SUPABASE_SERVICE_ROLE_KEY is missing on the server.",
+        )
+
+    job = _read_job(job_id)
     if job is None:
         raise HTTPException(
             status_code=404,
             detail="Job not found or expired — repurpose jobs are only kept for about an hour.",
         )
-    if job.user_id != user_id:
+    if job.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="Not your job.")
 
-    return RepurposeJobStatusResponse(status=job.status, result=job.result, error=job.error)
+    result = job.get("result")
+    return RepurposeJobStatusResponse(
+        status=job.get("status", "processing"),
+        result=RepurposeResponse(**result) if result else None,
+        error=job.get("error"),
+    )

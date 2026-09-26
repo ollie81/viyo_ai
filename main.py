@@ -124,6 +124,7 @@ try:
     from moderation import router as moderation_router
     from messaging import router as messaging_router
     from episodes import router as episodes_router
+    from episode_notify import router as episode_notify_router
     from wallet import router as wallet_router
     from paystack_payments import router as paystack_router
     from flutterwave_payments import router as flutterwave_router
@@ -144,6 +145,7 @@ try:
     app.include_router(moderation_router)
     app.include_router(messaging_router)
     app.include_router(episodes_router)
+    app.include_router(episode_notify_router)
     app.include_router(wallet_router)
     app.include_router(paystack_router)
     app.include_router(flutterwave_router)
@@ -162,7 +164,17 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,  # set via ALLOWED_ORIGINS env var — no wildcard
-    allow_methods=["POST"],
+    # Every method any router in this app actually exposes (GET for
+    # reads like conversations/spotlight/repurpose-job-polling, POST for
+    # writes, DELETE for the one endpoint that has it) — was locked to
+    # ["POST"] only, which fails the browser's CORS preflight for every
+    # GET call cross-origin. Starlette's CORSMiddleware answers a
+    # disallowed preflight with a 400 and no detail, which the browser
+    # then reports to fetch() as a bare "Failed to fetch" with no status
+    # code or body to explain why — this is what was silently breaking
+    # Messages, Discover Spotlight, and AI Repurposer's job-status
+    # polling on web, not a client bug or a weak connection.
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
