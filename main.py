@@ -124,6 +124,7 @@ try:
     from moderation import router as moderation_router
     from messaging import router as messaging_router
     from episodes import router as episodes_router
+    from episode_notify import router as episode_notify_router
     from wallet import router as wallet_router
     from paystack_payments import router as paystack_router
     from flutterwave_payments import router as flutterwave_router
@@ -144,6 +145,7 @@ try:
     app.include_router(moderation_router)
     app.include_router(messaging_router)
     app.include_router(episodes_router)
+    app.include_router(episode_notify_router)
     app.include_router(wallet_router)
     app.include_router(paystack_router)
     app.include_router(flutterwave_router)
