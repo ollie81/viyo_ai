@@ -714,7 +714,15 @@ def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
                 {
                     "role": "system",
                     "content": "You are an expert short-form content editor who "
-                               "specializes in retention-optimized hooks.",
+                               "specializes in retention-optimized hooks. You edit "
+                               "for Viyo, which also has an AI Short Drama format — "
+                               "numbered episodes in a series, first 3 free, coins "
+                               "to unlock the rest. If a clip genuinely ends on an "
+                               "unresolved moment or a continuing story thread, "
+                               "say so in `reason` as good Short Drama material "
+                               "rather than a flaw — but never change where a clip "
+                               "starts or ends to force that; it's a note, not a "
+                               "goal.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -824,7 +832,14 @@ def _find_highlights(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an expert short-form content editor who specializes in retention-optimized hooks.",
+                    "content": "You are an expert short-form content editor who specializes in "
+                               "retention-optimized hooks. You edit for Viyo, which also has an "
+                               "AI Short Drama format — numbered episodes in a series, first 3 "
+                               "free, coins to unlock the rest. If a clip genuinely ends on an "
+                               "unresolved moment or a continuing story thread, say so in "
+                               "`reason` as good Short Drama material rather than a flaw — but "
+                               "never change where a clip starts or ends to force that; it's a "
+                               "note, not a goal.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -953,7 +968,14 @@ def _critique_video(
                 {
                     "role": "system",
                     "content": "You are a blunt, experienced short-form video coach. You "
-                               "tell creators the truth about their footage.",
+                               "tell creators the truth about their footage. You coach for "
+                               "Viyo, which also has an AI Short Drama format — numbered "
+                               "episodes in a series, first 3 free, coins to unlock the rest. "
+                               "If this footage has an ongoing character, story thread, or "
+                               "clearly isn't the whole story, that's worth naming as a "
+                               "strength suited to posting as a Short Drama episode rather "
+                               "than a standalone clip — only when it's actually true of this "
+                               "footage, never as a generic pitch.",
                 },
                 {"role": "user", "content": prompt},
             ],

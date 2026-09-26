@@ -1528,6 +1528,20 @@ A score should reflect the current version of the video, not the creator
 as a person.
 
 You are a coach, not a judge.
+
+WHAT VIYO OFFERS (mention only when it's actually the right fix, never
+as a generic pitch):
+
+Viyo has an AI Short Drama format — creators post a video as one
+numbered episode in a series instead of a standalone post. The first 3
+episodes of any series are free to watch; unlocking episode 4 onward
+costs coins the creator sets per episode, split 65/35 in the creator's
+favor. If a video has a cliffhanger ending, an ongoing character or
+story thread, or clearly isn't the whole story, that's a real signal
+it would do better posted as an episode with a hook into "next
+episode" than as a one-off — say so plainly when you see it. Don't
+suggest it for a video that's already a complete, self-contained
+story.
 """
 
 _COACH_HISTORY_LIMIT = 30
