@@ -112,11 +112,24 @@ QUOTE_CARD_SIZE = "1080x1080"
 # without this package drawtext has nothing to render text with at all.
 QUOTE_CARD_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Text/vision model for the four gpt-4o-mini call sites below (highlight
+# selection, video critique, prompt-driven fallback, thumbnail pick) —
+# NOT the transcription call, which stays on whisper-1 (see its own
+# comment in _transcribe_with_openai for why). Luna is the direct,
+# cheaper successor to gpt-4o-mini's role: none of these four calls do
+# multi-step reasoning, so reasoning_effort="none" is passed at every
+# call site to keep behavior/cost/latency close to the old model rather
+# than paying for reasoning tokens on straightforward extraction and
+# generation tasks — Luna rejects `temperature` outright unless that's
+# set, and separately requires `max_completion_tokens` in place of the
+# older `max_tokens`.
+REPURPOSE_TEXT_MODEL = "gpt-6-luna"
+
 # How many evenly-spaced frames to pull from a rendered clip as thumbnail
 # candidates. 5 is enough spread to catch a genuinely different moment
 # (talking head vs. a reaction vs. a b-roll cutaway) without ballooning
 # the vision call's cost/latency — each candidate is one more image token
-# block in the same GPT-4o-mini request.
+# block in the same request.
 THUMBNAIL_CANDIDATE_COUNT = 5
 
 # Separate, stricter rate limit from the other AI endpoints — this is
@@ -696,7 +709,7 @@ def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
     )
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -706,6 +719,7 @@ def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.5,
+            reasoning_effort="none",
         )
         raw = response.choices[0].message.content.strip()
         clean = re.sub(r"```json|```", "", raw).strip()
@@ -806,7 +820,7 @@ def _find_highlights(
     )
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -815,6 +829,7 @@ def _find_highlights(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
+            reasoning_effort="none",
         )
         raw = response.choices[0].message.content.strip()
         clean = re.sub(r"```json|```", "", raw).strip()
@@ -933,7 +948,7 @@ def _critique_video(
 
     try:
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -943,6 +958,7 @@ def _critique_video(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
+            reasoning_effort="none",
         )
         raw = response.choices[0].message.content.strip()
         data = json.loads(re.sub(r"```json|```", "", raw).strip())
@@ -1759,10 +1775,11 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
 
     try:
         completion = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=REPURPOSE_TEXT_MODEL,
             messages=[{"role": "user", "content": content}],
             temperature=0,
-            max_tokens=50,
+            reasoning_effort="none",
+            max_completion_tokens=50,
         )
         raw = (completion.choices[0].message.content or "").strip()
         match = re.search(r"\{.*\}", raw, re.DOTALL)
