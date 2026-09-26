@@ -46,6 +46,13 @@ FREE_EPISODE_COUNT = 3
 # creator_earnings.
 CREATOR_SHARE = 0.65
 
+# Discount applied to each episode's price when unlocking a whole
+# series at once (see unlock_series_bundle) rather than one at a time —
+# a flat, global percentage, same "no single source of truth across
+# repos, mirrored in Flutter" tradeoff as FREE_EPISODE_COUNT/
+# CREATOR_SHARE above and coins.py's FEATURE_COSTS.
+BUNDLE_DISCOUNT = 0.20
+
 
 async def _get_current_user_id_no_guest(authorization: str = Header(None)) -> str:
     from main import get_current_user_id_no_guest
@@ -178,3 +185,127 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
                 )
 
     return UnlockEpisodeResponse(unlocked=True, coins_spent=price)
+
+
+class UnlockBundleResponse(BaseModel):
+    unlocked_episode_ids: list[str]
+    coins_spent: int
+    already_complete: bool = False
+
+
+@router.post("/series/{series_id}/unlock-bundle", response_model=UnlockBundleResponse)
+async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_current_user_id_no_guest)):
+    """
+    Unlocks every currently-locked episode of a series in one purchase,
+    at BUNDLE_DISCOUNT off the per-episode price — for a binge-watcher
+    who'd rather pay once than tap "unlock" on every episode. Does NOT
+    just loop unlock_episode N times: that would charge full price N
+    times (no way to apply a discount) and multiply this endpoint's own
+    known partial-failure surface (a lost creator_earnings credit) by N
+    per purchase instead of handling it once, batched.
+    """
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Episode unlocking is not configured.")
+
+    series = _get_series(series_id)
+    price = int(series.get("coin_price_per_episode") or 0)
+    series_title = series.get("title") or "this series"
+
+    try:
+        episodes = (
+            supabase_admin.table("posts")
+            .select("id,episode_number")
+            .eq("series_id", series_id)
+            .order("episode_number", ascending=True)
+            .execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load episodes: {e}")
+
+    # The owner never needs to unlock their own series — same free pass
+    # unlock_episode gives them per-episode, applied here up front.
+    if series["user_id"] == user_id:
+        lockable_ids = [ep["id"] for ep in episodes if (ep.get("episode_number") or 1) > FREE_EPISODE_COUNT]
+        return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=0, already_complete=True)
+
+    lockable = [ep for ep in episodes if (ep.get("episode_number") or 1) > FREE_EPISODE_COUNT]
+    if not lockable:
+        return UnlockBundleResponse(unlocked_episode_ids=[], coins_spent=0, already_complete=True)
+
+    lockable_ids = [ep["id"] for ep in lockable]
+    try:
+        already = (
+            supabase_admin.table("episode_unlocks")
+            .select("post_id")
+            .eq("user_id", user_id)
+            .in_("post_id", lockable_ids)
+            .execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not check existing unlocks: {e}")
+    already_unlocked_ids = {row["post_id"] for row in already}
+
+    to_unlock = [ep for ep in lockable if ep["id"] not in already_unlocked_ids]
+    if not to_unlock:
+        return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=0, already_complete=True)
+
+    per_episode_price = round(price * (1 - BUNDLE_DISCOUNT))
+
+    # Insert each unlock row before moving any coins, same idempotency-
+    # first ordering as unlock_episode above — looped rather than one
+    # batch insert so a single duplicate (a race against a concurrent
+    # per-episode unlock of the same post) only drops that one row
+    # instead of failing the whole purchase.
+    claimed_ids: list[str] = []
+    for ep in to_unlock:
+        try:
+            supabase_admin.table("episode_unlocks").insert({
+                "user_id": user_id,
+                "post_id": ep["id"],
+                "coins_spent": per_episode_price,
+            }).execute()
+            claimed_ids.append(ep["id"])
+        except Exception as e:
+            if "23505" in str(e) or "duplicate" in str(e).lower():
+                continue
+            raise HTTPException(status_code=500, detail=f"Could not unlock episode {ep['id']}: {e}")
+
+    if not claimed_ids:
+        # Every episode got claimed by something else between the
+        # already-unlocked check above and these inserts — nothing left
+        # to charge for.
+        return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=0, already_complete=True)
+
+    total_cost = per_episode_price * len(claimed_ids)
+
+    try:
+        debit_coins(
+            supabase_admin, user_id, total_cost, "series_bundle_unlock",
+            f"Unlocked {len(claimed_ids)} episodes of {series_title} (bundle, {int(BUNDLE_DISCOUNT * 100)}% off)",
+        )
+    except HTTPException:
+        try:
+            supabase_admin.table("episode_unlocks").delete().eq("user_id", user_id).in_("post_id", claimed_ids).execute()
+        except Exception:
+            pass
+        raise
+
+    creator_share = round(per_episode_price * CREATOR_SHARE)
+    creator_id = series["user_id"]
+    for post_id in claimed_ids:
+        for attempt in range(2):
+            try:
+                supabase_admin.table("creator_earnings").insert({
+                    "creator_id": creator_id,
+                    "source_post_id": post_id,
+                    "coins": creator_share,
+                }).execute()
+                break
+            except Exception as e:
+                if attempt == 1:
+                    print(
+                        f"[CRITICAL] Could not credit {creator_share} coins to creator "
+                        f"{creator_id} for bundle-unlocked episode {post_id} by {user_id}: {e}"
+                    )
+
+    return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=total_cost, already_complete=False)
