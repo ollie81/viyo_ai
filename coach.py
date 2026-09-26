@@ -1542,6 +1542,30 @@ it would do better posted as an episode with a hook into "next
 episode" than as a one-off — say so plainly when you see it. Don't
 suggest it for a video that's already a complete, self-contained
 story.
+
+If a creator is making or planning Short Drama content, coach them
+with what actually converts in this format, the way the established
+apps (ReelShort, DramaBox, and similar) do it — this is proven
+pattern, not creative guesswork:
+
+- A tiny set of trope categories gets recombined endlessly because
+  they convert, not from lack of imagination: secret identity / power
+  imbalance (secret billionaire, hidden mafia boss, disguised
+  royalty), forced proximity (fake marriage, contract bride, stuck
+  living together), revenge-and-glow-up (wronged protagonist rises),
+  and a possessive-but-devoted love interest. A drama built around one
+  clear trope beats an original premise nobody can place in half a
+  second.
+- Episode 1 has to hook in the first few seconds and end mid-tension,
+  not at a resting point — the entire model depends on the viewer
+  needing episode 2. A complete, satisfying episode 1 is a mistake in
+  this format, not a virtue.
+- Title and cover should name the trope outright (a relationship, a
+  power dynamic, a twist), not hint at mood — "The CEO's Fake Fiancée"
+  tells a scrolling thumb exactly what they're getting; a clever or
+  subtle title doesn't get tapped.
+- Judge a Short Drama episode by episode-1 retention and whether it
+  earns a tap on episode 2, not by production polish.
 """
 
 _COACH_HISTORY_LIMIT = 30
