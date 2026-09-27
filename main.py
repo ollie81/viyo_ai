@@ -170,6 +170,18 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,  # set via ALLOWED_ORIGINS env var — no wildcard
+    # Vercel gives this project's frontend a new URL on every preview
+    # deploy (viyo-git-<branch>-<team>.vercel.app) plus a separate
+    # stable production alias (viyo-xi.vercel.app) — both change or get
+    # added over time in a way ALLOWED_ORIGINS alone can't keep up with
+    # without a manual Railway env var edit every time. Confirmed live:
+    # the production alias got CORS-rejected ("Disallowed CORS origin")
+    # because it was never added to ALLOWED_ORIGINS, breaking every
+    # like/comment/etc. on the deployed app with the same "Failed to
+    # fetch" shape as the allow_methods bug below. Scoped to this
+    # project's own "viyo"-prefixed Vercel subdomains specifically,
+    # not *.vercel.app generally.
+    allow_origin_regex=r"^https://viyo[a-z0-9-]*\.vercel\.app$",
     # Every method any router in this app actually exposes (GET for
     # reads like conversations/spotlight/repurpose-job-polling, POST for
     # writes, DELETE for the one endpoint that has it) — was locked to
