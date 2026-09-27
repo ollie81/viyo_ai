@@ -99,7 +99,7 @@ async def get_series_analytics(
             supabase_admin.table("posts")
             .select("id,episode_number,view_count,like_count,comment_count")
             .eq("series_id", series_id)
-            .order("episode_number", ascending=True)
+            .order("episode_number", desc=False)
             .execute()
         ).data or []
     except Exception as e:
