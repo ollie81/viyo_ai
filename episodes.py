@@ -216,7 +216,7 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
             supabase_admin.table("posts")
             .select("id,episode_number")
             .eq("series_id", series_id)
-            .order("episode_number", ascending=True)
+            .order("episode_number", desc=False)
             .execute()
         ).data or []
     except Exception as e:
