@@ -60,6 +60,15 @@ BUNDLE_DISCOUNT = 0.20
 # kSingleAssetContentTypes).
 SINGLE_ASSET_CONTENT_TYPES = {"movie", "short_film"}
 
+# Fallback price for a series whose coin_price_per_episode is missing
+# or 0 — a row created before that column existed, or before this app
+# had per-series pricing at all. Without this, `int(... or 0)` below
+# would silently unlock every locked episode of that series for free,
+# since 0 coins always clears the balance check. Mirrored in Flutter
+# (series.dart's kDefaultEpisodeCoinPrice) — no single source of truth
+# across the two repos, same tradeoff as every other constant here.
+DEFAULT_EPISODE_COIN_PRICE = 30
+
 
 def _is_free_episode(content_type: Optional[str], episode_number: int) -> bool:
     """
@@ -143,7 +152,7 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
     if _is_free_episode(series.get("content_type"), episode_number):
         return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
 
-    price = int(series.get("coin_price_per_episode") or 0)
+    price = int(series.get("coin_price_per_episode") or DEFAULT_EPISODE_COIN_PRICE)
 
     # Insert the unlock row before moving any coins — the unique
     # constraint on (user_id, post_id) makes this the idempotency
@@ -228,7 +237,7 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
         raise HTTPException(status_code=503, detail="Episode unlocking is not configured.")
 
     series = _get_series(series_id)
-    price = int(series.get("coin_price_per_episode") or 0)
+    price = int(series.get("coin_price_per_episode") or DEFAULT_EPISODE_COIN_PRICE)
     series_title = series.get("title") or "this series"
 
     try:
