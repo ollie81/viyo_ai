@@ -53,6 +53,26 @@ CREATOR_SHARE = 0.65
 # CREATOR_SHARE above and coins.py's FEATURE_COSTS.
 BUNDLE_DISCOUNT = 0.20
 
+# Movie/Short Film titles are a single uploaded video, not a
+# multi-episode series — there's no "episode 4" to ever reach, so the
+# free-episode carve-out below would make every one of them 100% free
+# by default. Mirrored in Flutter (series.dart's
+# kSingleAssetContentTypes).
+SINGLE_ASSET_CONTENT_TYPES = {"movie", "short_film"}
+
+
+def _is_free_episode(content_type: Optional[str], episode_number: int) -> bool:
+    """
+    True for the first FREE_EPISODE_COUNT episodes of a normal
+    multi-episode title (series/short_drama/ai_film, or None — every
+    `series` row created before content_type existed). A Movie/Short
+    Film never gets this carve-out: it's priced from the first watch,
+    same as any already-unlocked episode past the free window.
+    """
+    if content_type in SINGLE_ASSET_CONTENT_TYPES:
+        return False
+    return episode_number <= FREE_EPISODE_COUNT
+
 
 async def _get_current_user_id_no_guest(authorization: str = Header(None)) -> str:
     from main import get_current_user_id_no_guest
@@ -85,7 +105,7 @@ def _get_series(series_id: str) -> dict:
     try:
         result = (
             supabase_admin.table("series")
-            .select("id,user_id,title,coin_price_per_episode")
+            .select("id,user_id,title,coin_price_per_episode,content_type")
             .eq("id", series_id)
             .limit(1)
             .execute()
@@ -119,10 +139,10 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
     if episode["user_id"] == user_id:
         return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
 
-    if episode_number <= FREE_EPISODE_COUNT:
+    series = _get_series(episode["series_id"])
+    if _is_free_episode(series.get("content_type"), episode_number):
         return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
 
-    series = _get_series(episode["series_id"])
     price = int(series.get("coin_price_per_episode") or 0)
 
     # Insert the unlock row before moving any coins — the unique
@@ -224,11 +244,12 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
 
     # The owner never needs to unlock their own series — same free pass
     # unlock_episode gives them per-episode, applied here up front.
+    content_type = series.get("content_type")
     if series["user_id"] == user_id:
-        lockable_ids = [ep["id"] for ep in episodes if (ep.get("episode_number") or 1) > FREE_EPISODE_COUNT]
+        lockable_ids = [ep["id"] for ep in episodes if not _is_free_episode(content_type, ep.get("episode_number") or 1)]
         return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=0, already_complete=True)
 
-    lockable = [ep for ep in episodes if (ep.get("episode_number") or 1) > FREE_EPISODE_COUNT]
+    lockable = [ep for ep in episodes if not _is_free_episode(content_type, ep.get("episode_number") or 1)]
     if not lockable:
         return UnlockBundleResponse(unlocked_episode_ids=[], coins_spent=0, already_complete=True)
 
