@@ -128,6 +128,7 @@ try:
     from series_analytics import router as series_analytics_router
     from series_boost import router as series_boost_router
     from referrals import router as referrals_router
+    from bunny_stream import router as bunny_stream_router
     from wallet import router as wallet_router
     from paystack_payments import router as paystack_router
     from flutterwave_payments import router as flutterwave_router
@@ -152,6 +153,7 @@ try:
     app.include_router(series_analytics_router)
     app.include_router(series_boost_router)
     app.include_router(referrals_router)
+    app.include_router(bunny_stream_router)
     app.include_router(wallet_router)
     app.include_router(paystack_router)
     app.include_router(flutterwave_router)
