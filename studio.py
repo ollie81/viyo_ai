@@ -1791,3 +1791,73 @@ async def publish_episode(series_id: str, episode_number: int, req: PublishEpiso
         print(f"[WARN] award_post_creation failed for Studio-published post {inserted['id']}: {e}")
 
     return PublishEpisodeResponse(post_id=inserted["id"], media_url=row["media_url"], video_status="processing")
+
+
+# ---------------------------------------------------------------------------
+# Studio home screen support
+# ---------------------------------------------------------------------------
+# Not a new phase — just enough to let the Flutter home screen show
+# "where did I leave off" per series without the admin having to
+# re-paste a script to find out: which episodes have been split into
+# scenes, whether those scenes are fully generated, and whether
+# they've already been published.
+class EpisodeStudioStatus(BaseModel):
+    episode_number: int
+    scene_count: int
+    images_done: bool
+    audio_done: bool
+    published: bool
+
+
+class EpisodesStatusResponse(BaseModel):
+    episodes: list[EpisodeStudioStatus]
+
+
+@router.get(
+    "/series/{series_id}/episodes",
+    response_model=EpisodesStatusResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def list_episode_status(series_id: str):
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+
+    try:
+        scene_rows = (
+            supabase_admin.table("series_scenes").select("episode_number").eq("series_id", series_id).execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load episodes: {e}")
+
+    episode_numbers = sorted({r["episode_number"] for r in scene_rows})
+    if not episode_numbers:
+        return EpisodesStatusResponse(episodes=[])
+
+    try:
+        published_rows = (
+            supabase_admin.table("posts")
+            .select("episode_number")
+            .eq("series_id", series_id)
+            .in_("episode_number", episode_numbers)
+            .execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not check published episodes: {e}")
+    published_numbers = {r["episode_number"] for r in published_rows}
+
+    episodes = []
+    for episode_number in episode_numbers:
+        scenes = _load_scenes(series_id, episode_number)
+        images_done = bool(scenes) and all(s.image_url for s in scenes)
+        audio_done = bool(scenes) and all(all(l.audio_url for l in s.lines) for s in scenes)
+        episodes.append(
+            EpisodeStudioStatus(
+                episode_number=episode_number,
+                scene_count=len(scenes),
+                images_done=images_done,
+                audio_done=audio_done,
+                published=episode_number in published_numbers,
+            )
+        )
+
+    return EpisodesStatusResponse(episodes=episodes)
