@@ -980,7 +980,12 @@ class SceneSplitResult(BaseModel):
 
 _SCENE_SPLIT_PROMPT = """You are a director breaking an episode script into individual scenes for a vertical short-drama production.
 
-Split the script below into scenes, in the order they occur. A new scene starts whenever the location changes or there's a significant time jump — don't split a single continuous conversation into multiple scenes just because several lines are spoken.
+If the script below has explicit scene markers ("Scene 1", "Scene 2 — Kitchen", "SCENE 3:", etc.), they are hard boundaries:
+- Every marked scene becomes at least one output scene. Never merge two differently-marked scenes into one, even if they feel short or continuous with each other.
+- Only split a single marked scene into MORE than one output scene when either: it has more than 2 dialogue lines, or the action changes significantly partway through it (characters move somewhere else, a new character enters in a way that shifts what's happening, a clear beat change). A marked scene with 2 or fewer lines and no major action shift stays exactly one output scene — do not split it further and do not merge it into a neighboring marked scene either.
+- Keep the marked scenes in their original order.
+
+If the script has NO scene markers at all, fall back to splitting wherever the location changes or there's a significant time jump — don't split a single continuous conversation into multiple scenes just because several lines are spoken.
 
 For each scene, identify:
 - location: the location name, matching the script's own naming as closely as possible
