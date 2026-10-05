@@ -23,6 +23,10 @@ pydantic==2.7.4
 moviepy==1.0.3
 ffmpeg-python==0.2.0
 
+# Viyo Studio (studio.py) — Gemini for script analysis (structured
+# JSON output) and reference image generation.
+google-genai==2.28.0
+
 # Speaker-tracking crop (repurpose.py) — pinned to 4.10.0.84 rather than
 # latest because opencv-python-headless 5.x stopped bundling the Haar
 # cascade XML data files this feature depends on (cv2.data.haarcascades

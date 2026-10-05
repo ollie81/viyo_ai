@@ -165,6 +165,18 @@ try:
 except Exception as _router_import_error:
     print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging/Episodes/Wallet/Paystack/Flutterwave/RewardedAds router not loaded: {_router_import_error}")
 
+# Viyo Studio gets its own try/except rather than joining the block
+# above — it pulls in google-genai, a brand-new, heavy dependency none
+# of the other routers need. If that import ever fails on a given
+# deploy (a bad pip install, a version conflict), it should only take
+# down Studio, not every other feature in this list.
+try:
+    from studio import router as studio_router
+
+    app.include_router(studio_router)
+except Exception as _studio_import_error:
+    print(f"[WARN] Studio router not loaded: {_studio_import_error}")
+
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
