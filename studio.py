@@ -61,6 +61,7 @@ import tempfile
 import uuid
 import wave
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -76,11 +77,18 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# $20/day by default — override in Railway if that's too tight or too
-# loose for how much casting work actually happens per day. Read as
-# whole dollars (easier to set correctly in an env var than cents) and
-# converted once here.
-STUDIO_DAILY_CAP_USD_CENTS = int(float(os.environ.get("STUDIO_DAILY_CAP_USD", "20")) * 100)
+# $3/day by default — a single config value, not hardcoded in the
+# Flutter app (the app only ever reads cap_usd_cents back from
+# GET /spend-today). Override in Railway (STUDIO_DAILY_CAP_USD, in
+# whole dollars) to change the limit without a new app release.
+STUDIO_DAILY_CAP_USD_CENTS = int(float(os.environ.get("STUDIO_DAILY_CAP_USD", "3")) * 100)
+
+# The admin's timezone (Africa/Kigali, UTC+2, no DST) — "today" for the
+# spend cap resets at midnight here, not at UTC midnight. ZoneInfo reads
+# from the `tzdata` package (requirements.txt) rather than assuming the
+# container image ships its own IANA tz database, which slim Python
+# Docker images often don't.
+STUDIO_TIMEZONE = ZoneInfo("Africa/Kigali")
 
 STUDIO_IMAGES_BUCKET = "studio-images"
 STUDIO_AUDIO_BUCKET = "studio-audio"
@@ -222,12 +230,17 @@ def _require_configured() -> None:
 
 
 def _today_start_utc() -> datetime.datetime:
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    """Midnight in STUDIO_TIMEZONE (Africa/Kigali), expressed in UTC
+    for comparison against `created_at` — "today" resets for the admin,
+    not at UTC midnight, which for UTC+2 would otherwise cut the day
+    over two hours early from their perspective."""
+    now_local = datetime.datetime.now(STUDIO_TIMEZONE)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(datetime.timezone.utc)
 
 
 def _spend_today_cents(user_id: Optional[str] = None) -> int:
-    """Total studio_api_costs logged since UTC midnight. `user_id` is
+    """Total studio_api_costs logged since local midnight. `user_id` is
     unused today (every call is admin-gated, not tied to a specific
     Supabase user) but already plumbed through so a future per-user cap
     only needs to pass it in — see this file's own module docstring."""
@@ -246,16 +259,36 @@ def _spend_today_cents(user_id: Optional[str] = None) -> int:
 
 
 def _check_daily_cap(estimated_cost_cents: int) -> None:
+    """Called before every billed Gemini call (text/image/voice) with
+    that call's actual-or-estimated cost, so a call that would push
+    today's spend over the cap never fires at all — not just once
+    already over it."""
     spent = _spend_today_cents()
     if spent + estimated_cost_cents > STUDIO_DAILY_CAP_USD_CENTS:
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Today's Studio spending cap reached (${spent / 100:.2f} of "
-                f"${STUDIO_DAILY_CAP_USD_CENTS / 100:.2f}). Try again after midnight UTC, "
-                "or raise STUDIO_DAILY_CAP_USD."
+                f"Daily limit reached (${STUDIO_DAILY_CAP_USD_CENTS / 100:.2f}). "
+                "Try again tomorrow or raise the limit."
             ),
         )
+
+
+def _estimate_text_cost_cents(input_text: str) -> int:
+    """Pre-call estimate for a text/structured-output Gemini call —
+    actual token counts aren't known until the response comes back, so
+    _check_daily_cap can't just wait for the real cost the way image/
+    voice calls do (those have a flat, known-ahead cost). Input tokens
+    are estimated at ~4 characters/token (a standard rule of thumb);
+    output is budgeted as a generous fixed upper bound for the
+    structured JSON this file's text calls return (cast/scene lists).
+    Deliberately conservative — overestimating blocks a call a few
+    cents early; underestimating lets one slip past the cap."""
+    estimated_input_tokens = max(1, len(input_text) // 4)
+    estimated_output_tokens = 4000
+    input_cost = estimated_input_tokens / 1_000_000 * GEMINI_TEXT_INPUT_USD_PER_1M_TOKENS
+    output_cost = estimated_output_tokens / 1_000_000 * GEMINI_TEXT_OUTPUT_USD_PER_1M_TOKENS
+    return max(1, round((input_cost + output_cost) * 100))
 
 
 def _log_cost(series_id: Optional[str], call_type: str, cost_usd_cents: int) -> None:
@@ -485,7 +518,7 @@ SCRIPT:
 @router.post("/analyze-script", response_model=AnalyzeScriptResponse, dependencies=[Depends(_require_admin)])
 async def analyze_script(req: AnalyzeScriptRequest):
     _require_configured()
-    _check_daily_cap(0)  # text cost isn't known until after the call; this just blocks when already over cap
+    _check_daily_cap(_estimate_text_cost_cents(req.script))
 
     try:
         response = _gemini_client.models.generate_content(
@@ -1057,7 +1090,7 @@ async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequ
     """
     _require_configured()
     _get_series_owner(series_id)  # 404s if the series doesn't exist
-    _check_daily_cap(0)
+    _check_daily_cap(_estimate_text_cost_cents(req.script))
 
     try:
         response = _gemini_client.models.generate_content(

@@ -31,6 +31,12 @@ ffmpeg-python==0.2.0
 # Viyo Studio (studio.py) — Gemini for script analysis (structured
 # JSON output) and reference image generation.
 google-genai==2.28.0
+# zoneinfo (stdlib) needs an IANA tz database to resolve "Africa/Kigali"
+# — slim Docker images like this one's python:3.11-slim base often
+# don't ship /usr/share/zoneinfo, so this is the officially-recommended
+# fallback: a pure-Python copy of the database, not relying on the
+# container having its own.
+tzdata==2025.2
 
 # Speaker-tracking crop (repurpose.py) — pinned to 4.10.0.84 rather than
 # latest because opencv-python-headless 5.x stopped bundling the Haar
