@@ -109,19 +109,21 @@ _gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
     _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-GEMINI_TEXT_MODEL = "gemini-2.5-flash"
-GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
-# Gemini's TTS-capable model, per Google's own Gemini API docs — the
-# "flash" (not "pro") preview variant specifically, since voice
-# previews are short and cheap is what matters here, not the extra
-# quality the pro TTS model charges more for.
-GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+GEMINI_TEXT_MODEL = "gemini-3.8-flash"
+GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+# Gemini's flagship TTS model, per Google's own Gemini API docs
+# (ai.google.dev/gemini-api/docs/models) — the "flash" variant
+# specifically, since voice previews are short and cheap is what
+# matters here, not the extra quality a pro-tier TTS model would add.
+GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
 
-# Approximate Gemini 2.5 Flash pricing (per 1M tokens) as of this
-# writing — Google changes these; re-check
-# https://ai.google.dev/gemini-api/docs/pricing before trusting this
-# for real budgeting. This is best-effort cost *tracking* against the
-# daily cap, not a billing-accurate invoice.
+# The 2.5 Flash generation these constants originally used was
+# retired ("no longer available to new users", surfaced as a live
+# 404 from the API itself) — bumped to the 3.8/3.1 generation above
+# accordingly. Pricing below is unverified against the new models;
+# re-check https://ai.google.dev/gemini-api/docs/pricing before
+# trusting it for real budgeting. This is best-effort cost *tracking*
+# against the daily cap, not a billing-accurate invoice.
 GEMINI_TEXT_INPUT_USD_PER_1M_TOKENS = 0.30
 GEMINI_TEXT_OUTPUT_USD_PER_1M_TOKENS = 2.50
 
