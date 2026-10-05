@@ -56,6 +56,8 @@ import datetime
 import io
 import os
 import re
+import subprocess
+import tempfile
 import uuid
 import wave
 from typing import Optional
@@ -82,6 +84,22 @@ STUDIO_DAILY_CAP_USD_CENTS = int(float(os.environ.get("STUDIO_DAILY_CAP_USD", "2
 
 STUDIO_IMAGES_BUCKET = "studio-images"
 STUDIO_AUDIO_BUCKET = "studio-audio"
+STUDIO_VIDEOS_BUCKET = "studio-videos"
+
+# Phase 4 pushes the assembled MP4 to Bunny Stream server-side, so it
+# reuses bunny_stream.py's own env vars, config check, and deterministic
+# playback-URL builder rather than redefining them here — one source of
+# truth for how this backend talks to Bunny, even though Phase 4's
+# upload mechanism (a direct PUT of bytes already on disk) differs from
+# that file's own client-facing TUS credential flow (see
+# _upload_finished_video_to_bunny's docstring below for why).
+from bunny_stream import (
+    BUNNY_STREAM_API_KEY,
+    BUNNY_STREAM_LIBRARY_ID,
+    _BUNNY_API_BASE,
+    _configured as _bunny_configured,
+    _playback_url as _bunny_playback_url,
+)
 
 supabase_admin: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -126,6 +144,25 @@ GEMINI_TTS_PREVIEW_COST_USD_CENTS = 1
 # per-line cost can be tuned independently of Phase 2's preview cost
 # later without the two meanings colliding.
 GEMINI_TTS_LINE_COST_USD_CENTS = 1
+
+# Phase 4 assembly is pure ffmpeg/Bunny work — no Gemini calls, nothing
+# to log against the daily cap or STUDIO_DAILY_CAP_USD.
+_FFMPEG_FPS = 30
+_FFMPEG_RESOLUTION = "1080x1920"
+# How long a scene with no dialogue lines holds on screen — a plain
+# establishing shot still needs *some* duration to not flash by instantly.
+_SCENE_SILENCE_SECONDS = 3.0
+_END_CARD_SECONDS = 3.0
+_END_CARD_TEXT = "Next episode on Viyo"
+# Matches the app's own dark background (see app_icon's
+# adaptive_icon_background in pubspec.yaml) so the end card doesn't
+# look like a foreign insert.
+_END_CARD_BG_COLOR = "0x0B0B1A"
+# Installed via the Dockerfile's `apt-get install ... fonts-dejavu-core`
+# line (same package repurpose.py's own burned-in text already depends
+# on — see QUOTE_CARD_FONT_PATH there).
+_CAPTION_FONT = "DejaVu Sans"
+_CAPTION_FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # Gemini's prebuilt TTS voice catalog, each tagged with a gender/age/
 # description for the auto-assignment heuristic below. The tags are
@@ -1336,3 +1373,419 @@ async def generate_line_audio(line_id: str):
 
     _log_cost(scene_row.get("series_id"), "line_audio", GEMINI_TTS_LINE_COST_USD_CENTS)
     return LineAudioResponse(audio_url=audio_url, cost_usd_cents=GEMINI_TTS_LINE_COST_USD_CENTS)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Assemble & Publish
+# ---------------------------------------------------------------------------
+# Turns one episode's already-generated scene images + line audio into
+# a real 9:16 MP4 (ffmpeg, subprocess-based — matching repurpose.py's
+# own style; moviepy/ffmpeg-python are in requirements.txt but unused
+# anywhere in this codebase, so this doesn't introduce a second way of
+# doing the same thing) and publishes it exactly the way every other
+# episode in this app gets published: a `posts` row with series_id +
+# episode_number, video hosted on Bunny Stream. The one difference from
+# the client's own publish flow (post_service.dart's createPost) is
+# *how* the bytes reach Bunny — see _upload_finished_video_to_bunny.
+#
+# Two separate endpoints, matching the spec's own "admin previews and
+# publishes" — assemble() renders the MP4 and uploads it to Supabase
+# Storage (STUDIO_VIDEOS_BUCKET) for an in-app preview; publish() is a
+# deliberate separate action that re-downloads that same preview and
+# pushes it to Bunny + creates the real post. There's no server-side
+# episode-draft state between the two calls (no new table for it) —
+# the preview_video_url and duration_seconds assemble() returns are
+# simply held in the Flutter screen's memory and sent back on publish,
+# the same "draft held client-side until a deliberate save" pattern
+# Phase 1's cast editing already uses.
+def _download_to_file(url: str, path: str) -> None:
+    try:
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not download {url}: {e}")
+    with open(path, "wb") as f:
+        f.write(resp.content)
+
+
+def _ffprobe_duration(path: str) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        return float(result.stdout.strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=500, detail=f"Could not read duration of {os.path.basename(path)}.")
+
+
+def _run_ffmpeg(cmd: list[str], step: str) -> None:
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"{step} failed: {result.stderr[-500:]}")
+
+
+def _srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, round(seconds * 1000))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, ms = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def _write_scene_srt(texts: list[str], durations: list[float], srt_path: str) -> None:
+    cursor = 0.0
+    entries = []
+    for i, (text, duration) in enumerate(zip(texts, durations), start=1):
+        start, end = cursor, cursor + duration
+        entries.append(f"{i}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n")
+        cursor = end
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(entries))
+
+
+def _concat_audio(input_paths: list[str], out_path: str) -> None:
+    cmd = ["ffmpeg", "-y"]
+    for p in input_paths:
+        cmd += ["-i", p]
+    inputs = "".join(f"[{i}:a]" for i in range(len(input_paths)))
+    cmd += [
+        "-filter_complex", f"{inputs}concat=n={len(input_paths)}:v=0:a=1[aout]",
+        "-map", "[aout]", "-ar", "44100", "-ac", "1", out_path,
+    ]
+    _run_ffmpeg(cmd, "Scene audio concat")
+
+
+def _render_silence(duration: float, out_path: str) -> None:
+    cmd = [
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=44100",
+        "-t", str(duration), "-ar", "44100", "-ac", "1", out_path,
+    ]
+    _run_ffmpeg(cmd, "Silence render")
+
+
+def _render_scene_clip(
+    image_path: str, audio_path: str, srt_path: Optional[str], duration: float, pan: str, out_path: str
+) -> None:
+    """Ken Burns (slow zoom, alternating center/pan-across by scene
+    index for some visual variety) with the scene's dialogue burned in
+    underneath, one caption per line, timed against that same audio.
+    Verified end to end (zoompan expression, subtitle burn-in, exact
+    duration) against synthetic test assets before writing this —
+    zoompan's expression syntax is easy to get subtly wrong."""
+    frames = max(1, int(round(duration * _FFMPEG_FPS)))
+    if pan == "left_right":
+        x_expr = f"(iw-iw/zoom)*(on/{frames})"
+    else:
+        x_expr = "iw/2-(iw/zoom/2)"
+    vf = (
+        f"scale=2160:3840,zoompan=z='min(zoom+0.0010,1.3)':x='{x_expr}':"
+        f"y='ih/2-(ih/zoom/2)':d={frames}:s={_FFMPEG_RESOLUTION}:fps={_FFMPEG_FPS}"
+    )
+    if srt_path:
+        # Same path-escaping precaution repurpose.py's own subtitles
+        # filter usage takes (see its `safe_path`) — ffmpeg's filter
+        # string syntax treats a bare ":" as an option separator.
+        safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
+        style = (
+            f"FontName={_CAPTION_FONT},FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
+        )
+        vf += f",subtitles='{safe_srt}':force_style='{style}'"
+    cmd = [
+        "ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
+        "-vf", vf, "-t", str(duration),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
+    ]
+    _run_ffmpeg(cmd, "Scene render")
+
+
+def _render_end_card(tmp_dir: str, out_path: str) -> None:
+    text_path = os.path.join(tmp_dir, "endcard_text.txt")
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(_END_CARD_TEXT)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c={_END_CARD_BG_COLOR}:s={_FFMPEG_RESOLUTION}:d={_END_CARD_SECONDS}",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=44100",
+        "-vf",
+        f"drawtext=textfile={text_path}:fontfile={_CAPTION_FONT_BOLD_PATH}:"
+        "fontcolor=white:fontsize=56:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-t", str(_END_CARD_SECONDS),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
+    ]
+    _run_ffmpeg(cmd, "End card render")
+
+
+def _concat_clips(clip_paths: list[str], out_path: str) -> None:
+    """The concat *filter*, not the concat demuxer — verified this the
+    hard way: the demuxer silently dropped ~15% of total duration when
+    re-encoding heterogeneous clips (confirmed via ffprobe on a test
+    render, video stream ending up shorter than its own audio), while
+    the filter produced frame-accurate output on the identical input.
+    The demuxer is only safe for stream-copying identical-codec
+    segments, which scene clips with different images/captions aren't."""
+    cmd = ["ffmpeg", "-y"]
+    for p in clip_paths:
+        cmd += ["-i", p]
+    parts = "".join(f"[{i}:v][{i}:a]" for i in range(len(clip_paths)))
+    cmd += [
+        "-filter_complex", f"{parts}concat=n={len(clip_paths)}:v=1:a=1[vout][aout]",
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out_path,
+    ]
+    _run_ffmpeg(cmd, "Episode concat")
+
+
+def _mix_background_music(video_path: str, music_path: str, duration: float, out_path: str) -> None:
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path, "-i", music_path,
+        "-filter_complex",
+        f"[1:a]volume=0.12,atrim=0:{duration}[music];"
+        "[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+        "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", out_path,
+    ]
+    _run_ffmpeg(cmd, "Background music mix")
+
+
+def _extract_thumbnail(video_path: str, out_path: str) -> None:
+    # 0.5s in, matching PostService.generateAndUploadVideoThumbnail's
+    # own timeMs: 500 — skips a possible black opening frame the same
+    # way a normally-uploaded episode's thumbnail already does.
+    cmd = ["ffmpeg", "-y", "-ss", "0.5", "-i", video_path, "-frames:v", "1", "-update", "1", out_path]
+    _run_ffmpeg(cmd, "Thumbnail extraction")
+
+
+def _upload_video_preview(video_bytes: bytes, path: str) -> str:
+    try:
+        supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(
+            path, video_bytes, file_options={"content-type": "video/mp4"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload assembled video: {e}")
+    return supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
+
+
+class AssembleEpisodeRequest(BaseModel):
+    # Admin-supplied — this backend has no royalty-free music library
+    # of its own (bundling real audio files here would mean vouching
+    # for licensing this codebase has no way to verify), so background
+    # music is opt-in: a URL to a track the admin already has the
+    # rights to use, mixed in low under the dialogue. Omitted entirely
+    # when not given, not replaced with a placeholder. Sound effects
+    # aren't implemented for the same reason plus the lack of any way
+    # to pick which effect fits a given scene automatically.
+    music_url: Optional[str] = None
+
+
+class AssembleEpisodeResponse(BaseModel):
+    preview_video_url: str
+    duration_seconds: int
+
+
+@router.post(
+    "/series/{series_id}/episode/{episode_number}/assemble",
+    response_model=AssembleEpisodeResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpisodeRequest):
+    """Renders this episode's scenes into one 9:16 MP4 and uploads it
+    to Storage for preview — does NOT touch Bunny or create a post;
+    see this section's own header comment for why that's a separate
+    deliberate publish() call instead of happening automatically here."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    _get_series_owner(series_id)
+    scenes = _load_scenes(series_id, episode_number)
+    if not scenes:
+        raise HTTPException(status_code=400, detail="No scenes for this episode yet — split the script first.")
+
+    missing = []
+    for i, scene in enumerate(scenes):
+        if not scene.image_url:
+            missing.append(f"Scene {i + 1} has no image")
+        for j, line in enumerate(scene.lines):
+            if not line.audio_url:
+                missing.append(f"Scene {i + 1}, line {j + 1} has no audio")
+    if missing:
+        detail = "Generate everything before assembling: " + "; ".join(missing[:5])
+        if len(missing) > 5:
+            detail += f" (+{len(missing) - 5} more)"
+        raise HTTPException(status_code=400, detail=detail)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        clip_paths = []
+        for i, scene in enumerate(scenes):
+            image_path = os.path.join(tmp, f"scene_{i}.png")
+            _download_to_file(scene.image_url, image_path)
+
+            line_audio_paths = []
+            for j, line in enumerate(scene.lines):
+                p = os.path.join(tmp, f"scene_{i}_line_{j}.wav")
+                _download_to_file(line.audio_url, p)
+                line_audio_paths.append(p)
+
+            scene_audio_path = os.path.join(tmp, f"scene_{i}_audio.wav")
+            if line_audio_paths:
+                _concat_audio(line_audio_paths, scene_audio_path)
+            else:
+                _render_silence(_SCENE_SILENCE_SECONDS, scene_audio_path)
+            scene_duration = _ffprobe_duration(scene_audio_path)
+
+            srt_path = None
+            if scene.lines:
+                srt_path = os.path.join(tmp, f"scene_{i}.srt")
+                line_durations = [_ffprobe_duration(p) for p in line_audio_paths]
+                _write_scene_srt([l.text for l in scene.lines], line_durations, srt_path)
+
+            clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
+            pan = "left_right" if i % 2 else "center"
+            _render_scene_clip(image_path, scene_audio_path, srt_path, scene_duration, pan, clip_path)
+            clip_paths.append(clip_path)
+
+        endcard_path = os.path.join(tmp, "endcard.mp4")
+        _render_end_card(tmp, endcard_path)
+        clip_paths.append(endcard_path)
+
+        assembled_path = os.path.join(tmp, "assembled.mp4")
+        _concat_clips(clip_paths, assembled_path)
+
+        final_path = assembled_path
+        if req.music_url:
+            music_path = os.path.join(tmp, "music_src")
+            _download_to_file(req.music_url, music_path)
+            mixed_path = os.path.join(tmp, "with_music.mp4")
+            _mix_background_music(assembled_path, music_path, _ffprobe_duration(assembled_path), mixed_path)
+            final_path = mixed_path
+
+        duration_seconds = int(round(_ffprobe_duration(final_path)))
+        with open(final_path, "rb") as f:
+            video_bytes = f.read()
+        preview_url = _upload_video_preview(video_bytes, f"{series_id}/{episode_number}/{uuid.uuid4().hex}.mp4")
+
+    return AssembleEpisodeResponse(preview_video_url=preview_url, duration_seconds=duration_seconds)
+
+
+def _upload_finished_video_to_bunny(video_path: str, title: str) -> str:
+    """Server-side push of a file already on disk — different from
+    bunny_stream.py's own create_bunny_video, which hands the Flutter
+    CLIENT a time-boxed TUS credential and never sees the bytes itself
+    (see that file's module docstring). Studio already has the whole
+    finished MP4 after ffmpeg assembly, so there's nothing for TUS's
+    resumable-chunked-upload machinery to buy here — Bunny's simpler
+    direct (non-TUS) upload API does the same job in two calls: create
+    the video object, then PUT the bytes straight to it."""
+    if not _bunny_configured():
+        raise HTTPException(status_code=503, detail="Bunny Stream is not configured.")
+
+    try:
+        create_resp = requests.post(
+            f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos",
+            json={"title": title[:200]},
+            headers={"AccessKey": BUNNY_STREAM_API_KEY, "Content-Type": "application/json"},
+            timeout=15,
+        )
+        create_resp.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Could not create Bunny video: {e}")
+
+    video_id = create_resp.json().get("guid")
+    if not video_id:
+        raise HTTPException(status_code=502, detail="Bunny did not return a video id.")
+
+    try:
+        with open(video_path, "rb") as f:
+            upload_resp = requests.put(
+                f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos/{video_id}",
+                data=f,
+                headers={"AccessKey": BUNNY_STREAM_API_KEY},
+                timeout=600,
+            )
+        upload_resp.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload video to Bunny: {e}")
+
+    return video_id
+
+
+class PublishEpisodeRequest(BaseModel):
+    preview_video_url: str
+    duration_seconds: int
+    caption: Optional[str] = None
+
+
+class PublishEpisodeResponse(BaseModel):
+    post_id: str
+    media_url: str
+    video_status: str
+
+
+@router.post(
+    "/series/{series_id}/episode/{episode_number}/publish",
+    response_model=PublishEpisodeResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def publish_episode(series_id: str, episode_number: int, req: PublishEpisodeRequest):
+    """Re-downloads the already-assembled preview (see assemble_episode
+    above for why this doesn't just keep the ffmpeg working directory
+    around), pushes it to Bunny, and inserts the same `posts` row shape
+    post_service.dart's own createPost does — this IS the publish
+    action (is_private is always False here), unlike that client flow,
+    which can also create a scheduled/private draft row."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    owner_user_id = _get_series_owner(series_id)
+
+    try:
+        series_rows = supabase_admin.table("series").select("title").eq("id", series_id).limit(1).execute().data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load series: {e}")
+    series_title = series_rows[0]["title"] if series_rows else "Viyo"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = os.path.join(tmp, "episode.mp4")
+        _download_to_file(req.preview_video_url, video_path)
+
+        video_id = _upload_finished_video_to_bunny(video_path, f"{series_title} - Episode {episode_number}")
+
+        thumb_path = os.path.join(tmp, "thumb.jpg")
+        _extract_thumbnail(video_path, thumb_path)
+        with open(thumb_path, "rb") as f:
+            thumb_bytes = f.read()
+        thumbnail_url = _upload_image(thumb_bytes, "image/jpeg", f"episode-thumbnails/{uuid.uuid4().hex}.jpg")
+
+    row = {
+        "user_id": owner_user_id,
+        "post_type": "video",
+        "caption": req.caption or f"{series_title} - Episode {episode_number}",
+        "media_url": _bunny_playback_url(video_id),
+        "thumbnail_url": thumbnail_url,
+        "duration_seconds": req.duration_seconds,
+        "is_private": False,
+        "series_id": series_id,
+        "episode_number": episode_number,
+        "video_provider": "bunny",
+        "bunny_video_id": video_id,
+        "video_status": "processing",
+    }
+    try:
+        inserted = supabase_admin.table("posts").insert(row).execute().data[0]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Video uploaded to Bunny ({video_id}) but could not create the post: {e}",
+        )
+
+    # Same reward the creator gets for posting any other episode —
+    # best-effort, matching _log_cost's own "never undo already-
+    # finished work over a logging failure" reasoning.
+    try:
+        supabase_admin.rpc(
+            "award_post_creation",
+            {"p_user_id": owner_user_id, "p_post_id": inserted["id"], "p_post_type": "video"},
+        ).execute()
+    except Exception as e:
+        print(f"[WARN] award_post_creation failed for Studio-published post {inserted['id']}: {e}")
+
+    return PublishEpisodeResponse(post_id=inserted["id"], media_url=row["media_url"], video_status="processing")
