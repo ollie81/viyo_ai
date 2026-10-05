@@ -961,6 +961,52 @@ def _match_by_name(name: str, rows: list[dict]) -> Optional[dict]:
     return None
 
 
+_NAME_TITLES = {"mr", "mrs", "ms", "miss", "dr", "prof", "sir", "madam", "mister", "doctor"}
+
+
+def _normalize_name_tokens(name: str) -> list[str]:
+    """Lowercases, strips punctuation, and drops honorifics, leaving the
+    bare name tokens to compare — so "MR. OSEI", "Mr. Osei" and "Osei"
+    all reduce to ["osei"]."""
+    cleaned = re.sub(r"[^\w\s]", " ", (name or "").lower())
+    return [t for t in cleaned.split() if t and t not in _NAME_TITLES]
+
+
+def _match_character_by_name(name: str, characters: list[dict]) -> Optional[dict]:
+    """Matches a script speaker name to a saved character: case-,
+    punctuation- and title-insensitive, and tolerant of a bare first or
+    last name standing in for a full name ("DANIEL" or "VANCE" both
+    match "Daniel Vance"). Only resolves a bare first/last name when
+    exactly one character could be meant — if two characters share a
+    first or last name, that's left unmatched (same as no match) rather
+    than silently guessing which one was meant.
+    """
+    needle_tokens = _normalize_name_tokens(name)
+    if not needle_tokens:
+        return None
+    needle = " ".join(needle_tokens)
+
+    full_matches = []
+    partial_matches = []
+    for row in characters:
+        row_tokens = _normalize_name_tokens(row.get("name") or "")
+        if not row_tokens:
+            continue
+        if " ".join(row_tokens) == needle:
+            full_matches.append(row)
+        elif len(needle_tokens) == 1 and needle_tokens[0] in row_tokens:
+            partial_matches.append(row)
+
+    if len(full_matches) == 1:
+        return full_matches[0]
+    if full_matches:
+        return None  # same normalized full name on multiple characters
+
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+    return None  # no match, or a first/last name shared by several characters
+
+
 class SceneLineOut(BaseModel):
     speaker: str
     text: str
@@ -1130,7 +1176,7 @@ async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequ
         location_match = _match_by_name(scene.location, locations)
         scene_characters = []
         for name in scene.characters_present:
-            match = _match_by_name(name, characters)
+            match = _match_character_by_name(name, characters)
             scene_characters.append({"character_id": match["id"] if match else None, "name": name})
 
         try:
@@ -1164,7 +1210,7 @@ async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequ
                             {
                                 "scene_id": scene_row["id"],
                                 "sort_order": j,
-                                "character_id": (_match_by_name(line.speaker, characters) or {}).get("id"),
+                                "character_id": (_match_character_by_name(line.speaker, characters) or {}).get("id"),
                                 "character_name": line.speaker,
                                 "text": line.text,
                             }
