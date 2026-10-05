@@ -40,8 +40,11 @@ before this router will do anything but fail with a clear 500 on the
 first real table access.
 """
 import datetime
+import io
 import os
+import re
 import uuid
+import wave
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -64,6 +67,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 STUDIO_DAILY_CAP_USD_CENTS = int(float(os.environ.get("STUDIO_DAILY_CAP_USD", "20")) * 100)
 
 STUDIO_IMAGES_BUCKET = "studio-images"
+STUDIO_AUDIO_BUCKET = "studio-audio"
 
 supabase_admin: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -75,6 +79,11 @@ if GEMINI_API_KEY:
 
 GEMINI_TEXT_MODEL = "gemini-2.5-flash"
 GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
+# Gemini's TTS-capable model, per Google's own Gemini API docs — the
+# "flash" (not "pro") preview variant specifically, since voice
+# previews are short and cheap is what matters here, not the extra
+# quality the pro TTS model charges more for.
+GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 
 # Approximate Gemini 2.5 Flash pricing (per 1M tokens) as of this
 # writing — Google changes these; re-check
@@ -90,6 +99,53 @@ GEMINI_TEXT_OUTPUT_USD_PER_1M_TOKENS = 2.50
 # rounded up) rather than computed from usage_metadata like the text
 # calls below are.
 GEMINI_IMAGE_COST_USD_CENTS = 4
+
+# Same reasoning as the image cost above: Gemini's TTS pricing isn't
+# broken out in official per-token docs in a way that's reliably
+# computable from usage_metadata the way plain text is, and a voice
+# preview is always a short one- or two-sentence sample — so this is a
+# flat best-effort estimate per preview call, not a computed cost.
+GEMINI_TTS_PREVIEW_COST_USD_CENTS = 1
+
+# Gemini's prebuilt TTS voice catalog, each tagged with a gender/age/
+# description for the auto-assignment heuristic below. The tags are
+# this codebase's own best-effort characterization of each voice (not
+# pulled live from Google) — double check against
+# https://ai.google.dev/gemini-api/docs/speech-generation before
+# relying on them for anything beyond a reasonable starting guess; the
+# admin can always override via POST /character/{id}/voice.
+GEMINI_VOICES: list[dict] = [
+    {"name": "Zephyr", "gender": "female", "age": "young", "description": "Bright"},
+    {"name": "Puck", "gender": "male", "age": "young", "description": "Upbeat"},
+    {"name": "Charon", "gender": "male", "age": "mature", "description": "Informative"},
+    {"name": "Kore", "gender": "female", "age": "adult", "description": "Firm"},
+    {"name": "Fenrir", "gender": "male", "age": "adult", "description": "Excitable"},
+    {"name": "Leda", "gender": "female", "age": "young", "description": "Youthful"},
+    {"name": "Orus", "gender": "male", "age": "adult", "description": "Firm"},
+    {"name": "Aoede", "gender": "female", "age": "adult", "description": "Breezy"},
+    {"name": "Callirrhoe", "gender": "female", "age": "adult", "description": "Easy-going"},
+    {"name": "Autonoe", "gender": "female", "age": "young", "description": "Bright"},
+    {"name": "Enceladus", "gender": "male", "age": "mature", "description": "Breathy"},
+    {"name": "Iapetus", "gender": "male", "age": "mature", "description": "Clear"},
+    {"name": "Umbriel", "gender": "male", "age": "adult", "description": "Easy-going"},
+    {"name": "Algieba", "gender": "male", "age": "mature", "description": "Smooth"},
+    {"name": "Despina", "gender": "female", "age": "adult", "description": "Smooth"},
+    {"name": "Erinome", "gender": "female", "age": "adult", "description": "Clear"},
+    {"name": "Algenib", "gender": "male", "age": "mature", "description": "Gravelly"},
+    {"name": "Rasalgethi", "gender": "male", "age": "mature", "description": "Informative"},
+    {"name": "Laomedeia", "gender": "female", "age": "young", "description": "Upbeat"},
+    {"name": "Achernar", "gender": "female", "age": "young", "description": "Soft"},
+    {"name": "Alnilam", "gender": "male", "age": "adult", "description": "Firm"},
+    {"name": "Schedar", "gender": "male", "age": "mature", "description": "Even"},
+    {"name": "Gacrux", "gender": "female", "age": "mature", "description": "Mature"},
+    {"name": "Pulcherrima", "gender": "female", "age": "adult", "description": "Forward"},
+    {"name": "Achird", "gender": "male", "age": "young", "description": "Friendly"},
+    {"name": "Zubenelgenubi", "gender": "male", "age": "adult", "description": "Casual"},
+    {"name": "Vindemiatrix", "gender": "female", "age": "mature", "description": "Gentle"},
+    {"name": "Sadachbia", "gender": "male", "age": "young", "description": "Lively"},
+    {"name": "Sadaltager", "gender": "male", "age": "mature", "description": "Knowledgeable"},
+    {"name": "Sulafat", "gender": "female", "age": "adult", "description": "Warm"},
+]
 
 
 def _require_admin(x_admin_key: str = Header(None)) -> None:
@@ -188,6 +244,108 @@ def _extract_image(response: types.GenerateContentResponse) -> tuple[bytes, str]
             if part.inline_data is not None and part.inline_data.data:
                 return part.inline_data.data, part.inline_data.mime_type or "image/png"
     raise HTTPException(status_code=502, detail="Gemini did not return an image for this prompt.")
+
+
+def _extract_audio_pcm(response: types.GenerateContentResponse) -> tuple[bytes, int]:
+    """Gemini TTS returns raw 16-bit mono PCM, not a self-describing
+    container — the sample rate comes back in the part's mime_type
+    (e.g. "audio/L16;codec=pcm;rate=24000") rather than in the bytes
+    themselves, so it has to be parsed out here and threaded through
+    to _pcm_to_wav."""
+    candidates = response.candidates or []
+    if candidates and candidates[0].content and candidates[0].content.parts:
+        for part in candidates[0].content.parts:
+            if part.inline_data is not None and part.inline_data.data:
+                rate_match = re.search(r"rate=(\d+)", part.inline_data.mime_type or "")
+                sample_rate = int(rate_match.group(1)) if rate_match else 24000
+                return part.inline_data.data, sample_rate
+    raise HTTPException(status_code=502, detail="Gemini did not return audio for this voice.")
+
+
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def _upload_audio(wav_bytes: bytes, path: str) -> str:
+    try:
+        supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).upload(
+            path, wav_bytes, file_options={"content-type": "audio/wav"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload generated audio: {e}")
+    return supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).get_public_url(path)
+
+
+def _normalize_gender(raw: str) -> str:
+    g = (raw or "").strip().lower()
+    if g.startswith("f") or "woman" in g or "girl" in g:
+        return "female"
+    if g.startswith("m") or "man" in g or "boy" in g:
+        return "male"
+    return "other"
+
+
+def _age_bucket(raw: str) -> str:
+    """Parses a free-text age like "mid-20s" or "around 60" into a
+    young/adult/mature bucket matching GEMINI_VOICES' own tags.
+    Falls back to word hints, then to "adult", when no digits are
+    present at all."""
+    digits = re.findall(r"\d+", raw or "")
+    if digits:
+        age = int(digits[0])
+        if age < 25:
+            return "young"
+        if age < 50:
+            return "adult"
+        return "mature"
+    text = (raw or "").lower()
+    if any(w in text for w in ("teen", "young", "kid", "child")):
+        return "young"
+    if any(w in text for w in ("old", "elder", "senior", "mature")):
+        return "mature"
+    return "adult"
+
+
+def _auto_assign_voice(gender: str, age: str, used: set) -> str:
+    """Free, local heuristic — no Gemini call, no cost logged. Prefers
+    an unused voice matching both gender and age, then gender alone,
+    then any unused voice, and only reuses a voice already given to
+    another character in this series once the cast outgrows the
+    30-voice catalog (a shared voice beats no voice at all)."""
+    target_gender = _normalize_gender(gender)
+    target_age = _age_bucket(age)
+
+    def pick(predicate):
+        for voice in GEMINI_VOICES:
+            if voice["name"] not in used and predicate(voice):
+                return voice["name"]
+        return None
+
+    choice = pick(lambda v: v["gender"] == target_gender and v["age"] == target_age)
+    if choice is None and target_gender != "other":
+        choice = pick(lambda v: v["gender"] == target_gender)
+    if choice is None:
+        choice = pick(lambda v: True)
+    if choice is None:
+        choice = GEMINI_VOICES[len(used) % len(GEMINI_VOICES)]["name"]
+    return choice
+
+
+def _get_character(character_id: str) -> dict:
+    try:
+        result = supabase_admin.table("series_characters").select("*").eq("id", character_id).limit(1).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load character: {e}")
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Character not found.")
+    return rows[0]
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +519,7 @@ class CharacterIn(BaseModel):
     clothing: str
     personality: str
     portrait_url: Optional[str] = None
+    voice_id: Optional[str] = None
 
 
 class LocationIn(BaseModel):
@@ -410,6 +569,11 @@ async def save_cast(series_id: str, req: SaveCastRequest):
     # while there's no scene data yet referencing individual character/
     # location rows by id. Once Phase 3 scenes reference these ids,
     # this will need to become a real upsert instead of delete+insert.
+    # NOTE: this also means re-saving a cast wipes any voice_id already
+    # assigned in Phase 2 (the Flutter cast objects in memory don't
+    # carry it round-trip) — another reason this needs to become a
+    # real upsert before Phase 3, not a new Phase 2 problem to solve
+    # on its own.
     try:
         supabase_admin.table("series_characters").delete().eq("series_id", series_id).execute()
         supabase_admin.table("series_locations").delete().eq("series_id", series_id).execute()
@@ -496,4 +660,161 @@ async def spend_today():
     return SpendTodayResponse(
         spent_usd_cents=_spend_today_cents(),
         cap_usd_cents=STUDIO_DAILY_CAP_USD_CENTS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Voices
+# ---------------------------------------------------------------------------
+# Unlike Phase 1's analyze/portrait/location endpoints (which operate on
+# draft data with no DB id yet, so the admin can freely edit before
+# ever saving), voice assignment operates on already-saved
+# series_characters rows — "the same voice in every episode" only
+# means something once a character has a stable id to hang that voice
+# off of. That's why every endpoint below takes a character_id rather
+# than a full character payload.
+class VoiceInfo(BaseModel):
+    name: str
+    gender: str
+    age: str
+    description: str
+
+
+class VoicesResponse(BaseModel):
+    voices: list[VoiceInfo]
+
+
+@router.get("/voices", response_model=VoicesResponse, dependencies=[Depends(_require_admin)])
+async def list_voices():
+    return VoicesResponse(voices=[VoiceInfo(**v) for v in GEMINI_VOICES])
+
+
+class VoicePreviewRequest(BaseModel):
+    voice_name: str
+    sample_text: Optional[str] = Field(None, max_length=500)
+
+
+class VoicePreviewResponse(BaseModel):
+    audio_url: str
+    cost_usd_cents: int
+
+
+@router.post(
+    "/character/{character_id}/voice-preview",
+    response_model=VoicePreviewResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def preview_voice(character_id: str, req: VoicePreviewRequest):
+    """Generates a short sample line in the given voice and uploads it
+    — does NOT persist anything, so the admin can audition as many
+    voices as they like before committing one via POST .../voice."""
+    _require_configured()
+    character = _get_character(character_id)
+    _check_daily_cap(GEMINI_TTS_PREVIEW_COST_USD_CENTS)
+
+    sample_text = req.sample_text or f"Hi, I'm {character['name']}."
+
+    try:
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_TTS_MODEL,
+            contents=sample_text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=req.voice_name)
+                    )
+                ),
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini voice preview failed: {e}")
+
+    pcm_bytes, sample_rate = _extract_audio_pcm(response)
+    wav_bytes = _pcm_to_wav(pcm_bytes, sample_rate)
+    path = f"previews/{uuid.uuid4().hex}.wav"
+    audio_url = _upload_audio(wav_bytes, path)
+
+    _log_cost(None, "voice_preview", GEMINI_TTS_PREVIEW_COST_USD_CENTS)
+    return VoicePreviewResponse(audio_url=audio_url, cost_usd_cents=GEMINI_TTS_PREVIEW_COST_USD_CENTS)
+
+
+class SetVoiceRequest(BaseModel):
+    voice_name: str
+
+
+class CharacterVoiceResponse(BaseModel):
+    id: str
+    voice_id: str
+
+
+@router.post(
+    "/character/{character_id}/voice",
+    response_model=CharacterVoiceResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def set_character_voice(character_id: str, req: SetVoiceRequest):
+    """Persists the admin's chosen voice — this, not the preview call
+    above, is what makes a character keep the same voice in every
+    future episode (Phase 3's dialogue-audio generation will read this
+    same voice_id back off series_characters)."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    _get_character(character_id)  # 404s if missing
+    try:
+        supabase_admin.table("series_characters").update({"voice_id": req.voice_name}).eq(
+            "id", character_id
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save voice: {e}")
+    return CharacterVoiceResponse(id=character_id, voice_id=req.voice_name)
+
+
+class AssignVoicesResponse(BaseModel):
+    characters: list[SavedCharacter]
+
+
+@router.post(
+    "/series/{series_id}/assign-voices",
+    response_model=AssignVoicesResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def assign_voices(series_id: str):
+    """Free local-heuristic auto-assignment (see _auto_assign_voice) for
+    every character in this series that doesn't already have a voice
+    — no Gemini call, no cost logged. Characters that already have a
+    voice_id are left untouched, so this is safe to call repeatedly
+    (e.g. right after saving a new batch of characters from Phase 1)."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    try:
+        rows = (
+            supabase_admin.table("series_characters")
+            .select("*")
+            .eq("series_id", series_id)
+            .order("sort_order")
+            .execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load cast: {e}")
+
+    used = {r["voice_id"] for r in rows if r.get("voice_id")}
+    updated_rows = []
+    for row in rows:
+        if row.get("voice_id"):
+            updated_rows.append(row)
+            continue
+        voice_name = _auto_assign_voice(row.get("gender", ""), row.get("age", ""), used)
+        used.add(voice_name)
+        try:
+            supabase_admin.table("series_characters").update({"voice_id": voice_name}).eq(
+                "id", row["id"]
+            ).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not save auto-assigned voice: {e}")
+        row["voice_id"] = voice_name
+        updated_rows.append(row)
+
+    return AssignVoicesResponse(
+        characters=[SavedCharacter(id=r["id"], **{k: r[k] for k in CharacterIn.model_fields}) for r in updated_rows]
     )
