@@ -1,11 +1,23 @@
 """
-Viyo Studio (Phase 1): Script -> Cast & Locations.
+Viyo Studio: Script -> Cast & Locations (Phase 1), Voices (Phase 2),
+and Scenes (Phase 3).
 
-Turns a pasted episode/series script into a structured cast list —
-characters and locations, each with a Gemini-generated reference
-image — that gets saved onto a `series` row and reused by every later
-episode (Phase 3's scene generation sends these same reference images
-back to Gemini so faces and places stay consistent across episodes).
+Phase 1 turns a pasted episode/series script into a structured cast
+list — characters and locations, each with a Gemini-generated
+reference image — that gets saved onto a `series` row and reused by
+every later episode. Phase 2 assigns each saved character a
+text-to-speech voice. Phase 3 splits one specific episode's script
+into scenes and sends those same Phase 1 reference images back to
+Gemini when generating each scene's image, so faces and places stay
+consistent across episodes, then generates each dialogue line's audio
+using that character's Phase 2 voice.
+
+There is no separate "episode" entity anywhere in this codebase — an
+episode is just a `posts` row with `series_id` + `episode_number` set
+(see episodes.py's own docstring). Phase 3 follows that same
+convention rather than inventing an episode table: `series_scenes` is
+keyed by `(series_id, episode_number)` directly, not by a foreign key
+to anything episode-shaped.
 
 Admin-only for now, gated the same way every other admin surface in
 this app already is (analytics.py, moderation.py): a shared secret in
@@ -30,14 +42,15 @@ real-money guardrail on an API that bills per call, not a coin-gating
 feature, so it fails closed (blocks generation) rather than open.
 
 New tables this file depends on (`series_characters`, `series_locations`,
-`studio_api_costs`) are NOT created by this codebase — same "no
-migration-runner access" constraint as everywhere else here. The SQL to
-create them (with RLS enabled and zero public policies, since every
-read/write here goes through this file's own service-role Supabase
-client, never the Flutter app's anon-key client directly) was handed
-over separately and must be run by hand in the Supabase SQL editor
-before this router will do anything but fail with a clear 500 on the
-first real table access.
+`studio_api_costs`, and Phase 3's `series_scenes` / `series_scene_lines`)
+are NOT created by this codebase — same "no migration-runner access"
+constraint as everywhere else here. The SQL to create them (with RLS
+enabled and zero public policies, since every read/write here goes
+through this file's own service-role Supabase client, never the
+Flutter app's anon-key client directly) was handed over separately
+and must be run by hand in the Supabase SQL editor before this router
+will do anything but fail with a clear 500 on the first real table
+access.
 """
 import datetime
 import io
@@ -47,6 +60,7 @@ import uuid
 import wave
 from typing import Optional
 
+import requests
 from fastapi import APIRouter, Depends, Header, HTTPException
 from google import genai
 from google.genai import types
@@ -106,6 +120,12 @@ GEMINI_IMAGE_COST_USD_CENTS = 4
 # preview is always a short one- or two-sentence sample — so this is a
 # flat best-effort estimate per preview call, not a computed cost.
 GEMINI_TTS_PREVIEW_COST_USD_CENTS = 1
+
+# A dialogue line is the same kind of short TTS call as a voice
+# preview — kept as its own constant (same value today) so Phase 3's
+# per-line cost can be tuned independently of Phase 2's preview cost
+# later without the two meanings colliding.
+GEMINI_TTS_LINE_COST_USD_CENTS = 1
 
 # Gemini's prebuilt TTS voice catalog, each tagged with a gender/age/
 # description for the auto-assignment heuristic below. The tags are
@@ -270,6 +290,22 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm_bytes)
     return buf.getvalue()
+
+
+def _fetch_image_part(url: str) -> types.Part:
+    """Downloads a previously-generated reference image (a character
+    portrait or location image, already public in Supabase Storage)
+    so its bytes can be sent to Gemini as conditioning input — Gemini
+    takes inline image bytes, not a URL, so this is the bridge between
+    "an image we already generated and saved" and "an image Gemini can
+    look at again for the next generation."""
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch reference image: {e}")
+    mime_type = resp.headers.get("content-type", "image/png").split(";")[0].strip() or "image/png"
+    return types.Part.from_bytes(data=resp.content, mime_type=mime_type)
 
 
 def _upload_audio(wav_bytes: bytes, path: str) -> str:
@@ -818,3 +854,485 @@ async def assign_voices(series_id: str):
     return AssignVoicesResponse(
         characters=[SavedCharacter(id=r["id"], **{k: r[k] for k in CharacterIn.model_fields}) for r in updated_rows]
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Scenes
+# ---------------------------------------------------------------------------
+# Scenes belong to one specific episode of a series, not the series as
+# a whole (unlike characters/locations/voices, which are reused across
+# every episode) — hence the (series_id, episode_number) keying
+# throughout this section rather than series_id alone.
+def _load_characters(series_id: str) -> list[dict]:
+    try:
+        return (
+            supabase_admin.table("series_characters").select("*").eq("series_id", series_id).execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load characters: {e}")
+
+
+def _load_locations(series_id: str) -> list[dict]:
+    try:
+        return (
+            supabase_admin.table("series_locations").select("*").eq("series_id", series_id).execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load locations: {e}")
+
+
+def _match_by_name(name: str, rows: list[dict]) -> Optional[dict]:
+    needle = (name or "").strip().lower()
+    for row in rows:
+        if (row.get("name") or "").strip().lower() == needle:
+            return row
+    return None
+
+
+class SceneLineOut(BaseModel):
+    speaker: str
+    text: str
+
+
+class SceneOut(BaseModel):
+    location: str
+    camera_shot: str
+    characters_present: list[str]
+    visual_description: str
+    lines: list[SceneLineOut]
+
+
+class SceneSplitResult(BaseModel):
+    scenes: list[SceneOut]
+
+
+_SCENE_SPLIT_PROMPT = """You are a director breaking an episode script into individual scenes for a vertical short-drama production.
+
+Split the script below into scenes, in the order they occur. A new scene starts whenever the location changes or there's a significant time jump — don't split a single continuous conversation into multiple scenes just because several lines are spoken.
+
+For each scene, identify:
+- location: the location name, matching the script's own naming as closely as possible
+- camera_shot: one of "wide", "medium", "close-up" — pick whichever best suits the scene's emotional beat
+- characters_present: every character who appears or speaks in this scene, by the name used in the script
+- visual_description: a short (1-2 sentence) description of what's visible on screen during this scene — the setting, who's where, what they're doing physically — not a summary of the dialogue
+- lines: the dialogue for this scene, in order, each with the speaking character's name and their line (skip stage directions that aren't actually spoken)
+
+SCRIPT:
+{script}
+"""
+
+
+class SplitScenesRequest(BaseModel):
+    script: str = Field(..., min_length=1, max_length=200_000)
+
+
+class SavedSceneLine(BaseModel):
+    id: str
+    sort_order: int
+    character_id: Optional[str]
+    character_name: str
+    text: str
+    audio_url: Optional[str]
+
+
+class SavedScene(BaseModel):
+    id: str
+    sort_order: int
+    location_id: Optional[str]
+    location_name: str
+    camera_shot: str
+    characters: list[dict]  # [{"character_id": str|None, "name": str}, ...]
+    visual_description: str
+    image_url: Optional[str]
+    lines: list[SavedSceneLine]
+
+
+class ScenesResponse(BaseModel):
+    scenes: list[SavedScene]
+    cost_usd_cents: int = 0
+
+
+def _row_to_scene(scene_row: dict, line_rows: list[dict]) -> SavedScene:
+    return SavedScene(
+        id=scene_row["id"],
+        sort_order=scene_row["sort_order"],
+        location_id=scene_row.get("location_id"),
+        location_name=scene_row.get("location_name") or "",
+        camera_shot=scene_row.get("camera_shot") or "medium",
+        characters=scene_row.get("characters") or [],
+        visual_description=scene_row.get("visual_description") or "",
+        image_url=scene_row.get("image_url"),
+        lines=[
+            SavedSceneLine(
+                id=l["id"],
+                sort_order=l["sort_order"],
+                character_id=l.get("character_id"),
+                character_name=l.get("character_name") or "",
+                text=l.get("text") or "",
+                audio_url=l.get("audio_url"),
+            )
+            for l in sorted(line_rows, key=lambda l: l["sort_order"])
+        ],
+    )
+
+
+def _load_scenes(series_id: str, episode_number: int) -> list[SavedScene]:
+    try:
+        scene_rows = (
+            supabase_admin.table("series_scenes")
+            .select("*")
+            .eq("series_id", series_id)
+            .eq("episode_number", episode_number)
+            .order("sort_order")
+            .execute()
+        ).data or []
+        scene_ids = [s["id"] for s in scene_rows]
+        line_rows = (
+            supabase_admin.table("series_scene_lines").select("*").in_("scene_id", scene_ids).execute()
+        ).data if scene_ids else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load scenes: {e}")
+
+    lines_by_scene: dict[str, list[dict]] = {}
+    for l in line_rows:
+        lines_by_scene.setdefault(l["scene_id"], []).append(l)
+
+    return [_row_to_scene(s, lines_by_scene.get(s["id"], [])) for s in scene_rows]
+
+
+@router.post(
+    "/series/{series_id}/episode/{episode_number}/split-scenes",
+    response_model=ScenesResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequest):
+    """Splits this episode's script into scenes and dialogue lines and
+    saves them — unlike Phase 1's analyze-script, there's no separate
+    draft-then-save step, since scene images and line audio (generated
+    by the endpoints below) need a stable id to attach to right away.
+
+    Replace-all for this (series_id, episode_number): re-running this
+    on the same episode wipes any images/audio already generated for
+    its previous scenes, same tradeoff save_cast already makes for the
+    whole cast — see that endpoint's own comment.
+    """
+    _require_configured()
+    _get_series_owner(series_id)  # 404s if the series doesn't exist
+    _check_daily_cap(0)
+
+    try:
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_TEXT_MODEL,
+            contents=_SCENE_SPLIT_PROMPT.format(script=req.script),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SceneSplitResult,
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini scene split failed: {e}")
+
+    parsed = response.parsed
+    if parsed is None:
+        raise HTTPException(status_code=502, detail="Gemini returned a response Viyo Studio couldn't parse.")
+    cost_cents = _text_cost_cents(response.usage_metadata)
+    _log_cost(series_id, "split_scenes", cost_cents)
+
+    characters = _load_characters(series_id)
+    locations = _load_locations(series_id)
+
+    try:
+        supabase_admin.table("series_scenes").delete().eq("series_id", series_id).eq(
+            "episode_number", episode_number
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not clear previous scenes: {e}")
+
+    saved_scenes: list[SavedScene] = []
+    for i, scene in enumerate(parsed.scenes):
+        location_match = _match_by_name(scene.location, locations)
+        scene_characters = []
+        for name in scene.characters_present:
+            match = _match_by_name(name, characters)
+            scene_characters.append({"character_id": match["id"] if match else None, "name": name})
+
+        try:
+            scene_row = (
+                supabase_admin.table("series_scenes")
+                .insert(
+                    {
+                        "series_id": series_id,
+                        "episode_number": episode_number,
+                        "sort_order": i,
+                        "location_id": location_match["id"] if location_match else None,
+                        "location_name": scene.location,
+                        "camera_shot": scene.camera_shot,
+                        "characters": scene_characters,
+                        "visual_description": scene.visual_description,
+                    }
+                )
+                .execute()
+                .data[0]
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not save scene: {e}")
+
+        line_rows = []
+        if scene.lines:
+            try:
+                line_rows = (
+                    supabase_admin.table("series_scene_lines")
+                    .insert(
+                        [
+                            {
+                                "scene_id": scene_row["id"],
+                                "sort_order": j,
+                                "character_id": (_match_by_name(line.speaker, characters) or {}).get("id"),
+                                "character_name": line.speaker,
+                                "text": line.text,
+                            }
+                            for j, line in enumerate(scene.lines)
+                        ]
+                    )
+                    .execute()
+                    .data
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Could not save scene lines: {e}")
+
+        saved_scenes.append(_row_to_scene(scene_row, line_rows))
+
+    return ScenesResponse(scenes=saved_scenes, cost_usd_cents=cost_cents)
+
+
+@router.get(
+    "/series/{series_id}/episode/{episode_number}/scenes",
+    response_model=ScenesResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def get_scenes(series_id: str, episode_number: int):
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    return ScenesResponse(scenes=_load_scenes(series_id, episode_number))
+
+
+def _get_scene(scene_id: str) -> dict:
+    try:
+        result = supabase_admin.table("series_scenes").select("*").eq("id", scene_id).limit(1).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load scene: {e}")
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Scene not found.")
+    return rows[0]
+
+
+def _get_scene_line(line_id: str) -> dict:
+    try:
+        result = supabase_admin.table("series_scene_lines").select("*").eq("id", line_id).limit(1).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load line: {e}")
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Line not found.")
+    return rows[0]
+
+
+class EditSceneRequest(BaseModel):
+    visual_description: Optional[str] = None
+    camera_shot: Optional[str] = None
+    location_id: Optional[str] = None
+    location_name: Optional[str] = None
+
+
+@router.post("/scene/{scene_id}/edit", response_model=SavedScene, dependencies=[Depends(_require_admin)])
+async def edit_scene(scene_id: str, req: EditSceneRequest):
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    scene_row = _get_scene(scene_id)
+    updates = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    if updates:
+        try:
+            scene_row = supabase_admin.table("series_scenes").update(updates).eq("id", scene_id).execute().data[0]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not save scene edit: {e}")
+
+    try:
+        line_rows = (
+            supabase_admin.table("series_scene_lines").select("*").eq("scene_id", scene_id).execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load scene lines: {e}")
+    return _row_to_scene(scene_row, line_rows)
+
+
+class EditLineRequest(BaseModel):
+    text: Optional[str] = None
+    character_id: Optional[str] = None
+    character_name: Optional[str] = None
+
+
+@router.post("/line/{line_id}/edit", response_model=SavedSceneLine, dependencies=[Depends(_require_admin)])
+async def edit_line(line_id: str, req: EditLineRequest):
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    row = _get_scene_line(line_id)  # 404s if missing
+    updates = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    if updates:
+        try:
+            row = supabase_admin.table("series_scene_lines").update(updates).eq("id", line_id).execute().data[0]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not save line edit: {e}")
+    return SavedSceneLine(
+        id=row["id"],
+        sort_order=row["sort_order"],
+        character_id=row.get("character_id"),
+        character_name=row.get("character_name") or "",
+        text=row.get("text") or "",
+        audio_url=row.get("audio_url"),
+    )
+
+
+class SceneImageResponse(BaseModel):
+    image_url: str
+    cost_usd_cents: int
+
+
+@router.post(
+    "/scene/{scene_id}/image", response_model=SceneImageResponse, dependencies=[Depends(_require_admin)]
+)
+async def generate_scene_image(scene_id: str):
+    """Generates (or regenerates) this scene's 9:16 image, conditioned
+    on the Phase 1 reference images of every character present and
+    the scene's location — this, not a fresh unconditioned generation,
+    is what keeps a character's face and a location's look consistent
+    from scene to scene and episode to episode."""
+    _require_configured()
+    scene_row = _get_scene(scene_id)
+    _check_daily_cap(GEMINI_IMAGE_COST_USD_CENTS)
+
+    reference_parts: list[types.Part] = []
+    character_names = []
+    for c in scene_row.get("characters") or []:
+        character_id = c.get("character_id")
+        if not character_id:
+            continue
+        try:
+            rows = (
+                supabase_admin.table("series_characters").select("name,portrait_url").eq("id", character_id).execute()
+            ).data or []
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not load character reference: {e}")
+        if rows and rows[0].get("portrait_url"):
+            reference_parts.append(types.Part.from_text(text=f"Reference photo for character \"{rows[0]['name']}\":"))
+            reference_parts.append(_fetch_image_part(rows[0]["portrait_url"]))
+            character_names.append(rows[0]["name"])
+
+    location_id = scene_row.get("location_id")
+    if location_id:
+        try:
+            loc_rows = (
+                supabase_admin.table("series_locations")
+                .select("name,reference_image_url")
+                .eq("id", location_id)
+                .execute()
+            ).data or []
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not load location reference: {e}")
+        if loc_rows and loc_rows[0].get("reference_image_url"):
+            reference_parts.append(
+                types.Part.from_text(text=f"Reference photo for location \"{loc_rows[0]['name']}\":")
+            )
+            reference_parts.append(_fetch_image_part(loc_rows[0]["reference_image_url"]))
+
+    instruction = (
+        "Using the reference photos above for likeness (same faces, same location — keep clothing and "
+        "setting consistent with them unless the description below says otherwise), generate a single "
+        "cinematic scene image for a vertical short-drama series.\n\n"
+        "9:16 vertical aspect ratio. "
+        f"Camera shot: {scene_row.get('camera_shot') or 'medium'} shot. "
+        f"Location: {scene_row.get('location_name') or 'unspecified'}. "
+        f"Characters in frame: {', '.join(character_names) or 'none specified'}.\n\n"
+        f"What's happening: {scene_row.get('visual_description') or ''}\n\n"
+        "No text, no watermark, no speech bubbles or captions baked into the image."
+    )
+
+    try:
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_IMAGE_MODEL,
+            contents=[*reference_parts, types.Part.from_text(text=instruction)],
+            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini scene image generation failed: {e}")
+
+    image_bytes, mime_type = _extract_image(response)
+    ext = "png" if "png" in mime_type else "jpg"
+    path = f"scenes/{uuid.uuid4().hex}.{ext}"
+    image_url = _upload_image(image_bytes, mime_type, path)
+
+    try:
+        supabase_admin.table("series_scenes").update({"image_url": image_url}).eq("id", scene_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save scene image: {e}")
+
+    _log_cost(scene_row.get("series_id"), "scene_image", GEMINI_IMAGE_COST_USD_CENTS)
+    return SceneImageResponse(image_url=image_url, cost_usd_cents=GEMINI_IMAGE_COST_USD_CENTS)
+
+
+class LineAudioResponse(BaseModel):
+    audio_url: str
+    cost_usd_cents: int
+
+
+@router.post("/line/{line_id}/audio", response_model=LineAudioResponse, dependencies=[Depends(_require_admin)])
+async def generate_line_audio(line_id: str):
+    """Generates (or regenerates) this dialogue line's audio using its
+    speaking character's Phase 2 voice — the same voice_id every other
+    line of theirs uses, in this episode and every other one."""
+    _require_configured()
+    line_row = _get_scene_line(line_id)
+    scene_row = _get_scene(line_row["scene_id"])
+    character_id = line_row.get("character_id")
+    if not character_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f'"{line_row.get("character_name")}" isn\'t matched to a saved character, so there\'s no voice to use. Fix the speaker name or assign one in Edit.',
+        )
+    character = _get_character(character_id)
+    voice_name = character.get("voice_id")
+    if not voice_name:
+        raise HTTPException(
+            status_code=400,
+            detail=f'{character["name"]} doesn\'t have a voice assigned yet — assign one in the Voices step first.',
+        )
+
+    _check_daily_cap(GEMINI_TTS_LINE_COST_USD_CENTS)
+    try:
+        response = _gemini_client.models.generate_content(
+            model=GEMINI_TTS_MODEL,
+            contents=line_row["text"],
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                    )
+                ),
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini line audio generation failed: {e}")
+
+    pcm_bytes, sample_rate = _extract_audio_pcm(response)
+    wav_bytes = _pcm_to_wav(pcm_bytes, sample_rate)
+    path = f"lines/{uuid.uuid4().hex}.wav"
+    audio_url = _upload_audio(wav_bytes, path)
+
+    try:
+        supabase_admin.table("series_scene_lines").update({"audio_url": audio_url}).eq("id", line_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save line audio: {e}")
+
+    _log_cost(scene_row.get("series_id"), "line_audio", GEMINI_TTS_LINE_COST_USD_CENTS)
+    return LineAudioResponse(audio_url=audio_url, cost_usd_cents=GEMINI_TTS_LINE_COST_USD_CENTS)
