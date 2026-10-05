@@ -18,7 +18,12 @@ python-dotenv==1.0.1
 python-multipart==0.0.9
 httpx==0.28.1
 requests==2.32.3
-pydantic==2.7.4
+# Bumped from 2.7.4 specifically because google-genai==2.28.0 (below)
+# requires pydantic>=2.12.5 — fastapi and openai both tolerate any
+# 2.x, so this pin was the actual blocker. Verified against a clean
+# `pip install -r requirements.txt` (previously ResolutionImpossible)
+# after adding Studio's google-genai dependency.
+pydantic==2.12.5
 
 moviepy==1.0.3
 ffmpeg-python==0.2.0
