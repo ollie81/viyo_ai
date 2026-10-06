@@ -1341,6 +1341,14 @@ class EditSceneRequest(BaseModel):
     camera_shot: Optional[str] = None
     location_id: Optional[str] = None
     location_name: Optional[str] = None
+    # [{"character_id": str|None, "name": str}, ...] — lets the admin
+    # fix a scene-level characters_present entry that split-scenes
+    # couldn't match at the time (e.g. one split before the name
+    # matcher got smarter, or a name the matcher is still ambiguous
+    # about). Scene-level entries are a split-time snapshot, unlike
+    # dialogue lines' own character_id, so nothing re-matches them
+    # automatically — this is how the admin corrects one by hand.
+    characters: Optional[list[dict]] = None
 
 
 @router.post("/scene/{scene_id}/edit", response_model=SavedScene, dependencies=[Depends(_require_admin)])
