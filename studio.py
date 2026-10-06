@@ -2042,11 +2042,14 @@ def _mix_background_music(video_path: str, music_path: str, duration: float, out
     _run_ffmpeg(cmd, "Background music mix")
 
 
-def _extract_thumbnail(video_path: str, out_path: str) -> None:
-    # 0.5s in, matching PostService.generateAndUploadVideoThumbnail's
+def _extract_thumbnail(video_path: str, out_path: str, at_seconds: float = 0.5) -> None:
+    # Defaults to 0.5s in, matching PostService.generateAndUploadVideoThumbnail's
     # own timeMs: 500 — skips a possible black opening frame the same
     # way a normally-uploaded episode's thumbnail already does.
-    cmd = ["ffmpeg", "-y", "-ss", "0.5", "-i", video_path, "-frames:v", "1", "-update", "1", out_path]
+    # assemble_episode also calls this at other timestamps to offer
+    # thumbnail candidates, since a single fixed frame is sometimes a
+    # bad pick (mid-blink, a blank establishing shot, a transition).
+    cmd = ["ffmpeg", "-y", "-ss", str(at_seconds), "-i", video_path, "-frames:v", "1", "-update", "1", out_path]
     _run_ffmpeg(cmd, "Thumbnail extraction")
 
 
@@ -2088,6 +2091,27 @@ async def upload_music(file: UploadFile = File(...)):
     return MusicUploadResponse(music_url=music_url)
 
 
+class ThumbnailUploadResponse(BaseModel):
+    thumbnail_url: str
+
+
+@router.post("/thumbnail", response_model=ThumbnailUploadResponse, dependencies=[Depends(_require_admin)])
+async def upload_thumbnail(file: UploadFile = File(...)):
+    """Lets the admin use a thumbnail that isn't one of
+    assemble_episode's auto-extracted candidates — a cover image made
+    elsewhere — fed into publish_episode's thumbnail_url the same way
+    a chosen candidate is."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    ext = os.path.splitext(file.filename or "")[1] or ".jpg"
+    path = f"episode-thumbnails/{uuid.uuid4().hex}{ext}"
+    thumbnail_url = _upload_image(data, file.content_type or "image/jpeg", path)
+    return ThumbnailUploadResponse(thumbnail_url=thumbnail_url)
+
+
 class AssembleEpisodeRequest(BaseModel):
     # Admin-supplied — this backend has no royalty-free music library
     # of its own (bundling real audio files here would mean vouching
@@ -2105,6 +2129,11 @@ class AssembleEpisodeRequest(BaseModel):
 class AssembleEpisodeResponse(BaseModel):
     preview_video_url: str
     duration_seconds: int
+    # A handful of candidate hero frames spread across the episode, so
+    # the admin can pick a good one in publish_episode's caption/
+    # thumbnail step instead of always getting the fixed 0.5s-in frame
+    # that function falls back to when none is chosen.
+    thumbnail_candidates: list[str] = []
 
 
 @router.post(
@@ -2190,11 +2219,43 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
             final_path = mixed_path
 
         duration_seconds = int(round(_ffprobe_duration(final_path)))
+
+        # A few candidate hero frames spread across the episode — a
+        # single fixed-timestamp grab (what publish_episode falls back
+        # to) is sometimes a bad pick: mid-blink, a blank establishing
+        # shot, a scene transition. Letting the admin see and choose
+        # from several matters for click-through in the feed, and
+        # that's a judgment call only a human previewing the episode
+        # can make well.
+        thumbnail_candidates: list[str] = []
+        candidate_offsets = sorted({
+            round(min(t, max(duration_seconds - 0.3, 0.1)), 2)
+            for t in (0.5, duration_seconds * 0.25, duration_seconds * 0.5, duration_seconds * 0.75)
+        })
+        for i, offset in enumerate(candidate_offsets):
+            cand_path = os.path.join(tmp, f"thumb_candidate_{i}.jpg")
+            try:
+                _extract_thumbnail(final_path, cand_path, at_seconds=offset)
+                with open(cand_path, "rb") as f:
+                    cand_bytes = f.read()
+                thumbnail_candidates.append(
+                    _upload_image(cand_bytes, "image/jpeg", f"episode-thumbnails/{uuid.uuid4().hex}.jpg")
+                )
+            except Exception:
+                # A bad candidate frame shouldn't block assembling the
+                # episode itself — publish_episode still has its own
+                # guaranteed 0.5s extraction as a fallback.
+                continue
+
         with open(final_path, "rb") as f:
             video_bytes = f.read()
         preview_url = _upload_video_preview(video_bytes, f"{series_id}/{episode_number}/{uuid.uuid4().hex}.mp4")
 
-    return AssembleEpisodeResponse(preview_video_url=preview_url, duration_seconds=duration_seconds)
+    return AssembleEpisodeResponse(
+        preview_video_url=preview_url,
+        duration_seconds=duration_seconds,
+        thumbnail_candidates=thumbnail_candidates,
+    )
 
 
 def _upload_finished_video_to_bunny(video_path: str, title: str) -> str:
@@ -2243,6 +2304,10 @@ class PublishEpisodeRequest(BaseModel):
     preview_video_url: str
     duration_seconds: int
     caption: Optional[str] = None
+    # One of assemble_episode's thumbnail_candidates, or a URL from
+    # upload_thumbnail below — used as-is instead of the automatic
+    # 0.5s-in extraction when given.
+    thumbnail_url: Optional[str] = None
 
 
 class PublishEpisodeResponse(BaseModel):
@@ -2279,11 +2344,14 @@ async def publish_episode(series_id: str, episode_number: int, req: PublishEpiso
 
         video_id = _upload_finished_video_to_bunny(video_path, f"{series_title} - Episode {episode_number}")
 
-        thumb_path = os.path.join(tmp, "thumb.jpg")
-        _extract_thumbnail(video_path, thumb_path)
-        with open(thumb_path, "rb") as f:
-            thumb_bytes = f.read()
-        thumbnail_url = _upload_image(thumb_bytes, "image/jpeg", f"episode-thumbnails/{uuid.uuid4().hex}.jpg")
+        if req.thumbnail_url:
+            thumbnail_url = req.thumbnail_url
+        else:
+            thumb_path = os.path.join(tmp, "thumb.jpg")
+            _extract_thumbnail(video_path, thumb_path)
+            with open(thumb_path, "rb") as f:
+                thumb_bytes = f.read()
+            thumbnail_url = _upload_image(thumb_bytes, "image/jpeg", f"episode-thumbnails/{uuid.uuid4().hex}.jpg")
 
     row = {
         "user_id": owner_user_id,
@@ -2321,6 +2389,56 @@ async def publish_episode(series_id: str, episode_number: int, req: PublishEpiso
     return PublishEpisodeResponse(post_id=inserted["id"], media_url=row["media_url"], video_status="processing")
 
 
+class DeletePostResponse(BaseModel):
+    deleted: bool
+
+
+@router.delete("/post/{post_id}", response_model=DeletePostResponse, dependencies=[Depends(_require_admin)])
+async def delete_studio_post(post_id: str):
+    """Removes a wrongly-published episode — e.g. published under the
+    wrong series/title, or a test run that was never meant to go
+    live. Deletes the Bunny video first, best-effort (a failed Bunny
+    delete shouldn't block removing the post the admin is actually
+    trying to get rid of), then deletes the posts row itself via the
+    service role — bypasses the owner-only RLS policy
+    PostService.deletePost relies on client-side, since a Studio-
+    published post's owner is the series' designated account, not
+    necessarily whoever is holding the admin key."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+
+    try:
+        rows = (
+            supabase_admin.table("posts")
+            .select("video_provider, bunny_video_id")
+            .eq("id", post_id)
+            .limit(1)
+            .execute()
+        ).data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load post: {e}")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Post not found.")
+
+    post = rows[0]
+    if post.get("video_provider") == "bunny" and post.get("bunny_video_id") and _bunny_configured():
+        try:
+            requests.delete(
+                f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos/{post['bunny_video_id']}",
+                headers={"AccessKey": BUNNY_STREAM_API_KEY},
+                timeout=15,
+            )
+        except requests.RequestException:
+            pass
+
+    try:
+        supabase_admin.table("posts").delete().eq("id", post_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not delete post: {e}")
+
+    return DeletePostResponse(deleted=True)
+
+
 # ---------------------------------------------------------------------------
 # Studio home screen support
 # ---------------------------------------------------------------------------
@@ -2335,6 +2453,7 @@ class EpisodeStudioStatus(BaseModel):
     images_done: bool
     audio_done: bool
     published: bool
+    post_id: Optional[str] = None
 
 
 class EpisodesStatusResponse(BaseModel):
@@ -2364,14 +2483,16 @@ async def list_episode_status(series_id: str):
     try:
         published_rows = (
             supabase_admin.table("posts")
-            .select("episode_number")
+            .select("id, episode_number")
             .eq("series_id", series_id)
             .in_("episode_number", episode_numbers)
             .execute()
         ).data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not check published episodes: {e}")
-    published_numbers = {r["episode_number"] for r in published_rows}
+    # Last write wins if an episode number was somehow ever published
+    # twice — fine here, this is only used to offer a delete action.
+    post_id_by_episode = {r["episode_number"]: r["id"] for r in published_rows}
 
     episodes = []
     for episode_number in episode_numbers:
@@ -2384,7 +2505,8 @@ async def list_episode_status(series_id: str):
                 scene_count=len(scenes),
                 images_done=images_done,
                 audio_done=audio_done,
-                published=episode_number in published_numbers,
+                published=episode_number in post_id_by_episode,
+                post_id=post_id_by_episode.get(episode_number),
             )
         )
 
