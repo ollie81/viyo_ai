@@ -1810,7 +1810,7 @@ def _render_scene_clip(
         # string syntax treats a bare ":" as an option separator.
         safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
         style = (
-            f"FontName={_CAPTION_FONT},FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,"
+            f"FontName={_CAPTION_FONT},FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"
             "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
         )
         vf += f",subtitles='{safe_srt}':force_style='{style}'"
@@ -1827,15 +1827,19 @@ def _render_scene_clip_from_video(
 ) -> None:
     """Same job as _render_scene_clip, but for a scene that got the
     optional Veo upgrade: starts from a real generated video clip
-    instead of a still image. Veo's own audio is always on and can't
-    be disabled via the API, so it's dropped entirely (-map only takes
-    the video stream) in favor of this scene's actual TTS dialogue —
-    otherwise Veo's guessed audio would play under/over the real
-    character voice. Veo only returns fixed 4/6/8-second clips, so
-    -stream_loop repeats it to cover a longer dialogue duration and
-    -t/-shortest trims it to cover a shorter one — verified both
-    directions against synthetic test clips before writing this, same
-    discipline _render_scene_clip's own docstring describes."""
+    instead of a still image. When the scene has real dialogue, Veo's
+    own audio (always on, can't be disabled via the API) is dropped
+    entirely in favor of this scene's actual TTS voice — otherwise
+    Veo's guessed audio would play under/over the real character
+    voice. When the scene has NO dialogue (srt_path is None — a pure
+    visual/establishing beat), there's nothing for Veo's audio to
+    compete with, so its own ambient sound is kept instead of
+    replacing it with flat silence. Veo only returns fixed 4/6/8-
+    second clips, so -stream_loop repeats it to cover a longer
+    duration and -t/-shortest trims it to cover a shorter one —
+    verified both directions against synthetic test clips before
+    writing this, same discipline _render_scene_clip's own docstring
+    describes."""
     # Explicit fps= matters here the same way it matters in
     # _render_scene_clip's zoompan filter: without it, this clip's
     # output framerate is whatever Veo itself generated at (observed:
@@ -1845,19 +1849,29 @@ def _render_scene_clip_from_video(
     # cause of "Episode concat failed" when an episode mixes a Veo
     # scene with Ken Burns scenes.
     vf = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps={_FFMPEG_FPS}"
-    if srt_path:
+    has_dialogue = bool(srt_path)
+    if has_dialogue:
         safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
         style = (
-            f"FontName={_CAPTION_FONT},FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,"
+            f"FontName={_CAPTION_FONT},FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"
             "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
         )
         vf += f",subtitles='{safe_srt}':force_style='{style}'"
-    cmd = [
-        "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path, "-i", audio_path,
-        "-vf", vf, "-t", str(duration),
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
-    ]
+
+    if has_dialogue:
+        cmd = [
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path, "-i", audio_path,
+            "-vf", vf, "-t", str(duration),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path,
+            "-vf", vf, "-t", str(duration),
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
+        ]
     _run_ffmpeg(cmd, "Scene render (Veo)")
 
 
