@@ -1540,8 +1540,34 @@ def _download_to_file(url: str, path: str) -> None:
         resp.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not download {url}: {e}")
+    if not resp.content:
+        raise HTTPException(status_code=502, detail=f"Downloaded 0 bytes from {url} — the file may have expired or failed to generate.")
     with open(path, "wb") as f:
         f.write(resp.content)
+
+
+def _validate_clip(path: str, label: str) -> None:
+    """Checks a just-rendered scene/end-card clip actually has a real
+    video stream and a real audio stream before it's handed to the
+    final concat — concat's own failure mode for a broken input (an
+    image that failed to download/decode, audio that came back empty)
+    is a cryptic libx264/aac "-22 Invalid argument" with no indication
+    of which of the N inputs was the problem, so this catches it one
+    clip earlier with an error that actually names the scene."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
+         "-of", "csv=p=0", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    lines = [l for l in result.stdout.strip().splitlines() if l]
+    has_video = any(l.startswith("video") for l in lines)
+    has_audio = any(l.startswith("audio") for l in lines)
+    if result.returncode != 0 or not lines or not has_video or not has_audio:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{label} failed to render properly (missing video or audio stream) — "
+            "try regenerating its image/audio and assembling again.",
+        )
 
 
 def _ffprobe_duration(path: str) -> float:
@@ -1778,10 +1804,12 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
             clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
             pan = "left_right" if i % 2 else "center"
             _render_scene_clip(image_path, scene_audio_path, srt_path, scene_duration, pan, clip_path)
+            _validate_clip(clip_path, f"Scene {i + 1}")
             clip_paths.append(clip_path)
 
         endcard_path = os.path.join(tmp, "endcard.mp4")
         _render_end_card(tmp, endcard_path)
+        _validate_clip(endcard_path, "End card")
         clip_paths.append(endcard_path)
 
         assembled_path = os.path.join(tmp, "assembled.mp4")
