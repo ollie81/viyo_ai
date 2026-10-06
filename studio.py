@@ -1862,16 +1862,40 @@ def _render_scene_clip_from_video(
 
 
 def _render_end_card(tmp_dir: str, out_path: str) -> None:
+    """Renders from real files on disk (a generated solid-color PNG +
+    a real silent WAV from _render_silence), not two live `-f lavfi`
+    sources piped directly into one ffmpeg call. Every scene clip
+    already works this way — a real image file + a real (possibly
+    silent) audio file — and the end card was the one clip built
+    differently. Bisecting a real "Episode concat failed" report (see
+    _bisect_concat_failure) pinned the end card down as the exact
+    clip whose addition broke the final concat, even once its frame
+    rate matched every other clip exactly. Converging it onto the
+    identical, already-proven real-file pattern sidesteps whatever
+    subtle live-dual-lavfi-source quirk was actually at fault, without
+    needing to fully root-cause ffmpeg's internal reason — verified
+    locally that this still produces a valid, concat-compatible clip
+    before shipping it."""
     text_path = os.path.join(tmp_dir, "endcard_text.txt")
     with open(text_path, "w", encoding="utf-8") as f:
         f.write(_END_CARD_TEXT)
+
+    bg_path = os.path.join(tmp_dir, "endcard_bg.png")
+    _run_ffmpeg(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            f"color=c={_END_CARD_BG_COLOR}:s={_FFMPEG_RESOLUTION}", "-frames:v", "1", bg_path,
+        ],
+        "End card background render",
+    )
+
+    silence_path = os.path.join(tmp_dir, "endcard_silence.wav")
+    _render_silence(_END_CARD_SECONDS, silence_path)
+
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i",
-        f"color=c={_END_CARD_BG_COLOR}:s={_FFMPEG_RESOLUTION}:d={_END_CARD_SECONDS}:r={_FFMPEG_FPS}",
-        "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=44100",
+        "ffmpeg", "-y", "-loop", "1", "-i", bg_path, "-i", silence_path,
         "-vf",
-        f"drawtext=textfile={text_path}:fontfile={_CAPTION_FONT_BOLD_PATH}:"
+        f"fps={_FFMPEG_FPS},drawtext=textfile={text_path}:fontfile={_CAPTION_FONT_BOLD_PATH}:"
         "fontcolor=white:fontsize=56:x=(w-text_w)/2:y=(h-text_h)/2",
         "-t", str(_END_CARD_SECONDS),
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
