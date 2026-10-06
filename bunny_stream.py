@@ -49,10 +49,36 @@ BUNNY_STREAM_LIBRARY_ID = os.environ.get("BUNNY_STREAM_LIBRARY_ID", "")
 # not secret, but kept server-side so it only needs updating in one
 # place if it ever changes, rather than baked into an app build.
 BUNNY_STREAM_PULL_ZONE = os.environ.get("BUNNY_STREAM_PULL_ZONE", "")
-# Which MP4 Fallback rung to play — must be a resolution the library
-# actually generates (1080/720/480/360); asking for higher than the
-# source's own resolution 404s, so this defaults conservatively.
+# Which MP4 Fallback rung to play when Bunny hasn't reported its
+# actually-generated resolutions yet (create_bunny_video, right before
+# upload even starts) — see _pick_resolution below for the real,
+# per-video choice used everywhere else. Bunny only generates rungs at
+# or below the source video's own resolution (a short, phone-shot or
+# AI-generated drama episode is very often under 720p), so asking for
+# a fixed 720p unconditionally 404s for any video Bunny didn't also
+# generate a 720p rendition for.
 BUNNY_STREAM_FALLBACK_RESOLUTION = os.environ.get("BUNNY_STREAM_FALLBACK_RESOLUTION", "720")
+
+# Highest to lowest — the first of these actually present in a video's
+# own availableResolutions wins. 240 is Bunny's baseline rung, normally
+# generated for every finished video, so it's the final fallback.
+_RESOLUTION_PRIORITY = ["1080", "720", "480", "360", "240"]
+
+
+def _pick_resolution(available_resolutions: str) -> str:
+    """
+    Bunny's video object reports availableResolutions as a comma-separated
+    string like "240p,360p,480p" — only the rungs it actually generated for
+    this specific video, which depends on the source's own resolution.
+    Picks the highest one actually present instead of assuming a fixed
+    rung exists, which is what let play_720p.mp4 404 forever for any
+    video Bunny encoded below 720p.
+    """
+    present = {r.strip().rstrip("p") for r in available_resolutions.split(",") if r.strip()}
+    for res in _RESOLUTION_PRIORITY:
+        if res in present:
+            return res
+    return BUNNY_STREAM_FALLBACK_RESOLUTION
 
 _BUNNY_API_BASE = "https://video.bunnycdn.com"
 _TUS_UPLOAD_ENDPOINT = "https://video.bunnycdn.com/tusupload"
@@ -85,8 +111,8 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
     return await get_current_user_id(authorization)
 
 
-def _playback_url(video_id: str) -> str:
-    return f"https://{BUNNY_STREAM_PULL_ZONE}/{video_id}/play_{BUNNY_STREAM_FALLBACK_RESOLUTION}p.mp4"
+def _playback_url(video_id: str, resolution: Optional[str] = None) -> str:
+    return f"https://{BUNNY_STREAM_PULL_ZONE}/{video_id}/play_{resolution or BUNNY_STREAM_FALLBACK_RESOLUTION}p.mp4"
 
 
 def _thumbnail_url(video_id: str) -> str:
@@ -201,13 +227,14 @@ async def get_bunny_video_status(video_id: str, user_id: str = Depends(_get_curr
     data = resp.json()
     raw_status = int(data.get("status", 0))
     length = data.get("length")
+    resolution = _pick_resolution(data.get("availableResolutions") or "")
 
     return BunnyVideoStatusResponse(
         video_id=video_id,
         ready=raw_status in _STATUS_FINISHED,
         failed=raw_status in _STATUS_FAILED,
         raw_status=raw_status,
-        playback_url=_playback_url(video_id),
+        playback_url=_playback_url(video_id, resolution),
         thumbnail_url=_thumbnail_url(video_id),
         duration_seconds=int(length) if length else None,
     )
