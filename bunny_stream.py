@@ -79,6 +79,12 @@ async def _get_current_user_id_no_guest(authorization: str = Header(None)) -> st
     return await get_current_user_id_no_guest(authorization)
 
 
+async def _get_current_user_id(authorization: str = Header(None)) -> str:
+    from main import get_current_user_id
+
+    return await get_current_user_id(authorization)
+
+
 def _playback_url(video_id: str) -> str:
     return f"https://{BUNNY_STREAM_PULL_ZONE}/{video_id}/play_{BUNNY_STREAM_FALLBACK_RESOLUTION}p.mp4"
 
@@ -157,14 +163,27 @@ class BunnyVideoStatusResponse(BaseModel):
 
 
 @router.get("/videos/bunny/{video_id}/status", response_model=BunnyVideoStatusResponse)
-async def get_bunny_video_status(video_id: str, user_id: str = Depends(_get_current_user_id_no_guest)):
+async def get_bunny_video_status(video_id: str, user_id: str = Depends(_get_current_user_id)):
     """
     Ownership isn't checked against a posts row here on purpose: this
     is polled right after the TUS upload finishes, before the posts
     row necessarily exists yet, and the only thing a guessed video_id
     could leak is processing progress on a video that isn't attached
     to any post/profile — not its bytes, not who owns it. user_id is
-    still required so only a signed-in account can call it at all.
+    still required so only a signed-in (or guest) session can call it
+    at all.
+
+    Guest-inclusive on purpose, unlike create_bunny_video above: this
+    is read-only and polled by every viewer of the Dramas feed, not
+    just the account that uploaded a video — Studio publishes every
+    drama episode through Bunny (video_status="processing" by
+    default), and the ONLY thing that ever flips that status to
+    "ready" is a guest or signed-in viewer's own client successfully
+    polling this endpoint (see video_feed_screen.dart's
+    _pollBunnyStatus). Using the no-guest variant here meant every
+    guest viewer's poll got a 403, failed silently, and left every
+    single episode in the feed stuck showing "Processing..." forever
+    for them — there's no server-side Bunny webhook backing this up.
     """
     if not _configured():
         raise HTTPException(status_code=503, detail="Bunny Stream is not configured.")
