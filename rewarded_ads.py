@@ -41,7 +41,15 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 # cross-repo-mirrored constant in this backend (FREE_EPISODE_COUNT,
 # FEATURE_COSTS, ...).
 REWARDED_AD_COINS = 10
-DAILY_AD_CAP = 5
+# Raised from 5 — coin purchases and subscriptions are both unavailable
+# on Android (Google Play's anti-steering policy, see buy_coins_screen's
+# own module comment), so ads are that platform's only way to earn
+# coins at all. Still capped, not removed: there's no AdMob Server-Side
+# Verification wired up (see this file's own module docstring), so this
+# is the only defense against claiming the reward without ever
+# watching an ad — a real SSV integration would be needed to lift this
+# safely to "unlimited".
+DAILY_AD_CAP = 30
 
 
 def _today_start_utc() -> datetime.datetime:
