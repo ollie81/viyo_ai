@@ -133,6 +133,7 @@ try:
     from paystack_payments import router as paystack_router
     from flutterwave_payments import router as flutterwave_router
     from lemonsqueezy_payments import router as lemonsqueezy_router
+    from subscriptions import router as subscriptions_router
     from google_play_payments import router as google_play_router
     from series_covers import router as series_covers_router
     from rewarded_ads import router as rewarded_ads_router
@@ -159,11 +160,12 @@ try:
     app.include_router(paystack_router)
     app.include_router(flutterwave_router)
     app.include_router(lemonsqueezy_router)
+    app.include_router(subscriptions_router)
     app.include_router(google_play_router)
     app.include_router(series_covers_router)
     app.include_router(rewarded_ads_router)
 except Exception as _router_import_error:
-    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging/Episodes/Wallet/Paystack/Flutterwave/RewardedAds router not loaded: {_router_import_error}")
+    print(f"[WARN] Video/Coach/Leaderboard/Posts/Discover/Payments/Analytics/Interactions/Gifting/Push/Moderation/Messaging/Episodes/Wallet/Paystack/Flutterwave/RewardedAds/Subscriptions router not loaded: {_router_import_error}")
 
 # Viyo Studio gets its own try/except rather than joining the block
 # above — it pulls in google-genai, a brand-new, heavy dependency none

@@ -169,7 +169,20 @@ async def lemonsqueezy_webhook(request: Request, x_signature: str = Header(None)
 
     event = await request.json()
     meta = event.get("meta") or {}
-    if meta.get("event_name") != "order_created":
+    event_name = meta.get("event_name") or ""
+
+    # Subscriptions (subscriptions.py) share this one webhook endpoint
+    # and signing secret rather than needing a second URL registered
+    # in the Lemon Squeezy dashboard — deferred import to avoid a
+    # circular import (subscriptions.py imports this module's own
+    # store id/API key/base URL at module load time).
+    if event_name.startswith("subscription_"):
+        from subscriptions import handle_subscription_event
+
+        handle_subscription_event(event)
+        return {"received": True}
+
+    if event_name != "order_created":
         return {"received": True}
 
     order = event.get("data") or {}

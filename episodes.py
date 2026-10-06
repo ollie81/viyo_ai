@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 
 from coins import debit_coins
+from subscriptions import is_active_subscriber
 
 router = APIRouter(prefix="/api/v1", tags=["episodes"])
 
@@ -152,6 +153,14 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
     if _is_free_episode(series.get("content_type"), episode_number):
         return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
 
+    # An active Viyo Premium subscriber skips the coin paywall entirely
+    # — no charge, and (see subscriptions.py's own module docstring)
+    # deliberately no episode_unlocks row and no creator_earnings
+    # credit either, since there's no real per-episode money to split
+    # from a flat subscription charge.
+    if is_active_subscriber(supabase_admin, user_id):
+        return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
+
     price = int(series.get("coin_price_per_episode") or DEFAULT_EPISODE_COIN_PRICE)
 
     # Insert the unlock row before moving any coins — the unique
@@ -261,6 +270,11 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
     lockable = [ep for ep in episodes if not _is_free_episode(content_type, ep.get("episode_number") or 1)]
     if not lockable:
         return UnlockBundleResponse(unlocked_episode_ids=[], coins_spent=0, already_complete=True)
+
+    # Same subscriber bypass as unlock_episode above.
+    if is_active_subscriber(supabase_admin, user_id):
+        lockable_ids = [ep["id"] for ep in lockable]
+        return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=0, already_complete=True)
 
     lockable_ids = [ep["id"] for ep in lockable]
     try:
