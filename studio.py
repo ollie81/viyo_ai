@@ -1851,7 +1851,8 @@ def _render_end_card(tmp_dir: str, out_path: str) -> None:
         f.write(_END_CARD_TEXT)
     cmd = [
         "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c={_END_CARD_BG_COLOR}:s={_FFMPEG_RESOLUTION}:d={_END_CARD_SECONDS}",
+        "-f", "lavfi", "-i",
+        f"color=c={_END_CARD_BG_COLOR}:s={_FFMPEG_RESOLUTION}:d={_END_CARD_SECONDS}:r={_FFMPEG_FPS}",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=44100",
         "-vf",
         f"drawtext=textfile={text_path}:fontfile={_CAPTION_FONT_BOLD_PATH}:"
@@ -1862,14 +1863,44 @@ def _render_end_card(tmp_dir: str, out_path: str) -> None:
     _run_ffmpeg(cmd, "End card render")
 
 
-def _concat_clips(clip_paths: list[str], out_path: str) -> None:
+def _describe_clip(path: str) -> str:
+    """One-line ffprobe summary of a clip's streams (codec, duration,
+    sample rate/channels, dimensions/frame rate) plus its file size —
+    used to enrich a concat failure with the real numbers from every
+    input clip. _validate_clip already rules out a clip missing a
+    stream entirely before concat runs; this catches the next layer
+    down — a stream that exists but looks wrong in some way (an
+    implausible duration, an odd sample rate) that only a concat
+    re-encode trips over."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,duration,sample_rate,channels,width,height,r_frame_rate",
+         "-of", "csv=p=0", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    size = os.path.getsize(path) if os.path.exists(path) else -1
+    lines = [l for l in result.stdout.strip().splitlines() if l]
+    if not lines:
+        return f"{os.path.basename(path)} ({size}B): ffprobe found no streams ({result.stderr.strip()[:200]})"
+    return f"{os.path.basename(path)} ({size}B): " + " | ".join(lines)
+
+
+def _concat_clips(clip_paths: list[str], out_path: str, labels: Optional[list[str]] = None) -> None:
     """The concat *filter*, not the concat demuxer — verified this the
     hard way: the demuxer silently dropped ~15% of total duration when
     re-encoding heterogeneous clips (confirmed via ffprobe on a test
     render, video stream ending up shorter than its own audio), while
     the filter produced frame-accurate output on the identical input.
     The demuxer is only safe for stream-copying identical-codec
-    segments, which scene clips with different images/captions aren't."""
+    segments, which scene clips with different images/captions aren't.
+
+    On failure, [labels] (parallel to clip_paths, e.g. "Scene 1",
+    "End card") name which input is which in the attached per-clip
+    diagnostic dump — every synthetic repro tried while building this
+    (silent scenes, captioned scenes, a Veo-sourced clip, a clip under
+    0.1s) rendered fine, so whatever actually breaks this is specific
+    to the real generated assets and only visible from their real
+    numbers, not guessable from here."""
     cmd = ["ffmpeg", "-y"]
     for p in clip_paths:
         cmd += ["-i", p]
@@ -1879,7 +1910,16 @@ def _concat_clips(clip_paths: list[str], out_path: str) -> None:
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out_path,
     ]
-    _run_ffmpeg(cmd, "Episode concat")
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        dump = "\n".join(
+            f"{labels[i] if labels and i < len(labels) else f'input {i}'}: {_describe_clip(p)}"
+            for i, p in enumerate(clip_paths)
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Episode concat failed: {result.stderr[-400:]}\n\nPer-clip diagnostic:\n{dump}",
+        )
 
 
 def _mix_background_music(video_path: str, music_path: str, duration: float, out_path: str) -> None:
@@ -1999,7 +2039,8 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
         clip_paths.append(endcard_path)
 
         assembled_path = os.path.join(tmp, "assembled.mp4")
-        _concat_clips(clip_paths, assembled_path)
+        clip_labels = [f"Scene {i + 1}" for i in range(len(scenes))] + ["End card"]
+        _concat_clips(clip_paths, assembled_path, labels=clip_labels)
 
         final_path = assembled_path
         if req.music_url:
