@@ -753,6 +753,56 @@ async def get_cast(series_id: str):
     )
 
 
+class UpdateSeriesDetailsRequest(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    genre: Optional[str] = None
+
+
+class UpdateSeriesDetailsResponse(BaseModel):
+    id: str
+    title: str
+    description: str
+    genre: str
+
+
+@router.post(
+    "/series/{series_id}/details",
+    response_model=UpdateSeriesDetailsResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def update_series_details(series_id: str, req: UpdateSeriesDetailsRequest):
+    """Renames/edits a drama's title, description or genre.
+
+    Routed through the service-role client, like every other write in
+    this file, rather than a direct RLS-scoped client update: `series`'
+    update policy is owner-only, but Viyo Studio manages every drama
+    regardless of which account originally created it (often a
+    different session than whoever's running Studio today) — a direct
+    client write would silently match 0 rows for any series Studio
+    itself didn't just create in the current session.
+    """
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    updates = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+    try:
+        result = supabase_admin.table("series").update(updates).eq("id", series_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save drama details: {e}")
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Series not found.")
+    row = rows[0]
+    return UpdateSeriesDetailsResponse(
+        id=row["id"],
+        title=row.get("title") or "",
+        description=row.get("description") or "",
+        genre=row.get("genre") or "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Spend tracking
 # ---------------------------------------------------------------------------
