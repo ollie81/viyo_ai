@@ -1836,7 +1836,15 @@ def _render_scene_clip_from_video(
     -t/-shortest trims it to cover a shorter one — verified both
     directions against synthetic test clips before writing this, same
     discipline _render_scene_clip's own docstring describes."""
-    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    # Explicit fps= matters here the same way it matters in
+    # _render_scene_clip's zoompan filter: without it, this clip's
+    # output framerate is whatever Veo itself generated at (observed:
+    # 24fps) while every Ken Burns scene and the end card render at
+    # _FFMPEG_FPS (30) — a real, confirmed mismatch (via the per-clip
+    # diagnostic _concat_clips attaches on failure) that's the likely
+    # cause of "Episode concat failed" when an episode mixes a Veo
+    # scene with Ken Burns scenes.
+    vf = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps={_FFMPEG_FPS}"
     if srt_path:
         safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
         style = (
