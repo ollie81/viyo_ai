@@ -1932,10 +1932,45 @@ def _concat_clips(clip_paths: list[str], out_path: str, labels: Optional[list[st
             f"{labels[i] if labels and i < len(labels) else f'input {i}'}: {_describe_clip(p)}"
             for i, p in enumerate(clip_paths)
         )
+        bisection = _bisect_concat_failure(clip_paths, labels, os.path.dirname(out_path))
         raise HTTPException(
             status_code=500,
-            detail=f"Episode concat failed: {result.stderr[-400:]}\n\nPer-clip diagnostic:\n{dump}",
+            detail=(
+                f"Episode concat failed: {result.stderr[-400:]}\n\n{bisection}\n\n"
+                f"Per-clip diagnostic:\n{dump}"
+            ),
         )
+
+
+def _bisect_concat_failure(clip_paths: list[str], labels: Optional[list[str]], tmp_dir: str) -> str:
+    """When the full concat fails, retries concatenating increasing
+    prefixes of clip_paths (2 clips, then 3, then 4, ...) to find
+    exactly which clip's addition first breaks it. The per-clip
+    ffprobe dump shows every stream's codec/resolution/rate looking
+    consistent, so whatever's actually wrong only surfaces when ffmpeg
+    tries to combine streams in the filter graph — not from reading
+    headers, which is all the static dump above can see."""
+    if len(clip_paths) < 2:
+        return "Bisection: only one clip — nothing to narrow down."
+    for i in range(2, len(clip_paths) + 1):
+        probe_path = os.path.join(tmp_dir, f"_bisect_{i}.mp4")
+        cmd = ["ffmpeg", "-y"]
+        for p in clip_paths[:i]:
+            cmd += ["-i", p]
+        parts = "".join(f"[{j}:v][{j}:a]" for j in range(i))
+        cmd += [
+            "-filter_complex", f"{parts}concat=n={i}:v=1:a=1[vout][aout]",
+            "-map", "[vout]", "-map", "[aout]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", probe_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            culprit = labels[i - 1] if labels and i - 1 < len(labels) else f"input {i - 1}"
+            return (
+                f"Bisection: concatenating the first {i} clips fails; adding \"{culprit}\" "
+                f"is what breaks it. Its own error: {result.stderr[-300:]}"
+            )
+    return "Bisection: every prefix concatenated fine on retry (the failure may be intermittent)."
 
 
 def _mix_background_music(video_path: str, music_path: str, duration: float, out_path: str) -> None:
