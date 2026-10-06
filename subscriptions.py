@@ -1,6 +1,6 @@
 """
-Viyo Premium — a real, recurring subscription (weekly or monthly) via
-Lemon Squeezy, alongside Viyo Coins' one-time top-ups
+Viyo Premium — a real, recurring subscription (weekly, monthly, or
+yearly) via Lemon Squeezy, alongside Viyo Coins' one-time top-ups
 (lemonsqueezy_payments.py and the other *_payments.py files). An
 active subscriber skips the per-episode coin paywall entirely (see
 episodes.py's is_active_subscriber call) instead of spending coins
@@ -32,11 +32,12 @@ calls out), so these are written directly over PostgREST, not through
 a Postgres function.
 
 Lemon Squeezy needs a real "Viyo Premium" subscription product with
-two variants (Weekly, Monthly) created in its dashboard first — unlike
-the coin purchases above, a subscription needs a real fixed price per
-variant (custom_price only works for a one-time order), so there's no
-way around creating those two variants for real and setting
-LEMONSQUEEZY_WEEKLY_VARIANT_ID / LEMONSQUEEZY_MONTHLY_VARIANT_ID.
+three variants (Weekly, Monthly, Yearly) created in its dashboard
+first — unlike the coin purchases above, a subscription needs a real
+fixed price per variant (custom_price only works for a one-time
+order), so there's no way around creating those three variants for
+real and setting LEMONSQUEEZY_WEEKLY_VARIANT_ID /
+LEMONSQUEEZY_MONTHLY_VARIANT_ID / LEMONSQUEEZY_YEARLY_VARIANT_ID.
 """
 import os
 from typing import Literal, Optional
@@ -56,10 +57,12 @@ router = APIRouter(prefix="/api/v1", tags=["subscriptions"])
 
 LEMONSQUEEZY_WEEKLY_VARIANT_ID = os.environ.get("LEMONSQUEEZY_WEEKLY_VARIANT_ID", "")
 LEMONSQUEEZY_MONTHLY_VARIANT_ID = os.environ.get("LEMONSQUEEZY_MONTHLY_VARIANT_ID", "")
+LEMONSQUEEZY_YEARLY_VARIANT_ID = os.environ.get("LEMONSQUEEZY_YEARLY_VARIANT_ID", "")
 
 _VARIANT_BY_PLAN = {
     "weekly": LEMONSQUEEZY_WEEKLY_VARIANT_ID,
     "monthly": LEMONSQUEEZY_MONTHLY_VARIANT_ID,
+    "yearly": LEMONSQUEEZY_YEARLY_VARIANT_ID,
 }
 
 # Lemon Squeezy subscription statuses that mean "currently has access" —
@@ -76,6 +79,7 @@ def _configured() -> bool:
         and LEMONSQUEEZY_STORE_ID
         and LEMONSQUEEZY_WEEKLY_VARIANT_ID
         and LEMONSQUEEZY_MONTHLY_VARIANT_ID
+        and LEMONSQUEEZY_YEARLY_VARIANT_ID
     )
 
 
@@ -93,7 +97,7 @@ async def _get_current_user_and_email(authorization: str = Header(None)) -> tupl
 
 
 class SubscriptionCheckoutRequest(BaseModel):
-    plan: Literal["weekly", "monthly"]
+    plan: Literal["weekly", "monthly", "yearly"]
 
 
 class SubscriptionCheckoutResponse(BaseModel):
