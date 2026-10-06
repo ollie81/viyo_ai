@@ -58,6 +58,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 import wave
 from typing import Optional
@@ -154,6 +155,28 @@ GEMINI_TTS_PREVIEW_COST_USD_CENTS = 1
 # per-line cost can be tuned independently of Phase 2's preview cost
 # later without the two meanings colliding.
 GEMINI_TTS_LINE_COST_USD_CENTS = 1
+
+# Optional per-scene upgrade from the default Ken Burns (still image +
+# zoom/pan) to a real Veo-generated video clip. Lite is the only tier
+# that fits a whole episode inside a $3/day cap — Standard is $0.40/s
+# (a single 8s clip alone blows the entire cap), Fast is $0.10/s.
+# Verified against ai.google.dev/gemini-api/docs/pricing's published
+# per-second rates (720p); re-check there before trusting this for
+# real budgeting, same caveat as the text/image costs above.
+VEO_MODEL = "veo-3.1-lite-generate-preview"
+VEO_PRICE_PER_SEC_USD_CENTS = 5
+# Veo only accepts 4, 6 or 8 second clips — no arbitrary duration.
+VEO_ALLOWED_DURATIONS = (4, 6, 8)
+# Generation is an async operation polled to completion rather than a
+# normal request/response call — Google's own docs give an 11s-to-6min
+# latency range. Polling inside the HTTP request (rather than a proper
+# job queue Studio has no infrastructure for) risks hitting Railway's
+# own request timeout on a slow render, so this caps how long a single
+# call will wait before giving up — comfortably under typical platform
+# timeouts, with the real operation still finishing server-side on
+# Google's end either way.
+VEO_MAX_POLL_SECONDS = 280
+VEO_POLL_INTERVAL_SECONDS = 10
 
 # Phase 4 assembly is pure ffmpeg/Bunny work — no Gemini calls, nothing
 # to log against the daily cap or STUDIO_DAILY_CAP_USD.
@@ -1117,6 +1140,7 @@ class SavedScene(BaseModel):
     characters: list[dict]  # [{"character_id": str|None, "name": str}, ...]
     visual_description: str
     image_url: Optional[str]
+    video_url: Optional[str]
     lines: list[SavedSceneLine]
 
 
@@ -1135,6 +1159,7 @@ def _row_to_scene(scene_row: dict, line_rows: list[dict]) -> SavedScene:
         characters=scene_row.get("characters") or [],
         visual_description=scene_row.get("visual_description") or "",
         image_url=scene_row.get("image_url"),
+        video_url=scene_row.get("video_url"),
         lines=[
             SavedSceneLine(
                 id=l["id"],
@@ -1453,6 +1478,134 @@ async def generate_scene_image(scene_id: str):
     return SceneImageResponse(image_url=image_url, cost_usd_cents=GEMINI_IMAGE_COST_USD_CENTS)
 
 
+def _fetch_veo_image(url: str) -> types.Image:
+    """Same job as _fetch_image_part, but Veo's image-to-video input
+    takes a types.Image (image_bytes + mime_type), not the types.Part
+    shape generate_content's contents= list expects."""
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch scene image for Veo: {e}")
+    mime_type = resp.headers.get("content-type", "image/png").split(";")[0].strip() or "image/png"
+    return types.Image(image_bytes=resp.content, mime_type=mime_type)
+
+
+class SceneVideoRequest(BaseModel):
+    duration_seconds: int = 8
+
+
+class SceneVideoResponse(BaseModel):
+    video_url: str
+    duration_seconds: int
+    cost_usd_cents: int
+
+
+@router.post(
+    "/scene/{scene_id}/video", response_model=SceneVideoResponse, dependencies=[Depends(_require_admin)]
+)
+async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
+    """Generates a real Veo 3.1 Lite video clip for this one scene,
+    animating its already-generated reference image — an opt-in,
+    per-scene upgrade from the default Ken Burns zoom/pan, since Veo
+    costs dramatically more than everything else Studio calls (see
+    VEO_PRICE_PER_SEC_USD_CENTS's own comment). assemble_episode uses
+    this clip instead of the still image for any scene that has one,
+    so one episode can freely mix Veo scenes and Ken Burns scenes —
+    nothing here requires every scene to match.
+
+    Note for whoever reads this after the first real call: Veo's
+    generate_videos is new to this codebase and untested against a
+    live API key as of writing — if the google-genai SDK's exact
+    param/class names here (types.Image, GenerateVideosConfig's
+    fields, operations.get, files.download) don't match what 2.28.0
+    actually exposes, this fails loudly with a 502 before anything is
+    charged (Veo only bills on a successfully generated video) or
+    saved, rather than silently costing money for a broken result.
+    """
+    _require_configured()
+    scene_row = _get_scene(scene_id)
+    if not scene_row.get("image_url"):
+        raise HTTPException(
+            status_code=400, detail="Generate this scene's image first — Veo needs it as a starting frame."
+        )
+
+    duration = req.duration_seconds if req.duration_seconds in VEO_ALLOWED_DURATIONS else 8
+    estimated_cost_cents = duration * VEO_PRICE_PER_SEC_USD_CENTS
+    _check_daily_cap(estimated_cost_cents)
+
+    veo_image = _fetch_veo_image(scene_row["image_url"])
+    prompt = (
+        "Animate this image into a short cinematic video clip for a vertical short-drama series. "
+        f"Camera shot: {scene_row.get('camera_shot') or 'medium'} shot. "
+        f"What's happening: {scene_row.get('visual_description') or ''}\n\n"
+        "Subtle, natural motion — keep the characters, location and framing consistent with the "
+        "reference image. No text, no captions, no watermark."
+    )
+
+    try:
+        operation = _gemini_client.models.generate_videos(
+            model=VEO_MODEL,
+            prompt=prompt,
+            image=veo_image,
+            config=types.GenerateVideosConfig(
+                aspect_ratio="9:16", duration_seconds=duration, generate_audio=False
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Veo video generation failed to start: {e}")
+
+    waited = 0
+    while not operation.done:
+        if waited >= VEO_MAX_POLL_SECONDS:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Veo is still rendering after several minutes. It may still finish on Google's "
+                    "end — wait a bit and check back rather than retrying right away."
+                ),
+            )
+        time.sleep(VEO_POLL_INTERVAL_SECONDS)
+        waited += VEO_POLL_INTERVAL_SECONDS
+        try:
+            operation = _gemini_client.operations.get(operation)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not check Veo generation status: {e}")
+
+    if getattr(operation, "error", None):
+        raise HTTPException(status_code=502, detail=f"Veo video generation failed: {operation.error}")
+
+    generated_videos = (operation.response.generated_videos if operation.response else None) or []
+    if not generated_videos or not generated_videos[0].video:
+        raise HTTPException(status_code=502, detail="Veo did not return a video.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = os.path.join(tmp, "veo_output.mp4")
+        try:
+            _gemini_client.files.download(file=generated_videos[0].video, destination=video_path)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not download Veo's generated video: {e}")
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+
+    path = f"scenes/{scene_id}/{uuid.uuid4().hex}.mp4"
+    try:
+        supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(
+            path, video_bytes, file_options={"content-type": "video/mp4"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload Veo video: {e}")
+    video_url = supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
+
+    try:
+        supabase_admin.table("series_scenes").update({"video_url": video_url}).eq("id", scene_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save scene video: {e}")
+
+    _log_cost(scene_row.get("series_id"), "scene_video", estimated_cost_cents)
+    return SceneVideoResponse(video_url=video_url, duration_seconds=duration, cost_usd_cents=estimated_cost_cents)
+
+
 class LineAudioResponse(BaseModel):
     audio_url: str
     cost_usd_cents: int
@@ -1663,6 +1816,37 @@ def _render_scene_clip(
     _run_ffmpeg(cmd, "Scene render")
 
 
+def _render_scene_clip_from_video(
+    video_path: str, audio_path: str, srt_path: Optional[str], duration: float, out_path: str
+) -> None:
+    """Same job as _render_scene_clip, but for a scene that got the
+    optional Veo upgrade: starts from a real generated video clip
+    instead of a still image. Veo's own audio is always on and can't
+    be disabled via the API, so it's dropped entirely (-map only takes
+    the video stream) in favor of this scene's actual TTS dialogue —
+    otherwise Veo's guessed audio would play under/over the real
+    character voice. Veo only returns fixed 4/6/8-second clips, so
+    -stream_loop repeats it to cover a longer dialogue duration and
+    -t/-shortest trims it to cover a shorter one — verified both
+    directions against synthetic test clips before writing this, same
+    discipline _render_scene_clip's own docstring describes."""
+    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    if srt_path:
+        safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
+        style = (
+            f"FontName={_CAPTION_FONT},FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
+        )
+        vf += f",subtitles='{safe_srt}':force_style='{style}'"
+    cmd = [
+        "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path, "-i", audio_path,
+        "-vf", vf, "-t", str(duration),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
+    ]
+    _run_ffmpeg(cmd, "Scene render (Veo)")
+
+
 def _render_end_card(tmp_dir: str, out_path: str) -> None:
     text_path = os.path.join(tmp_dir, "endcard_text.txt")
     with open(text_path, "w", encoding="utf-8") as f:
@@ -1765,7 +1949,7 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
 
     missing = []
     for i, scene in enumerate(scenes):
-        if not scene.image_url:
+        if not scene.image_url and not scene.video_url:
             missing.append(f"Scene {i + 1} has no image")
         for j, line in enumerate(scene.lines):
             if not line.audio_url:
@@ -1779,9 +1963,6 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
     with tempfile.TemporaryDirectory() as tmp:
         clip_paths = []
         for i, scene in enumerate(scenes):
-            image_path = os.path.join(tmp, f"scene_{i}.png")
-            _download_to_file(scene.image_url, image_path)
-
             line_audio_paths = []
             for j, line in enumerate(scene.lines):
                 p = os.path.join(tmp, f"scene_{i}_line_{j}.wav")
@@ -1802,8 +1983,15 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
                 _write_scene_srt([l.text for l in scene.lines], line_durations, srt_path)
 
             clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
-            pan = "left_right" if i % 2 else "center"
-            _render_scene_clip(image_path, scene_audio_path, srt_path, scene_duration, pan, clip_path)
+            if scene.video_url:
+                video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
+                _download_to_file(scene.video_url, video_path)
+                _render_scene_clip_from_video(video_path, scene_audio_path, srt_path, scene_duration, clip_path)
+            else:
+                image_path = os.path.join(tmp, f"scene_{i}.png")
+                _download_to_file(scene.image_url, image_path)
+                pan = "left_right" if i % 2 else "center"
+                _render_scene_clip(image_path, scene_audio_path, srt_path, scene_duration, pan, clip_path)
             _validate_clip(clip_path, f"Scene {i + 1}")
             clip_paths.append(clip_path)
 
