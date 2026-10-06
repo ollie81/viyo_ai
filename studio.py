@@ -1926,21 +1926,41 @@ def _describe_clip(path: str) -> str:
 
 
 def _concat_clips(clip_paths: list[str], out_path: str, labels: Optional[list[str]] = None) -> None:
-    """The concat *filter*, not the concat demuxer — verified this the
-    hard way: the demuxer silently dropped ~15% of total duration when
-    re-encoding heterogeneous clips (confirmed via ffprobe on a test
-    render, video stream ending up shorter than its own audio), while
-    the filter produced frame-accurate output on the identical input.
-    The demuxer is only safe for stream-copying identical-codec
-    segments, which scene clips with different images/captions aren't.
+    """Tries the concat *demuxer* with a lossless stream copy first,
+    falling back to the concat *filter* (re-encoding) only if that
+    fails. This order used to be the other way around: the demuxer
+    used to silently drop ~15% of total duration when stream-copying
+    heterogeneous clips (different codecs/frame rates between scene
+    images and captions), so the filter was the only safe choice.
+    That's no longer true — every clip this function receives is now
+    rendered to the exact same spec (1080x1920, _FFMPEG_FPS, h264/
+    yuv420p, aac/44100/mono) by _render_scene_clip,
+    _render_scene_clip_from_video and _render_end_card, so a stream
+    copy is valid and sidesteps re-encoding (and whatever's opening
+    the encoder successfully in local testing but failing in
+    production with "Could not open encoder before EOF" — frame rate
+    and live-lavfi-source fixes that were each independently confirmed
+    real via bisection on an actual failure still didn't resolve it,
+    and the likeliest remaining explanation is the ffmpeg *build*
+    itself: Debian bookworm, what this app's own Dockerfile's
+    python:3.11-slim base actually ships, packages ffmpeg 5.1.9 — a
+    full major version behind the 6.1.1 this was tested against).
 
-    On failure, [labels] (parallel to clip_paths, e.g. "Scene 1",
-    "End card") name which input is which in the attached per-clip
-    diagnostic dump — every synthetic repro tried while building this
-    (silent scenes, captioned scenes, a Veo-sourced clip, a clip under
-    0.1s) rendered fine, so whatever actually breaks this is specific
-    to the real generated assets and only visible from their real
-    numbers, not guessable from here."""
+    On a demuxer failure, falls back to the filter-based re-encode,
+    and on failure there, [labels] (parallel to clip_paths, e.g.
+    "Scene 1", "End card") name which input is which in the attached
+    per-clip diagnostic + bisection dump."""
+    list_path = os.path.join(os.path.dirname(out_path), "_concat_list.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in clip_paths:
+            f.write(f"file '{p}'\n")
+    copy_result = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if copy_result.returncode == 0:
+        return
+
     cmd = ["ffmpeg", "-y"]
     for p in clip_paths:
         cmd += ["-i", p]
@@ -1960,8 +1980,8 @@ def _concat_clips(clip_paths: list[str], out_path: str, labels: Optional[list[st
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Episode concat failed: {result.stderr[-400:]}\n\n{bisection}\n\n"
-                f"Per-clip diagnostic:\n{dump}"
+                f"Episode concat failed (stream copy also failed: {copy_result.stderr[-200:]}): "
+                f"{result.stderr[-400:]}\n\n{bisection}\n\nPer-clip diagnostic:\n{dump}"
             ),
         )
 
