@@ -1548,9 +1548,7 @@ async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
             model=VEO_MODEL,
             prompt=prompt,
             image=veo_image,
-            config=types.GenerateVideosConfig(
-                aspect_ratio="9:16", duration_seconds=duration, generate_audio=False
-            ),
+            config=types.GenerateVideosConfig(aspect_ratio="9:16", duration_seconds=duration),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Veo video generation failed to start: {e}")
