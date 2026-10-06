@@ -65,7 +65,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -2060,15 +2060,45 @@ def _upload_video_preview(video_bytes: bytes, path: str) -> str:
     return supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
 
 
+class MusicUploadResponse(BaseModel):
+    music_url: str
+
+
+@router.post("/music", response_model=MusicUploadResponse, dependencies=[Depends(_require_admin)])
+async def upload_music(file: UploadFile = File(...)):
+    """Uploads a background-music file the admin already has the
+    rights to use (see AssembleEpisodeRequest.music_url's own comment
+    below — there's no bundled library) so it can be referenced by URL
+    without the admin needing to find their own external hosting for
+    it first."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    ext = os.path.splitext(file.filename or "")[1] or ".mp3"
+    path = f"music/{uuid.uuid4().hex}{ext}"
+    try:
+        supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).upload(
+            path, data, file_options={"content-type": file.content_type or "audio/mpeg"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload music: {e}")
+    music_url = supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).get_public_url(path)
+    return MusicUploadResponse(music_url=music_url)
+
+
 class AssembleEpisodeRequest(BaseModel):
     # Admin-supplied — this backend has no royalty-free music library
     # of its own (bundling real audio files here would mean vouching
     # for licensing this codebase has no way to verify), so background
     # music is opt-in: a URL to a track the admin already has the
-    # rights to use, mixed in low under the dialogue. Omitted entirely
-    # when not given, not replaced with a placeholder. Sound effects
-    # aren't implemented for the same reason plus the lack of any way
-    # to pick which effect fits a given scene automatically.
+    # rights to use, mixed in low under the dialogue (uploaded via
+    # upload_music above, or any other URL the admin already has).
+    # Omitted entirely when not given, not replaced with a placeholder.
+    # Sound effects aren't implemented for the same reason plus the
+    # lack of any way to pick which effect fits a given scene
+    # automatically.
     music_url: Optional[str] = None
 
 
