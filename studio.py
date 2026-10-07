@@ -1386,13 +1386,19 @@ class EditSceneRequest(BaseModel):
     camera_shot: Optional[str] = None
     location_id: Optional[str] = None
     location_name: Optional[str] = None
-    # [{"character_id": str|None, "name": str}, ...] — lets the admin
-    # fix a scene-level characters_present entry that split-scenes
-    # couldn't match at the time (e.g. one split before the name
-    # matcher got smarter, or a name the matcher is still ambiguous
-    # about). Scene-level entries are a split-time snapshot, unlike
-    # dialogue lines' own character_id, so nothing re-matches them
-    # automatically — this is how the admin corrects one by hand.
+    # [{"character_id": str|None, "name": str, "costume_override": str},
+    # ...] — lets the admin fix a scene-level characters_present entry
+    # that split-scenes couldn't match at the time (e.g. one split
+    # before the name matcher got smarter, or a name the matcher is
+    # still ambiguous about). Scene-level entries are a split-time
+    # snapshot, unlike dialogue lines' own character_id, so nothing
+    # re-matches them automatically — this is how the admin corrects
+    # one by hand. costume_override (optional, defaults to "" when
+    # absent) swaps out that one character's locked costume for just
+    # this one scene — e.g. pajamas for a home scene instead of their
+    # usual suit — without touching the character's own costume_lock,
+    # which every *other* scene they're in keeps using unchanged. See
+    # generate_scene_image's own use of it.
     characters: Optional[list[dict]] = None
 
 
@@ -1482,8 +1488,19 @@ async def generate_scene_image(scene_id: str):
             reference_parts.append(types.Part.from_text(text=f"Reference photo for character \"{rows[0]['name']}\":"))
             reference_parts.append(_fetch_image_part(rows[0]["portrait_url"]))
             character_names.append(rows[0]["name"])
-        if rows and (rows[0].get("costume_lock") or "").strip():
-            costume_lines.append(f"{rows[0]['name']}: {rows[0]['costume_lock'].strip()}")
+        if rows:
+            # A per-scene override (EditSceneRequest.characters' own
+            # costume_override) wins over the character's own locked
+            # default — this is the one place in the whole costume-
+            # lock feature where a scene is allowed to show a
+            # different outfit, used deliberately (e.g. pajamas for a
+            # home scene) rather than the lock silently failing to
+            # hold. The reference portrait above is unaffected either
+            # way, so the face/likeness stays pinned regardless of
+            # which costume line wins here.
+            costume = (c.get("costume_override") or "").strip() or (rows[0].get("costume_lock") or "").strip()
+            if costume:
+                costume_lines.append(f"{rows[0]['name']}: {costume}")
 
     location_id = scene_row.get("location_id")
     if location_id:
