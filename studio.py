@@ -2728,16 +2728,22 @@ async def list_episode_status(series_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not load episodes: {e}")
 
-    episode_numbers = sorted({r["episode_number"] for r in scene_rows})
-    if not episode_numbers:
-        return EpisodesStatusResponse(episodes=[])
+    episode_numbers_with_scenes = {r["episode_number"] for r in scene_rows}
 
+    # Queried independently of episode_numbers_with_scenes, not just to
+    # check status for episode numbers scenes already told us about —
+    # an episode published through the simpler direct-upload flow
+    # (upload_ai_drama_screen.dart) never creates series_scenes rows at
+    # all, so without this a published episode like that would be
+    # completely invisible here even though it's live in the Dramas
+    # feed: this function would report "Scenes: not started" for a
+    # series that actually already has an episode out.
     try:
         published_rows = (
             supabase_admin.table("posts")
             .select("id, episode_number")
             .eq("series_id", series_id)
-            .in_("episode_number", episode_numbers)
+            .not_.is_("episode_number", "null")
             .execute()
         ).data or []
     except Exception as e:
@@ -2746,8 +2752,17 @@ async def list_episode_status(series_id: str):
     # twice — fine here, this is only used to offer a delete action.
     post_id_by_episode = {r["episode_number"]: r["id"] for r in published_rows}
 
+    episode_numbers = sorted(episode_numbers_with_scenes | set(post_id_by_episode.keys()))
+    if not episode_numbers:
+        return EpisodesStatusResponse(episodes=[])
+
     episodes = []
     for episode_number in episode_numbers:
+        # No series_scenes rows for a published-but-scene-less episode
+        # (the direct-upload case above) — _load_scenes correctly
+        # returns [] for it, which reads as scene_count 0 / neither
+        # images nor audio done, rather than this endpoint claiming
+        # scene progress it has no actual record of.
         scenes = _load_scenes(series_id, episode_number)
         images_done = bool(scenes) and all(s.image_url for s in scenes)
         audio_done = bool(scenes) and all(all(l.audio_url for l in s.lines) for s in scenes)
