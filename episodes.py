@@ -71,14 +71,26 @@ SINGLE_ASSET_CONTENT_TYPES = {"movie", "short_film"}
 DEFAULT_EPISODE_COIN_PRICE = 30
 
 
-def _is_free_episode(content_type: Optional[str], episode_number: int) -> bool:
+def _is_free_episode(
+    content_type: Optional[str], episode_number: int, is_free_override: Optional[bool] = None
+) -> bool:
     """
     True for the first FREE_EPISODE_COUNT episodes of a normal
     multi-episode title (series/short_drama/ai_film, or None — every
     `series` row created before content_type existed). A Movie/Short
     Film never gets this carve-out: it's priced from the first watch,
     same as any already-unlocked episode past the free window.
+
+    [is_free_override] — a post's own `is_free` column — wins over
+    both of those when the creator has explicitly set one: True always
+    frees the episode regardless of position, False always keeps it
+    paid even inside the free window. None (the column's default —
+    nothing set) falls through to the position-based rule above,
+    unchanged from before this override existed. Mirrored in Flutter
+    (utils/episode_lock.dart's own isEpisodeLocked).
     """
+    if is_free_override is not None:
+        return is_free_override
     if content_type in SINGLE_ASSET_CONTENT_TYPES:
         return False
     return episode_number <= FREE_EPISODE_COUNT
@@ -94,7 +106,7 @@ def _get_episode(post_id: str) -> dict:
     try:
         result = (
             supabase_admin.table("posts")
-            .select("id,user_id,series_id,episode_number")
+            .select("id,user_id,series_id,episode_number,is_free")
             .eq("id", post_id)
             .limit(1)
             .execute()
@@ -150,7 +162,7 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
         return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
 
     series = _get_series(episode["series_id"])
-    if _is_free_episode(series.get("content_type"), episode_number):
+    if _is_free_episode(series.get("content_type"), episode_number, episode.get("is_free")):
         return UnlockEpisodeResponse(unlocked=True, coins_spent=0)
 
     # An active Viyo Premium subscriber skips the coin paywall entirely
@@ -252,7 +264,7 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
     try:
         episodes = (
             supabase_admin.table("posts")
-            .select("id,episode_number")
+            .select("id,episode_number,is_free")
             .eq("series_id", series_id)
             .order("episode_number", desc=False)
             .execute()
@@ -264,10 +276,16 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
     # unlock_episode gives them per-episode, applied here up front.
     content_type = series.get("content_type")
     if series["user_id"] == user_id:
-        lockable_ids = [ep["id"] for ep in episodes if not _is_free_episode(content_type, ep.get("episode_number") or 1)]
+        lockable_ids = [
+            ep["id"] for ep in episodes
+            if not _is_free_episode(content_type, ep.get("episode_number") or 1, ep.get("is_free"))
+        ]
         return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=0, already_complete=True)
 
-    lockable = [ep for ep in episodes if not _is_free_episode(content_type, ep.get("episode_number") or 1)]
+    lockable = [
+        ep for ep in episodes
+        if not _is_free_episode(content_type, ep.get("episode_number") or 1, ep.get("is_free"))
+    ]
     if not lockable:
         return UnlockBundleResponse(unlocked_episode_ids=[], coins_spent=0, already_complete=True)
 

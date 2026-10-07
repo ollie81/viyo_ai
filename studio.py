@@ -825,6 +825,14 @@ class UpdateSeriesDetailsRequest(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = None
     genre: Optional[str] = None
+    # Reassigns which real account this drama — and every episode
+    # already published from it — belongs to. Every Studio-generated
+    # episode already gets a real owner at publish time (see
+    # publish_episode's own owner_user_id, read from series.user_id),
+    # but until now there was no way to change it after the fact, or
+    # to pick anyone other than whichever account happened to be
+    # signed in when the series was first created in Studio.
+    user_id: Optional[str] = None
 
 
 class UpdateSeriesDetailsResponse(BaseModel):
@@ -832,6 +840,7 @@ class UpdateSeriesDetailsResponse(BaseModel):
     title: str
     description: str
     genre: str
+    user_id: str
 
 
 @router.post(
@@ -840,7 +849,8 @@ class UpdateSeriesDetailsResponse(BaseModel):
     dependencies=[Depends(_require_admin)],
 )
 async def update_series_details(series_id: str, req: UpdateSeriesDetailsRequest):
-    """Renames/edits a drama's title, description or genre.
+    """Renames/edits a drama's title, description or genre, and/or
+    reassigns which account owns it.
 
     Routed through the service-role client, like every other write in
     this file, rather than a direct RLS-scoped client update: `series`'
@@ -855,6 +865,17 @@ async def update_series_details(series_id: str, req: UpdateSeriesDetailsRequest)
     updates = {k: v for k, v in req.model_dump(exclude_none=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    if "user_id" in updates:
+        try:
+            profile_rows = (
+                supabase_admin.table("profiles").select("id").eq("id", updates["user_id"]).limit(1).execute()
+            ).data or []
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not verify creator account: {e}")
+        if not profile_rows:
+            raise HTTPException(status_code=400, detail="No account found with that id.")
+
     try:
         result = supabase_admin.table("series").update(updates).eq("id", series_id).execute()
     except Exception as e:
@@ -863,11 +884,30 @@ async def update_series_details(series_id: str, req: UpdateSeriesDetailsRequest)
     if not rows:
         raise HTTPException(status_code=404, detail="Series not found.")
     row = rows[0]
+
+    if "user_id" in updates:
+        # Every episode already published from this series needs to
+        # move with it — publish_episode only ever reads series.user_id
+        # once, at publish time, so leaving already-published posts
+        # behind would mean the drama's own page shows the new creator
+        # while its episodes in the feed still show the old one.
+        try:
+            supabase_admin.table("posts").update({"user_id": updates["user_id"]}).eq(
+                "series_id", series_id
+            ).execute()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Saved the new owner on the drama, but could not update its already-published "
+                f"episodes to match: {e}",
+            )
+
     return UpdateSeriesDetailsResponse(
         id=row["id"],
         title=row.get("title") or "",
         description=row.get("description") or "",
         genre=row.get("genre") or "",
+        user_id=row.get("user_id") or "",
     )
 
 
