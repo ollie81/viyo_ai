@@ -39,8 +39,22 @@ from typing import Optional
 import requests
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
+from supabase import create_client, Client
 
 router = APIRouter(prefix="/api/v1", tags=["bunny_stream"])
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+# Service-role client used only to self-heal a post's stored media_url
+# below — bypasses RLS on purpose. The posts.update RLS policy is
+# owner-only, so a plain client-side write from a non-owner viewer
+# (anyone except the uploader) silently fails; get_bunny_video_status
+# is polled by EVERY viewer, not just the owner, so the fix has to be
+# able to write regardless of who's asking.
+supabase_admin: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 BUNNY_STREAM_API_KEY = os.environ.get("BUNNY_STREAM_API_KEY", "")
 BUNNY_STREAM_LIBRARY_ID = os.environ.get("BUNNY_STREAM_LIBRARY_ID", "")
@@ -228,13 +242,61 @@ async def get_bunny_video_status(video_id: str, user_id: str = Depends(_get_curr
     raw_status = int(data.get("status", 0))
     length = data.get("length")
     resolution = _pick_resolution(data.get("availableResolutions") or "")
+    playback_url = _playback_url(video_id, resolution)
+
+    _self_heal_post_media_url(video_id, raw_status, playback_url)
 
     return BunnyVideoStatusResponse(
         video_id=video_id,
         ready=raw_status in _STATUS_FINISHED,
         failed=raw_status in _STATUS_FAILED,
         raw_status=raw_status,
-        playback_url=_playback_url(video_id, resolution),
+        playback_url=playback_url,
         thumbnail_url=_thumbnail_url(video_id),
         duration_seconds=int(length) if length else None,
     )
+
+
+def _self_heal_post_media_url(video_id: str, raw_status: int, playback_url: str) -> None:
+    """
+    Persists this poll's result onto every posts row for this video, via
+    the service-role client — bypassing RLS on purpose.
+
+    Without this, the only place the corrected URL/status ever got saved
+    was the Flutter client's own follow-up write (PostService.
+    updateVideoStatus), which goes through the normal Supabase client and
+    is RLS-scoped: posts' update policy is owner-only, so that write
+    silently no-ops for every viewer except the post's own uploader. A
+    drama episode is watched overwhelmingly by people who aren't its
+    uploader, so in practice the fix never stuck — the same broken
+    play_<N>p.mp4 URL (or a stuck "processing" status) kept getting
+    re-served to every other viewer forever, each one re-discovering the
+    same failure. Doing the write here means the very first poll from
+    ANYONE, owner or not, heals it for everyone after.
+    """
+    if supabase_admin is None:
+        return
+    new_status = "failed" if raw_status in _STATUS_FAILED else ("ready" if raw_status in _STATUS_FINISHED else None)
+    if new_status is None:
+        return  # still processing/transcoding — nothing to correct yet
+    try:
+        rows = (
+            supabase_admin.table("posts")
+            .select("id, media_url, video_status")
+            .eq("bunny_video_id", video_id)
+            .execute()
+            .data
+        )
+        for row in rows:
+            updates = {}
+            if row.get("video_status") != new_status:
+                updates["video_status"] = new_status
+            if new_status == "ready" and row.get("media_url") != playback_url:
+                updates["media_url"] = playback_url
+            if updates:
+                supabase_admin.table("posts").update(updates).eq("id", row["id"]).execute()
+    except Exception as e:
+        # Best-effort, same reasoning as every other self-heal path in
+        # this codebase: worse case is the next poll (from anyone) tries
+        # again, never that a transient DB hiccup breaks video playback.
+        print(f"[WARN] self-heal write-back failed for bunny video {video_id}: {e}")
