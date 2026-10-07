@@ -1,16 +1,17 @@
 """
 Backfilling a series' missing cover image, on behalf of any viewer.
 
-series_service.dart's SeriesService.backfillCoverIfMissing captures a
-video frame in the viewer's own browser (web-only — see
-web_thumbnail_html.dart) and tries to save it as the series' poster art
-whenever a series is shown with no cover yet. The `series` table's own
-RLS update policy is owner-only (`auth.uid() = user_id`), so that write
-only ever actually lands when the viewer happens to be the series'
-creator — profile screens, the upload flow's series picker. Everywhere
-else a coverless series is actually seen (the Dramas tab, Discover),
-the viewer is a stranger browsing someone else's content, and the RLS
-write silently no-ops, leaving the placeholder tile in place forever.
+series_service.dart's SeriesService.backfillCoverIfMissing generates a
+frame from the series' earliest episode (via video_metadata.py's
+server-side ffmpeg extractor — see that file) and tries to save it as
+the series' poster art whenever a series is shown with no cover yet.
+The `series` table's own RLS update policy is owner-only
+(`auth.uid() = user_id`), so that write only ever actually lands when
+the viewer happens to be the series' creator — profile screens, the
+upload flow's series picker. Everywhere else a coverless series is
+actually seen (the Dramas tab, Discover), the viewer is a stranger
+browsing someone else's content, and the RLS write silently no-ops,
+leaving the placeholder tile in place forever.
 
 Routed through here with the service-role client so the fix isn't just
 "open up RLS" (which would let anyone deface anyone's series art):

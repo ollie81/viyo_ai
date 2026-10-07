@@ -244,7 +244,11 @@ async def get_bunny_video_status(video_id: str, user_id: str = Depends(_get_curr
     resolution = _pick_resolution(data.get("availableResolutions") or "")
     playback_url = _playback_url(video_id, resolution)
 
-    _self_heal_post_media_url(video_id, raw_status, playback_url)
+    _self_heal_post_media_url(
+        video_id, raw_status, playback_url,
+        width=data.get("width"), height=data.get("height"),
+        duration_seconds=int(length) if length else None,
+    )
 
     return BunnyVideoStatusResponse(
         video_id=video_id,
@@ -257,7 +261,14 @@ async def get_bunny_video_status(video_id: str, user_id: str = Depends(_get_curr
     )
 
 
-def _self_heal_post_media_url(video_id: str, raw_status: int, playback_url: str) -> None:
+def _self_heal_post_media_url(
+    video_id: str,
+    raw_status: int,
+    playback_url: str,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    duration_seconds: Optional[int] = None,
+) -> None:
     """
     Persists this poll's result onto every posts row for this video, via
     the service-role client — bypassing RLS on purpose.
@@ -273,26 +284,42 @@ def _self_heal_post_media_url(video_id: str, raw_status: int, playback_url: str)
     re-served to every other viewer forever, each one re-discovering the
     same failure. Doing the write here means the very first poll from
     ANYONE, owner or not, heals it for everyone after.
+
+    width/height/duration_seconds ride along on the same write for the
+    same reason: this is the one place that already has Bunny's own
+    video object in hand, which reports a Bunny-hosted video's real
+    encoded dimensions and length — there's no reason to ask a viewer's
+    browser to decode the video client-side just to learn its shape
+    when Bunny already told us. width/height only ever fill a
+    currently-null value, same posture as media_url/video_status above;
+    duration_seconds is always kept in sync with Bunny's own number
+    when it differs, since Bunny's is authoritative and the client-side
+    create-post flow only ever has a placeholder/guessed value to start
+    with (never a real one — it hasn't finished uploading yet).
     """
     if supabase_admin is None:
         return
     new_status = "failed" if raw_status in _STATUS_FAILED else ("ready" if raw_status in _STATUS_FINISHED else None)
-    if new_status is None:
-        return  # still processing/transcoding — nothing to correct yet
     try:
         rows = (
             supabase_admin.table("posts")
-            .select("id, media_url, video_status")
+            .select("id, media_url, video_status, width, height, duration_seconds")
             .eq("bunny_video_id", video_id)
             .execute()
             .data
         )
         for row in rows:
             updates = {}
-            if row.get("video_status") != new_status:
-                updates["video_status"] = new_status
-            if new_status == "ready" and row.get("media_url") != playback_url:
-                updates["media_url"] = playback_url
+            if new_status is not None:
+                if row.get("video_status") != new_status:
+                    updates["video_status"] = new_status
+                if new_status == "ready" and row.get("media_url") != playback_url:
+                    updates["media_url"] = playback_url
+            if width and height and not row.get("width") and not row.get("height"):
+                updates["width"] = width
+                updates["height"] = height
+            if duration_seconds and row.get("duration_seconds") != duration_seconds:
+                updates["duration_seconds"] = duration_seconds
             if updates:
                 supabase_admin.table("posts").update(updates).eq("id", row["id"]).execute()
     except Exception as e:
