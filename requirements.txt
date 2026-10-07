@@ -43,3 +43,8 @@ tzdata==2025.2
 # cascade XML data files this feature depends on (cv2.data.haarcascades
 # is an empty directory on 5.x); 4.10.0.84 still ships them.
 opencv-python-headless==4.10.0.84
+
+# Already an indirect dependency (moviepy, opencv). Pinned explicitly
+# since series_covers.py imports it directly to recompress oversized
+# cover images before they're ever stored.
+Pillow==12.3.0
