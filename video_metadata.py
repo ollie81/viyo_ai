@@ -28,6 +28,14 @@ and a single-frame ffmpeg extract each resolve in well under a second
 regardless of the video's total length, which matters once long-form
 uploads can run 30-40 minutes (see create_post_screen.dart's raised
 cap).
+
+A third endpoint, POST /api/v1/admin/backfill-post-thumbnails, is a
+one-off admin action rather than something the client calls: the
+generate-thumbnail call above only ever fires at upload time, so every
+video post made before it shipped is stuck with no thumbnail_url
+forever — the client has no reason to ever ask again for a post it's
+not uploading right now. This walks every such post once and fills it
+in the same way.
 """
 import json
 import os
@@ -44,10 +52,18 @@ router = APIRouter(prefix="/api/v1", tags=["video_metadata"])
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
 supabase_admin: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _require_admin(x_admin_key: str = Header(None)) -> None:
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin endpoint is not configured.")
+    if x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key.")
 
 _THUMB_BUCKET = "posts-media"
 _THUMB_MAX_WIDTH = 1080
@@ -226,3 +242,66 @@ async def generate_thumbnail_endpoint(
             pass
 
     return GenerateThumbnailResponse(thumbnail_url=url)
+
+
+class BackfillThumbnailsResponse(BaseModel):
+    checked: int
+    generated: int
+    skipped: int
+    failed: int
+
+
+@router.post(
+    "/admin/backfill-post-thumbnails",
+    response_model=BackfillThumbnailsResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def backfill_post_thumbnails():
+    """One-off: generates thumbnail_url for every existing video post
+    that has none. These are posts uploaded before the automatic
+    generate-thumbnail-on-create call existed (or whose client-side
+    capture silently failed at the time) — nothing was ever going to
+    revisit them on its own, since the client only calls
+    generate_thumbnail_endpoint right after creating a post, never for
+    one it's just viewing. Safe to re-run: only ever touches a row
+    whose thumbnail_url is still null."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Thumbnail backfill is not configured.")
+
+    rows = (
+        supabase_admin.table("posts")
+        .select("id,media_url")
+        .eq("post_type", "video")
+        .is_("thumbnail_url", "null")
+        .not_.is_("media_url", "null")
+        .execute()
+        .data
+        or []
+    )
+
+    checked = generated = skipped = failed = 0
+    for row in rows:
+        checked += 1
+        media_url = row.get("media_url") or ""
+        if not media_url:
+            skipped += 1
+            continue
+        jpeg_bytes = generate_thumbnail_bytes(media_url)
+        if jpeg_bytes is None:
+            failed += 1
+            continue
+        url = upload_thumbnail_bytes(jpeg_bytes)
+        if url is None:
+            failed += 1
+            continue
+        try:
+            supabase_admin.table("posts").update(
+                {"thumbnail_url": url}
+            ).eq("id", row["id"]).is_("thumbnail_url", "null").execute()
+            generated += 1
+        except Exception:
+            failed += 1
+
+    return BackfillThumbnailsResponse(
+        checked=checked, generated=generated, skipped=skipped, failed=failed
+    )
