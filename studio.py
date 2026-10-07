@@ -69,6 +69,7 @@ from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from pydantic_core import PydanticUndefined
 from supabase import create_client, Client
 
 router = APIRouter(prefix="/api/v1/admin/studio", tags=["studio"])
@@ -705,6 +706,39 @@ class LocationIn(BaseModel):
     reference_image_url: Optional[str] = None
 
 
+def _row_with_field_defaults(row: dict, model: type[BaseModel]) -> dict:
+    """Builds the kwargs for model(**...) from a DB row, falling back to
+    a field's own default instead of raising KeyError when the row
+    predates that column — exactly what happened with costume_lock: it
+    was added to CharacterIn (and, separately, handed over as a
+    migration that adds the column to series_characters) after some
+    character rows already existed. A row that query ran against
+    before that migration landed has no costume_lock key in it at all,
+    and the plain `{k: r[k] for k in Model.model_fields}` this replaces
+    raised a bare KeyError on the very first such row — a crash neither
+    get_cast/save_cast/assign_voices' own try/except caught (it happens
+    after them, building the response), so it surfaced as a raw 500
+    with no detail, and the Flutter Studio home screen's per-series
+    error handling silently displayed that as "Cast: not started" —
+    indistinguishable from a series that genuinely has no cast. A
+    column that's still genuinely missing from the row AND has no
+    default on the model (a required field with real data loss) still
+    raises, correctly, instead of inventing a value for something that
+    was never optional.
+    """
+    out = {}
+    for key, field in model.model_fields.items():
+        if key in row:
+            out[key] = row[key]
+        elif field.default is not PydanticUndefined:
+            out[key] = field.default
+        elif field.default_factory is not None:
+            out[key] = field.default_factory()
+        else:
+            raise KeyError(key)
+    return out
+
+
 class SaveCastRequest(BaseModel):
     characters: list[CharacterIn]
     locations: list[LocationIn]
@@ -788,8 +822,8 @@ async def save_cast(series_id: str, req: SaveCastRequest):
         raise HTTPException(status_code=500, detail=f"Could not save cast: {e}")
 
     return CastResponse(
-        characters=[SavedCharacter(id=r["id"], **{k: r[k] for k in CharacterIn.model_fields}) for r in char_rows],
-        locations=[SavedLocation(id=r["id"], **{k: r[k] for k in LocationIn.model_fields}) for r in loc_rows],
+        characters=[SavedCharacter(id=r["id"], **_row_with_field_defaults(r, CharacterIn)) for r in char_rows],
+        locations=[SavedLocation(id=r["id"], **_row_with_field_defaults(r, LocationIn)) for r in loc_rows],
     )
 
 
@@ -816,8 +850,8 @@ async def get_cast(series_id: str):
         raise HTTPException(status_code=500, detail=f"Could not load cast: {e}")
 
     return CastResponse(
-        characters=[SavedCharacter(id=r["id"], **{k: r[k] for k in CharacterIn.model_fields}) for r in char_rows],
-        locations=[SavedLocation(id=r["id"], **{k: r[k] for k in LocationIn.model_fields}) for r in loc_rows],
+        characters=[SavedCharacter(id=r["id"], **_row_with_field_defaults(r, CharacterIn)) for r in char_rows],
+        locations=[SavedLocation(id=r["id"], **_row_with_field_defaults(r, LocationIn)) for r in loc_rows],
     )
 
 
@@ -1082,7 +1116,7 @@ async def assign_voices(series_id: str):
         updated_rows.append(row)
 
     return AssignVoicesResponse(
-        characters=[SavedCharacter(id=r["id"], **{k: r[k] for k in CharacterIn.model_fields}) for r in updated_rows]
+        characters=[SavedCharacter(id=r["id"], **_row_with_field_defaults(r, CharacterIn)) for r in updated_rows]
     )
 
 
