@@ -185,17 +185,39 @@ _FFMPEG_RESOLUTION = "1080x1920"
 # How long a scene with no dialogue lines holds on screen — a plain
 # establishing shot still needs *some* duration to not flash by instantly.
 _SCENE_SILENCE_SECONDS = 3.0
-_END_CARD_SECONDS = 3.0
-_END_CARD_TEXT = "Next episode on Viyo"
-# Matches the app's own dark background (see app_icon's
-# adaptive_icon_background in pubspec.yaml) so the end card doesn't
-# look like a foreign insert.
-_END_CARD_BG_COLOR = "0x0B0B1A"
 # Installed via the Dockerfile's `apt-get install ... fonts-dejavu-core`
 # line (same package repurpose.py's own burned-in text already depends
 # on — see QUOTE_CARD_FONT_PATH there).
-_CAPTION_FONT = "DejaVu Sans"
 _CAPTION_FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Ken Burns zoom range for every still-image scene — 1.0 (no crop) up
+# to this cap, never further and never reset back to 1.0 mid-scene, so
+# a scene is always visibly, continuously moving (see _render_scene_clip's
+# own docstring for why this is never skipped).
+_ZOOM_MIN = 1.0
+_ZOOM_MAX = 1.12
+
+# Burned-in dialogue captions (see _build_caption_filters). Deliberately
+# real pixel values against this pipeline's own known 1080x1920 output,
+# not libass/ASS units — see _build_caption_filters' own docstring for
+# why: an ASS MarginV computed from these same numbers silently rendered
+# off-screen, confirmed empirically before switching to drawtext.
+_CAPTION_FONT_SIZE = 52
+_CAPTION_Y_FRACTION = 0.72  # "lower third" — about 72% down the frame
+_CAPTION_LINE_HEIGHT = _CAPTION_FONT_SIZE + 18
+_CAPTION_MAX_CHARS_PER_LINE = 26  # calibrated against this exact font/size — see _wrap_caption_lines
+
+# Freeze-frame outro (replaces the old separate end card) — holds the
+# final scene's last frame instead of cutting to a different, unrelated
+# card. No bundled emoji in _OUTRO_TEXT: tried rendering 🔥 via drawtext
+# against both DejaVu Sans Bold (no emoji glyphs — renders as a visible
+# tofu/missing-glyph box) and the system's own NotoColorEmoji (a color
+# bitmap font drawtext's FreeType-based text renderer can't load at all
+# — "Error initializing filters") before dropping it from the actual
+# burned-in video text rather than ship a broken-looking glyph.
+_OUTRO_SECONDS = 1.5
+_OUTRO_TEXT = "PART 2 ON VIYO"
+_OUTRO_FONT_SIZE = 84
 
 # Gemini's prebuilt TTS voice catalog, each tagged with a gender/age/
 # description for the auto-assignment heuristic below. The tags are
@@ -579,6 +601,14 @@ class CharacterImageRequest(BaseModel):
     appearance: str
     clothing: str
     personality: str
+    # A fixed, verbatim costume description (e.g. "black designer suit
+    # jacket, white shirt, black tie") reused as-is in every image
+    # prompt this character appears in — unlike [clothing] above (a
+    # looser, script-inferred wardrobe guess), this is admin-written
+    # specifically to pin one exact outfit across every scene, so a
+    # character doesn't visibly change clothes scene to scene. Empty
+    # by default — see CharacterIn's own comment.
+    costume_lock: str = ""
 
 
 class LocationImageRequest(BaseModel):
@@ -616,12 +646,19 @@ def _generate_and_upload_image(prompt: str, path_prefix: str, call_type: str) ->
 @router.post("/character/portrait", response_model=ImageResponse, dependencies=[Depends(_require_admin)])
 async def generate_character_portrait(req: CharacterImageRequest):
     _require_configured()
+    clothing_line = f"Clothing: {req.clothing}"
+    if req.costume_lock.strip():
+        # Reinforces, not just adds to, [clothing] — this is the exact
+        # outfit every later scene image is also told to match (see
+        # generate_scene_image), so the reference portrait itself
+        # needs to start from it, not a looser general description.
+        clothing_line = f"Clothing (exact, required): {req.costume_lock}"
     prompt = (
         "Front-facing portrait photo of a fictional character for a drama series, "
         "shoulders-up, looking directly at camera, neutral plain studio background, "
         "soft even lighting, photorealistic.\n\n"
         f"Name: {req.name}\nAge: {req.age}\nGender: {req.gender}\n"
-        f"Appearance: {req.appearance}\nClothing: {req.clothing}\nPersonality: {req.personality}\n\n"
+        f"Appearance: {req.appearance}\n{clothing_line}\nPersonality: {req.personality}\n\n"
         "No text, no watermark, no other people in frame."
     )
     return _generate_and_upload_image(prompt, "characters", "character_portrait")
@@ -651,6 +688,13 @@ class CharacterIn(BaseModel):
     personality: str
     portrait_url: Optional[str] = None
     voice_id: Optional[str] = None
+    # See CharacterImageRequest's own comment — a fixed costume
+    # description always injected verbatim into every scene image
+    # prompt this character appears in (generate_scene_image), not
+    # just the portrait. Empty/unset is a real, supported choice (no
+    # lock — clothing can vary scene to scene same as before this
+    # existed), not a default waiting to be filled in.
+    costume_lock: str = ""
 
 
 class LocationIn(BaseModel):
@@ -722,6 +766,7 @@ async def save_cast(series_id: str, req: SaveCastRequest):
                 "clothing": c.clothing,
                 "personality": c.personality,
                 "portrait_url": c.portrait_url,
+                "costume_lock": c.costume_lock,
                 "sort_order": i,
             }
             for i, c in enumerate(req.characters)
@@ -1419,13 +1464,17 @@ async def generate_scene_image(scene_id: str):
 
     reference_parts: list[types.Part] = []
     character_names = []
+    costume_lines = []
     for c in scene_row.get("characters") or []:
         character_id = c.get("character_id")
         if not character_id:
             continue
         try:
             rows = (
-                supabase_admin.table("series_characters").select("name,portrait_url").eq("id", character_id).execute()
+                supabase_admin.table("series_characters")
+                .select("name,portrait_url,costume_lock")
+                .eq("id", character_id)
+                .execute()
             ).data or []
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not load character reference: {e}")
@@ -1433,6 +1482,8 @@ async def generate_scene_image(scene_id: str):
             reference_parts.append(types.Part.from_text(text=f"Reference photo for character \"{rows[0]['name']}\":"))
             reference_parts.append(_fetch_image_part(rows[0]["portrait_url"]))
             character_names.append(rows[0]["name"])
+        if rows and (rows[0].get("costume_lock") or "").strip():
+            costume_lines.append(f"{rows[0]['name']}: {rows[0]['costume_lock'].strip()}")
 
     location_id = scene_row.get("location_id")
     if location_id:
@@ -1451,6 +1502,19 @@ async def generate_scene_image(scene_id: str):
             )
             reference_parts.append(_fetch_image_part(loc_rows[0]["reference_image_url"]))
 
+    costume_block = ""
+    if costume_lines:
+        # Repeated verbatim in every scene this character appears in —
+        # the reference portrait alone only pins likeness, and Gemini
+        # has been observed drifting an outfit's details (a tie color,
+        # a jacket vs. no jacket) across otherwise-consistent scene
+        # images. Phrased as a hard constraint, not a style suggestion,
+        # same register as the "No text, no watermark" line below.
+        costume_block = (
+            "\n\nCOSTUME LOCK — these characters must be wearing exactly this, with no variation "
+            "from scene to scene:\n" + "\n".join(costume_lines)
+        )
+
     instruction = (
         "Using the reference photos above for likeness (same faces, same location — keep clothing and "
         "setting consistent with them unless the description below says otherwise), generate a single "
@@ -1458,7 +1522,8 @@ async def generate_scene_image(scene_id: str):
         "9:16 vertical aspect ratio. "
         f"Camera shot: {scene_row.get('camera_shot') or 'medium'} shot. "
         f"Location: {scene_row.get('location_name') or 'unspecified'}. "
-        f"Characters in frame: {', '.join(character_names) or 'none specified'}.\n\n"
+        f"Characters in frame: {', '.join(character_names) or 'none specified'}."
+        f"{costume_block}\n\n"
         f"What's happening: {scene_row.get('visual_description') or ''}\n\n"
         "No text, no watermark, no speech bubbles or captions baked into the image."
     )
@@ -1747,23 +1812,104 @@ def _run_ffmpeg(cmd: list[str], step: str) -> None:
         raise HTTPException(status_code=500, detail=f"{step} failed: {result.stderr[-500:]}")
 
 
-def _srt_timestamp(seconds: float) -> str:
-    total_ms = max(0, round(seconds * 1000))
-    hours, rem = divmod(total_ms, 3_600_000)
-    minutes, rem = divmod(rem, 60_000)
-    secs, ms = divmod(rem, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
-
-def _write_scene_srt(texts: list[str], durations: list[float], srt_path: str) -> None:
+def _scene_cues(texts: list[str], durations: list[float]) -> list[tuple[str, float, float]]:
+    """Turns a scene's dialogue line texts + their (already-known, from
+    each line's own TTS audio) durations into (text, start, end) cues,
+    each timed back-to-back starting at 0 — the same cursor-accumulation
+    _write_scene_srt used to do, just handed to _build_caption_filters
+    instead of written out as an SRT file."""
     cursor = 0.0
-    entries = []
-    for i, (text, duration) in enumerate(zip(texts, durations), start=1):
-        start, end = cursor, cursor + duration
-        entries.append(f"{i}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n")
-        cursor = end
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(entries))
+    cues = []
+    for text, duration in zip(texts, durations):
+        cues.append((text, cursor, cursor + duration))
+        cursor += duration
+    return cues
+
+
+def _wrap_caption_lines(
+    text: str, max_chars: int = _CAPTION_MAX_CHARS_PER_LINE, max_lines: int = 2
+) -> list[str]:
+    """Greedy word-wrap into at most [max_lines] lines of up to
+    [max_chars] each — the "max 2 lines" cap on burned-in captions.
+    Any text left over past the last line is truncated with an
+    ellipsis rather than silently dropped or left to overflow past the
+    frame edge; a TTS dialogue line actually long enough to hit this
+    is rare in practice."""
+    words = text.split()
+    if not words:
+        return []
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= max_chars or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    if len(lines) <= max_lines:
+        return lines
+
+    kept = lines[: max_lines - 1]
+    rest = " ".join(lines[max_lines - 1 :])
+    if len(rest) > max_chars:
+        rest = rest[: max_chars - 1].rstrip() + "…"
+    kept.append(rest)
+    return kept
+
+
+def _build_caption_filters(cues: list[tuple[str, float, float]], tmp_dir: str, prefix: str) -> str:
+    """Builds a chained drawtext filter string burning in [cues] —
+    (text, start_seconds, end_seconds) dialogue cues — as bold white,
+    black-outlined text anchored in the lower third (~72% down the
+    frame, see _CAPTION_Y_FRACTION), each cue capped at 2 lines.
+    Returns "" (nothing to append to a -vf chain) if there are no cues.
+
+    Deliberately drawtext, not the `subtitles` filter this used to use:
+    an SRT run through `subtitles` falls back to libass's own default
+    PlayResX/Y (384x288 — unrelated to this pipeline's real 1080x1920
+    output) whenever the SRT itself carries no resolution of its own,
+    so a MarginV written against this frame's real pixel height ends up
+    scaled into that other coordinate space and renders off the top of
+    the frame entirely — confirmed empirically (text present and
+    correctly positioned at the filter's small built-in default margin,
+    completely gone once that margin was raised to where "72% down"
+    actually needed it) before switching to drawtext, whose x/y are
+    plain output-frame pixels with no such hidden coordinate space.
+
+    Each wrapped line is also its own separate drawtext instance (its
+    own textfile=, individually centered via its own (w-text_w)/2)
+    rather than one drawtext call with an embedded newline: a single
+    multi-line drawtext centers the whole block on its widest line, not
+    each line on its own, so a cue whose two lines are different
+    lengths — the normal case — renders its shorter line partly or
+    fully off-center. Confirmed the same way: a deliberately short
+    first line against a long second line landed flush against the
+    frame edge, invisible, until each line got its own instance.
+    """
+    if not cues:
+        return ""
+    filters = []
+    for ci, (text, start, end) in enumerate(cues):
+        for li, line in enumerate(_wrap_caption_lines(text)):
+            text_path = os.path.join(tmp_dir, f"{prefix}_cap_{ci}_{li}.txt")
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(line)
+            # Same path-escaping precaution the old srt_path handling
+            # took — ffmpeg's filter string syntax treats a bare ":" as
+            # an option separator.
+            safe_path = text_path.replace("\\", "/").replace(":", "\\:")
+            y = f"h*{_CAPTION_Y_FRACTION}+{li * _CAPTION_LINE_HEIGHT}"
+            filters.append(
+                f"drawtext=fontfile={_CAPTION_FONT_BOLD_PATH}:textfile='{safe_path}':"
+                f"fontcolor=white:fontsize={_CAPTION_FONT_SIZE}:borderw=3:bordercolor=black:"
+                f"x=(w-text_w)/2:y={y}:enable='between(t\\,{start:.3f}\\,{end:.3f})'"
+            )
+    return "," + ",".join(filters)
 
 
 def _concat_audio(input_paths: list[str], out_path: str) -> None:
@@ -1787,33 +1933,38 @@ def _render_silence(duration: float, out_path: str) -> None:
 
 
 def _render_scene_clip(
-    image_path: str, audio_path: str, srt_path: Optional[str], duration: float, pan: str, out_path: str
+    image_path: str, audio_path: str, cues: list[tuple[str, float, float]], duration: float, pan: str, out_path: str
 ) -> None:
-    """Ken Burns (slow zoom, alternating center/pan-across by scene
-    index for some visual variety) with the scene's dialogue burned in
-    underneath, one caption per line, timed against that same audio.
-    Verified end to end (zoompan expression, subtitle burn-in, exact
-    duration) against synthetic test assets before writing this —
-    zoompan's expression syntax is easy to get subtly wrong."""
+    """Ken Burns (slow zoom-in, or zoom-plus-pan-across, alternating by
+    scene index for some visual variety — see assemble_episode's own
+    i % 2) with the scene's dialogue burned in underneath. Always
+    moving, start to finish: zoom climbs from _ZOOM_MIN to _ZOOM_MAX
+    continuously for the scene's whole duration (never resets, never
+    plateaus early), so a still image never just sits there frozen —
+    the one thing this whole function exists to guarantee. The pan
+    variant reuses the same zoom range rather than its own: a pure
+    translation needs zoom > 1 to have any x-room to move across at
+    all (at zoom=1 the crop window already fills the source exactly,
+    leaving nothing to pan into — confirmed empirically), so this
+    gets the pan "for free" out of the same subtle zoom already
+    driving the plain zoom-in variant.
+
+    Verified end to end (zoompan expression, caption position/timing,
+    exact duration) against synthetic test assets before writing this
+    — zoompan's expression syntax, and libass's own default coordinate
+    space the previous subtitle-based caption approach silently fell
+    into, are each easy to get subtly, invisibly wrong."""
     frames = max(1, int(round(duration * _FFMPEG_FPS)))
+    zoom_step = (_ZOOM_MAX - _ZOOM_MIN) / frames
     if pan == "left_right":
         x_expr = f"(iw-iw/zoom)*(on/{frames})"
     else:
         x_expr = "iw/2-(iw/zoom/2)"
     vf = (
-        f"scale=2160:3840,zoompan=z='min(zoom+0.0010,1.3)':x='{x_expr}':"
+        f"scale=2160:3840,zoompan=z='min(zoom+{zoom_step:.8f},{_ZOOM_MAX})':x='{x_expr}':"
         f"y='ih/2-(ih/zoom/2)':d={frames}:s={_FFMPEG_RESOLUTION}:fps={_FFMPEG_FPS}"
     )
-    if srt_path:
-        # Same path-escaping precaution repurpose.py's own subtitles
-        # filter usage takes (see its `safe_path`) — ffmpeg's filter
-        # string syntax treats a bare ":" as an option separator.
-        safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
-        style = (
-            f"FontName={_CAPTION_FONT},FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
-        )
-        vf += f",subtitles='{safe_srt}':force_style='{style}'"
+    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
         "-vf", vf, "-t", str(duration),
@@ -1823,7 +1974,7 @@ def _render_scene_clip(
 
 
 def _render_scene_clip_from_video(
-    video_path: str, audio_path: str, srt_path: Optional[str], duration: float, out_path: str
+    video_path: str, audio_path: str, cues: list[tuple[str, float, float]], duration: float, out_path: str
 ) -> None:
     """Same job as _render_scene_clip, but for a scene that got the
     optional Veo upgrade: starts from a real generated video clip
@@ -1831,7 +1982,7 @@ def _render_scene_clip_from_video(
     own audio (always on, can't be disabled via the API) is dropped
     entirely in favor of this scene's actual TTS voice — otherwise
     Veo's guessed audio would play under/over the real character
-    voice. When the scene has NO dialogue (srt_path is None — a pure
+    voice. When the scene has NO dialogue (cues is empty — a pure
     visual/establishing beat), there's nothing for Veo's audio to
     compete with, so its own ambient sound is kept instead of
     replacing it with flat silence. Veo only returns fixed 4/6/8-
@@ -1843,20 +1994,14 @@ def _render_scene_clip_from_video(
     # Explicit fps= matters here the same way it matters in
     # _render_scene_clip's zoompan filter: without it, this clip's
     # output framerate is whatever Veo itself generated at (observed:
-    # 24fps) while every Ken Burns scene and the end card render at
+    # 24fps) while every Ken Burns scene and the freeze outro render at
     # _FFMPEG_FPS (30) — a real, confirmed mismatch (via the per-clip
     # diagnostic _concat_clips attaches on failure) that's the likely
     # cause of "Episode concat failed" when an episode mixes a Veo
     # scene with Ken Burns scenes.
     vf = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps={_FFMPEG_FPS}"
-    has_dialogue = bool(srt_path)
-    if has_dialogue:
-        safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
-        style = (
-            f"FontName={_CAPTION_FONT},FontSize=16,Bold=1,PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
-        )
-        vf += f",subtitles='{safe_srt}':force_style='{style}'"
+    has_dialogue = bool(cues)
+    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
 
     if has_dialogue:
         cmd = [
@@ -1875,46 +2020,86 @@ def _render_scene_clip_from_video(
     _run_ffmpeg(cmd, "Scene render (Veo)")
 
 
-def _render_end_card(tmp_dir: str, out_path: str) -> None:
-    """Renders from real files on disk (a generated solid-color PNG +
-    a real silent WAV from _render_silence), not two live `-f lavfi`
-    sources piped directly into one ffmpeg call. Every scene clip
-    already works this way — a real image file + a real (possibly
-    silent) audio file — and the end card was the one clip built
-    differently. Bisecting a real "Episode concat failed" report (see
-    _bisect_concat_failure) pinned the end card down as the exact
-    clip whose addition broke the final concat, even once its frame
-    rate matched every other clip exactly. Converging it onto the
-    identical, already-proven real-file pattern sidesteps whatever
-    subtle live-dual-lavfi-source quirk was actually at fault, without
-    needing to fully root-cause ffmpeg's internal reason — verified
-    locally that this still produces a valid, concat-compatible clip
-    before shipping it."""
-    text_path = os.path.join(tmp_dir, "endcard_text.txt")
-    with open(text_path, "w", encoding="utf-8") as f:
-        f.write(_END_CARD_TEXT)
+def _render_sound_hit(duration: float, out_path: str) -> None:
+    """Synthesizes a cinematic "hit" — a decaying low-frequency boom
+    layered with a short filtered-noise crack at the onset — entirely
+    in ffmpeg. There's no bundled sound-effects library in this
+    codebase (same constraint upload_music's own docstring notes for
+    background music), and the freeze outro this backs needs to sound
+    dramatic with zero admin setup, not wait on someone finding and
+    uploading their own impact sample.
 
-    bg_path = os.path.join(tmp_dir, "endcard_bg.png")
+    Renders from real files on disk and mixes them in a second pass,
+    rather than one ffmpeg call juggling two live `-f lavfi` sources
+    and a filter_complex — same "real files, not live dual-lavfi"
+    discipline _render_end_card (this function's predecessor) already
+    adopted after bisecting a real concat failure to that exact
+    pattern. Gain-staged by hand after measuring: the straightforward
+    boom+crack mix peaks right at ~0dBFS (the edge of clipping) even
+    with amix's own normalize — confirmed via ffmpeg's astats filter
+    before picking the 0.5 final gain below, which lands around -2dB."""
+    boom_path = os.path.join(os.path.dirname(out_path), "_sound_hit_boom.wav")
+    crack_path = os.path.join(os.path.dirname(out_path), "_sound_hit_crack.wav")
     _run_ffmpeg(
         [
             "ffmpeg", "-y", "-f", "lavfi", "-i",
-            f"color=c={_END_CARD_BG_COLOR}:s={_FFMPEG_RESOLUTION}", "-frames:v", "1", bg_path,
+            f"aevalsrc=0.8*exp(-6*t)*sin(2*PI*85*t):d={duration}:s=44100:c=mono",
+            boom_path,
         ],
-        "End card background render",
+        "Sound hit (boom)",
+    )
+    _run_ffmpeg(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", f"anoisesrc=d={duration}:c=white:a=0.6:r=44100",
+            "-af", f"highpass=f=1500,afade=t=out:st=0.05:d=0.12,atrim=0:{duration}",
+            crack_path,
+        ],
+        "Sound hit (crack)",
+    )
+    _run_ffmpeg(
+        [
+            "ffmpeg", "-y", "-i", boom_path, "-i", crack_path,
+            "-filter_complex",
+            "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,volume=0.5[aout]",
+            "-map", "[aout]", "-ac", "1", "-ar", "44100", out_path,
+        ],
+        "Sound hit (mix)",
     )
 
-    silence_path = os.path.join(tmp_dir, "endcard_silence.wav")
-    _render_silence(_END_CARD_SECONDS, silence_path)
+
+def _render_freeze_outro(last_frame_path: str, tmp_dir: str, out_path: str) -> None:
+    """Freezes the final scene's last frame for _OUTRO_SECONDS with a
+    synthesized dramatic sound hit and big "PART 2 ON VIYO" text over
+    it — replaces the old separate end card (a different, unrelated
+    solid-color card cutting in after the episode actually ends).
+    Holding on the episode's own last frame instead keeps the cut
+    inside the scene the viewer was just watching, which is what makes
+    the "freeze" read as a deliberate dramatic beat rather than a
+    jarring cut to a slide.
+
+    Renders from a real image file + a real synthesized-but-on-disk
+    WAV, same "real files on disk, not a live dual-source filter
+    graph" discipline _render_sound_hit's own docstring explains —
+    verified locally that this still produces a valid, concat-
+    compatible clip (matching every other clip's exact spec) before
+    shipping it."""
+    sound_path = os.path.join(tmp_dir, "outro_sound_hit.wav")
+    _render_sound_hit(_OUTRO_SECONDS, sound_path)
+
+    text_path = os.path.join(tmp_dir, "outro_text.txt")
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(_OUTRO_TEXT)
 
     cmd = [
-        "ffmpeg", "-y", "-loop", "1", "-i", bg_path, "-i", silence_path,
+        "ffmpeg", "-y", "-loop", "1", "-i", last_frame_path, "-i", sound_path,
         "-vf",
         f"fps={_FFMPEG_FPS},drawtext=textfile={text_path}:fontfile={_CAPTION_FONT_BOLD_PATH}:"
-        "fontcolor=white:fontsize=56:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-t", str(_END_CARD_SECONDS),
+        f"fontcolor=white:fontsize={_OUTRO_FONT_SIZE}:borderw=5:bordercolor=black:"
+        "x=(w-text_w)/2:y=(h-text_h)/2",
+        "-t", str(_OUTRO_SECONDS),
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_path,
     ]
-    _run_ffmpeg(cmd, "End card render")
+    _run_ffmpeg(cmd, "Freeze outro render")
 
 
 def _describe_clip(path: str) -> str:
@@ -1949,7 +2134,7 @@ def _concat_clips(clip_paths: list[str], out_path: str, labels: Optional[list[st
     That's no longer true — every clip this function receives is now
     rendered to the exact same spec (1080x1920, _FFMPEG_FPS, h264/
     yuv420p, aac/44100/mono) by _render_scene_clip,
-    _render_scene_clip_from_video and _render_end_card, so a stream
+    _render_scene_clip_from_video and _render_freeze_outro, so a stream
     copy is valid and sidesteps re-encoding (and whatever's opening
     the encoder successfully in local testing but failing in
     production with "Could not open encoder before EOF" — frame rate
@@ -2182,32 +2367,42 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
                 _render_silence(_SCENE_SILENCE_SECONDS, scene_audio_path)
             scene_duration = _ffprobe_duration(scene_audio_path)
 
-            srt_path = None
+            cues: list[tuple[str, float, float]] = []
             if scene.lines:
-                srt_path = os.path.join(tmp, f"scene_{i}.srt")
                 line_durations = [_ffprobe_duration(p) for p in line_audio_paths]
-                _write_scene_srt([l.text for l in scene.lines], line_durations, srt_path)
+                cues = _scene_cues([l.text for l in scene.lines], line_durations)
 
             clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
             if scene.video_url:
                 video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
                 _download_to_file(scene.video_url, video_path)
-                _render_scene_clip_from_video(video_path, scene_audio_path, srt_path, scene_duration, clip_path)
+                _render_scene_clip_from_video(video_path, scene_audio_path, cues, scene_duration, clip_path)
             else:
                 image_path = os.path.join(tmp, f"scene_{i}.png")
                 _download_to_file(scene.image_url, image_path)
                 pan = "left_right" if i % 2 else "center"
-                _render_scene_clip(image_path, scene_audio_path, srt_path, scene_duration, pan, clip_path)
+                _render_scene_clip(image_path, scene_audio_path, cues, scene_duration, pan, clip_path)
             _validate_clip(clip_path, f"Scene {i + 1}")
             clip_paths.append(clip_path)
 
-        endcard_path = os.path.join(tmp, "endcard.mp4")
-        _render_end_card(tmp, endcard_path)
-        _validate_clip(endcard_path, "End card")
-        clip_paths.append(endcard_path)
+        # Freeze outro: holds the episode's own last frame (not a
+        # separate, unrelated card) for a dramatic beat into the "Part
+        # 2" hook — see _render_freeze_outro's own docstring. Reuses
+        # the final iteration's clip_path/scene_duration above; Python
+        # keeps a for loop's locals alive after it ends, and scenes is
+        # already confirmed non-empty up front.
+        last_frame_path = os.path.join(tmp, "outro_last_frame.png")
+        # A hair before the true end, not exactly at it — seeking to a
+        # clip's literal last timestamp sometimes lands past EOF with
+        # no frame to extract (confirmed empirically).
+        _extract_thumbnail(clip_path, last_frame_path, at_seconds=max(0.0, scene_duration - 0.1))
+        outro_path = os.path.join(tmp, "outro.mp4")
+        _render_freeze_outro(last_frame_path, tmp, outro_path)
+        _validate_clip(outro_path, "Freeze outro")
+        clip_paths.append(outro_path)
 
         assembled_path = os.path.join(tmp, "assembled.mp4")
-        clip_labels = [f"Scene {i + 1}" for i in range(len(scenes))] + ["End card"]
+        clip_labels = [f"Scene {i + 1}" for i in range(len(scenes))] + ["Freeze outro"]
         _concat_clips(clip_paths, assembled_path, labels=clip_labels)
 
         final_path = assembled_path
