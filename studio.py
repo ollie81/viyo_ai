@@ -739,9 +739,21 @@ def _row_with_field_defaults(row: dict, model: type[BaseModel]) -> dict:
     return out
 
 
+class CharacterSaveIn(CharacterIn):
+    # Present when this item is an already-saved character being
+    # edited/kept; absent for one newly added via Analyze Script. See
+    # save_cast's own comment for why this is what makes the save a
+    # real upsert instead of delete-then-insert.
+    id: Optional[str] = None
+
+
+class LocationSaveIn(LocationIn):
+    id: Optional[str] = None
+
+
 class SaveCastRequest(BaseModel):
-    characters: list[CharacterIn]
-    locations: list[LocationIn]
+    characters: list[CharacterSaveIn]
+    locations: list[LocationSaveIn]
 
 
 class SavedCharacter(CharacterIn):
@@ -774,24 +786,54 @@ async def save_cast(series_id: str, req: SaveCastRequest):
         raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
     _get_series_owner(series_id)  # 404s if the series doesn't exist
 
-    # Replace-all semantics for Phase 1 — simplest correct behavior
-    # while there's no scene data yet referencing individual character/
-    # location rows by id. Once Phase 3 scenes reference these ids,
-    # this will need to become a real upsert instead of delete+insert.
-    # NOTE: this also means re-saving a cast wipes any voice_id already
-    # assigned in Phase 2 (the Flutter cast objects in memory don't
-    # carry it round-trip) — another reason this needs to become a
-    # real upsert before Phase 3, not a new Phase 2 problem to solve
-    # on its own.
+    # Real upsert, not delete-then-insert. A character/location's id is
+    # what scenes and dialogue lines actually reference
+    # (generate_scene_image reads character_id off a scene; editLine
+    # stores one per line) — recreating every row under a fresh id on
+    # every single save orphaned that reference silently, which read
+    # in the app as a character the admin had plainly already cast
+    # (e.g. "MR. OSEI") permanently flagged unmatched on every scene
+    # that used them, with no save ever able to fix it since the next
+    # save just orphaned the new id too. It also wiped voice_id every
+    # time, since the old insert-only path never wrote it back at all.
+    #
+    # An item in the request with an id that belongs to this series
+    # gets updated in place (same row, same id, every field including
+    # voice_id refreshed). An item with no id is a brand new character/
+    # location and gets inserted. An existing row whose id isn't in
+    # this request at all was explicitly removed via the per-card
+    # delete button in the UI, and only that row gets deleted — not
+    # "everything that existed before this save."
     try:
-        supabase_admin.table("series_characters").delete().eq("series_id", series_id).execute()
-        supabase_admin.table("series_locations").delete().eq("series_id", series_id).execute()
+        existing_char_ids = {
+            r["id"]
+            for r in (
+                supabase_admin.table("series_characters").select("id").eq("series_id", series_id).execute()
+            ).data
+            or []
+        }
+        existing_loc_ids = {
+            r["id"]
+            for r in (
+                supabase_admin.table("series_locations").select("id").eq("series_id", series_id).execute()
+            ).data
+            or []
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not clear previous cast: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not load existing cast: {e}")
+
+    removed_char_ids = existing_char_ids - {c.id for c in req.characters if c.id}
+    removed_loc_ids = existing_loc_ids - {l.id for l in req.locations if l.id}
 
     try:
-        char_rows = supabase_admin.table("series_characters").insert([
-            {
+        if removed_char_ids:
+            supabase_admin.table("series_characters").delete().in_("id", list(removed_char_ids)).execute()
+        if removed_loc_ids:
+            supabase_admin.table("series_locations").delete().in_("id", list(removed_loc_ids)).execute()
+
+        char_rows = []
+        for i, c in enumerate(req.characters):
+            row = {
                 "series_id": series_id,
                 "name": c.name,
                 "age": c.age,
@@ -800,14 +842,28 @@ async def save_cast(series_id: str, req: SaveCastRequest):
                 "clothing": c.clothing,
                 "personality": c.personality,
                 "portrait_url": c.portrait_url,
+                "voice_id": c.voice_id,
                 "costume_lock": c.costume_lock,
                 "sort_order": i,
             }
-            for i, c in enumerate(req.characters)
-        ]).execute().data if req.characters else []
+            if c.id and c.id in existing_char_ids:
+                result = supabase_admin.table("series_characters").update(row).eq("id", c.id).execute().data
+            else:
+                # An id supplied here that ISN'T in existing_char_ids
+                # (as opposed to no id at all) is an explicit recreate
+                # — recovering a row that's been deleted, with its
+                # original id, so anything that already referenced it
+                # (a scene's character_id) resolves again instead of
+                # getting a new, unrelated row. Postgres accepts an
+                # explicit UUID on insert same as any other column.
+                if c.id:
+                    row["id"] = c.id
+                result = supabase_admin.table("series_characters").insert(row).execute().data
+            char_rows.extend(result or [])
 
-        loc_rows = supabase_admin.table("series_locations").insert([
-            {
+        loc_rows = []
+        for i, l in enumerate(req.locations):
+            row = {
                 "series_id": series_id,
                 "name": l.name,
                 "description": l.description,
@@ -816,8 +872,13 @@ async def save_cast(series_id: str, req: SaveCastRequest):
                 "reference_image_url": l.reference_image_url,
                 "sort_order": i,
             }
-            for i, l in enumerate(req.locations)
-        ]).execute().data if req.locations else []
+            if l.id and l.id in existing_loc_ids:
+                result = supabase_admin.table("series_locations").update(row).eq("id", l.id).execute().data
+            else:
+                if l.id:
+                    row["id"] = l.id
+                result = supabase_admin.table("series_locations").insert(row).execute().data
+            loc_rows.extend(result or [])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not save cast: {e}")
 
