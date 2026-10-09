@@ -224,7 +224,17 @@ app.add_middleware(
     # code or body to explain why — this is what was silently breaking
     # Messages, Discover Spotlight, and AI Repurposer's job-status
     # polling on web, not a client bug or a weak connection.
-    allow_methods=["GET", "POST", "DELETE"],
+    #
+    # PUT hit the exact same bug the moment Ads Studio's campaign/
+    # script update endpoints (ads_studio.py's update_campaign,
+    # save_script) shipped using it — confirmed live, same bare
+    # "ClientException: Failed to fetch" with zero status/body, on the
+    # very first PUT call from the web build. Every method actually
+    # used anywhere in this app must be listed here explicitly; there's
+    # no wildcard-but-still-safe option with allow_origins this specific
+    # (an origin regex, not "*"), since CORSMiddleware only lets you
+    # wildcard allow_methods alongside a wildcard allow_origins.
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
