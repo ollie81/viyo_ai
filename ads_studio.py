@@ -100,9 +100,7 @@ from studio import (
     GEMINI_IMAGE_COST_USD_CENTS,
     GEMINI_TTS_LINE_COST_USD_CENTS,
     GEMINI_VOICES,
-    VEO_MODEL,
     VEO_ALLOWED_DURATIONS,
-    VEO_PRICE_PER_SEC_USD_CENTS,
     VEO_MAX_POLL_SECONDS,
     VEO_POLL_INTERVAL_SECONDS,
     _FFMPEG_FPS,
@@ -112,6 +110,27 @@ from studio import (
 from bunny_stream import _playback_url as _bunny_playback_url
 
 router = APIRouter(prefix="/api/v1/admin/ads-studio", tags=["ads_studio"])
+
+# Drama Studio only ever uses Lite (the one tier that fits inside its own
+# $3/day cap). Ads Studio exposes all three real Veo 3.1 tiers so a
+# campaign can trade cost for quality deliberately — model IDs confirmed
+# against Google's Gemini API docs/model listing, not guessed:
+# "veo-3.1-generate-preview" (Standard) is the exact ID the official
+# ai.google.dev Veo docs use; "-lite-"/"-fast-" follow the same documented
+# naming convention and "-lite-" is already proven working in studio.py.
+# Per-second prices are the same best-effort estimates studio.py's own
+# VEO_PRICE_PER_SEC_USD_CENTS carries — re-check ai.google.dev/gemini-api
+# /docs/pricing before trusting these for real budgeting; the daily cap
+# (_check_daily_cap) is the real backstop regardless of tier, not these
+# numbers themselves. Standard is ~8x Lite's cost (an 8s clip alone is
+# close to the whole default daily cap) — the Flutter picker warns before
+# letting an admin select it.
+VEO_TIERS: dict[str, dict] = {
+    "lite": {"model": "veo-3.1-lite-generate-preview", "price_per_sec_cents": 5, "label": "Lite"},
+    "fast": {"model": "veo-3.1-fast-generate-preview", "price_per_sec_cents": 10, "label": "Fast"},
+    "standard": {"model": "veo-3.1-generate-preview", "price_per_sec_cents": 40, "label": "Standard"},
+}
+DEFAULT_VEO_TIER = "lite"
 
 # Same two env vars every other file in this codebase reads independently
 # to build its own service-role client (video_metadata.py, bunny_stream.py,
@@ -231,6 +250,17 @@ async def list_formats():
     return [AdFormatOut(key=k, label=v["label"]) for k, v in AD_FORMATS.items()]
 
 
+class VeoTierOut(BaseModel):
+    key: str
+    label: str
+    price_per_sec_cents: int
+
+
+@router.get("/veo-tiers", response_model=list[VeoTierOut], dependencies=[Depends(_require_admin)])
+async def list_veo_tiers():
+    return [VeoTierOut(key=k, label=v["label"], price_per_sec_cents=v["price_per_sec_cents"]) for k, v in VEO_TIERS.items()]
+
+
 # ---------------------------------------------------------------------------
 # Campaigns
 # ---------------------------------------------------------------------------
@@ -249,6 +279,7 @@ class CreateCampaignRequest(BaseModel):
     aspect_ratio: str = "9:16"
     resolution: str = "720p"
     use_veo: bool = False
+    veo_tier: str = DEFAULT_VEO_TIER
     voice_gender_preference: Optional[str] = None
 
 
@@ -269,6 +300,7 @@ class CampaignOut(BaseModel):
     aspect_ratio: str
     resolution: str
     use_veo: bool
+    veo_tier: str
     voice_gender_preference: Optional[str] = None
     voice_name: Optional[str] = None
     selected_hook_id: Optional[str] = None
@@ -300,6 +332,7 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         aspect_ratio=row.get("aspect_ratio") or "9:16",
         resolution=row.get("resolution") or "720p",
         use_veo=bool(row.get("use_veo")),
+        veo_tier=row.get("veo_tier") or DEFAULT_VEO_TIER,
         voice_gender_preference=row.get("voice_gender_preference"),
         voice_name=row.get("voice_name"),
         selected_hook_id=row.get("selected_hook_id"),
@@ -335,6 +368,8 @@ async def create_campaign(req: CreateCampaignRequest):
         raise HTTPException(status_code=400, detail=f"resolution must be one of {AD_RESOLUTIONS}.")
     if req.format is not None and req.format not in AD_FORMATS:
         raise HTTPException(status_code=400, detail=f"format must be one of {list(AD_FORMATS)} or omitted.")
+    if req.veo_tier not in VEO_TIERS:
+        raise HTTPException(status_code=400, detail=f"veo_tier must be one of {list(VEO_TIERS)}.")
     if req.use_veo and req.aspect_ratio == "1:1":
         raise HTTPException(
             status_code=400,
@@ -356,6 +391,7 @@ async def create_campaign(req: CreateCampaignRequest):
         "aspect_ratio": req.aspect_ratio,
         "resolution": req.resolution,
         "use_veo": req.use_veo,
+        "veo_tier": req.veo_tier,
         "voice_gender_preference": req.voice_gender_preference,
         "status": "draft",
         "cost_usd_cents": 0,
@@ -380,6 +416,7 @@ class UpdateCampaignRequest(BaseModel):
     aspect_ratio: Optional[str] = None
     resolution: Optional[str] = None
     use_veo: Optional[bool] = None
+    veo_tier: Optional[str] = None
     voice_gender_preference: Optional[str] = None
 
 
@@ -394,6 +431,8 @@ async def update_campaign(campaign_id: str, req: UpdateCampaignRequest):
         raise HTTPException(status_code=400, detail=f"aspect_ratio must be one of {AD_ASPECT_RATIOS}.")
     if "resolution" in patch and patch["resolution"] not in AD_RESOLUTIONS:
         raise HTTPException(status_code=400, detail=f"resolution must be one of {AD_RESOLUTIONS}.")
+    if "veo_tier" in patch and patch["veo_tier"] not in VEO_TIERS:
+        raise HTTPException(status_code=400, detail=f"veo_tier must be one of {list(VEO_TIERS)}.")
     if not patch:
         return _row_to_campaign(_get_campaign(campaign_id))
     try:
@@ -1127,6 +1166,31 @@ def _render_ad_scene_clip_from_video(
     _run_ffmpeg(cmd, "Ad scene render (Veo)")
 
 
+def _render_ad_scene_clip_veo_native_audio(
+    video_path: str, cues: list[tuple[str, float, float]], width: int, height: int, out_path: str,
+) -> None:
+    """For a Veo-animated scene using Veo's OWN generated audio (see
+    _generate_ad_scene_video's native_audio param) instead of a
+    separately-generated TTS track layered on top — no second audio
+    input, no -stream_loop/-t stretch-to-fit, since the whole point is
+    to keep Veo's video and the speech it generated together exactly as
+    it rendered them. The scene's clip length is whatever Veo actually
+    returned (passed back as the scene's duration by the caller), not
+    the script's originally planned seconds — looping or trimming
+    generated dialogue would chop or repeat actual spoken words, which
+    is worse than a campaign's total runtime drifting slightly from the
+    requested duration."""
+    vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={_FFMPEG_FPS}"
+    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", vf,
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out_path,
+    ]
+    _run_ffmpeg(cmd, "Ad scene render (Veo native audio)")
+
+
 def _generate_ad_scene_image(prompt: str, reference_urls: list[str], campaign_id: str) -> str:
     _check_daily_cap(GEMINI_IMAGE_COST_USD_CENTS)
     reference_parts = [_fetch_image_part(u) for u in reference_urls[:4]]
@@ -1145,28 +1209,53 @@ def _generate_ad_scene_image(prompt: str, reference_urls: list[str], campaign_id
     return url
 
 
-def _generate_ad_scene_video(image_url: str, visual_description: str, camera_shot: str, aspect_ratio: str, campaign_id: str) -> str:
+def _generate_ad_scene_video(
+    image_url: str, visual_description: str, camera_shot: str, aspect_ratio: str, campaign_id: str,
+    veo_tier: str = DEFAULT_VEO_TIER, dialogue: Optional[str] = None,
+) -> tuple[str, int]:
     """Reuses studio.py's _fetch_veo_image unmodified. Veo only accepts
     "16:9"/"9:16" (never called for a 1:1 campaign — create_campaign/
-    update_campaign already reject use_veo+1:1 together)."""
+    update_campaign already reject use_veo+1:1 together).
+
+    When [dialogue] is given, this asks Veo to generate and voice that
+    exact line itself (generate_audio=True) rather than animating
+    silently — real lip-adjacent sync, since Veo renders the video and
+    its speech together, at the cost of not controlling the exact voice
+    or guaranteeing word-for-word delivery the way a separate Gemini TTS
+    pass does. The caller (_run_ad_generation) keeps this native audio
+    track instead of layering TTS on top when dialogue is set. Returns
+    (video_url, actual_duration_seconds) — the duration matters because
+    the caller must NOT loop/trim a clip that has real generated speech
+    in it (see _render_ad_scene_clip_veo_native_audio's own docstring)."""
+    tier = VEO_TIERS.get(veo_tier, VEO_TIERS[DEFAULT_VEO_TIER])
     veo_aspect = "16:9" if aspect_ratio == "16:9" else "9:16"
-    duration = VEO_ALLOWED_DURATIONS[0]
-    cost_cents = duration * VEO_PRICE_PER_SEC_USD_CENTS
+    duration = VEO_ALLOWED_DURATIONS[-1] if dialogue else VEO_ALLOWED_DURATIONS[0]
+    cost_cents = duration * tier["price_per_sec_cents"]
     _check_daily_cap(cost_cents)
 
     veo_image = _fetch_veo_image(image_url)
-    prompt = (
-        "Animate this image into a short video clip for a marketing video. "
-        f"Camera shot: {camera_shot or 'medium'} shot. What's happening: {visual_description}\n\n"
-        "Subtle, natural motion — keep framing and subject consistent with the reference image. "
-        "No text, no captions, no watermark."
-    )
+    if dialogue:
+        prompt = (
+            "Animate this image into a short video clip for a marketing video, with the subject speaking "
+            f"this exact line out loud, naturally: \"{dialogue}\"\n\n"
+            f"Camera shot: {camera_shot or 'medium'} shot. What's happening: {visual_description}\n\n"
+            "Natural lip movement and delivery matching the speech. No text, no captions, no watermark."
+        )
+    else:
+        prompt = (
+            "Animate this image into a short video clip for a marketing video. "
+            f"Camera shot: {camera_shot or 'medium'} shot. What's happening: {visual_description}\n\n"
+            "Subtle, natural motion — keep framing and subject consistent with the reference image. "
+            "No text, no captions, no watermark."
+        )
     try:
         operation = _gemini_client.models.generate_videos(
-            model=VEO_MODEL,
+            model=tier["model"],
             prompt=prompt,
             image=veo_image,
-            config=types.GenerateVideosConfig(aspect_ratio=veo_aspect, duration_seconds=duration),
+            config=types.GenerateVideosConfig(
+                aspect_ratio=veo_aspect, duration_seconds=duration, generate_audio=True
+            ),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Veo video generation failed to start: {e}")
@@ -1200,7 +1289,7 @@ def _generate_ad_scene_video(image_url: str, visual_description: str, camera_sho
             video_bytes = f.read()
     url = _upload_video_preview(video_bytes, f"ads/{campaign_id}/scenes/{uuid.uuid4().hex}_veo.mp4")
     _log_cost(campaign_id, "ad_scene_video", cost_cents)
-    return url
+    return url, duration
 
 
 def _generate_ad_line_audio(text: str, voice_name: str, campaign_id: str) -> str:
@@ -1252,6 +1341,7 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
         aspect_ratio = campaign.get("aspect_ratio") or "9:16"
         resolution = campaign.get("resolution") or "720p"
         use_veo = bool(campaign.get("use_veo"))
+        veo_tier = campaign.get("veo_tier") or DEFAULT_VEO_TIER
         width, height = _ad_target_dimensions(aspect_ratio, resolution)
 
         voice_name = campaign.get("voice_name")
@@ -1268,27 +1358,7 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             for i, scene in enumerate(scenes):
                 dialogue = (scene.get("dialogue_or_vo") or "").strip()
                 planned_seconds = float(scene.get("seconds") or 3.0)
-
-                audio_path = os.path.join(tmp, f"scene_{i}_audio.wav")
-                if dialogue:
-                    line_url = _generate_ad_line_audio(dialogue, voice_name, campaign_id)
-                    raw_path = os.path.join(tmp, f"scene_{i}_raw.wav")
-                    _download_to_file(line_url, raw_path)
-                    audio_duration = _ffprobe_duration(raw_path)
-                    if audio_duration < planned_seconds:
-                        pad_path = os.path.join(tmp, f"scene_{i}_pad.wav")
-                        _render_silence(planned_seconds - audio_duration, pad_path)
-                        _concat_audio([raw_path, pad_path], audio_path)
-                        scene_duration = planned_seconds
-                    else:
-                        audio_path = raw_path
-                        scene_duration = audio_duration
-                    cues = _scene_cues([scene.get("caption_text") or dialogue], [scene_duration])
-                else:
-                    _render_silence(planned_seconds, audio_path)
-                    scene_duration = planned_seconds
-                    caption = (scene.get("caption_text") or "").strip()
-                    cues = _scene_cues([caption], [scene_duration]) if caption else []
+                caption = (scene.get("caption_text") or dialogue).strip()
 
                 image_prompt = (
                     f"Cinematic marketing video scene. {aspect_ratio} aspect ratio. "
@@ -1299,18 +1369,65 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                 image_url = _generate_ad_scene_image(image_prompt, reference_urls, campaign_id)
 
                 clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
-                if use_veo:
-                    video_url = _generate_ad_scene_video(
-                        image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "", aspect_ratio, campaign_id
+
+                if use_veo and dialogue:
+                    # Veo generates the video AND voices the dialogue
+                    # itself — kept as-is (not layered with a separate
+                    # TTS track) for real lip-adjacent sync. The clip's
+                    # length follows Veo's own fixed duration, not the
+                    # script's planned seconds — see
+                    # _render_ad_scene_clip_veo_native_audio's docstring
+                    # for why looping/trimming generated speech would be
+                    # worse than a little total-runtime drift.
+                    video_url, veo_duration = _generate_ad_scene_video(
+                        image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
+                        aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue,
                     )
                     video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
                     _download_to_file(video_url, video_path)
-                    _render_ad_scene_clip_from_video(video_path, audio_path, cues, scene_duration, width, height, clip_path)
+                    scene_duration = float(veo_duration)
+                    cues = _scene_cues([caption], [scene_duration]) if caption else []
+                    _render_ad_scene_clip_veo_native_audio(video_path, cues, width, height, clip_path)
                 else:
-                    image_path = os.path.join(tmp, f"scene_{i}.png")
-                    _download_to_file(image_url, image_path)
-                    pan = "left_right" if i % 2 else "center"
-                    _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
+                    audio_path = os.path.join(tmp, f"scene_{i}_audio.wav")
+                    if dialogue:
+                        line_url = _generate_ad_line_audio(dialogue, voice_name, campaign_id)
+                        raw_path = os.path.join(tmp, f"scene_{i}_raw.wav")
+                        _download_to_file(line_url, raw_path)
+                        audio_duration = _ffprobe_duration(raw_path)
+                        if audio_duration < planned_seconds:
+                            pad_path = os.path.join(tmp, f"scene_{i}_pad.wav")
+                            _render_silence(planned_seconds - audio_duration, pad_path)
+                            _concat_audio([raw_path, pad_path], audio_path)
+                            scene_duration = planned_seconds
+                        else:
+                            audio_path = raw_path
+                            scene_duration = audio_duration
+                        cues = _scene_cues([caption], [scene_duration]) if caption else []
+                    else:
+                        _render_silence(planned_seconds, audio_path)
+                        scene_duration = planned_seconds
+                        cues = _scene_cues([caption], [scene_duration]) if caption else []
+
+                    if use_veo:
+                        # No dialogue — a pure visual/establishing beat.
+                        # Veo's own ambient audio is kept (no speech to
+                        # protect from looping), so the silence track
+                        # above is unused here; it still gets rendered
+                        # for simplicity/symmetry with the Ken Burns path.
+                        video_url, _ = _generate_ad_scene_video(
+                            image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
+                            aspect_ratio, campaign_id, veo_tier=veo_tier,
+                        )
+                        video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
+                        _download_to_file(video_url, video_path)
+                        _render_ad_scene_clip_from_video(video_path, audio_path, cues, scene_duration, width, height, clip_path)
+                    else:
+                        image_path = os.path.join(tmp, f"scene_{i}.png")
+                        _download_to_file(image_url, image_path)
+                        pan = "left_right" if i % 2 else "center"
+                        _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
+
                 _validate_clip(clip_path, f"Scene {i + 1}")
                 clip_paths.append(clip_path)
                 _update_job(job_id, progress_pct=int((i + 1) / total * 85))

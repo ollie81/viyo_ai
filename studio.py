@@ -401,6 +401,16 @@ def _extract_audio_pcm(response: types.GenerateContentResponse) -> tuple[bytes, 
 
 
 def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
+    # Gemini's returned PCM chunk has no guaranteed alignment to the
+    # 2-byte (16-bit) sample width declared below — confirmed live: an
+    # odd-length byte string leaves one dangling byte that gets written
+    # into the WAV data chunk as a malformed final sample, which most
+    # decoders (and ffmpeg) render as a short click/pop right at the
+    # end of playback — reported directly as "weird sounds in the
+    # speech end." Trimming to the nearest whole sample before writing
+    # drops at most one byte (inaudible) instead of corrupting the tail.
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
         wav_file.setnchannels(1)

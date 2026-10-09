@@ -27,6 +27,7 @@ create table if not exists ad_campaigns (
   aspect_ratio text not null default '9:16',
   resolution text not null default '720p',
   use_veo boolean not null default false,
+  veo_tier text not null default 'lite',
   voice_gender_preference text,
   voice_name text,
   selected_hook_id uuid,
@@ -106,6 +107,11 @@ create table if not exists ad_viyo_asset_library (
   label text not null default '',
   created_at timestamptz not null default now()
 );
+
+-- Safe to run even if ad_campaigns already exists from an earlier
+-- version of this file (the CREATE TABLE above only applies to a fresh
+-- table) — adds the Veo-tier column if it isn't there yet.
+alter table ad_campaigns add column if not exists veo_tier text not null default 'lite';
 
 alter table ad_campaigns enable row level security;
 alter table ad_assets enable row level security;
