@@ -307,6 +307,7 @@ class CampaignOut(BaseModel):
     script: Optional[list[dict]] = None
     status: str
     video_url: Optional[str] = None
+    bunny_video_id: Optional[str] = None
     thumbnail_url: Optional[str] = None
     duration_actual_seconds: Optional[int] = None
     cost_usd_cents: int
@@ -339,6 +340,7 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         script=row.get("script"),
         status=row.get("status") or "draft",
         video_url=row.get("video_url"),
+        bunny_video_id=row.get("bunny_video_id"),
         thumbnail_url=row.get("thumbnail_url"),
         duration_actual_seconds=row.get("duration_actual_seconds"),
         cost_usd_cents=row.get("cost_usd_cents") or 0,
