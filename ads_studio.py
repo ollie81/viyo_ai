@@ -1217,16 +1217,27 @@ def _generate_ad_scene_video(
     "16:9"/"9:16" (never called for a 1:1 campaign — create_campaign/
     update_campaign already reject use_veo+1:1 together).
 
-    When [dialogue] is given, this asks Veo to generate and voice that
-    exact line itself (generate_audio=True) rather than animating
-    silently — real lip-adjacent sync, since Veo renders the video and
-    its speech together, at the cost of not controlling the exact voice
-    or guaranteeing word-for-word delivery the way a separate Gemini TTS
-    pass does. The caller (_run_ad_generation) keeps this native audio
-    track instead of layering TTS on top when dialogue is set. Returns
-    (video_url, actual_duration_seconds) — the duration matters because
-    the caller must NOT loop/trim a clip that has real generated speech
-    in it (see _render_ad_scene_clip_veo_native_audio's own docstring)."""
+    When [dialogue] is given, the prompt asks Veo to speak that exact
+    line itself rather than animating silently — real lip-adjacent
+    sync, since Veo renders the video and its own audio together, at
+    the cost of not controlling the exact voice or guaranteeing word-
+    for-word delivery the way a separate Gemini TTS pass does. The
+    caller (_run_ad_generation) keeps this native audio track instead
+    of layering TTS on top when dialogue is set.
+
+    Does NOT pass generate_audio in GenerateVideosConfig — confirmed
+    live that it 502s immediately ("generate_audio parameter is only
+    supported in Gemini Enterprise Agent Platform mode, not in Gemini
+    Developer API mode"), since this codebase authenticates with a
+    plain API key (genai.Client(api_key=...)), not Vertex AI/Enterprise.
+    Per studio.py's own generate_scene_video (proven working, also
+    never sets this field), Veo's audio generation is always on
+    regardless on the Developer API tier — the field exists only to
+    explicitly toggle it on the Enterprise tier, which isn't this
+    project's access level. Returns (video_url, actual_duration_seconds)
+    — the duration matters because the caller must NOT loop/trim a clip
+    that has real generated speech in it (see
+    _render_ad_scene_clip_veo_native_audio's own docstring)."""
     tier = VEO_TIERS.get(veo_tier, VEO_TIERS[DEFAULT_VEO_TIER])
     veo_aspect = "16:9" if aspect_ratio == "16:9" else "9:16"
     duration = VEO_ALLOWED_DURATIONS[-1] if dialogue else VEO_ALLOWED_DURATIONS[0]
@@ -1253,9 +1264,7 @@ def _generate_ad_scene_video(
             model=tier["model"],
             prompt=prompt,
             image=veo_image,
-            config=types.GenerateVideosConfig(
-                aspect_ratio=veo_aspect, duration_seconds=duration, generate_audio=True
-            ),
+            config=types.GenerateVideosConfig(aspect_ratio=veo_aspect, duration_seconds=duration),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Veo video generation failed to start: {e}")
