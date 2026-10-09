@@ -181,6 +181,18 @@ try:
 except Exception as _studio_import_error:
     print(f"[WARN] Studio router not loaded: {_studio_import_error}")
 
+# Ads Studio imports `from studio import ...` for its reused Gemini/Veo/
+# ffmpeg/Bunny helpers, so it only has a chance of loading if Studio
+# itself already did — same isolation reasoning as Studio's own
+# try/except above, so a problem here can never take down the rest of
+# the app, including Studio itself.
+try:
+    from ads_studio import router as ads_studio_router
+
+    app.include_router(ads_studio_router)
+except Exception as _ads_studio_import_error:
+    print(f"[WARN] Ads Studio router not loaded: {_ads_studio_import_error}")
+
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
