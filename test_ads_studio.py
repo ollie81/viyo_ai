@@ -19,6 +19,7 @@ from ads_studio import (
     _normalize_scene_durations,
     _scene_count_for_duration,
     _ad_target_dimensions,
+    _veo_duration_for_scene,
 )
 
 
@@ -98,6 +99,26 @@ class AdTargetDimensionsTests(unittest.TestCase):
         w2, h2 = _ad_target_dimensions("1:1", "1080p")
         self.assertEqual(w2, h2)
         self.assertGreater(w2, w)
+
+
+class VeoDurationForSceneTests(unittest.TestCase):
+    def test_dialogue_picks_closest_allowed_duration(self):
+        # Regression for the real bug: an 8s campaign splits into two
+        # ~4s scenes, and every dialogue scene was coming back at a
+        # flat 8s regardless of the plan, doubling the assembled video.
+        self.assertEqual(_veo_duration_for_scene(4.0, has_dialogue=True), 4)
+        self.assertEqual(_veo_duration_for_scene(3.0, has_dialogue=True), 4)
+        self.assertEqual(_veo_duration_for_scene(5.0, has_dialogue=True), 4)
+        self.assertEqual(_veo_duration_for_scene(5.5, has_dialogue=True), 6)
+        self.assertEqual(_veo_duration_for_scene(7.0, has_dialogue=True), 6)
+        self.assertEqual(_veo_duration_for_scene(8.0, has_dialogue=True), 8)
+        self.assertEqual(_veo_duration_for_scene(100.0, has_dialogue=True), 8)
+
+    def test_silent_scene_always_takes_shortest(self):
+        # No speech to protect from looping — always the cheapest tier,
+        # the renderer stretches/loops it to the planned length later.
+        self.assertEqual(_veo_duration_for_scene(4.0, has_dialogue=False), 4)
+        self.assertEqual(_veo_duration_for_scene(30.0, has_dialogue=False), 4)
 
 
 if __name__ == "__main__":

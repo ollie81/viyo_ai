@@ -1211,9 +1211,28 @@ def _generate_ad_scene_image(prompt: str, reference_urls: list[str], campaign_id
     return url
 
 
+def _veo_duration_for_scene(target_seconds: float, has_dialogue: bool) -> int:
+    """Picks which of Veo's fixed clip lengths (VEO_ALLOWED_DURATIONS,
+    e.g. 4/6/8s) to render. A dialogue scene's clip length becomes the
+    final scene length as-is (its real generated speech can't be looped
+    or trimmed to fit afterward — see _render_ad_scene_clip_veo_native_
+    audio), so it picks whichever allowed duration is closest to what
+    the script actually planned for this scene. Previously this always
+    returned the longest allowed duration regardless of the plan, so a
+    short campaign split into several short dialogue scenes (e.g. an 8s
+    ad as two ~4s scenes) rendered every scene at a flat 8s and silently
+    doubled the assembled video's real length. A silent scene has
+    nothing to protect from looping, so it always takes the shortest
+    (cheapest) tier — the renderer stretches/loops it to the planned
+    length afterward."""
+    if not has_dialogue:
+        return VEO_ALLOWED_DURATIONS[0]
+    return min(VEO_ALLOWED_DURATIONS, key=lambda d: abs(d - target_seconds))
+
+
 def _generate_ad_scene_video(
     image_url: str, visual_description: str, camera_shot: str, aspect_ratio: str, campaign_id: str,
-    veo_tier: str = DEFAULT_VEO_TIER, dialogue: Optional[str] = None,
+    veo_tier: str = DEFAULT_VEO_TIER, dialogue: Optional[str] = None, target_seconds: float = 4.0,
 ) -> tuple[str, int]:
     """Reuses studio.py's _fetch_veo_image unmodified. Veo only accepts
     "16:9"/"9:16" (never called for a 1:1 campaign — create_campaign/
@@ -1239,10 +1258,14 @@ def _generate_ad_scene_video(
     project's access level. Returns (video_url, actual_duration_seconds)
     — the duration matters because the caller must NOT loop/trim a clip
     that has real generated speech in it (see
-    _render_ad_scene_clip_veo_native_audio's own docstring)."""
+    _render_ad_scene_clip_veo_native_audio's own docstring).
+
+    [target_seconds] is the script's planned length for this scene —
+    see _veo_duration_for_scene for how that maps to one of Veo's fixed
+    clip lengths."""
     tier = VEO_TIERS.get(veo_tier, VEO_TIERS[DEFAULT_VEO_TIER])
     veo_aspect = "16:9" if aspect_ratio == "16:9" else "9:16"
-    duration = VEO_ALLOWED_DURATIONS[-1] if dialogue else VEO_ALLOWED_DURATIONS[0]
+    duration = _veo_duration_for_scene(target_seconds, bool(dialogue))
     cost_cents = duration * tier["price_per_sec_cents"]
     _check_daily_cap(cost_cents)
 
@@ -1392,7 +1415,7 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                     # worse than a little total-runtime drift.
                     video_url, veo_duration = _generate_ad_scene_video(
                         image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
-                        aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue,
+                        aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue, target_seconds=planned_seconds,
                     )
                     video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
                     _download_to_file(video_url, video_path)
