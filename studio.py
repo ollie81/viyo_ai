@@ -2024,12 +2024,37 @@ def _wrap_caption_lines(
     return kept
 
 
-def _build_caption_filters(cues: list[tuple[str, float, float]], tmp_dir: str, prefix: str) -> str:
+def _caption_metrics(canvas_width: int) -> tuple[int, int, int]:
+    """Scales (font_size, line_height, border_width) to an actual
+    output width. _CAPTION_FONT_SIZE/_CAPTION_LINE_HEIGHT were
+    calibrated against Drama Studio's one fixed canvas (1080 wide) —
+    canvas_width=1080 (the default below) reproduces those exact
+    numbers bit-for-bit. Ads Studio renders at several different
+    widths (720p 9:16 is 720 wide, 16:9 can be 1280/1920, 1:1 can be
+    720/1080), and burning in text sized for a 1080-wide frame onto a
+    720-wide one was visibly oversized relative to the frame and could
+    overflow past the edges — _CAPTION_MAX_CHARS_PER_LINE is a plain
+    character count with no real pixel measurement behind it, so it
+    only stays correct if font size and frame width scale together.
+    Border width scales too so the outline doesn't look chunky (small
+    frame) or thin (large frame) relative to the text."""
+    scale = canvas_width / 1080.0
+    font_size = max(28, round(_CAPTION_FONT_SIZE * scale))
+    line_height = font_size + max(8, round(18 * scale))
+    border_w = max(2, round(3 * scale))
+    return font_size, line_height, border_w
+
+
+def _build_caption_filters(cues: list[tuple[str, float, float]], tmp_dir: str, prefix: str, canvas_width: int = 1080) -> str:
     """Builds a chained drawtext filter string burning in [cues] —
     (text, start_seconds, end_seconds) dialogue cues — as bold white,
     black-outlined text anchored in the lower third (~72% down the
     frame, see _CAPTION_Y_FRACTION), each cue capped at 2 lines.
     Returns "" (nothing to append to a -vf chain) if there are no cues.
+    [canvas_width] is the actual output frame width in pixels — see
+    _caption_metrics for why it matters; the default (1080) is Drama
+    Studio's own fixed canvas, so every existing call site here in
+    studio.py is unaffected by this parameter's existence.
 
     Deliberately drawtext, not the `subtitles` filter this used to use:
     an SRT run through `subtitles` falls back to libass's own default
@@ -2055,6 +2080,7 @@ def _build_caption_filters(cues: list[tuple[str, float, float]], tmp_dir: str, p
     """
     if not cues:
         return ""
+    font_size, line_height, border_w = _caption_metrics(canvas_width)
     filters = []
     for ci, (text, start, end) in enumerate(cues):
         for li, line in enumerate(_wrap_caption_lines(text)):
@@ -2065,10 +2091,10 @@ def _build_caption_filters(cues: list[tuple[str, float, float]], tmp_dir: str, p
             # took — ffmpeg's filter string syntax treats a bare ":" as
             # an option separator.
             safe_path = text_path.replace("\\", "/").replace(":", "\\:")
-            y = f"h*{_CAPTION_Y_FRACTION}+{li * _CAPTION_LINE_HEIGHT}"
+            y = f"h*{_CAPTION_Y_FRACTION}+{li * line_height}"
             filters.append(
                 f"drawtext=fontfile={_CAPTION_FONT_BOLD_PATH}:textfile='{safe_path}':"
-                f"fontcolor=white:fontsize={_CAPTION_FONT_SIZE}:borderw=3:bordercolor=black:"
+                f"fontcolor=white:fontsize={font_size}:borderw={border_w}:bordercolor=black:"
                 f"x=(w-text_w)/2:y={y}:enable='between(t\\,{start:.3f}\\,{end:.3f})'"
             )
     return "," + ",".join(filters)

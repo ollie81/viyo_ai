@@ -158,6 +158,20 @@ AD_DURATIONS = (8, 15, 30, 45, 60)
 AD_ASPECT_RATIOS = ("9:16", "16:9", "1:1")
 AD_RESOLUTIONS = ("720p", "1080p")
 
+# What an uploaded asset actually IS, for any campaign/product — not
+# specific to any one brand. This is the real distinction section 2 of
+# the Ads Studio spec asks for: a "product asset" (screenshot/product
+# photo/logo) is real source material that must render exactly as
+# uploaded, never silently reinterpreted by a generative model; a
+# "creative" asset (plain "other") is fair game as loose visual/style
+# conditioning for AI-generated scenes. "reference" is kept accepted
+# (not rejected) purely for backward compatibility with assets uploaded
+# before this distinction existed — those stay treated as creative-only
+# (the safe default when the asset's real nature isn't known), never
+# promoted to exact-reproduction automatically.
+AD_ASSET_TYPES = ("screenshot", "product_photo", "logo", "other")
+EXACT_ASSET_TYPES = {"screenshot", "product_photo", "logo"}
+
 # ---------------------------------------------------------------------------
 # Ad formats — each entry's "style" is baked into the hook/script prompts
 # below so the generated content actually reads differently per format,
@@ -525,9 +539,11 @@ def _validate_and_store_image(data: bytes, content_type: Optional[str], filename
 
 
 @router.post("/campaign/{campaign_id}/assets", response_model=AssetOut, dependencies=[Depends(_require_admin)])
-async def upload_campaign_asset(campaign_id: str, asset_type: str = "reference", file: UploadFile = File(...)):
+async def upload_campaign_asset(campaign_id: str, asset_type: str = "other", file: UploadFile = File(...)):
     _require_configured()
     _get_campaign(campaign_id)
+    if asset_type not in AD_ASSET_TYPES:
+        asset_type = "other"
     try:
         count_result = (
             supabase_admin.table("ad_assets")
@@ -956,6 +972,16 @@ class AdSceneSchema(BaseModel):
     dialogue_or_vo: str
     caption_text: str
     is_cta: bool
+    # Empty string (never omitted — Gemini structured output needs a
+    # concrete value) unless this scene should show one of the real
+    # uploaded assets AS-IS, in which case it's that asset's token
+    # (e.g. "A2") from the ASSET LIST block in the prompt below. See
+    # _run_ad_generation: a scene with this set renders via
+    # deterministic compositing on the real asset file, never through
+    # an image/video model, so it must be a genuine match. Defaulted so
+    # an older client's save-script request (sent before this field
+    # existed) still validates instead of 422ing.
+    featured_asset_id: str = ""
 
 
 class AdScriptSchema(BaseModel):
@@ -973,7 +999,7 @@ AUDIENCE: {audience}
 OBJECTIVE: {objective}
 FORMAT STYLE: {format_style}
 CALL TO ACTION (must be the final scene): {cta_text}
-
+{asset_block}
 Write exactly {scene_count} scenes totaling {duration} seconds. Apply this pacing:
 - Scene 1 (0-3s): the hook above, staged as an interesting visual/action/line — no logo, no intro, nothing wasted.
 - Early-middle scenes: continue the story/demonstration naturally, raising curiosity or stakes.
@@ -990,16 +1016,56 @@ For each scene give:
 - caption_text: the on-screen caption burned into the video for this scene (usually the same as dialogue_or_vo, \
 condensed if long)
 - is_cta: true only for the final scene
+- featured_asset_id: {asset_field_instruction}
 
 Keep dialogue natural and in-character for the format — never a generic ad-read, never "Hey guys, check out this app."
 """
 
+_ASSET_BLOCK_TEMPLATE = """
+REAL UPLOADED ASSETS AVAILABLE (shown above as images, in this exact order) — these are actual product \
+screenshots/photos/logos the user supplied, not something to reinterpret:
+{asset_list}
 
-def _build_script_prompt(campaign: dict, hook_text: str) -> str:
+Any scene that should show one of these AS-IS — the real app/website screenshot being demonstrated, the real \
+product photo, or the real logo — must set featured_asset_id to that asset's token (e.g. "A2"). A scene with \
+featured_asset_id set renders the literal uploaded image directly with no AI reinterpretation, so only use a \
+token when that specific asset is actually right for that scene (the screenshot that matches what's being \
+described, the product actually being shown, etc.) — never reference an asset that doesn't fit. Leave it "" for \
+any scene that's a generated/creative visual (atmosphere, a situation, storytelling with no specific real asset \
+on screen). Not every scene needs a real asset, and some campaigns call for mostly generated scenes with the \
+real asset shown only once or twice where it actually matters (e.g. a screenshot during an app demo beat, a \
+product photo at the reveal, a logo at the very end) — use real assets where showing the literal real thing is \
+what the scene calls for, not everywhere just because they're available.
+"""
+
+
+def _build_asset_block(assets: list[dict]) -> tuple[str, str]:
+    """Returns (prompt block describing the assets by token, instruction
+    for the featured_asset_id field) — empty strings when there are no
+    assets, so a campaign with nothing uploaded gets the exact same
+    prompt as before this feature existed."""
+    if not assets:
+        return "", '"" — this campaign has no uploaded assets, so every scene is generated/creative.'
+    lines = []
+    for i, a in enumerate(assets):
+        token = f"A{i + 1}"
+        label = (a.get("label") or "").strip() or "untitled"
+        lines.append(f"{token}: type={a.get('asset_type') or 'other'}, label={label}")
+    asset_list = "\n".join(lines)
+    block = _ASSET_BLOCK_TEMPLATE.format(asset_list=asset_list)
+    instruction = (
+        'one of the asset tokens above (e.g. "A1") if this scene should show that real asset as-is, or "" for a '
+        "generated/creative scene"
+    )
+    return block, instruction
+
+
+def _build_script_prompt(campaign: dict, hook_text: str, assets: list[dict]) -> str:
     format_key = campaign.get("format") or campaign.get("recommended_format") or "story_driven"
     format_info = AD_FORMATS.get(format_key, AD_FORMATS["story_driven"])
     duration = campaign.get("duration_seconds") or 15
     features = "; ".join(campaign.get("target_features") or []) or "none specified"
+    asset_block, asset_field_instruction = _build_asset_block(assets)
     return _SCRIPT_PROMPT.format(
         duration=duration,
         format_label=format_info["label"],
@@ -1012,6 +1078,8 @@ def _build_script_prompt(campaign: dict, hook_text: str) -> str:
         objective=campaign.get("objective") or "drive interest and engagement",
         cta_text=campaign.get("cta_text") or "Try it today",
         scene_count=_scene_count_for_duration(duration),
+        asset_block=asset_block,
+        asset_field_instruction=asset_field_instruction,
     )
 
 
@@ -1028,6 +1096,22 @@ class GenerateScriptResponse(BaseModel):
     cost_usd_cents: int
 
 
+def _resolve_featured_asset_tokens(scenes: list[dict], assets: list[dict]) -> list[dict]:
+    """Maps each scene's featured_asset_id (a short token like "A2" —
+    see _build_asset_block) back to the real ad_assets row id, so
+    everything downstream (_run_ad_generation) only ever deals in real
+    ids and never has to know the token scheme existed. An
+    unrecognized/hallucinated token (or one from a stale/edited asset
+    list) safely falls back to "" — a generated/creative scene — rather
+    than erroring the whole script, since a wrong guess here is a
+    missed opportunity, not a correctness bug worth failing over."""
+    token_to_id = {f"A{i + 1}": a["id"] for i, a in enumerate(assets)}
+    for s in scenes:
+        token = (s.get("featured_asset_id") or "").strip()
+        s["featured_asset_id"] = token_to_id.get(token, "")
+    return scenes
+
+
 @router.post("/campaign/{campaign_id}/script", response_model=GenerateScriptResponse, dependencies=[Depends(_require_admin)])
 async def generate_script(campaign_id: str):
     _require_configured()
@@ -1039,13 +1123,34 @@ async def generate_script(campaign_id: str):
     if not hook_rows:
         raise HTTPException(status_code=400, detail="Selected hook no longer exists — pick another.")
     hook_text = hook_rows[0]["hook_text"]
+    assets = _load_campaign_assets(campaign_id)
 
-    prompt = _build_script_prompt(campaign, hook_text)
-    _check_daily_cap(_estimate_text_cost_cents(prompt))
+    prompt = _build_script_prompt(campaign, hook_text, assets)
+    # A small flat per-image buffer on top of the text-only estimate —
+    # _estimate_text_cost_cents only counts prompt characters, not the
+    # vision tokens each uploaded asset adds once shown to the model
+    # below. This is only a pre-flight budget-cap check; the real spend
+    # logged after the call (_text_cost_cents) always reads the actual
+    # usage_metadata regardless.
+    _check_daily_cap(_estimate_text_cost_cents(prompt) + len(assets))
+    # Gemini actually SEES each uploaded asset (not just a text label)
+    # so it can judge which real screenshot/photo genuinely fits which
+    # scene — "understand the selected product and use the supplied
+    # assets appropriately" only works if the model looks at them.
+    # Interleaving "Asset A{n}:" immediately before each image is what
+    # lets it reliably echo back the right token.
+    contents: list = []
+    for i, a in enumerate(assets):
+        contents.append(types.Part.from_text(text=f"Asset A{i + 1} ({a.get('asset_type') or 'other'}):"))
+        try:
+            contents.append(_fetch_image_part(a["url"]))
+        except HTTPException:
+            contents.pop()  # text label with no image behind it is worse than omitting the asset entirely
+    contents.append(types.Part.from_text(text=prompt))
     try:
         response = _gemini_client.models.generate_content(
             model=GEMINI_TEXT_MODEL,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=AdScriptSchema),
         )
     except Exception as e:
@@ -1060,6 +1165,7 @@ async def generate_script(campaign_id: str):
 
     scenes = sorted((s.model_dump() for s in parsed.scenes), key=lambda s: s["order"])
     scenes = _normalize_scene_durations(scenes, float(campaign.get("duration_seconds") or 15))
+    scenes = _resolve_featured_asset_tokens(scenes, assets)
     if scenes:
         scenes[-1]["is_cta"] = True
 
@@ -1135,7 +1241,7 @@ def _render_ad_scene_clip(
         f"scale={upscale_w}:{upscale_h},zoompan=z='min(zoom+{zoom_step:.8f},{_ZOOM_MAX})':x='{x_expr}':"
         f"y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={_FFMPEG_FPS}"
     )
-    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
+    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0], canvas_width=width)
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
         "-vf", vf, "-t", str(duration),
@@ -1150,7 +1256,7 @@ def _render_ad_scene_clip_from_video(
 ) -> None:
     vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={_FFMPEG_FPS}"
     has_dialogue = bool(cues)
-    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
+    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0], canvas_width=width)
     if has_dialogue:
         cmd = [
             "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path, "-i", audio_path,
@@ -1183,7 +1289,7 @@ def _render_ad_scene_clip_veo_native_audio(
     is worse than a campaign's total runtime drifting slightly from the
     requested duration."""
     vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={_FFMPEG_FPS}"
-    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
+    vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0], canvas_width=width)
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vf", vf,
@@ -1348,6 +1454,38 @@ def _generate_ad_line_audio(text: str, voice_name: str, campaign_id: str) -> str
     return url
 
 
+def _build_scene_audio_track(
+    dialogue: str, planned_seconds: float, caption: str, voice_name: str, campaign_id: str, tmp: str, i: int,
+) -> tuple[str, float, list[tuple[str, float, float]]]:
+    """Builds a scene's standalone audio track — TTS dialogue (padded
+    with silence up to the planned length if the line runs short, or
+    left at its real spoken length if longer, never truncated mid-
+    word) or plain silence for a pure-visual beat — plus its caption
+    cues. Shared by both the real-asset compositing path and the
+    generated-image Ken Burns path below; neither involves Veo's own
+    native audio, so both need this exact same track-building logic."""
+    audio_path = os.path.join(tmp, f"scene_{i}_audio.wav")
+    if dialogue:
+        line_url = _generate_ad_line_audio(dialogue, voice_name, campaign_id)
+        raw_path = os.path.join(tmp, f"scene_{i}_raw.wav")
+        _download_to_file(line_url, raw_path)
+        audio_duration = _ffprobe_duration(raw_path)
+        if audio_duration < planned_seconds:
+            pad_path = os.path.join(tmp, f"scene_{i}_pad.wav")
+            _render_silence(planned_seconds - audio_duration, pad_path)
+            _concat_audio([raw_path, pad_path], audio_path)
+            scene_duration = planned_seconds
+        else:
+            audio_path = raw_path
+            scene_duration = audio_duration
+        cues = _scene_cues([caption], [scene_duration]) if caption else []
+    else:
+        _render_silence(planned_seconds, audio_path)
+        scene_duration = planned_seconds
+        cues = _scene_cues([caption], [scene_duration]) if caption else []
+    return audio_path, scene_duration, cues
+
+
 def _update_job(job_id: str, **fields) -> None:
     fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
@@ -1371,7 +1509,14 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
         if not scenes:
             raise HTTPException(status_code=400, detail="No script to generate from.")
         assets = _load_campaign_assets(campaign_id)
-        reference_urls = [a["url"] for a in assets]
+        assets_by_id = {a["id"]: a for a in assets}
+        # A screenshot as loose "style inspiration" for a generated
+        # creative scene produces nonsense (the model redraws random
+        # UI into an unrelated shot) — excluded from the generic
+        # conditioning pool. A product photo or logo is legitimate
+        # style/brand grounding for a generated scene even when that
+        # scene isn't showing the asset itself verbatim, so those stay.
+        creative_reference_urls = [a["url"] for a in assets if a.get("asset_type") != "screenshot"]
         aspect_ratio = campaign.get("aspect_ratio") or "9:16"
         resolution = campaign.get("resolution") or "720p"
         use_veo = bool(campaign.get("use_veo"))
@@ -1393,74 +1538,82 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                 dialogue = (scene.get("dialogue_or_vo") or "").strip()
                 planned_seconds = float(scene.get("seconds") or 3.0)
                 caption = (scene.get("caption_text") or dialogue).strip()
-
-                image_prompt = (
-                    f"Cinematic marketing video scene. {aspect_ratio} aspect ratio. "
-                    f"Camera shot: {scene.get('camera_shot') or 'medium'} shot. "
-                    f"What's happening: {scene.get('visual_description') or ''}\n\n"
-                    "No text, no watermark, no captions baked into the image."
-                )
-                image_url = _generate_ad_scene_image(image_prompt, reference_urls, campaign_id)
-
                 clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
 
-                if use_veo and dialogue:
-                    # Veo generates the video AND voices the dialogue
-                    # itself — kept as-is (not layered with a separate
-                    # TTS track) for real lip-adjacent sync. The clip's
-                    # length follows Veo's own fixed duration, not the
-                    # script's planned seconds — see
-                    # _render_ad_scene_clip_veo_native_audio's docstring
-                    # for why looping/trimming generated speech would be
-                    # worse than a little total-runtime drift.
-                    video_url, veo_duration = _generate_ad_scene_video(
-                        image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
-                        aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue, target_seconds=planned_seconds,
-                    )
-                    video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
-                    _download_to_file(video_url, video_path)
-                    scene_duration = float(veo_duration)
-                    cues = _scene_cues([caption], [scene_duration]) if caption else []
-                    _render_ad_scene_clip_veo_native_audio(video_path, cues, width, height, clip_path)
-                else:
-                    audio_path = os.path.join(tmp, f"scene_{i}_audio.wav")
-                    if dialogue:
-                        line_url = _generate_ad_line_audio(dialogue, voice_name, campaign_id)
-                        raw_path = os.path.join(tmp, f"scene_{i}_raw.wav")
-                        _download_to_file(line_url, raw_path)
-                        audio_duration = _ffprobe_duration(raw_path)
-                        if audio_duration < planned_seconds:
-                            pad_path = os.path.join(tmp, f"scene_{i}_pad.wav")
-                            _render_silence(planned_seconds - audio_duration, pad_path)
-                            _concat_audio([raw_path, pad_path], audio_path)
-                            scene_duration = planned_seconds
-                        else:
-                            audio_path = raw_path
-                            scene_duration = audio_duration
-                        cues = _scene_cues([caption], [scene_duration]) if caption else []
-                    else:
-                        _render_silence(planned_seconds, audio_path)
-                        scene_duration = planned_seconds
-                        cues = _scene_cues([caption], [scene_duration]) if caption else []
+                featured_asset = assets_by_id.get((scene.get("featured_asset_id") or "").strip())
+                use_exact_asset = bool(featured_asset) and featured_asset.get("asset_type") in EXACT_ASSET_TYPES
 
-                    if use_veo:
-                        # No dialogue — a pure visual/establishing beat.
-                        # Veo's own ambient audio is kept (no speech to
-                        # protect from looping), so the silence track
-                        # above is unused here; it still gets rendered
-                        # for simplicity/symmetry with the Ken Burns path.
-                        video_url, _ = _generate_ad_scene_video(
+                if use_exact_asset:
+                    # Deterministic compositing on the REAL uploaded
+                    # asset — never regenerated, never Veo-animated —
+                    # so its pixels are guaranteed to be exactly what
+                    # the user actually uploaded (the real app
+                    # screenshot, product photo, or logo), not an AI
+                    # model's reinterpretation of it. See section 2 of
+                    # the Ads Studio spec: "use deterministic video
+                    # compositing rather than asking an image or video
+                    # model to recreate their details from text."
+                    url_path = featured_asset["url"].split("?")[0]
+                    ext = os.path.splitext(url_path)[1] or ".jpg"
+                    image_path = os.path.join(tmp, f"scene_{i}_real_asset{ext}")
+                    _download_to_file(featured_asset["url"], image_path)
+                    audio_path, scene_duration, cues = _build_scene_audio_track(
+                        dialogue, planned_seconds, caption, voice_name, campaign_id, tmp, i
+                    )
+                    pan = "left_right" if i % 2 else "center"
+                    _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
+                else:
+                    image_prompt = (
+                        f"Cinematic marketing video scene. {aspect_ratio} aspect ratio. "
+                        f"Camera shot: {scene.get('camera_shot') or 'medium'} shot. "
+                        f"What's happening: {scene.get('visual_description') or ''}\n\n"
+                        "No text, no watermark, no captions baked into the image."
+                    )
+                    image_url = _generate_ad_scene_image(image_prompt, creative_reference_urls, campaign_id)
+
+                    if use_veo and dialogue:
+                        # Veo generates the video AND voices the
+                        # dialogue itself — kept as-is (not layered
+                        # with a separate TTS track) for real lip-
+                        # adjacent sync. The clip's length follows
+                        # Veo's own fixed duration, not the script's
+                        # planned seconds — see
+                        # _render_ad_scene_clip_veo_native_audio's
+                        # docstring for why looping/trimming generated
+                        # speech would be worse than a little total-
+                        # runtime drift.
+                        video_url, veo_duration = _generate_ad_scene_video(
                             image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
-                            aspect_ratio, campaign_id, veo_tier=veo_tier,
+                            aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue, target_seconds=planned_seconds,
                         )
                         video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
                         _download_to_file(video_url, video_path)
-                        _render_ad_scene_clip_from_video(video_path, audio_path, cues, scene_duration, width, height, clip_path)
+                        scene_duration = float(veo_duration)
+                        cues = _scene_cues([caption], [scene_duration]) if caption else []
+                        _render_ad_scene_clip_veo_native_audio(video_path, cues, width, height, clip_path)
                     else:
-                        image_path = os.path.join(tmp, f"scene_{i}.png")
-                        _download_to_file(image_url, image_path)
-                        pan = "left_right" if i % 2 else "center"
-                        _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
+                        audio_path, scene_duration, cues = _build_scene_audio_track(
+                            dialogue, planned_seconds, caption, voice_name, campaign_id, tmp, i
+                        )
+                        if use_veo:
+                            # No dialogue — a pure visual/establishing
+                            # beat. Veo's own ambient audio is kept (no
+                            # speech to protect from looping), so the
+                            # silence track above is unused here; it
+                            # still gets rendered for simplicity/
+                            # symmetry with the Ken Burns path.
+                            video_url, _ = _generate_ad_scene_video(
+                                image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
+                                aspect_ratio, campaign_id, veo_tier=veo_tier,
+                            )
+                            video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
+                            _download_to_file(video_url, video_path)
+                            _render_ad_scene_clip_from_video(video_path, audio_path, cues, scene_duration, width, height, clip_path)
+                        else:
+                            image_path = os.path.join(tmp, f"scene_{i}.png")
+                            _download_to_file(image_url, image_path)
+                            pan = "left_right" if i % 2 else "center"
+                            _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
 
                 _validate_clip(clip_path, f"Scene {i + 1}")
                 clip_paths.append(clip_path)

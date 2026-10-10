@@ -20,6 +20,9 @@ from ads_studio import (
     _scene_count_for_duration,
     _ad_target_dimensions,
     _veo_duration_for_scene,
+    _build_asset_block,
+    _resolve_featured_asset_tokens,
+    EXACT_ASSET_TYPES,
 )
 
 
@@ -119,6 +122,56 @@ class VeoDurationForSceneTests(unittest.TestCase):
         # the renderer stretches/loops it to the planned length later.
         self.assertEqual(_veo_duration_for_scene(4.0, has_dialogue=False), 4)
         self.assertEqual(_veo_duration_for_scene(30.0, has_dialogue=False), 4)
+
+
+class AssetBlockTests(unittest.TestCase):
+    def test_no_assets_produces_empty_block(self):
+        block, instruction = _build_asset_block([])
+        self.assertEqual(block, "")
+        self.assertIn('""', instruction)
+
+    def test_assets_get_sequential_tokens_in_order(self):
+        assets = [
+            {"asset_type": "screenshot", "label": "Home feed"},
+            {"asset_type": "logo", "label": ""},
+        ]
+        block, instruction = _build_asset_block(assets)
+        self.assertIn("A1: type=screenshot, label=Home feed", block)
+        self.assertIn("A2: type=logo, label=untitled", block)
+        self.assertIn("A1", instruction)
+
+
+class ResolveFeaturedAssetTokensTests(unittest.TestCase):
+    def test_valid_token_maps_to_real_asset_id(self):
+        assets = [{"id": "real-uuid-1"}, {"id": "real-uuid-2"}]
+        scenes = [{"featured_asset_id": "A2"}]
+        resolved = _resolve_featured_asset_tokens(scenes, assets)
+        self.assertEqual(resolved[0]["featured_asset_id"], "real-uuid-2")
+
+    def test_unrecognized_token_falls_back_to_empty_string(self):
+        # A hallucinated or stale token must never propagate into
+        # _run_ad_generation looking like a real asset id — it has to
+        # fail safe into "generated/creative scene", never crash or
+        # point at the wrong asset.
+        assets = [{"id": "real-uuid-1"}]
+        scenes = [{"featured_asset_id": "A99"}, {"featured_asset_id": ""}]
+        resolved = _resolve_featured_asset_tokens(scenes, assets)
+        self.assertEqual(resolved[0]["featured_asset_id"], "")
+        self.assertEqual(resolved[1]["featured_asset_id"], "")
+
+    def test_no_assets_resolves_every_scene_to_empty(self):
+        scenes = [{"featured_asset_id": "A1"}]
+        resolved = _resolve_featured_asset_tokens(scenes, [])
+        self.assertEqual(resolved[0]["featured_asset_id"], "")
+
+
+class ExactAssetTypesTests(unittest.TestCase):
+    def test_screenshot_product_photo_and_logo_are_exact(self):
+        self.assertEqual(EXACT_ASSET_TYPES, {"screenshot", "product_photo", "logo"})
+
+    def test_other_and_legacy_reference_are_not_exact(self):
+        self.assertNotIn("other", EXACT_ASSET_TYPES)
+        self.assertNotIn("reference", EXACT_ASSET_TYPES)
 
 
 if __name__ == "__main__":

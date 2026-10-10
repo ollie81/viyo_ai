@@ -12,7 +12,7 @@ import unittest
 import wave
 import io
 
-from studio import _pcm_to_wav
+from studio import _pcm_to_wav, _caption_metrics, _CAPTION_FONT_SIZE, _CAPTION_LINE_HEIGHT
 
 
 class PcmToWavTests(unittest.TestCase):
@@ -39,6 +39,43 @@ class PcmToWavTests(unittest.TestCase):
             self.assertEqual(f.getnchannels(), 1)
             self.assertEqual(f.getsampwidth(), 2)
             self.assertEqual(f.getframerate(), 24000)
+
+
+class CaptionMetricsTests(unittest.TestCase):
+    def test_default_1080_matches_drama_studio_original_constants(self):
+        # Drama Studio's only canvas is 1080 wide — the default must
+        # reproduce the exact numbers every existing caller already
+        # renders with, so this change is a pure no-op for it.
+        font_size, line_height, border_w = _caption_metrics(1080)
+        self.assertEqual(font_size, _CAPTION_FONT_SIZE)
+        self.assertEqual(line_height, _CAPTION_LINE_HEIGHT)
+        self.assertEqual(border_w, 3)
+
+    def test_narrower_canvas_scales_down(self):
+        # Regression for the real bug: Ads Studio's default 720p 9:16
+        # output (720 wide) was burning in captions sized for a
+        # 1080-wide frame, oversized relative to the actual frame and
+        # prone to overflowing past the edges.
+        font_size, _, _ = _caption_metrics(720)
+        self.assertLess(font_size, _CAPTION_FONT_SIZE)
+
+    def test_wider_canvas_scales_up(self):
+        font_size, _, _ = _caption_metrics(1920)
+        self.assertGreater(font_size, _CAPTION_FONT_SIZE)
+
+    def test_font_size_never_collapses_to_unreadable(self):
+        font_size, _, border_w = _caption_metrics(1)
+        self.assertGreaterEqual(font_size, 28)
+        self.assertGreaterEqual(border_w, 2)
+
+    def test_scales_proportionally_with_width(self):
+        # If font size tracks frame width, the same wrapped line
+        # occupies the same fraction of the frame at any resolution —
+        # this is what keeps _CAPTION_MAX_CHARS_PER_LINE (a plain
+        # character count) still correct across resolutions.
+        font_720, _, _ = _caption_metrics(720)
+        font_1440, _, _ = _caption_metrics(1440)
+        self.assertAlmostEqual(font_1440 / font_720, 2.0, delta=0.1)
 
 
 if __name__ == "__main__":
