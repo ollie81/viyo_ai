@@ -78,6 +78,15 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Sync (sync.so) — real lip-sync on a character's still portrait,
+# dubbed with this scene's already-generated dialogue audio. Separate
+# from Veo: Veo animates a scene (camera/body motion) but can't match
+# a given audio track's mouth shapes, and its own native dialogue
+# invents a fresh voice every call with no way to pin it to this
+# character's assigned voice_id — see generate_talking_portrait's own
+# docstring. Optional: every endpoint below 503s with a clear message
+# if this is unset, same as GEMINI_API_KEY above.
+SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
 
 # $3/day by default — a single config value, not hardcoded in the
 # Flutter app (the app only ever reads cap_usd_cents back from
@@ -178,6 +187,22 @@ VEO_ALLOWED_DURATIONS = (4, 6, 8)
 # Google's end either way.
 VEO_MAX_POLL_SECONDS = 280
 VEO_POLL_INTERVAL_SECONDS = 10
+
+# lipsync-2 is Sync's base tier — cheapest, and the one that actually
+# fits this app's $3/day cap across a whole episode's worth of
+# dialogue scenes (sync-3/lipsync-2-pro cost 2-3x more per the pricing
+# page). $0.045/sec is the midpoint of the $0.04-0.05/sec range Sync's
+# docs give for this tier — re-check platform.sync.so/settings/billing
+# before trusting this for real budgeting, same caveat VEO_PRICE_PER_SEC
+# above carries for Veo's own published rate.
+SYNC_MODEL = "lipsync-2"
+SYNC_PRICE_PER_SEC_USD_CENTS = 4.5
+SYNC_API_BASE = "https://api.sync.so"
+# Async like Veo (POST creates a generation, GET polls it) — same
+# in-request-polling tradeoff and the same reasoning for the cap as
+# VEO_MAX_POLL_SECONDS/VEO_POLL_INTERVAL_SECONDS above.
+SYNC_MAX_POLL_SECONDS = 280
+SYNC_POLL_INTERVAL_SECONDS = 10
 
 # Phase 4 assembly is pure ffmpeg/Bunny work — no Gemini calls, nothing
 # to log against the daily cap or STUDIO_DAILY_CAP_USD.
@@ -1406,6 +1431,7 @@ class SavedScene(BaseModel):
     visual_description: str
     image_url: Optional[str]
     video_url: Optional[str]
+    talking_portrait_url: Optional[str]
     lines: list[SavedSceneLine]
 
 
@@ -1425,6 +1451,7 @@ def _row_to_scene(scene_row: dict, line_rows: list[dict]) -> SavedScene:
         visual_description=scene_row.get("visual_description") or "",
         image_url=scene_row.get("image_url"),
         video_url=scene_row.get("video_url"),
+        talking_portrait_url=scene_row.get("talking_portrait_url"),
         lines=[
             SavedSceneLine(
                 id=l["id"],
@@ -1927,6 +1954,186 @@ async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
     return SceneVideoResponse(video_url=video_url, duration_seconds=duration, cost_usd_cents=estimated_cost_cents)
 
 
+class TalkingPortraitResponse(BaseModel):
+    talking_portrait_url: str
+    cost_usd_cents: int
+
+
+@router.post(
+    "/scene/{scene_id}/talking-portrait",
+    response_model=TalkingPortraitResponse,
+    dependencies=[Depends(_require_admin)],
+)
+async def generate_talking_portrait(scene_id: str):
+    """Real lip-synced video for a scene carried by one character
+    actually talking — an alternative to generate_scene_video (Veo)
+    for dialogue scenes, not a replacement for it. Takes that
+    character's already-approved portrait and this scene's already-
+    generated dialogue audio (the same per-line TTS audio every other
+    render path already uses) and sends both to Sync (sync.so), which
+    returns one video with the mouth matched to that exact audio.
+
+    Veo can't do this: it has no way to see audio it'll only be dubbed
+    with later, and its own native dialogue generation invents a fresh
+    voice on every call with no way to pin it to this character's
+    assigned Phase-2 voice_id — which is exactly why Veo's own audio is
+    always dropped in favor of the real TTS voice when a scene has
+    dialogue (see _render_scene_clip_from_video's own docstring).
+
+    Only supports a scene carried by exactly one speaking character —
+    Sync lip-syncs one face against one continuous audio track, so a
+    scene where two characters trade lines has no single face to sync
+    correctly and is rejected with a clear 400 rather than silently
+    syncing the wrong line to the wrong face.
+
+    Untested against a live Sync API key as of writing, same honesty
+    note generate_scene_video's own docstring carries for Veo: if
+    Sync's exact response field names here don't match what their API
+    actually returns, this fails loudly with a clear 502 before
+    anything is charged or saved, never silently."""
+    if not SYNC_API_KEY:
+        raise HTTPException(status_code=503, detail="Real lip sync isn't configured yet (SYNC_API_KEY unset).")
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Viyo Studio is not configured (Supabase).")
+
+    scene_row = _get_scene(scene_id)
+    try:
+        line_rows = (
+            supabase_admin.table("series_scene_lines")
+            .select("*")
+            .eq("scene_id", scene_id)
+            .order("sort_order")
+            .execute()
+        ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load scene lines: {e}")
+
+    if not line_rows:
+        raise HTTPException(status_code=400, detail="This scene has no dialogue to lip sync to.")
+    missing_audio = [l for l in line_rows if not l.get("audio_url")]
+    if missing_audio:
+        raise HTTPException(status_code=400, detail="Generate every line's audio in this scene first.")
+
+    character_ids = {l.get("character_id") for l in line_rows if l.get("character_id")}
+    if len(character_ids) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Real lip sync only supports a scene carried by one speaking character — "
+            f"this scene has {len(character_ids)}. Use Generate real video (Veo) instead for multi-character scenes.",
+        )
+    character = _get_character(next(iter(character_ids)))
+    if not character.get("portrait_url"):
+        raise HTTPException(status_code=400, detail=f"Generate {character['name']}'s portrait first.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        line_audio_paths = []
+        for i, line in enumerate(line_rows):
+            p = os.path.join(tmp, f"line_{i}.wav")
+            _download_to_file(line["audio_url"], p)
+            line_audio_paths.append(p)
+        if len(line_audio_paths) > 1:
+            scene_audio_path = os.path.join(tmp, "scene_audio.wav")
+            _concat_audio(line_audio_paths, scene_audio_path)
+        else:
+            scene_audio_path = line_audio_paths[0]
+        duration = _ffprobe_duration(scene_audio_path)
+
+        estimated_cost_cents = max(1, round(duration * SYNC_PRICE_PER_SEC_USD_CENTS))
+        _check_daily_cap(estimated_cost_cents)
+
+        with open(scene_audio_path, "rb") as f:
+            audio_bytes = f.read()
+    audio_storage_path = f"scenes/{scene_id}/{uuid.uuid4().hex}.wav"
+    try:
+        supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).upload(
+            audio_storage_path, audio_bytes, file_options={"content-type": "audio/wav"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload scene audio for lip sync: {e}")
+    scene_audio_url = supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).get_public_url(audio_storage_path)
+
+    try:
+        create_resp = requests.post(
+            f"{SYNC_API_BASE}/v2/generate",
+            headers={"x-api-key": SYNC_API_KEY, "Content-Type": "application/json"},
+            json={
+                "model": SYNC_MODEL,
+                "input": [
+                    {"type": "image", "url": character["portrait_url"]},
+                    {"type": "audio", "url": scene_audio_url},
+                ],
+                "options": {"sync_mode": "cut_off"},
+            },
+            timeout=30,
+        )
+        create_resp.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sync lip sync failed to start: {e}")
+    generation_id = create_resp.json().get("id")
+    if not generation_id:
+        raise HTTPException(status_code=502, detail="Sync did not return a generation id.")
+
+    status = None
+    output_url = None
+    waited = 0
+    while waited < SYNC_MAX_POLL_SECONDS:
+        time.sleep(SYNC_POLL_INTERVAL_SECONDS)
+        waited += SYNC_POLL_INTERVAL_SECONDS
+        try:
+            poll_resp = requests.get(
+                f"{SYNC_API_BASE}/v2/generate/{generation_id}",
+                headers={"x-api-key": SYNC_API_KEY},
+                timeout=30,
+            )
+            poll_resp.raise_for_status()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not check Sync generation status: {e}")
+        data = poll_resp.json()
+        status = data.get("status")
+        if status == "COMPLETED":
+            output_url = data.get("outputUrl")
+            break
+        if status in ("FAILED", "REJECTED"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Sync lip sync {status.lower()}: {data.get('error') or 'no reason given'}.",
+            )
+
+    if status != "COMPLETED" or not output_url:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Sync is still rendering after several minutes. It may still finish on their end — "
+                "wait a bit and check back rather than retrying right away."
+            ),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = os.path.join(tmp, "talking_portrait.mp4")
+        _download_to_file(output_url, video_path)
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+
+    path = f"scenes/{scene_id}/talking_{uuid.uuid4().hex}.mp4"
+    try:
+        supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(
+            path, video_bytes, file_options={"content-type": "video/mp4"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not upload the talking-portrait video: {e}")
+    talking_portrait_url = supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
+
+    try:
+        supabase_admin.table("series_scenes").update({"talking_portrait_url": talking_portrait_url}).eq(
+            "id", scene_id
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save the talking-portrait video: {e}")
+
+    _log_cost(scene_row.get("series_id"), "scene_lipsync", estimated_cost_cents, provider="sync")
+    return TalkingPortraitResponse(talking_portrait_url=talking_portrait_url, cost_usd_cents=estimated_cost_cents)
+
+
 class LineAudioResponse(BaseModel):
     audio_url: str
     cost_usd_cents: int
@@ -2250,7 +2457,12 @@ def _render_scene_clip(
 
 
 def _render_scene_clip_from_video(
-    video_path: str, audio_path: str, cues: list[tuple[str, float, float]], duration: float, out_path: str
+    video_path: str,
+    audio_path: str,
+    cues: list[tuple[str, float, float]],
+    duration: float,
+    out_path: str,
+    keep_own_audio: bool = False,
 ) -> None:
     """Same job as _render_scene_clip, but for a scene that got the
     optional Veo upgrade: starts from a real generated video clip
@@ -2266,7 +2478,16 @@ def _render_scene_clip_from_video(
     duration and -t/-shortest trims it to cover a shorter one —
     verified both directions against synthetic test clips before
     writing this, same discipline _render_scene_clip's own docstring
-    describes."""
+    describes.
+
+    [keep_own_audio] is for the OTHER kind of pre-rendered scene video
+    — a Sync talking-portrait clip (generate_talking_portrait), whose
+    audio IS this scene's real dialogue already lip-synced to the
+    video, not a guess to be discarded. True keeps that baked-in audio
+    regardless of [cues], instead of replacing it with [audio_path]
+    (which is that exact same audio anyway, just not muxed into the
+    video — using it would only risk a sync drift ffmpeg's two-input
+    mux could introduce for zero benefit)."""
     # Explicit fps= matters here the same way it matters in
     # _render_scene_clip's zoompan filter: without it, this clip's
     # output framerate is whatever Veo itself generated at (observed:
@@ -2276,7 +2497,7 @@ def _render_scene_clip_from_video(
     # cause of "Episode concat failed" when an episode mixes a Veo
     # scene with Ken Burns scenes.
     vf = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps={_FFMPEG_FPS}"
-    has_dialogue = bool(cues)
+    has_dialogue = bool(cues) and not keep_own_audio
     vf += _build_caption_filters(cues, os.path.dirname(out_path), os.path.splitext(os.path.basename(out_path))[0])
 
     if has_dialogue:
@@ -2616,7 +2837,7 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
 
     missing = []
     for i, scene in enumerate(scenes):
-        if not scene.image_url and not scene.video_url:
+        if not scene.image_url and not scene.video_url and not scene.talking_portrait_url:
             missing.append(f"Scene {i + 1} has no image")
         for j, line in enumerate(scene.lines):
             if not line.audio_url:
@@ -2649,7 +2870,21 @@ async def assemble_episode(series_id: str, episode_number: int, req: AssembleEpi
                 cues = _scene_cues([l.text for l in scene.lines], line_durations)
 
             clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
-            if scene.video_url:
+            if scene.talking_portrait_url:
+                # Real lip-synced video (generate_talking_portrait) —
+                # takes priority over the Veo clip when both somehow
+                # exist, since it's the more expensive, more deliberate
+                # choice. Its own audio IS this scene's dialogue
+                # already matched to the video — see
+                # _render_scene_clip_from_video's keep_own_audio
+                # docstring for why that's kept as-is rather than
+                # re-dubbed.
+                video_path = os.path.join(tmp, f"scene_{i}_talking.mp4")
+                _download_to_file(scene.talking_portrait_url, video_path)
+                _render_scene_clip_from_video(
+                    video_path, scene_audio_path, cues, scene_duration, clip_path, keep_own_audio=True
+                )
+            elif scene.video_url:
                 video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
                 _download_to_file(scene.video_url, video_path)
                 _render_scene_clip_from_video(video_path, scene_audio_path, cues, scene_duration, clip_path)
