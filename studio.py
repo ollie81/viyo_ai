@@ -634,12 +634,12 @@ class ImageResponse(BaseModel):
     cost_usd_cents: int
 
 
-def _generate_and_upload_image(prompt: str, path_prefix: str, call_type: str) -> ImageResponse:
+def _generate_image_response(contents, path_prefix: str, call_type: str, series_id: Optional[str] = None) -> ImageResponse:
     _check_daily_cap(GEMINI_IMAGE_COST_USD_CENTS)
     try:
         response = _gemini_client.models.generate_content(
             model=GEMINI_IMAGE_MODEL,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
         )
     except Exception as e:
@@ -650,8 +650,28 @@ def _generate_and_upload_image(prompt: str, path_prefix: str, call_type: str) ->
     path = f"{path_prefix}/{uuid.uuid4().hex}.{ext}"
     image_url = _upload_image(image_bytes, mime_type, path)
 
-    _log_cost(None, call_type, GEMINI_IMAGE_COST_USD_CENTS)
+    _log_cost(series_id, call_type, GEMINI_IMAGE_COST_USD_CENTS)
     return ImageResponse(image_url=image_url, cost_usd_cents=GEMINI_IMAGE_COST_USD_CENTS)
+
+
+def _generate_and_upload_image(prompt: str, path_prefix: str, call_type: str) -> ImageResponse:
+    return _generate_image_response(prompt, path_prefix, call_type)
+
+
+def _generate_and_upload_image_with_references(
+    prompt: str, reference_urls: list[str], path_prefix: str, call_type: str, series_id: Optional[str] = None
+) -> ImageResponse:
+    """Same as _generate_and_upload_image, but conditions the generation
+    on up to 4 existing images (e.g. a character's already-approved
+    portrait) via Gemini's multimodal input — the strongest consistency
+    method this provider exposes for "make this new image look like
+    that existing one." Built for drama_creator.py's cover and
+    four-view-sheet generation (reuses the exact same conditioning
+    technique ads_studio.py's own scene generation already relies on),
+    but lives here so both Studio features share one implementation."""
+    reference_parts = [_fetch_image_part(u) for u in reference_urls[:4]]
+    contents = [*reference_parts, types.Part.from_text(text=prompt)] if reference_parts else prompt
+    return _generate_image_response(contents, path_prefix, call_type, series_id=series_id)
 
 
 @router.post("/character/portrait", response_model=ImageResponse, dependencies=[Depends(_require_admin)])
@@ -706,6 +726,20 @@ class CharacterIn(BaseModel):
     # lock — clothing can vary scene to scene same as before this
     # existed), not a default waiting to be filled in.
     costume_lock: str = ""
+    # Additive fields for drama_creator.py's AI-assistant flow — all
+    # default to empty/None so the original paste-a-script flow (which
+    # never sets any of these) is completely unaffected; every existing
+    # character row just reads back with these blank.
+    skin_tone: str = ""
+    face_shape: str = ""
+    eye_color: str = ""
+    hairstyle: str = ""
+    body_proportions: str = ""
+    voice_description: str = ""
+    front_view_url: Optional[str] = None
+    side_view_url: Optional[str] = None
+    rear_view_url: Optional[str] = None
+    four_view_sheet_url: Optional[str] = None
 
 
 class LocationIn(BaseModel):
@@ -746,6 +780,43 @@ def _row_with_field_defaults(row: dict, model: type[BaseModel]) -> dict:
             out[key] = field.default_factory()
         else:
             raise KeyError(key)
+    return out
+
+
+# Rich-field column names (see drama_creator.py / CharacterIn's own
+# comment) that only the new AI-assistant flow's client actually knows
+# to send. The old paste-a-script screen's Character model has no idea
+# these fields exist, so every request it sends omits them — if that
+# request's blank/default value for one of these always won, editing
+# an AI-assistant-created character from the OLD screen would silently
+# blank out its skin tone/face shape/etc. on the very next save. See
+# _merged_rich_fields just below for how that's avoided.
+_RICH_CHARACTER_FIELDS = (
+    "skin_tone", "face_shape", "eye_color", "hairstyle", "body_proportions", "voice_description",
+    "front_view_url", "side_view_url", "rear_view_url", "four_view_sheet_url",
+)
+
+
+def _merged_rich_fields(incoming_model: BaseModel, existing_row: Optional[dict], field_names: tuple[str, ...]) -> dict:
+    """For each of [field_names] on [incoming_model]: keep the incoming
+    value if it's truthy (a real edit), otherwise fall back to
+    [existing_row]'s already-stored value, otherwise omit the key
+    entirely (a brand-new row with nothing set yet, where the column's
+    own DB default should apply). Pulled out of save_cast as its own
+    pure function specifically so the regression it fixes — the old
+    paste-a-script screen's client doesn't know drama_creator.py's
+    rich character fields exist, so its save requests always send
+    them blank, which used to silently blank out an AI-assistant-
+    created character's skin_tone/face_shape/etc. the next time it got
+    edited from that other screen — has a test that doesn't depend on
+    a live Supabase call."""
+    out: dict = {}
+    for field in field_names:
+        incoming = getattr(incoming_model, field)
+        if incoming:
+            out[field] = incoming
+        elif existing_row is not None:
+            out[field] = existing_row.get(field)
     return out
 
 
@@ -815,13 +886,11 @@ async def save_cast(series_id: str, req: SaveCastRequest):
     # delete button in the UI, and only that row gets deleted — not
     # "everything that existed before this save."
     try:
-        existing_char_ids = {
-            r["id"]
-            for r in (
-                supabase_admin.table("series_characters").select("id").eq("series_id", series_id).execute()
-            ).data
-            or []
-        }
+        existing_char_rows = (
+            supabase_admin.table("series_characters").select("*").eq("series_id", series_id).execute()
+        ).data or []
+        existing_chars_by_id = {r["id"]: r for r in existing_char_rows}
+        existing_char_ids = set(existing_chars_by_id.keys())
         existing_loc_ids = {
             r["id"]
             for r in (
@@ -856,6 +925,8 @@ async def save_cast(series_id: str, req: SaveCastRequest):
                 "costume_lock": c.costume_lock,
                 "sort_order": i,
             }
+            existing = existing_chars_by_id.get(c.id) if c.id else None
+            row.update(_merged_rich_fields(c, existing, _RICH_CHARACTER_FIELDS))
             if c.id and c.id in existing_char_ids:
                 result = supabase_admin.table("series_characters").update(row).eq("id", c.id).execute().data
             else:
@@ -1426,6 +1497,19 @@ async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequ
     cost_cents = _text_cost_cents(response.usage_metadata)
     _log_cost(series_id, "split_scenes", cost_cents)
 
+    saved_scenes = _persist_episode_scenes(series_id, episode_number, parsed.scenes)
+    return ScenesResponse(scenes=saved_scenes, cost_usd_cents=cost_cents)
+
+
+def _persist_episode_scenes(series_id: str, episode_number: int, scenes: list[SceneOut]) -> list[SavedScene]:
+    """Replace-all persistence for one episode's scene/line breakdown —
+    extracted from split_scenes so the AI-driven storyboard generator
+    (drama_creator.py, built directly from a confirmed plot rather than
+    a pasted script) can save the exact same `series_scenes`/
+    `series_scene_lines` shape without duplicating this matching logic.
+    Re-running this on the same (series_id, episode_number) wipes any
+    images/audio already generated for its previous scenes — same
+    tradeoff save_cast already makes for the whole cast."""
     characters = _load_characters(series_id)
     locations = _load_locations(series_id)
 
@@ -1437,7 +1521,7 @@ async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequ
         raise HTTPException(status_code=500, detail=f"Could not clear previous scenes: {e}")
 
     saved_scenes: list[SavedScene] = []
-    for i, scene in enumerate(parsed.scenes):
+    for i, scene in enumerate(scenes):
         location_match = _match_by_name(scene.location, locations)
         scene_characters = []
         for name in scene.characters_present:
@@ -1490,7 +1574,7 @@ async def split_scenes(series_id: str, episode_number: int, req: SplitScenesRequ
 
         saved_scenes.append(_row_to_scene(scene_row, line_rows))
 
-    return ScenesResponse(scenes=saved_scenes, cost_usd_cents=cost_cents)
+    return saved_scenes
 
 
 @router.get(

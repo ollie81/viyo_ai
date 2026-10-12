@@ -193,6 +193,16 @@ try:
 except Exception as _ads_studio_import_error:
     print(f"[WARN] Ads Studio router not loaded: {_ads_studio_import_error}")
 
+# Drama Creator (the AI-assistant-driven "New Drama" flow) also imports
+# `from studio import ...` for its reused Gemini/image/cast/scene
+# helpers — same isolation reasoning as Ads Studio's try/except above.
+try:
+    from drama_creator import router as drama_creator_router
+
+    app.include_router(drama_creator_router)
+except Exception as _drama_creator_import_error:
+    print(f"[WARN] Drama Creator router not loaded: {_drama_creator_import_error}")
+
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
