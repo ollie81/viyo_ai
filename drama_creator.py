@@ -157,11 +157,15 @@ def _openai_text_cost_cents(usage) -> int:
 
 router = APIRouter(prefix="/api/v1/admin/drama-creator", tags=["drama_creator"])
 
-# Matches the reference UI exactly ("2 added. max 2") — the data model
-# underneath (series_characters, keyed by series_id with no row-count
-# constraint) already supports more; this is purely a v1 UI cap, not
-# an architectural limit.
-MAX_CHARACTERS = 2
+# The reference UI this was first built against capped at 2 ("2 added.
+# max 2"), but that was always a v1 scaffolding choice, not a real
+# product limit — the data model underneath (series_characters, keyed
+# by series_id with no row-count constraint) already supported more.
+# Raised to 4 once a real drama (a lost-heir plot needing a
+# protagonist, an antagonist, a love interest, and a separate
+# secret-keeper) made the 2-character cap actively wrong, not just
+# conservative.
+MAX_CHARACTERS = 4
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -280,9 +284,19 @@ reused verbatim to build the episode's actual first scene — vague instructions
    - cliffhanger: the EXACT moment episode 1 ends on — a real, specific turn (a reveal, a betrayal landing, a door \
 opening on something unexpected, an ultimatum), strong enough that stopping there is genuinely uncomfortable. \
 Never a vague "tension rises" — name the actual beat.
-3. characters: EXACTLY {max_characters} main characters (the protagonist and whichever other character is most \
-central to the conflict with them — an antagonist, love interest, or rival, whichever the story actually calls \
-for). For each:
+3. characters: up to {max_characters} main characters.
+
+IF the director's idea above already names and describes specific characters (e.g. "Selam: 19, kitchen servant..."), \
+use EXACTLY those characters, faithfully — same names, same ages, same roles, same relationships. Do not invent \
+different people, merge any of them, or drop one, even if there are fewer than {max_characters}. Your job for a \
+cast that's already written is to fill in the rich visual/voice fields below from what's given (and only invent \
+specifics the idea left unstated, like an exact eye color) — never to replace a described character with your own.
+
+IF the idea is a loose one-liner with no named cast, invent {max_characters} main characters yourself (the \
+protagonist and whichever others are most central to the conflict — an antagonist, love interest, rival, or \
+confidant, whichever the story actually calls for).
+
+For each character, whichever way they came from above:
    - name, age (an approximate range, e.g. "mid-20s"), gender
    - appearance: one-sentence overall description
    - skin_tone, face_shape, eye_color, hairstyle: specific enough that an image generator stays consistent across \
@@ -351,9 +365,18 @@ async def generate_idea(series_id: str, req: StartIdeaRequest):
 
     plot_dict = parsed.plot.model_dump()
     try:
-        supabase_admin.table("series").update({"title": parsed.title, "plot_json": plot_dict}).eq(
-            "id", series_id
-        ).execute()
+        supabase_admin.table("series").update({
+            "title": parsed.title,
+            "plot_json": plot_dict,
+            # The director's own words, verbatim — fed back into cover
+            # and storyboard generation below (see generate_cover/
+            # generate_storyboard) so style/format direction the idea
+            # carried (shot style, location limits, cultural/costume
+            # accuracy notes, pacing) survives past this first step
+            # instead of only surviving whatever the structured plot
+            # fields happened to capture.
+            "story_notes": req.idea_text,
+        }).eq("id", series_id).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not save the generated story: {e}")
 
@@ -407,6 +430,7 @@ class SetupResponse(BaseModel):
     setup_confirmed: bool
     episode_duration_seconds: int
     drama_aspect_ratio: str
+    episode_scene_count: Optional[int] = None
     points_used: int
 
 
@@ -431,6 +455,7 @@ async def get_setup(series_id: str):
         setup_confirmed=bool(series.get("setup_confirmed")),
         episode_duration_seconds=int(series.get("episode_duration_seconds") or 30),
         drama_aspect_ratio=series.get("drama_aspect_ratio") or "9:16",
+        episode_scene_count=series.get("episode_scene_count"),
         points_used=_points_used(series_id),
     )
 
@@ -443,11 +468,14 @@ letters, numbers, or logos anywhere in the image — a title will be composited 
 
 PREMISE: {premise}
 MAIN CONFLICT: {main_conflict}
+DIRECTOR'S OWN NOTES ON SETTING/STYLE (follow these precisely — era, location, dress, cultural detail): {story_notes}
 
 The reference images above show this drama's actual main characters — depict them, in character, in a moment \
 that captures the story's tone: cinematic lighting, professional photographic composition, dramatic atmosphere \
 appropriate to the genre. Their faces, hair, skin tone, and clothing must match the reference images exactly — \
-never substitute different-looking people. 9:16 vertical aspect ratio, no text, no watermark."""
+never substitute different-looking people. Respect the setting and cultural detail in the director's notes \
+exactly as given — do not generalize, modernize, or substitute a different culture/era/location. 9:16 vertical \
+aspect ratio, no text, no watermark."""
 
 
 class CoverResponse(BaseModel):
@@ -474,6 +502,7 @@ async def generate_cover(series_id: str):
         genre=series.get("genre") or "Drama",
         premise=plot.get("premise") or series.get("description") or "",
         main_conflict=plot.get("main_conflict") or "",
+        story_notes=series.get("story_notes") or "none given",
     )
     result = _generate_and_upload_image_with_references(
         prompt, portrait_urls, f"drama-covers/{series_id}", "drama_cover", series_id=series_id
@@ -613,6 +642,12 @@ async def generate_character_views(character_id: str):
 class UpdateEpisodeSettingsRequest(BaseModel):
     episode_duration_seconds: Optional[int] = None
     drama_aspect_ratio: Optional[str] = None
+    # Overrides the default duration->scene-count curve (ads_studio.py's
+    # _scene_count_for_duration, built for ad pacing — a few long
+    # scenes). A real drama can want the opposite: many short, tight
+    # beats (e.g. a historical drama scripted as 10-12 close-up scenes
+    # in 35-45 seconds total). None means "use the default curve."
+    episode_scene_count: Optional[int] = None
 
 
 @router.put("/{series_id}/episode-settings", dependencies=[Depends(_require_admin)])
@@ -636,6 +671,19 @@ async def update_episode_settings(series_id: str, req: UpdateEpisodeSettingsRequ
                 detail="Only 9:16 is supported for episode rendering right now — 16:9/1:1 aren't wired into assembly yet.",
             )
         patch["drama_aspect_ratio"] = req.drama_aspect_ratio
+    if req.episode_scene_count is not None:
+        # 0 is a real request, not a no-op: it's the clear sentinel
+        # ("go back to Auto") — a JSON body can't distinguish "field
+        # omitted" from "field explicitly set to null" once Pydantic
+        # parses it (both land as None), so there'd otherwise be no way
+        # for a client to ever un-set an override back to the default
+        # duration-driven curve.
+        if req.episode_scene_count == 0:
+            patch["episode_scene_count"] = None
+        elif not (2 <= req.episode_scene_count <= 20):
+            raise HTTPException(status_code=400, detail="episode_scene_count must be 0 (auto) or between 2 and 20.")
+        else:
+            patch["episode_scene_count"] = req.episode_scene_count
     if patch:
         try:
             supabase_admin.table("series").update(patch).eq("id", series_id).execute()
@@ -700,6 +748,8 @@ MAIN CONFLICT: {main_conflict}
 EMOTIONAL TURNING POINTS: {turning_points}
 OPENING HOOK (scene 1 must BE this, not lead up to it): {opening_hook}
 CLIFFHANGER (the final scene must end ON this, not merely gesture toward it): {cliffhanger}
+DIRECTOR'S OWN NOTES (follow any format/style/location constraints here exactly — e.g. a location cap, a shot-\
+style preference, setting/cultural detail): {story_notes}
 
 CAST:
 {cast_block}
@@ -743,7 +793,12 @@ async def generate_storyboard(series_id: str, req: StoryboardRequest):
         raise HTTPException(status_code=400, detail="No characters to build scenes around.")
 
     duration = int(series.get("episode_duration_seconds") or 30)
-    scene_count = _scene_count_for_duration(duration)
+    # An explicit override (set via /episode-settings) always wins over
+    # the default duration->count curve — that curve was built for ad
+    # pacing (ads_studio.py's _scene_count_for_duration: a few longer
+    # scenes) and under-produces for a drama scripted as many short,
+    # tight beats, e.g. 10-12 close-up scenes in a 35-45s episode.
+    scene_count = series.get("episode_scene_count") or _scene_count_for_duration(duration)
     cast_block = "\n".join(
         f"- {c.get('name')}: {c.get('appearance') or ''} Personality: {c.get('personality') or ''}"
         for c in characters
@@ -757,6 +812,7 @@ async def generate_storyboard(series_id: str, req: StoryboardRequest):
         premise=plot.get("premise") or "",
         main_conflict=plot.get("main_conflict") or "",
         turning_points=plot.get("emotional_turning_points") or "",
+        story_notes=series.get("story_notes") or "none given",
         opening_hook=plot.get("opening_hook") or "",
         cliffhanger=plot.get("cliffhanger") or "",
         cast_block=cast_block,

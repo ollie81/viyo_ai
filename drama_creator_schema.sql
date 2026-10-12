@@ -35,6 +35,17 @@ alter table series add column if not exists setup_confirmed_at timestamptz;
 alter table series add column if not exists episode_duration_seconds int not null default 30;
 alter table series add column if not exists drama_aspect_ratio text not null default '9:16';
 
+-- Overrides the default duration->scene-count curve (built for ad
+-- pacing — a few longer scenes) when a drama wants the opposite: many
+-- short, tight beats. Null means "use the default curve."
+alter table series add column if not exists episode_scene_count int;
+
+-- The director's own idea text, verbatim — fed back into cover and
+-- storyboard generation so format/style/location/cultural notes the
+-- idea carried survive past the initial plot write-up instead of only
+-- surviving whatever the structured plot fields happened to capture.
+alter table series add column if not exists story_notes text;
+
 -- Richer per-character fields the AI Drama Assistant now generates
 -- and the four-view sheet step fills in — series_characters already
 -- had name/age/gender/appearance/clothing/personality/portrait_url/

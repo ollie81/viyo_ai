@@ -117,8 +117,11 @@ class OpenAiCostTests(unittest.TestCase):
 
 
 class MaxCharactersTests(unittest.TestCase):
-    def test_matches_reference_ui_cap(self):
-        self.assertEqual(MAX_CHARACTERS, 2)
+    def test_raised_from_the_original_reference_ui_cap_of_2(self):
+        # Raised once a real drama (lost-heir plot needing protagonist
+        # + antagonist + love interest + a separate secret-keeper)
+        # showed 2 was a v1 scaffolding choice, not a real limit.
+        self.assertEqual(MAX_CHARACTERS, 4)
 
 
 class ComposeFourViewSheetTests(unittest.TestCase):
