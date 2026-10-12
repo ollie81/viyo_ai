@@ -337,16 +337,20 @@ def _estimate_text_cost_cents(input_text: str) -> int:
     return max(1, round((input_cost + output_cost) * 100))
 
 
-def _log_cost(series_id: Optional[str], call_type: str, cost_usd_cents: int) -> None:
+def _log_cost(series_id: Optional[str], call_type: str, cost_usd_cents: int, provider: str = "gemini") -> None:
     """Best-effort — a failed log write must never undo work (an image
     already generated and uploaded, a script already analyzed) that the
-    caller is about to return to the admin."""
+    caller is about to return to the admin. [provider] defaults to
+    "gemini" (every existing call site here is unaffected) — passed
+    explicitly as "openai" by drama_creator.py's GPT-backed story/
+    storyboard generation so spend is attributed to the real provider
+    that was actually billed, not silently mislabeled."""
     try:
         supabase_admin.table("studio_api_costs").insert({
             "series_id": series_id,
             "user_id": None,
             "call_type": call_type,
-            "provider": "gemini",
+            "provider": provider,
             "cost_usd_cents": cost_usd_cents,
         }).execute()
     except Exception as e:

@@ -12,8 +12,9 @@ exact same tables (`series`, `series_characters`, `series_scenes`,
 `series_scene_lines`) and the exact same downstream screens (Voices,
 Scenes, Publish) keep working completely unmodified regardless of
 which flow produced the cast/scenes they're looking at. Concretely
-reused rather than reimplemented from studio.py: the Gemini client and
-cost-cap machinery, `_get_character`/`_load_characters`,
+reused rather than reimplemented from studio.py: the cost-cap
+machinery (provider-agnostic — see `_log_cost`'s own `provider` param),
+`_get_character`/`_load_characters`,
 `CharacterIn`/`CharacterSaveIn`/`SaveCastRequest`/`save_cast` (the real
 upsert that keeps character ids stable), `SceneOut`/`SceneSplitResult`/
 `ScenesResponse`/`_persist_episode_scenes` (so an AI-written storyboard
@@ -21,6 +22,15 @@ is saved in the exact same shape `split_scenes` already produces), and
 the new (added alongside this file)
 `_generate_and_upload_image_with_references` for reference-conditioned
 image generation.
+
+Two different model providers, deliberately: the actual story/
+storyboard WRITING (idea -> plot+cast, and the episode storyboard) runs
+on GPT (OpenAI, see the client/constants just below) — picked
+specifically for narrative/hook quality at the user's own request — while
+every IMAGE generation (portraits via studio.py's existing endpoint,
+covers, four-view sheets) stays on Gemini, since that's where the
+reference-image-conditioning consistency machinery lives. Nothing
+about image generation changed in this pass.
 
 Admin-only, same `X-Admin-Key` gate as every other Studio surface —
 Viyo Studio has no per-user role concept (see studio.py's own
@@ -63,7 +73,7 @@ from typing import Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
-from google.genai import types
+from openai import OpenAI
 from PIL import Image
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
@@ -73,8 +83,6 @@ from studio import (
     _require_admin,
     _check_daily_cap,
     _log_cost,
-    _estimate_text_cost_cents,
-    _text_cost_cents,
     _get_series_owner,
     _get_character,
     _load_characters,
@@ -89,10 +97,63 @@ from studio import (
     SceneOut,
     SceneSplitResult,
     ScenesResponse,
-    GEMINI_TEXT_MODEL,
     STUDIO_IMAGES_BUCKET,
 )
 from ads_studio import _scene_count_for_duration
+
+# The AI Drama Assistant's actual story/storyboard WRITING (idea -> plot
+# + cast, and the episode storyboard) runs on GPT rather than Gemini —
+# a deliberate choice for narrative/hook quality specifically for this
+# flow, made explicitly at the user's request. Cover and four-view-sheet
+# IMAGE generation stay on Gemini (_generate_and_upload_image_with_
+# references, imported above) — nothing about image generation changes
+# here, this is a text-model swap only, and only for drama_creator.py;
+# studio.py's own script-analysis/scene-split text calls (the old
+# paste-a-script flow) are untouched and still run on Gemini.
+#
+# Reuses the SAME OPENAI_API_KEY env var main.py already depends on for
+# its own (unrelated) OpenAI usage — no new credential to configure.
+#
+# Model/pricing verified directly against OpenAI's own docs (developers
+# .openai.com/api/docs/models, /pricing) as of Oct 2026, not guessed —
+# same "look it up, don't assume" posture every other provider-specific
+# constant in this codebase follows (see e.g. ads_studio.py's Veo model
+# IDs). gpt-6-astra is OpenAI's current flagship ("our most capable
+# model for the most demanding work") — the right tier for narrative
+# quality, at real cost: $10/1M input tokens, $50/1M output tokens
+# (standard, <=272K context). Override via DRAMA_CREATOR_OPENAI_MODEL
+# if a cheaper sibling (e.g. "gpt-6.1-sol", ~5x cheaper) is ever
+# preferred over top-tier story/hook quality.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+_openai_client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+OPENAI_TEXT_MODEL = os.environ.get("DRAMA_CREATOR_OPENAI_MODEL", "gpt-6-astra")
+OPENAI_TEXT_INPUT_USD_PER_1M_TOKENS = 10.0
+OPENAI_TEXT_OUTPUT_USD_PER_1M_TOKENS = 50.0
+
+
+def _estimate_openai_text_cost_cents(input_text: str) -> int:
+    """Pre-call estimate for the daily-cap check, same shape as
+    studio.py's own _estimate_text_cost_cents — ~4 characters/token for
+    input, a generous fixed upper bound for output (a full plot + 2
+    rich character drafts, or a multi-scene storyboard, runs longer
+    than Studio's own cast/scene-split JSON, hence the larger budget
+    here than that function's 4000)."""
+    estimated_input_tokens = max(1, len(input_text) // 4)
+    estimated_output_tokens = 6000
+    input_cost = estimated_input_tokens / 1_000_000 * OPENAI_TEXT_INPUT_USD_PER_1M_TOKENS
+    output_cost = estimated_output_tokens / 1_000_000 * OPENAI_TEXT_OUTPUT_USD_PER_1M_TOKENS
+    return max(1, round((input_cost + output_cost) * 100))
+
+
+def _openai_text_cost_cents(usage) -> int:
+    """Reads the Responses API's usage object (response.usage —
+    input_tokens/output_tokens) for the real, billed cost, same role
+    studio.py's _text_cost_cents plays for Gemini calls."""
+    if usage is None:
+        return 0
+    input_cost = (getattr(usage, "input_tokens", 0) or 0) / 1_000_000 * OPENAI_TEXT_INPUT_USD_PER_1M_TOKENS
+    output_cost = (getattr(usage, "output_tokens", 0) or 0) / 1_000_000 * OPENAI_TEXT_OUTPUT_USD_PER_1M_TOKENS
+    return max(1, round((input_cost + output_cost) * 100))
 
 router = APIRouter(prefix="/api/v1/admin/drama-creator", tags=["drama_creator"])
 
@@ -113,7 +174,9 @@ def _require_configured() -> None:
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Drama Creator is not configured (Supabase).")
     if _gemini_client is None:
-        raise HTTPException(status_code=503, detail="Drama Creator is not configured (GEMINI_API_KEY unset).")
+        raise HTTPException(status_code=503, detail="Drama Creator is not configured (GEMINI_API_KEY unset) — needed for cover/reference-sheet images.")
+    if _openai_client is None:
+        raise HTTPException(status_code=503, detail="Drama Creator is not configured (OPENAI_API_KEY unset) — needed for story/storyboard writing.")
 
 
 def _get_series(series_id: str) -> dict:
@@ -170,6 +233,7 @@ class DramaPlotDraft(BaseModel):
     major_secrets: str
     emotional_turning_points: str
     episode_progression: str
+    opening_hook: str
     cliffhanger: str
 
 
@@ -186,11 +250,14 @@ class PlotOut(BaseModel):
     major_secrets: str = ""
     emotional_turning_points: str = ""
     episode_progression: str = ""
+    opening_hook: str = ""
     cliffhanger: str = ""
 
 
-_IDEA_PROMPT = """You are the AI Drama Assistant for a vertical short-drama app, helping a director turn a one-line \
-idea into a complete drama concept, the way a strong short-drama writer would.
+_IDEA_PROMPT = """You are the AI Drama Assistant for a vertical short-drama app — the single biggest lever a short \
+drama has over a viewer is whether the first few seconds of an episode earn their attention and whether the last \
+few seconds earn the next tap. You're helping a director turn a one-line idea into a complete drama concept built \
+around both of those, the way the strongest working short-drama writers do it.
 
 DIRECTOR'S IDEA: {idea_text}
 GENRE: {genre}
@@ -206,7 +273,13 @@ emotional formula regardless of genre:
    - major_secrets: what's hidden, from whom, and why it matters once revealed.
    - emotional_turning_points: 2-3 key beats where the emotional stakes shift.
    - episode_progression: roughly how the story unfolds across episodes, and this episode's place in that arc.
-   - cliffhanger: what episode 1 should end on to pull the viewer into episode 2.
+   - opening_hook: the EXACT moment, line, or image episode 1 opens on — not a theme or a mood, a concrete, \
+specific beat (an action already in progress, a shocking line of dialogue, a reveal, a question the viewer can't \
+not need answered). No slow setup, no scene-setting before it, no logo/intro beat wasted getting to it. This is \
+reused verbatim to build the episode's actual first scene — vague instructions here produce a vague opening.
+   - cliffhanger: the EXACT moment episode 1 ends on — a real, specific turn (a reveal, a betrayal landing, a door \
+opening on something unexpected, an ultimatum), strong enough that stopping there is genuinely uncomfortable. \
+Never a vague "tension rises" — name the actual beat.
 3. characters: EXACTLY {max_characters} main characters (the protagonist and whichever other character is most \
 central to the conflict with them — an antagonist, love interest, or rival, whichever the story actually calls \
 for). For each:
@@ -229,22 +302,22 @@ async def generate_idea(series_id: str, req: StartIdeaRequest):
     _get_series_owner(series_id)  # 404s if the series doesn't exist
 
     prompt = _IDEA_PROMPT.format(idea_text=req.idea_text, genre=req.genre or "Drama", max_characters=MAX_CHARACTERS)
-    _check_daily_cap(_estimate_text_cost_cents(prompt))
+    _check_daily_cap(_estimate_openai_text_cost_cents(prompt))
     try:
-        response = _gemini_client.models.generate_content(
-            model=GEMINI_TEXT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=DramaIdeaSchema),
+        response = _openai_client.responses.parse(
+            model=OPENAI_TEXT_MODEL,
+            input=[{"role": "user", "content": prompt}],
+            text_format=DramaIdeaSchema,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Drama idea generation failed: {e}")
 
-    parsed = response.parsed
+    parsed = response.output_parsed
     if parsed is None or not parsed.characters:
-        raise HTTPException(status_code=502, detail="Gemini returned a response Drama Creator couldn't parse.")
+        raise HTTPException(status_code=502, detail="GPT returned a response Drama Creator couldn't parse.")
 
-    cost_cents = _text_cost_cents(response.usage_metadata)
-    _log_cost(series_id, "drama_idea", cost_cents)
+    cost_cents = _openai_text_cost_cents(response.usage)
+    _log_cost(series_id, "drama_idea", cost_cents, provider="openai")
 
     drafts = parsed.characters[:MAX_CHARACTERS]
     save_req = SaveCastRequest(
@@ -301,6 +374,7 @@ class UpdatePlotRequest(BaseModel):
     major_secrets: Optional[str] = None
     emotional_turning_points: Optional[str] = None
     episode_progression: Optional[str] = None
+    opening_hook: Optional[str] = None
     cliffhanger: Optional[str] = None
 
 
@@ -624,7 +698,8 @@ GENRE: {genre}
 PREMISE: {premise}
 MAIN CONFLICT: {main_conflict}
 EMOTIONAL TURNING POINTS: {turning_points}
-CLIFFHANGER (this episode should build toward it): {cliffhanger}
+OPENING HOOK (scene 1 must BE this, not lead up to it): {opening_hook}
+CLIFFHANGER (the final scene must end ON this, not merely gesture toward it): {cliffhanger}
 
 CAST:
 {cast_block}
@@ -639,9 +714,15 @@ generate an accurate scene image from
 - lines: the dialogue for this scene, in order, each with the speaking character's exact name and their line \
 (a pure visual beat can have zero lines)
 
-Open with something that immediately draws the viewer in — no slow setup, no establishing shot wasted on nothing \
-happening. Build toward the cliffhanger above by the final scene. Keep dialogue natural, never a summary read \
-aloud.
+Scene 1 is the single most important scene in the episode: it must open on the OPENING HOOK above, already \
+happening — no logo beat, no character introduction, no establishing shot before it, nothing that delays it by \
+even one beat. If a viewer only watched the first 2 seconds, those 2 seconds must already be the hook.
+
+The final scene is the second most important: it must land ON the CLIFFHANGER above as a real, felt turn — not a \
+fade-out, not a vague "to be continued" feeling, an actual moment that makes NOT tapping the next episode feel \
+wrong. Every scene in between earns that ending; none of them pad toward it.
+
+Keep dialogue natural and specific to these characters, never a generic summary read aloud.
 """
 
 
@@ -676,25 +757,26 @@ async def generate_storyboard(series_id: str, req: StoryboardRequest):
         premise=plot.get("premise") or "",
         main_conflict=plot.get("main_conflict") or "",
         turning_points=plot.get("emotional_turning_points") or "",
+        opening_hook=plot.get("opening_hook") or "",
         cliffhanger=plot.get("cliffhanger") or "",
         cast_block=cast_block,
     )
-    _check_daily_cap(_estimate_text_cost_cents(prompt))
+    _check_daily_cap(_estimate_openai_text_cost_cents(prompt))
     try:
-        response = _gemini_client.models.generate_content(
-            model=GEMINI_TEXT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SceneSplitResult),
+        response = _openai_client.responses.parse(
+            model=OPENAI_TEXT_MODEL,
+            input=[{"role": "user", "content": prompt}],
+            text_format=SceneSplitResult,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Storyboard generation failed: {e}")
 
-    parsed = response.parsed
+    parsed = response.output_parsed
     if parsed is None or not parsed.scenes:
-        raise HTTPException(status_code=502, detail="Gemini returned a response Drama Creator couldn't parse.")
+        raise HTTPException(status_code=502, detail="GPT returned a response Drama Creator couldn't parse.")
 
-    cost_cents = _text_cost_cents(response.usage_metadata)
-    _log_cost(series_id, "drama_storyboard", cost_cents)
+    cost_cents = _openai_text_cost_cents(response.usage)
+    _log_cost(series_id, "drama_storyboard", cost_cents, provider="openai")
 
     # Same replace-all persistence split_scenes uses — produces the
     # identical series_scenes/series_scene_lines shape, so the existing

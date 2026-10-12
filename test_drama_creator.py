@@ -10,9 +10,18 @@ _gemini_client) only reads env vars and is safe to import without them
 set.
 """
 import unittest
+from types import SimpleNamespace
 
 from studio import _merged_rich_fields, _RICH_CHARACTER_FIELDS, CharacterSaveIn
-from drama_creator import MAX_CHARACTERS, PlotOut, _compose_four_view_sheet
+from drama_creator import (
+    MAX_CHARACTERS,
+    PlotOut,
+    _compose_four_view_sheet,
+    _estimate_openai_text_cost_cents,
+    _openai_text_cost_cents,
+    OPENAI_TEXT_INPUT_USD_PER_1M_TOKENS,
+    OPENAI_TEXT_OUTPUT_USD_PER_1M_TOKENS,
+)
 
 
 class MergedRichFieldsTests(unittest.TestCase):
@@ -72,6 +81,39 @@ class PlotOutTests(unittest.TestCase):
         self.assertEqual(plot.premise, "A woman returns.")
         self.assertEqual(plot.main_conflict, "")
         self.assertEqual(plot.cliffhanger, "He already knew.")
+
+    def test_has_a_dedicated_opening_hook_field(self):
+        # The field the storyboard prompt builds scene 1 around — must
+        # survive a round trip distinctly from premise/cliffhanger.
+        plot = PlotOut(opening_hook="She finds the letter already open.")
+        self.assertEqual(plot.opening_hook, "She finds the letter already open.")
+        self.assertEqual(plot.premise, "")
+
+
+class OpenAiCostTests(unittest.TestCase):
+    def test_estimate_scales_with_prompt_length(self):
+        short = _estimate_openai_text_cost_cents("hi")
+        long = _estimate_openai_text_cost_cents("word " * 5000)
+        self.assertGreater(long, short)
+
+    def test_estimate_uses_real_pricing_constants_not_invented_ones(self):
+        # gpt-6-astra: $10/1M input, $50/1M output — verified against
+        # OpenAI's own pricing page, not guessed (see drama_creator.py's
+        # own comment on where these numbers came from).
+        self.assertEqual(OPENAI_TEXT_INPUT_USD_PER_1M_TOKENS, 10.0)
+        self.assertEqual(OPENAI_TEXT_OUTPUT_USD_PER_1M_TOKENS, 50.0)
+
+    def test_real_cost_reads_usage_object_correctly(self):
+        usage = SimpleNamespace(input_tokens=100_000, output_tokens=10_000)
+        # 100k input @ $10/1M = $1.00; 10k output @ $50/1M = $0.50 -> $1.50 -> 150 cents
+        self.assertEqual(_openai_text_cost_cents(usage), 150)
+
+    def test_none_usage_costs_nothing(self):
+        self.assertEqual(_openai_text_cost_cents(None), 0)
+
+    def test_real_cost_never_rounds_down_to_zero_for_a_nonzero_call(self):
+        usage = SimpleNamespace(input_tokens=1, output_tokens=0)
+        self.assertGreaterEqual(_openai_text_cost_cents(usage), 1)
 
 
 class MaxCharactersTests(unittest.TestCase):
