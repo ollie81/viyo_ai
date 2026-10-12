@@ -292,9 +292,13 @@ different people, merge any of them, or drop one, even if there are fewer than {
 cast that's already written is to fill in the rich visual/voice fields below from what's given (and only invent \
 specifics the idea left unstated, like an exact eye color) — never to replace a described character with your own.
 
-IF the idea is a loose one-liner with no named cast, invent {max_characters} main characters yourself (the \
-protagonist and whichever others are most central to the conflict — an antagonist, love interest, rival, or \
-confidant, whichever the story actually calls for).
+IF the idea is a loose one-liner with no named cast, invent {max_characters} main characters yourself — not just \
+the protagonist. A protagonist alone has no one to create real conflict with, so actually use close to the full \
+{max_characters}: the protagonist PLUS whichever of an antagonist, love interest, rival, or confidant the story \
+needs to have real stakes and real scenes with other people in them. Only write fewer than {max_characters} if the \
+idea is unmistakably a single-character narrative (e.g. explicitly about someone alone) — a normal one-line \
+premise like "a poor student discovers she's a missing heir" still needs the family who's hiding it from her, the \
+rival who resents her, or the love interest who complicates things, not just the student by herself.
 
 For each character, whichever way they came from above:
    - name, age (an approximate range, e.g. "mid-20s"), gender
