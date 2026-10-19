@@ -75,12 +75,35 @@ async def notify_new_episode(
 
     # Only the episode's own owner may trigger a fan-out to their
     # followers — otherwise any authenticated client could spam another
-    # creator's followers by passing an arbitrary post_id.
+    # creator's followers by passing an arbitrary post_id. Doesn't apply
+    # to notify_episode_followers() itself below — studio.py's own
+    # publish_episode already establishes legitimate authority via
+    # _require_admin + _get_series_owner before calling it directly,
+    # with no per-request user JWT to check ownership against at all.
     if post["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not your episode.")
 
     series_id = post.get("series_id")
     if not series_id:
+        return {"notified": 0}
+
+    return notify_episode_followers(post_id, user_id, series_id, post.get("episode_number"))
+
+
+def notify_episode_followers(
+    post_id: str, user_id: str, series_id: str, episode_number: Optional[int]
+) -> dict:
+    """The actual fan-out — pulled out of the HTTP route above so
+    studio.py's publish_episode can call it directly once it's
+    inserted a Studio-published episode's post row. That row's
+    user_id is the series' own designated account (_get_series_owner),
+    never whoever's logged into the admin Studio screen, so going
+    through the HTTP route above (which checks post["user_id"] against
+    the CALLING client's own JWT) would 403 "Not your episode" on
+    every single Studio-published episode — this skips that check
+    entirely, exactly as safe here since the caller already proved
+    its own authority before ever reaching this function."""
+    if supabase_admin is None:
         return {"notified": 0}
 
     series_title = "a series"
@@ -146,8 +169,7 @@ async def notify_new_episode(
     if not follower_ids:
         return {"notified": 0}
 
-    episode_number = post.get("episode_number") or 1
-    message = f"{actor_name} posted Episode {episode_number} of {series_title}"
+    message = f"{actor_name} posted Episode {episode_number or 1} of {series_title}"
 
     # One batch insert for every recipient's in-app row, not a
     # per-follower loop — this is the one place in the codebase where a

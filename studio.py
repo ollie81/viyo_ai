@@ -72,6 +72,8 @@ from pydantic import BaseModel, Field
 from pydantic_core import PydanticUndefined
 from supabase import create_client, Client
 
+from episode_notify import notify_episode_followers
+
 router = APIRouter(prefix="/api/v1/admin/studio", tags=["studio"])
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -3091,6 +3093,19 @@ async def publish_episode(series_id: str, episode_number: int, req: PublishEpiso
         ).execute()
     except Exception as e:
         print(f"[WARN] award_post_creation failed for Studio-published post {inserted['id']}: {e}")
+
+    # The same new-episode fan-out the regular upload flow gets
+    # (episode_notify.py) — called directly rather than through that
+    # module's HTTP route, since this post's owner is the series'
+    # designated account (owner_user_id above), never whoever is
+    # holding the admin key, and that route's ownership check would
+    # 403 against any real caller here. Best-effort, same reasoning as
+    # award_post_creation above: a dropped notification must never
+    # undo or block a publish that already succeeded.
+    try:
+        notify_episode_followers(inserted["id"], owner_user_id, series_id, episode_number)
+    except Exception as e:
+        print(f"[WARN] notify_episode_followers failed for Studio-published post {inserted['id']}: {e}")
 
     return PublishEpisodeResponse(post_id=inserted["id"], media_url=row["media_url"], video_status="processing")
 
