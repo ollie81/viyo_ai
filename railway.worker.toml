@@ -1,0 +1,13 @@
+# Config for the AI Repurposer worker service (the second Railway
+# service). Same image as the API; only the start command differs.
+# In the worker service: Settings -> Config-as-code -> path
+# "railway.worker.toml". The API service keeps using the Dockerfile CMD.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python repurpose_worker.py"
+restartPolicyType = "ALWAYS"
+# Long enough for a SIGTERM'd worker to hand its job back to the queue.
+drainingSeconds = 15

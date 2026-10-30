@@ -52,15 +52,17 @@ import subprocess
 import urllib.parse
 import urllib.request
 import uuid
-from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
-from coins import spend_on_feature, refund_feature
+import clip_selection
+from coins import FEATURE_COSTS
+from repurpose_jobs import JobConfig, JobStore, TransientJobError, supabase_rpc
+from repurpose_storage import SOURCE_BUCKET, SupabaseStorage
 
 # Speaker-tracking crop is optional: this app runs fine without it (the
 # reframe just falls back to a fixed center crop, same as before this
@@ -132,24 +134,46 @@ REPURPOSE_TEXT_MODEL = "gpt-6-luna"
 # block in the same request.
 THUMBNAIL_CANDIDATE_COUNT = 5
 
-# Separate, stricter rate limit from the other AI endpoints — this is
-# far more expensive per call (Whisper + GPT + FFmpeg render).
-REPURPOSE_RATE_LIMIT = 5
-REPURPOSE_RATE_WINDOW = 60 * 60 * 24  # per day
-_repurpose_requests: dict = defaultdict(deque)
+# Clip selection gets a little reasoning (it's the step the whole
+# product's quality rests on); every other text call above stays at
+# "none". Both overridable without a deploy.
+REPURPOSE_SELECTION_MODEL = os.environ.get("REPURPOSE_SELECTION_MODEL", REPURPOSE_TEXT_MODEL)
+REPURPOSE_SELECTION_REASONING = os.environ.get("REPURPOSE_SELECTION_REASONING", "low")
+
+job_config = JobConfig.from_env(cost=FEATURE_COSTS["repurpose"]["cost"])
+job_store: Optional[JobStore] = JobStore(supabase_rpc(supabase_admin), job_config) if supabase_admin else None
+storage: Optional[SupabaseStorage] = SupabaseStorage(supabase_admin, SUPABASE_URL) if supabase_admin else None
+
+_ALLOWED_UPLOAD_TYPES = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+    "video/x-matroska": "mkv", "video/3gpp": "3gp", "video/x-m4v": "m4v",
+    "application/octet-stream": "mp4",
+}
+# Supabase signed upload URLs are valid for two hours.
+_SIGNED_UPLOAD_TTL_SECONDS = 2 * 60 * 60
 
 
-def _check_repurpose_rate_limit(user_id: str):
-    now = time.time()
-    q = _repurpose_requests[user_id]
-    while q and now - q[0] > REPURPOSE_RATE_WINDOW:
-        q.popleft()
-    if len(q) >= REPURPOSE_RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Limit reached: {REPURPOSE_RATE_LIMIT} AI repurposes per day. Try again tomorrow.",
-        )
-    q.append(now)
+def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
+    import openai
+
+    def call(messages: list[dict]) -> str:
+        kwargs = {}
+        if REPURPOSE_SELECTION_REASONING == "none":
+            kwargs["temperature"] = 0.3
+        try:
+            response = client.chat.completions.create(
+                model=REPURPOSE_SELECTION_MODEL,
+                messages=messages,
+                reasoning_effort=REPURPOSE_SELECTION_REASONING,
+                max_completion_tokens=8000,
+                **kwargs,
+            )
+        except openai.APIError as e:
+            raise TransientJobError("selection_unavailable",
+                                    "Clip selection is temporarily unavailable.", f"LLM error: {e}")
+        return response.choices[0].message.content or ""
+
+    return call
 
 
 async def _get_current_user_id(authorization: str = Header(None)) -> str:
@@ -168,11 +192,15 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
 
 
 class RepurposeRequest(BaseModel):
-    # Flutter uploads the video to Supabase Storage first, then sends
-    # us the public URL. This avoids streaming a large file through
-    # Railway's inbound proxy, which has a hard timeout that caused
-    # the "Broken pipe" error on the previous multipart approach.
-    video_url: str = Field(..., description="Public Supabase Storage URL of the source video")
+    # Exactly one of these. source_path is the current flow: a path in
+    # the private repurpose-sources bucket from POST /repurpose/uploads.
+    # video_url is a public posts-media URL, still accepted so app
+    # versions released before the private bucket keep working.
+    source_path: Optional[str] = Field(None, max_length=300)
+    video_url: Optional[str] = Field(None, description="Legacy: public Supabase Storage URL")
+    # One per "Create clips" tap. Re-sending the same value (a retried
+    # request after a timeout) returns the same job without a second charge.
+    client_request_id: Optional[str] = Field(None, min_length=8, max_length=100)
     # Optional. Normal videos with speech never need this — highlights,
     # captions and hook lines all come from the transcript as before.
     # It only does anything when there's no speech to work with (a
@@ -204,6 +232,12 @@ class HighlightSegment(BaseModel):
     # the opening seconds (see _generate_ass) and to show the creator
     # what the AI thinks is doing the work in the first 2 seconds.
     hook_line: str = ""
+    category: Optional[str] = None
+    # What's said in the clip, word for word.
+    transcript: str = ""
+    # How the 0-100 score was built (content rubric, delivery,
+    # structure, penalties), so the number can be explained.
+    score_breakdown: dict = {}
 
 
 class VideoFeedback(BaseModel):
@@ -257,6 +291,9 @@ class RepurposeResponse(BaseModel):
     # None only if the feedback pass itself failed — a missing critique
     # never fails a job that produced usable clips.
     feedback: Optional[VideoFeedback] = None
+    # How many clips the video could support, how many made it, and an
+    # honest note when it's fewer than hoped.
+    selection: Optional[dict] = None
 
 
 class RepurposeJobStartResponse(BaseModel):
@@ -268,34 +305,36 @@ class RepurposeJobStatusResponse(BaseModel):
     status: str  # "processing" | "done" | "failed"
     result: Optional[RepurposeResponse] = None
     error: Optional[str] = None
+    # Finer-grained progress for the current app; older versions ignore it.
+    stage: Optional[str] = None
+    progress: Optional[float] = None
+    message: Optional[str] = None
+    coins_refunded: Optional[int] = None
 
 
-# Job state lives in Supabase Storage, not an in-memory dict. This app
-# has no schema/migration access to add a proper jobs table (same
-# constraint coins.py hit for free-taste tracking — see its module
-# docstring — solved there by reusing the transactions table; there's
-# no similarly-shaped existing table for a job's full result payload,
-# but there is already a bucket this exact endpoint uploads clips to).
-# A dict is wiped by every Railway restart/redeploy, which silently
-# strands any client mid-poll with a job_id that suddenly 404s and no
-# way to know whether the coins it was charged got refunded. A JSON
-# object per job in the same bucket the clips already land in survives
-# restarts and is shared across instances, at the cost of one Storage
-# round trip per status write/read instead of a dict access.
+class RepurposeUploadRequest(BaseModel):
+    content_type: str = Field(..., max_length=100)
+    size_bytes: int = Field(..., gt=0)
+
+
+class RepurposeUploadResponse(BaseModel):
+    # PUT the file body here (Content-Type = the type declared above).
+    upload_url: str
+    source_path: str
+    max_bytes: int
+    expires_in_seconds: int
+
+
+# Before the repurpose_jobs table, job state was a JSON file per job in
+# this bucket. Nothing writes these any more; they're still read (so a
+# job started just before the deploy can be polled to completion) and
+# swept (see repurpose_cleanup) until the last of them expires.
 _REPURPOSE_JOB_TTL_SECONDS = 60 * 60
 _JOB_PREFIX = "_jobs"
 
 
 def _job_path(job_id: str) -> str:
     return f"{_JOB_PREFIX}/{job_id}.json"
-
-
-def _write_job(job_id: str, data: dict) -> None:
-    supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-        _job_path(job_id),
-        json.dumps(data).encode("utf-8"),
-        file_options={"content-type": "application/json", "upsert": "true"},
-    )
 
 
 def _read_job(job_id: str) -> Optional[dict]:
@@ -308,25 +347,6 @@ def _read_job(job_id: str) -> Optional[dict]:
         # same "not found or expired" the TTL case already produces,
         # since there's nothing more specific to tell them.
         return None
-
-
-def _finish_job(
-    job_id: str, user_id: str, created_at: float, status: str,
-    result: Optional[dict] = None, error: Optional[str] = None,
-) -> None:
-    """Best-effort terminal write — this runs from inside an already-
-    failing except block in some callers, so a Storage hiccup here must
-    log rather than raise and mask the real error."""
-    try:
-        _write_job(job_id, {
-            "user_id": user_id,
-            "status": status,
-            "result": result,
-            "error": error,
-            "created_at": created_at,
-        })
-    except Exception as e:
-        print(f"[WARN] Could not persist repurpose job {job_id} result: {e}")
 
 
 def _cleanup_expired_repurpose_jobs() -> None:
@@ -385,48 +405,6 @@ def _validate_storage_url(url: str) -> None:
         )
 
 
-def _download_video(url: str, dest_path: str) -> None:
-    """
-    Downloads the source video with a hard size cap enforced while
-    streaming, not after the fact — the previous version downloaded the
-    entire file with urlretrieve before ever checking MAX_INPUT_SIZE_BYTES,
-    so a large or slow-drip remote file would be fully pulled down
-    (bandwidth/disk/cost) before being rejected. A timeout guards against
-    a remote server that simply hangs.
-    """
-    _validate_storage_url(url)
-    try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
-            # Re-validate after following any redirects — the initial URL
-            # passing the check doesn't guarantee the final one does.
-            _validate_storage_url(resp.geturl())
-
-            content_length = resp.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_INPUT_SIZE_BYTES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)}MB.",
-                )
-
-            written = 0
-            with open(dest_path, "wb") as out:
-                while True:
-                    chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    written += len(chunk)
-                    if written > MAX_INPUT_SIZE_BYTES:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)}MB.",
-                        )
-                    out.write(chunk)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not download video from URL: {e}")
-
-
 def _run_ffprobe_duration(path: str) -> float:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -460,241 +438,19 @@ def _has_audio_stream(path: str) -> bool:
     return bool(result.stdout.strip())
 
 
-def _transcribe_with_openai(path: str) -> dict:
+def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> HighlightSegment:
     """
-    Transcribe long videos safely.
+    The single clip for a video with no usable speech (no audio track,
+    or only music/ambient sound), packaged from the creator's own
+    description instead of a transcript: the opening of the video,
+    capped at MAX_OUTPUT_CLIP_SECONDS.
 
-    OpenAI's audio upload endpoint has a per-file size limit, so a long
-    video's audio is split into small MP3 chunks first. Each chunk is
-    transcribed separately and the timestamps are shifted back into the
-    original video's timeline.
-    """
-    if not _has_audio_stream(path):
-        raise HTTPException(
-            status_code=400,
-            detail="This video has no audio track — the AI Repurposer needs "
-            "spoken audio to find highlights. Try a video with sound.",
-        )
-
-    with tempfile.TemporaryDirectory() as audio_tmp:
-        audio_pattern = os.path.join(audio_tmp, "audio_%03d.mp3")
-
-        # 64 kbps mono MP3 keeps each chunk comfortably below the API limit.
-        # 600 seconds (10 minutes) is intentionally conservative.
-        extract_cmd = [
-            "ffmpeg", "-y",
-            "-i", path,
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "libmp3lame",
-            "-b:a", "64k",
-            "-f", "segment",
-            "-segment_time", "600",
-            "-reset_timestamps", "1",
-            audio_pattern,
-        ]
-        result = subprocess.run(
-            extract_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Audio extraction failed: {result.stderr[-500:]}"
-            )
-
-        chunks = sorted(
-            os.path.join(audio_tmp, n)
-            for n in os.listdir(audio_tmp)
-            if n.endswith(".mp3")
-        )
-
-        all_segments = []
-        all_words = []
-        all_text = []
-        offset = 0.0
-
-        for chunk in chunks:
-            chunk_duration = _run_ffprobe_duration(chunk)
-
-            with open(chunk, "rb") as f:
-                try:
-                    result = ai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        response_format="verbose_json",
-                        # Word timings drive the karaoke-style captions
-                        # (see _generate_ass). Segment timings alone can
-                        # only light up a whole line at a time, which is
-                        # what makes auto-captions look auto-generated.
-                        timestamp_granularities=["segment", "word"],
-                    )
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"Transcription failed: {e}"
-                    )
-
-            data = result.model_dump() if hasattr(result, "model_dump") else dict(result)
-            text = (data.get("text") or "").strip()
-            if text:
-                all_text.append(text)
-
-            for seg in data.get("segments", []) or []:
-                seg = dict(seg)
-                seg["start"] = float(seg.get("start", 0)) + offset
-                seg["end"] = float(seg.get("end", 0)) + offset
-                all_segments.append(seg)
-
-            for word in data.get("words", []) or []:
-                word = dict(word)
-                word["start"] = float(word.get("start", 0)) + offset
-                word["end"] = float(word.get("end", 0)) + offset
-                all_words.append(word)
-
-            offset += chunk_duration
-
-        return {
-            "text": " ".join(all_text).strip(),
-            "segments": all_segments,
-            "words": all_words,
-        }
-
-MAX_HIGHLIGHT_CANDIDATES = 5
-
-# Roughly one additional highlight candidate per 6 minutes of source video —
-# a 3-minute video and a 30-minute video obviously don't contain the same
-# number of genuinely distinct highlight-worthy moments. Capped at
-# MAX_HIGHLIGHT_CANDIDATES so a near-max-length (33-minute) upload still
-# renders in a bounded amount of time (each extra candidate means another
-# full render + thumbnail-selection + quote-card pass below).
-_MINUTES_PER_ADDITIONAL_CLIP = 6
-
-
-def _highlight_count_for_duration(duration_seconds: float) -> int:
-    minutes = duration_seconds / 60
-    count = 1 + int(minutes // _MINUTES_PER_ADDITIONAL_CLIP)
-    return max(1, min(MAX_HIGHLIGHT_CANDIDATES, count))
-
-
-# Caption/hashtag limits. Kept well under every short-form platform's
-# own cap so a generated caption is never the thing that gets rejected
-# at post time.
-MAX_CAPTION_CHARS = 300
-MAX_HASHTAGS = 6
-# Burned across the opening seconds, so it has to fit a phone screen
-# without covering the video.
-MAX_HOOK_LINE_CHARS = 70
-
-# Words that carry no hook on their own. A clip opening on these burns
-# the two seconds that decide whether anyone keeps watching, so the
-# start is nudged past them — the prompt asks the model to avoid this,
-# this is what actually guarantees it.
-_FILLER_OPENERS = {
-    "so", "um", "uh", "erm", "ah", "oh", "eh", "hmm", "mm", "mhm",
-    "and", "but", "or", "then", "well", "like", "okay", "ok", "right",
-    "yeah", "yep", "yes", "no", "now", "just", "basically", "actually",
-    "anyway", "anyways", "literally", "obviously", "honestly", "look",
-    "listen", "i", "you", "it", "we", "they", "that", "this", "the",
-    "a", "an", "is", "was", "know", "mean", "think", "guess",
-}
-# Never chase a hook further than this into the clip — past it, the
-# model's chosen moment has effectively been abandoned.
-_MAX_HOOK_SKIP_SECONDS = 2.5
-
-
-def _tighten_hook_start(words: list, start_time: float, end_time: float) -> float:
-    """
-    Moves start_time forward past any filler the clip would otherwise
-    open on, landing on the first word that can actually carry a hook.
-
-    Returns start_time unchanged when there are no word timings, when
-    the opening is already strong, or when skipping would eat more than
-    _MAX_HOOK_SKIP_SECONDS or leave too short a clip.
-    """
-    if not words:
-        return start_time
-
-    in_clip = sorted(
-        (w for w in words if float(w.get("start", 0)) >= start_time - 0.15
-         and float(w.get("start", 0)) < end_time),
-        key=lambda w: float(w.get("start", 0)),
-    )
-    if not in_clip:
-        return start_time
-
-    for word in in_clip:
-        token = re.sub(r"[^a-z']", "", str(word.get("word", "")).lower())
-        if token and token not in _FILLER_OPENERS:
-            candidate = float(word.get("start", 0))
-            # Small lead-in so the first syllable isn't clipped.
-            candidate = max(start_time, candidate - 0.1)
-            if candidate - start_time > _MAX_HOOK_SKIP_SECONDS:
-                return start_time
-            if end_time - candidate < MIN_OUTPUT_CLIP_SECONDS:
-                return start_time
-            return candidate
-
-    return start_time
-
-
-def _clean_hashtags(tags: list) -> list:
-    """
-    Normalises whatever the model returned into plain, postable tags:
-    no '#', no spaces, lowercase, deduped, capped. The model is asked
-    for this format already — this is the guarantee, not the request.
-    """
-    cleaned = []
-    for tag in tags or []:
-        tag = re.sub(r"[^a-z0-9]", "", str(tag).lower())
-        if tag and tag not in cleaned:
-            cleaned.append(tag)
-        if len(cleaned) >= MAX_HASHTAGS:
-            break
-    return cleaned
-
-
-def _overlap_fraction(a: HighlightSegment, b: HighlightSegment) -> float:
-    overlap = max(0.0, min(a.end_time, b.end_time) - max(a.start_time, b.start_time))
-    shorter = min(a.end_time - a.start_time, b.end_time - b.start_time)
-    return overlap / shorter if shorter > 0 else 0.0
-
-
-def _fallback_highlight(max_duration: float) -> HighlightSegment:
-    return HighlightSegment(
-        start_time=0.0,
-        end_time=min(30.0, max_duration),
-        reason="Default clip (AI highlight detection unavailable)",
-        suggested_title="Featured Clip",
-        score=50,
-    )
-
-
-def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
-    """
-    Builds the single highlight for a video with no usable speech (no
-    audio track at all, or audio — like music — Whisper found nothing
-    to transcribe in), driven by the creator's own description instead
-    of a transcript.
-
-    There's no speech to time a cut against, so unlike _find_highlights
-    this never returns more than one candidate: the whole video, capped
-    at MAX_OUTPUT_CLIP_SECONDS same as any other clip. Only the title,
-    caption, hashtags and hook overlay come from the model, grounded in
-    what the creator actually asked for rather than guessed.
+    There is nothing to measure, so the score is 0 and the category is
+    "prompt" (the app hides the score for these). If the model can't
+    write the packaging, this raises a retryable error rather than
+    returning a generic "Featured Clip".
     """
     clip_length = min(max_duration, MAX_OUTPUT_CLIP_SECONDS)
-    fallback = HighlightSegment(
-        start_time=0.0,
-        end_time=clip_length,
-        reason="Based on your description — no spoken audio to find highlights in.",
-        suggested_title="Featured Clip",
-        score=50,
-    )
-
     prompt = (
         "A creator uploaded a video with no usable spoken audio (silent, or "
         "music/ambient sound with nothing to transcribe) and described what "
@@ -711,185 +467,31 @@ def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> list:
         response = ai_client.chat.completions.create(
             model=REPURPOSE_TEXT_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert short-form content editor who "
-                               "specializes in retention-optimized hooks. You edit "
-                               "for Viyo, which also has an AI Short Drama format — "
-                               "numbered episodes in a series, first 3 free, coins "
-                               "to unlock the rest. If a clip genuinely ends on an "
-                               "unresolved moment or a continuing story thread, "
-                               "say so in `reason` as good Short Drama material "
-                               "rather than a flaw — but never change where a clip "
-                               "starts or ends to force that; it's a note, not a "
-                               "goal.",
-                },
+                {"role": "system", "content": "You are an expert short-form content editor who "
+                                              "specializes in retention-optimized hooks."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.5,
             reasoning_effort="none",
         )
-        raw = response.choices[0].message.content.strip()
-        clean = re.sub(r"```json|```", "", raw).strip()
-        data = json.loads(clean)
-        return [HighlightSegment(
-            start_time=0.0,
-            end_time=clip_length,
-            reason="Based on your description — no spoken audio to find highlights in.",
-            suggested_title=str(data.get("suggested_title", "")).strip() or "Featured Clip",
-            score=60,
-            caption=str(data.get("caption", "")).strip()[:MAX_CAPTION_CHARS],
-            hashtags=_clean_hashtags(data.get("hashtags") or []),
-            hook_line=str(data.get("hook_line", "")).strip()[:MAX_HOOK_LINE_CHARS],
-        )]
-    except Exception:
-        return [fallback]
-
-
-def _format_timestamped_transcript(segments: list) -> str:
-    """
-    Renders Whisper's own per-segment timestamps as `[start -> end] text`
-    lines. _find_highlights previously received only the flat concatenated
-    transcript text with no timing information at all, yet was asked to
-    return start_time/end_time in seconds — meaning every clip boundary
-    was effectively a guess based on word count and assumed speaking
-    pace, not grounded in the real audio. This gives the model actual
-    numbers to point to instead.
-    """
-    lines = []
-    for seg in segments:
-        text = (seg.get("text") or "").strip()
-        if not text:
-            continue
-        lines.append(f"[{seg.get('start', 0):.1f}s -> {seg.get('end', 0):.1f}s] {text}")
-    return "\n".join(lines)
-
-
-def _find_highlights(
-    segments: list,
-    max_duration: float,
-    count: int = MAX_HIGHLIGHT_CANDIDATES,
-    words: Optional[list] = None,
-) -> list:
-    """
-    Returns up to `count` ranked, non-overlapping highlight candidates
-    instead of a single "best" pick — the point of multiple options is
-    that they're genuinely different moments, so a candidate that mostly
-    overlaps an already-accepted one is skipped rather than counted.
-
-    Two things this asks for beyond "find something engaging": clip
-    boundaries grounded in Whisper's real timestamps (see
-    _format_timestamped_transcript) rather than guessed, and an opening
-    line that actually hooks a viewer — the single biggest lever on
-    whether a short-form clip gets watched past the first second, which
-    the previous prompt never asked for at all.
-    """
-    if not segments:
-        return [_fallback_highlight(max_duration)]
-
-    timestamped_transcript = _format_timestamped_transcript(segments)
-
-    prompt = (
-        f"Below is a timestamped transcript of a video, {max_duration:.0f} seconds "
-        "long. Each line is tagged with its EXACT start and end time in the source "
-        "video — use these real timestamps for start_time/end_time. Never estimate "
-        "or invent a time that isn't grounded in the lines below.\n\n"
-        f"Identify the {count} best short-form clip candidates, ranked best first. "
-        "They must be genuinely different moments, not overlapping variations of "
-        "the same one.\n\n"
-        "CLIP LENGTH: let each moment decide its own length, between "
-        f"{MIN_OUTPUT_CLIP_SECONDS} and {MAX_OUTPUT_CLIP_SECONDS} seconds. Do NOT "
-        "stretch a clip toward the maximum. A punchy 15-second exchange is a better "
-        "clip than the same exchange padded to 45 seconds with lead-in and wind-down. "
-        "Cut the moment where the idea genuinely completes.\n\n"
-        "For each candidate:\n"
-        "- THE FIRST 2 SECONDS DECIDE EVERYTHING. start_time must land exactly on the "
-        "first word of a hook — a bold claim, a question, a number, a contradiction, "
-        "or a surprising statement. Never start on filler ('so', 'um', 'yeah', 'and "
-        "then', 'basically'), on a greeting, or mid-sentence. If the strongest hook "
-        "sits a few seconds into a thought, start there and let the setup go.\n"
-        "- hook_line: quote the exact opening words (roughly the first 2 seconds of "
-        "speech) that do the hooking, copied verbatim from the transcript.\n"
-        "- end_time should land at a natural end of thought (a punchline, a payoff, "
-        "a conclusion) so the clip feels complete rather than cut off.\n"
-        "- score (0-100) should weigh the strength of the opening hook specifically, "
-        "not just whether the topic is generally interesting.\n"
-        "- caption is the ready-to-post caption for this clip: 1-2 short lines in the "
-        "creator's own voice, opening with a hook line, no hashtags inside it, and no "
-        "quotation marks around it.\n"
-        "- hashtags is 3-6 lowercase tags relevant to THIS clip's actual subject, "
-        "without the # symbol. Prefer specific tags a real audience searches over "
-        "generic filler like fyp or viral.\n\n"
-        "Return ONLY a raw JSON array, each item an object with keys: start_time "
-        "(seconds), end_time (seconds), reason (explain both why the moment is "
-        "compelling and why the opening line hooks a viewer), suggested_title, "
-        "score, caption, hashtags (array of strings), hook_line.\n\n"
-        f"TRANSCRIPT:\n{timestamped_transcript}"
+        data = clip_selection.parse_json_object(response.choices[0].message.content or "")
+        title = str(data.get("suggested_title", "")).strip()
+        if not title:
+            raise ValueError("no title in response")
+    except Exception as e:
+        raise TransientJobError("selection_unavailable",
+                                "Couldn't write your clip from the description.", str(e))
+    return HighlightSegment(
+        start_time=0.0,
+        end_time=clip_length,
+        reason="Based on your description — this video has no speech to choose moments from.",
+        suggested_title=title[:clip_selection.MAX_TITLE_CHARS],
+        score=0,
+        category="prompt",
+        caption=str(data.get("caption", "")).strip()[:clip_selection.MAX_CAPTION_CHARS],
+        hashtags=clip_selection.clean_hashtags(data.get("hashtags") or []),
+        hook_line=str(data.get("hook_line", "")).strip()[:clip_selection.MAX_HOOK_LINE_CHARS],
     )
-    try:
-        response = ai_client.chat.completions.create(
-            model=REPURPOSE_TEXT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert short-form content editor who specializes in "
-                               "retention-optimized hooks. You edit for Viyo, which also has an "
-                               "AI Short Drama format — numbered episodes in a series, first 3 "
-                               "free, coins to unlock the rest. If a clip genuinely ends on an "
-                               "unresolved moment or a continuing story thread, say so in "
-                               "`reason` as good Short Drama material rather than a flaw — but "
-                               "never change where a clip starts or ends to force that; it's a "
-                               "note, not a goal.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            reasoning_effort="none",
-        )
-        raw = response.choices[0].message.content.strip()
-        clean = re.sub(r"```json|```", "", raw).strip()
-        data = json.loads(clean)
-        if not isinstance(data, list):
-            data = [data]
-        candidates = [HighlightSegment(**item) for item in data]
-    except Exception:
-        return [_fallback_highlight(max_duration)]
-
-    # A very short source can't yield a minimum-length clip; never
-    # stretch past what actually exists.
-    min_length = min(MIN_OUTPUT_CLIP_SECONDS, max_duration)
-
-    accepted: list[HighlightSegment] = []
-    for seg in candidates:
-        # Clamp to the source video's real bounds and our length range
-        # — never trust the model's numbers blindly.
-        seg.start_time = max(0.0, min(seg.start_time, max_duration))
-        seg.end_time = max(seg.start_time + 1, min(seg.end_time, max_duration))
-        if seg.end_time - seg.start_time > MAX_OUTPUT_CLIP_SECONDS:
-            seg.end_time = seg.start_time + MAX_OUTPUT_CLIP_SECONDS
-        # Extend a too-short clip toward the end of the source, then
-        # backwards if there's no room left — a 4-second fragment is
-        # not a clip regardless of how the model timed it.
-        if seg.end_time - seg.start_time < min_length:
-            seg.end_time = min(max_duration, seg.start_time + min_length)
-            seg.start_time = max(0.0, seg.end_time - min_length)
-
-        # Guarantee the opening two seconds actually hook, rather than
-        # trusting the prompt to have done it.
-        seg.start_time = _tighten_hook_start(words, seg.start_time, seg.end_time)
-
-        seg.score = max(0, min(seg.score, 100))
-        seg.caption = seg.caption.strip()[:MAX_CAPTION_CHARS]
-        seg.hashtags = _clean_hashtags(seg.hashtags)
-        seg.hook_line = seg.hook_line.strip()[:MAX_HOOK_LINE_CHARS]
-
-        if any(_overlap_fraction(seg, a) > 0.5 for a in accepted):
-            continue
-        accepted.append(seg)
-        if len(accepted) >= count:
-            break
-
-    return accepted or [_fallback_highlight(max_duration)]
 
 
 def _measure_video_signals(words: list, segments: list, duration: float) -> dict:
@@ -919,7 +521,7 @@ def _measure_video_signals(words: list, segments: list, duration: float) -> dict
 
 
 def _critique_video(
-    transcript: str, signals: dict, highlights: list
+    transcript: str, signals: dict, best_score: int
 ) -> Optional[VideoFeedback]:
     """
     Tells the creator what's actually wrong with their footage.
@@ -933,7 +535,6 @@ def _critique_video(
     if not transcript.strip():
         return None
 
-    best_score = max((h.score for h in highlights), default=0)
     # Long transcripts get trimmed: the critique is about delivery and
     # structure, both of which are legible from a generous sample.
     sample = transcript[:6000]
@@ -1610,14 +1211,12 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
     continuous cut — this is the actual editing step; picking a good
     highlight window alone doesn't remove the pauses/filler air inside it.
 
-    Single-block case (nothing to trim) uses the same fast input-seek
-    approach as before. The multi-block case still seeks to the first
-    block before decoding — filter-based trims only skip frames *after*
-    decode, so without this the whole video up to that point would be
-    decoded for nothing.
+    Each kept block is its own input, seeked straight to its start.
+    Trimming blocks out of one shared input instead makes ffmpeg buffer
+    every decoded frame between the branches: memory grew ~1 GB per cut
+    on 1080p sources (1.3 GB for one block, 4.3 GB for four), enough to
+    get the worker OOM-killed on a clip with normal dead-air removal.
     """
-    seek_offset = blocks[0][0]
-    rel_blocks = [(b_start - seek_offset, b_end - seek_offset) for b_start, b_end in blocks]
 
     # Pans the crop to follow the detected speaker when tracking is
     # reliable enough; falls back to the plain static center crop
@@ -1640,36 +1239,27 @@ def _render_clip(input_path: str, output_path: str, srt_path: Optional[str], blo
             )
             post_filter += f",subtitles='{safe_path}':force_style='{style}'"
 
-    if len(rel_blocks) == 1:
-        start, end = rel_blocks[0]
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(seek_offset), "-i", input_path, "-t", str(end - start),
-            "-vf", post_filter,
-            "-af", _LOUDNORM_FILTER,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            output_path,
-        ]
-    else:
-        filter_parts = []
-        for i, (b_start, b_end) in enumerate(rel_blocks):
-            filter_parts.append(f"[0:v]trim=start={b_start}:end={b_end},setpts=PTS-STARTPTS[v{i}]")
-            filter_parts.append(f"[0:a]atrim=start={b_start}:end={b_end},asetpts=PTS-STARTPTS[a{i}]")
-        concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(rel_blocks)))
-        filter_parts.append(f"{concat_inputs}concat=n={len(rel_blocks)}:v=1:a=1[vcat][acat]")
-        filter_parts.append(f"[vcat]{post_filter}[vout]")
-        filter_parts.append(f"[acat]{_LOUDNORM_FILTER}[aout]")
+    inputs = []
+    for b_start, b_end in blocks:
+        inputs += ["-ss", f"{b_start:.3f}", "-t", f"{b_end - b_start:.3f}", "-i", input_path]
+    filter_parts = []
+    for i in range(len(blocks)):
+        filter_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
+        filter_parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(blocks)))
+    filter_parts.append(f"{concat_inputs}concat=n={len(blocks)}:v=1:a=1[vcat][acat]")
+    filter_parts.append(f"[vcat]{post_filter}[vout]")
+    filter_parts.append(f"[acat]{_LOUDNORM_FILTER}[aout]")
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(seek_offset), "-i", input_path,
-            "-filter_complex", ";".join(filter_parts),
-            "-map", "[vout]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            output_path,
-        ]
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
@@ -1816,262 +1406,122 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
         return fallback_index
 
 
-def _run_repurpose_job(
-    job_id: str, video_url: str, user_id: str, charged: int, created_at: float,
-    creative_prompt: Optional[str] = None,
-) -> None:
-    """
-    The actual transcribe → find-highlights → render-per-clip pipeline,
-    run outside the request/response cycle (see repurpose_video below for
-    why). Every step here used to run inline in the POST handler and
-    raise HTTPException straight into FastAPI's own error handling; there
-    is no request to raise into from a background task, so this catches
-    everything itself and records it in the job's Storage record instead.
-
-    `charged` is what spend_on_feature already took for this job (0 for
-    a free daily taste) — any failure below refunds it. This is the
-    single most expensive action in the app (40 coins, no free taste)
-    charged upfront before any processing happens; a creator whose job
-    fails on something as ordinary as a silent video must not just be
-    out the coins with nothing to show for it.
-
-    `created_at` is carried through from the job's initial write rather
-    than re-read from Storage, both to save a round trip and so the
-    TTL clock starts at job creation, not completion.
-
-    `creative_prompt` is the optional escape hatch for a video with no
-    usable speech — see RepurposeRequest.creative_prompt and
-    _highlights_from_prompt. Every video with real speech in it ignores
-    this entirely and goes through the normal transcript-driven path.
-    """
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            source_path = os.path.join(tmp, "source.mp4")
-
-            # Download the video from Supabase Storage.
-            # This is a server-to-server download (Railway → Supabase CDN)
-            # and is not subject to Railway's inbound request timeout.
-            _download_video(video_url, source_path)
-
-            duration = _run_ffprobe_duration(source_path)
-            if duration > MAX_INPUT_DURATION_SECONDS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Video too long — max {MAX_INPUT_DURATION_SECONDS}s.",
-                )
-
-            if _has_audio_stream(source_path):
-                whisper_result = _transcribe_with_openai(source_path)
-            elif creative_prompt:
-                # No audio track at all, but the creator opted into
-                # describing the clip instead — see _highlights_from_prompt
-                # below. Nothing to transcribe either way.
-                whisper_result = {"text": "", "segments": [], "words": []}
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="This video has no audio track — the AI Repurposer needs "
-                    "spoken audio to find highlights. Try a video with sound, or "
-                    "describe what you want the clip to look like instead.",
-                )
-            transcript_text = whisper_result.get("text", "")
-            segments = whisper_result.get("segments", [])
-            words = whisper_result.get("words", [])
-
-            # Transcription (the slow, expensive part) happens once no matter
-            # how many candidate clips come out of it — only the render/upload
-            # step below repeats per clip, which is cheap by comparison.
-            highlight_count = _highlight_count_for_duration(duration)
-            if not segments and creative_prompt:
-                # No speech anywhere to find highlights in — either no
-                # audio track, or audio (e.g. music) Whisper found
-                # nothing to transcribe. Use the creator's own
-                # description instead of the generic fallback clip.
-                highlights = _highlights_from_prompt(creative_prompt, duration)
-            else:
-                highlights = _find_highlights(
-                    segments, duration, count=highlight_count, words=words
-                )
-
-            clips = []
-            for i, highlight in enumerate(highlights):
-                # Cut dead air out of the chosen window instead of rendering
-                # it as one continuous clip — this is what actually edits the
-                # clip rather than just picking where to cut it.
-                blocks = _find_speech_blocks(segments, highlight.start_time, highlight.end_time)
-                dead_air_removed = _dead_air_removed_seconds(blocks)
-
-                # Second, finer pass: cuts filler words ("um", "uh") out
-                # of the same blocks — these have actual sound, so no
-                # silence gap above ever catches them.
-                kept_before_filler = sum(b_end - b_start for b_start, b_end in blocks)
-                blocks, filler_words_removed_count = _remove_filler_words(blocks, words)
-                kept_after_filler = sum(b_end - b_start for b_start, b_end in blocks)
-                filler_words_removed_seconds = round(kept_before_filler - kept_after_filler, 2)
-
-                # Karaoke captions when word timings came back, plain
-                # line-at-a-time SRT when they didn't — burning in the
-                # simpler captions beats burning in none at all.
-                captions_path = os.path.join(tmp, f"captions_{i}.ass")
-                if not _generate_ass(words, captions_path, blocks, highlight.hook_line):
-                    captions_path = os.path.join(tmp, f"captions_{i}.srt")
-                    _generate_srt(segments, captions_path, blocks)
-
-                output_path = os.path.join(tmp, f"output_{i}.mp4")
-                _render_clip(source_path, output_path, captions_path, blocks)
-
-                # Upload the finished clip to Supabase Storage — survives
-                # Railway's ephemeral filesystem across redeploys.
-                storage_path = f"{user_id}/{int(time.time())}_{i}.mp4"
-                with open(output_path, "rb") as f:
-                    try:
-                        supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                            storage_path, f, file_options={"content-type": "video/mp4"}
-                        )
-                    except Exception as e:
-                        raise HTTPException(status_code=502, detail=f"Storage upload failed: {e}")
-
-                public_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(storage_path)
-
-                # A second, cheap format from the same upload — a shareable
-                # quote card, not just the video. Never fails the request:
-                # the video clip is what actually matters, so a render or
-                # upload problem here (e.g. a stricter bucket MIME policy)
-                # just means this one clip has no quote card, not a 502.
-                quote_card_url = None
-                try:
-                    quote_card_path = os.path.join(tmp, f"quote_{i}.png")
-                    _render_quote_card(highlight.suggested_title, quote_card_path)
-                    quote_card_storage_path = f"{user_id}/{int(time.time())}_{i}_quote.png"
-                    with open(quote_card_path, "rb") as qf:
-                        supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                            quote_card_storage_path, qf, file_options={"content-type": "image/png"}
-                        )
-                    quote_card_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
-                        quote_card_storage_path
-                    )
-                except Exception as e:
-                    print(f"[WARN] Quote card failed for clip {i}: {e}")
-
-                # A GPT-4o-mini vision pick of the most scroll-stopping frame
-                # from the clip itself, uploaded as the poster image — most
-                # feed UIs show the thumbnail before anyone presses play, so
-                # this is the single biggest lever on whether a clip gets a
-                # first tap at all. Same never-fail-the-request pattern as
-                # the quote card above.
-                thumbnail_url = None
-                try:
-                    candidates = _extract_thumbnail_candidates(output_path, tmp, THUMBNAIL_CANDIDATE_COUNT)
-                    if candidates:
-                        best_index = _pick_best_thumbnail(candidates)
-                        thumbnail_storage_path = f"{user_id}/{int(time.time())}_{i}_thumb.jpg"
-                        with open(candidates[best_index], "rb") as tf:
-                            supabase_admin.storage.from_(PROCESSED_BUCKET).upload(
-                                thumbnail_storage_path, tf, file_options={"content-type": "image/jpeg"}
-                            )
-                        thumbnail_url = supabase_admin.storage.from_(PROCESSED_BUCKET).get_public_url(
-                            thumbnail_storage_path
-                        )
-                except Exception as e:
-                    print(f"[WARN] Thumbnail selection failed for clip {i}: {e}")
-
-                clips.append(RepurposeClipResult(
-                    processed_video_url=public_url,
-                    highlight=highlight,
-                    dead_air_removed_seconds=dead_air_removed,
-                    filler_words_removed_seconds=filler_words_removed_seconds,
-                    filler_words_removed_count=filler_words_removed_count,
-                    quote_card_url=quote_card_url,
-                    thumbnail_url=thumbnail_url,
-                ))
-
-        # Runs after the clips so it can cite the best hook score found,
-        # and never blocks them: _critique_video returns None on failure
-        # rather than raising.
-        signals = _measure_video_signals(words, segments, duration)
-        feedback = _critique_video(transcript_text, signals, highlights)
-
-        result = RepurposeResponse(
-            status="success",
-            transcript=transcript_text,
-            clips=clips,
-            feedback=feedback,
+def _require_jobs() -> JobStore:
+    if job_store is None or storage is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Video repurposing isn't configured yet — SUPABASE_SERVICE_ROLE_KEY is missing on the server.",
         )
-        _finish_job(job_id, user_id, created_at, "done", result=result.model_dump(mode="json"))
-    except HTTPException as e:
-        refund_feature(supabase_admin, user_id, "repurpose", charged)
-        _finish_job(job_id, user_id, created_at, "failed", error=str(e.detail))
+    return job_store
+
+
+def _max_upload_bytes() -> int:
+    """The smaller of our own input cap and the private bucket's limit.
+    The project-wide limit (dashboard setting) isn't readable over the
+    API; if it's lower, the upload itself is rejected with HTTP 413."""
+    bucket_limit = storage.bucket_file_size_limit(SOURCE_BUCKET) if storage else None
+    return min(MAX_INPUT_SIZE_BYTES, bucket_limit) if bucket_limit else MAX_INPUT_SIZE_BYTES
+
+
+@router.post("/repurpose/uploads", response_model=RepurposeUploadResponse)
+async def create_repurpose_upload(
+    req: RepurposeUploadRequest,
+    user_id: str = Depends(_get_current_user_id),
+):
+    """
+    Step 1 of a repurpose: issues a signed upload URL for a server-chosen
+    path in the private repurpose-sources bucket. The creator's video is
+    never publicly readable, and nobody can write to anyone else's path.
+    Nothing is charged here.
+    """
+    _require_jobs()
+    content_type = req.content_type.split(";")[0].strip().lower()
+    ext = _ALLOWED_UPLOAD_TYPES.get(content_type)
+    if ext is None:
+        raise HTTPException(status_code=400, detail="That file type isn't supported. Upload an MP4, MOV or WebM video.")
+    max_bytes = _max_upload_bytes()
+    if req.size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video too large — max {max_bytes // (1024 * 1024)} MB.",
+        )
+
+    path = f"{user_id}/{uuid.uuid4().hex}.{ext}"
+    try:
+        signed = storage.signed_upload(SOURCE_BUCKET, path)
+        job_store.register_upload(user_id, SOURCE_BUCKET, path, req.size_bytes, content_type)
     except Exception as e:
-        refund_feature(supabase_admin, user_id, "repurpose", charged)
-        _finish_job(job_id, user_id, created_at, "failed", error=f"Unexpected error: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not prepare the upload: {e}")
+    return RepurposeUploadResponse(
+        upload_url=signed["url"], source_path=path, max_bytes=max_bytes,
+        expires_in_seconds=_SIGNED_UPLOAD_TTL_SECONDS,
+    )
+
+
+_CREATE_ERRORS = {
+    "daily_limit": (429, None),
+    "profile_not_found": (404, "Your profile couldn't be found."),
+    "unknown_upload": (400, "That upload wasn't found. Please upload the video again."),
+    "upload_already_used": (409, "That upload was already used. Please upload the video again."),
+}
 
 
 @router.post("/repurpose", response_model=RepurposeJobStartResponse)
 async def repurpose_video(
     req: RepurposeRequest,
-    background_tasks: BackgroundTasks,
     user_id: str = Depends(_get_current_user_id),
 ):
     """
-    Starts video repurposing as a background job and returns immediately
-    with a job_id, instead of processing everything inline and holding
-    the connection open until it's done.
-
-    Why: with clip count now scaled to source length (up to
-    MAX_HIGHLIGHT_CANDIDATES), a long video's total pipeline —
-    transcription plus one render + thumbnail-selection + quote-card
-    pass per clip — can take several minutes. The old synchronous
-    version had to fit that entire pipeline inside one HTTP round trip;
-    if it ran past Railway's request-handling limit, the connection was
-    killed and the client got nothing back even if the work would have
-    finished. Returning a job_id immediately means the slow work no
-    longer has to fit inside one request — the client polls
-    GET /repurpose/{job_id} instead (see below).
-
-    Flutter still uploads the raw video to Supabase Storage first and
-    sends only the URL here, for the same reason as before: this keeps
-    large file data off the Railway inbound proxy.
+    Step 2: charges the creator and queues the job, atomically, and
+    returns immediately. The worker service does the processing; poll
+    GET /repurpose/{job_id}. Re-sending the same client_request_id
+    returns the same job without charging again.
     """
-    if supabase_admin is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Video repurposing isn't configured yet — SUPABASE_SERVICE_ROLE_KEY is missing on the server.",
-        )
+    store = _require_jobs()
+    if bool(req.source_path) == bool(req.video_url):
+        raise HTTPException(status_code=400, detail="Send exactly one of source_path or video_url.")
 
-    _check_repurpose_rate_limit(user_id)
-    # Fail fast on a malformed/malicious URL before spending any coins
-    # or creating a job for it.
-    _validate_storage_url(req.video_url)
+    if req.source_path:
+        if not req.source_path.startswith(f"{user_id}/"):
+            raise HTTPException(status_code=400, detail=_CREATE_ERRORS["unknown_upload"][1])
+        size = storage.object_size(SOURCE_BUCKET, req.source_path)
+        if size is None:
+            raise HTTPException(status_code=400, detail="Your video hasn't finished uploading. Please try again.")
+        if size > MAX_INPUT_SIZE_BYTES:
+            raise HTTPException(status_code=400, detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)} MB.")
+        kind, bucket, path, url = "private_upload", SOURCE_BUCKET, req.source_path, None
+    else:
+        _validate_storage_url(req.video_url)
+        kind, bucket, path, url = "legacy_public_url", None, None, req.video_url
 
-    # Charged upfront, before the background job even starts — any
-    # failure inside _run_repurpose_job refunds this same amount rather
-    # than leaving the creator out 40 coins for a job that never
-    # produced anything.
-    charged = spend_on_feature(supabase_admin, user_id, "repurpose")
-
-    job_id = str(uuid.uuid4())
-    created_at = time.time()
     try:
-        _write_job(job_id, {
-            "user_id": user_id,
-            "status": "processing",
-            "result": None,
-            "error": None,
-            "created_at": created_at,
-        })
+        outcome = store.create_job(
+            user_id, source_kind=kind, source_bucket=bucket, source_path=path, source_url=url,
+            creative_prompt=req.creative_prompt, client_request_id=req.client_request_id,
+        )
     except Exception as e:
-        # The job record itself never made it to Storage — nothing was
-        # actually started, so this must not be a silent 40-coin charge.
-        refund_feature(supabase_admin, user_id, "repurpose", charged)
         raise HTTPException(status_code=502, detail=f"Could not start job: {e}")
 
-    _cleanup_expired_repurpose_jobs()
+    if not outcome.get("ok"):
+        error = outcome.get("error")
+        if error == "insufficient_coins":
+            raise HTTPException(status_code=402, detail={
+                "error": "insufficient_coins", "feature": "repurpose",
+                "balance": outcome.get("balance", 0), "needed": outcome.get("needed", job_config.cost),
+            })
+        if error == "daily_limit":
+            raise HTTPException(
+                status_code=429,
+                detail=f"Limit reached: {job_config.daily_limit} AI repurposes per day. Try again tomorrow.",
+            )
+        status, message = _CREATE_ERRORS.get(error, (400, "Could not start the job."))
+        raise HTTPException(status_code=status, detail=message)
 
-    background_tasks.add_task(
-        _run_repurpose_job, job_id, req.video_url, user_id, charged, created_at, req.creative_prompt
-    )
+    return RepurposeJobStartResponse(job_id=str(outcome["job_id"]), status="processing")
 
-    return RepurposeJobStartResponse(job_id=job_id, status="processing")
+
+_LEGACY_STATUS = {"queued": "processing", "processing": "processing",
+                  "succeeded": "done", "failed": "failed"}
 
 
 @router.get("/repurpose/{job_id}", response_model=RepurposeJobStatusResponse)
@@ -2079,27 +1529,43 @@ async def get_repurpose_job(
     job_id: str,
     user_id: str = Depends(_get_current_user_id),
 ):
-    """Polled by the client until status is "done" or "failed" — see
-    repurpose_video above for why this is a separate step instead of one
-    long blocking POST."""
-    if supabase_admin is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Video repurposing isn't configured yet — SUPABASE_SERVICE_ROLE_KEY is missing on the server.",
+    store = _require_jobs()
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    job = store.get_job(job_id)
+    if job is None:
+        legacy = _read_job(job_id)
+        if legacy is None:
+            raise HTTPException(status_code=404, detail="Job not found or expired.")
+        if legacy.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="Not your job.")
+        result = legacy.get("result")
+        return RepurposeJobStatusResponse(
+            status=legacy.get("status", "processing"),
+            result=RepurposeResponse(**result) if result else None,
+            error=legacy.get("error"),
         )
 
-    job = _read_job(job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found or expired — repurpose jobs are only kept for about an hour.",
-        )
-    if job.get("user_id") != user_id:
+    if str(job.get("user_id")) != user_id:
         raise HTTPException(status_code=403, detail="Not your job.")
 
+    status = job.get("status", "queued")
+    refunded = job.get("refund_amount") if job.get("refunded_at") else None
+    error = None
+    if status == "failed":
+        error = job.get("error") or "Processing failed."
+        if refunded:
+            error += f" Your {refunded} coins were refunded."
     result = job.get("result")
     return RepurposeJobStatusResponse(
-        status=job.get("status", "processing"),
+        status=_LEGACY_STATUS.get(status, "processing"),
         result=RepurposeResponse(**result) if result else None,
-        error=job.get("error"),
+        error=error,
+        stage=job.get("stage"),
+        progress=job.get("progress"),
+        message=job.get("status_message") or ("Waiting for a processing slot" if status == "queued" else None),
+        coins_refunded=refunded,
     )
