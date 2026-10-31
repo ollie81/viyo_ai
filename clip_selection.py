@@ -252,8 +252,10 @@ def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds:
         f"The video is {video_seconds / 60:.1f} minutes long. Below is the transcript for "
         f"{_fmt_time(sentences[lo].start)}-{_fmt_time(sentences[hi].end)} as numbered sentences "
         "with their real start/end times.\n\n"
-        f"Find up to {max_candidates} moments that would each work as a standalone short. "
-        "Return fewer, or none, if fewer are genuinely good.\n\n"
+        f"List the {max_candidates} best candidate moments in this part, best first. Include "
+        "weaker ones too and score them honestly: low scores are expected and get filtered out "
+        "later, so never inflate a score to justify including a moment. Return fewer only if "
+        "this part doesn't contain that many distinct, complete moments.\n\n"
         "RULES\n"
         "- A moment is a contiguous range of sentences: start_sentence..end_sentence "
         "(inclusive), using the S numbers below. Never use numbers outside this list.\n"
@@ -378,6 +380,9 @@ class Candidate:
     transcript: str
     ends_on_sentence: bool
     end_pause: float
+    # "" when the LLM's range fit as proposed; "trimmed_to_fit" /
+    # "extended_to_fit" when the ending was moved to meet the length limits.
+    length_adjustment: str = ""
     content_score: int = 0
     delivery_score: int = 50
     structure_score: int = 0
@@ -414,6 +419,60 @@ def _trim_leading_fillers(words: list[dict], first: int, last: int) -> int:
     return i
 
 
+# Penalties for a range the code moved to meet the length limits: the
+# LLM scored the moment it proposed, not exactly this one. Trimming can
+# cut into the payoff, so it costs more than adding a little context.
+LENGTH_ADJUSTMENT_PENALTY = {"trimmed_to_fit": 8, "extended_to_fit": 5}
+MAX_EXTENSION_SENTENCES = 3
+
+
+def _fit_length(words: list[dict], sentences: list["Sentence"], first_word: int,
+                s0: int, s1: int, last_allowed: int) -> tuple[Optional[int], Optional[str]]:
+    """
+    Returns (end_sentence, adjustment) so the clip's speech lands within
+    [MIN_CLIP_SECONDS, MAX_CLIP_SECONDS], or (None, reason) if it can't.
+
+    Too long: keep the LLM's opening (the hook) and move the ending back
+    to the latest sentence that fits, preferring one that ends on a full
+    stop, then one followed by a natural pause. Too short: extend by up
+    to MAX_EXTENSION_SENTENCES following sentences, never across a long
+    silence (that's where a thought usually ends).
+    """
+    def speech_to(e: int) -> float:
+        return speech_seconds(words[first_word: sentences[e].last_word + 1])
+
+    speech = speech_to(s1)
+    if MIN_CLIP_SECONDS <= speech <= MAX_CLIP_SECONDS:
+        return s1, None
+
+    if speech > MAX_CLIP_SECONDS:
+        best: Optional[tuple[int, int]] = None
+        for e in range(s1 - 1, s0 - 1, -1):
+            sp = speech_to(e)
+            if sp > MAX_CLIP_SECONDS:
+                continue
+            if sp < MIN_CLIP_SECONDS:
+                break
+            rank = 2 if sentences[e].terminal else (1 if sentences[e].pause_after >= PAUSE_BREAK_SECONDS else 0)
+            if best is None or rank > best[1]:
+                best = (e, rank)
+            if rank == 2:
+                break
+        return (best[0], "trimmed_to_fit") if best else (None, "too_long")
+
+    e = s1
+    while e < min(last_allowed, len(sentences) - 1) and e - s1 < MAX_EXTENSION_SENTENCES:
+        e += 1
+        if sentences[e].start - sentences[e - 1].end > SOFT_SENTENCE_BREAK_GAP_SECONDS:
+            break
+        sp = speech_to(e)
+        if sp > MAX_CLIP_SECONDS:
+            break
+        if sp >= MIN_CLIP_SECONDS:
+            return e, "extended_to_fit"
+    return None, "too_short"
+
+
 def _hook_is_verbatim(hook: str, clip_words: list[dict]) -> bool:
     hook_keys = [k for k in (_key(t) for t in hook.split()) if k]
     if not hook_keys:
@@ -438,6 +497,9 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
         return None, "sentence_ids_out_of_range"
 
     first = _trim_leading_fillers(words, sentences[s0].first_word, sentences[s1].last_word)
+    s1, adjustment = _fit_length(words, sentences, first, s0, s1, window[1])
+    if s1 is None:
+        return None, adjustment
     last = sentences[s1].last_word
     clip_words = words[first: last + 1]
     start = max(0.0, float(clip_words[0]["start"]) - 0.05)
@@ -447,11 +509,6 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     end = min(end, video_seconds)
     duration = end - start
     speech = speech_seconds(clip_words)
-
-    if speech < MIN_CLIP_SECONDS:
-        return None, "too_short"
-    if speech > MAX_CLIP_SECONDS:
-        return None, "too_long"
 
     rubric = {k: _int_score((raw.get("scores") or {}).get(k)) for k in RUBRIC_KEYS}
     category = str(raw.get("category", "other")).strip().lower()
@@ -481,6 +538,7 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
         transcript=" ".join(w["text"] for w in clip_words),
         ends_on_sentence=sentences[s1].terminal,
         end_pause=min(sentences[s1].pause_after, 99.0),
+        length_adjustment=adjustment or "",
     )
     if not cand.title:
         return None, "missing_title"
@@ -514,12 +572,15 @@ def score_candidate(c: Candidate) -> None:
     c.structure_score = max(0, structure)
 
     context_penalty = 15 if c.context_dependent else 0
-    final = 0.75 * c.content_score + 0.15 * c.delivery_score + 0.10 * c.structure_score - context_penalty
+    length_penalty = LENGTH_ADJUSTMENT_PENALTY.get(c.length_adjustment, 0)
+    final = (0.75 * c.content_score + 0.15 * c.delivery_score + 0.10 * c.structure_score
+             - context_penalty - length_penalty)
     c.score = max(0, min(100, int(round(final))))
     c.breakdown = {
         "content": c.content_score, "delivery": c.delivery_score,
         "structure": c.structure_score, "structure_penalties": penalties,
-        "context_penalty": context_penalty, "rubric": dict(c.rubric),
+        "context_penalty": context_penalty, "length_adjustment": c.length_adjustment or None,
+        "length_penalty": length_penalty, "rubric": dict(c.rubric),
     }
 
 
@@ -592,6 +653,9 @@ def select_clips(candidates: list[Candidate], target: int, min_score: int,
 
     if len(accepted) >= target:
         note = ""
+    elif not accepted and not candidates and rejected:
+        note = ("We couldn't cut any moment from this video into a clip of a usable length "
+                f"({int(MIN_CLIP_SECONDS)}-{int(MAX_CLIP_SECONDS)} seconds of speech).")
     elif not accepted:
         note = ("No moment in this video was strong enough to work as a standalone short "
                 "without the rest of the video.")

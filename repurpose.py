@@ -170,7 +170,8 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
     state = {"reasoning": bool(REPURPOSE_REASONING_EFFORT)}
 
     def create(messages: list[dict]):
-        kwargs = _llm_kwargs(0.3) if state["reasoning"] else {"temperature": 0.3}
+        # Temperature 0: the same video should get the same picks.
+        kwargs = _llm_kwargs(0) if state["reasoning"] else {"temperature": 0}
         return client.chat.completions.create(
             model=REPURPOSE_SELECTION_MODEL,
             messages=messages,

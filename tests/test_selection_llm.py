@@ -33,7 +33,7 @@ def test_default_sends_temperature_and_no_reasoning(monkeypatch):
     monkeypatch.setattr(r, "REPURPOSE_REASONING_EFFORT", "")
     client = FakeClient()
     assert r.selection_llm(client)([{"role": "user", "content": "x"}]) == '{"candidates": []}'
-    assert "reasoning_effort" not in client.calls[0] and client.calls[0]["temperature"] == 0.3
+    assert "reasoning_effort" not in client.calls[0] and client.calls[0]["temperature"] == 0
 
 
 def test_rejected_reasoning_falls_back_once_and_sticks(monkeypatch):

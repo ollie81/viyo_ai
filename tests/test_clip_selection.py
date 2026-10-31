@@ -163,7 +163,7 @@ def test_hook_line_that_was_not_said_is_replaced_with_real_words(story):
     assert c.hook_line.lower().startswith("nobody tells you")
 
 
-@pytest.mark.parametrize("ids,reason", [((0, 1), "too_short"), ((9, 12), "sentence_ids_out_of_range"),
+@pytest.mark.parametrize("ids,reason", [((9, 12), "sentence_ids_out_of_range"),
                                         (("x", 2), "invalid_sentence_ids")])
 def test_invalid_candidates_are_rejected_not_repaired(story, ids, reason):
     words, sentences = story
@@ -171,12 +171,54 @@ def test_invalid_candidates_are_rejected_not_repaired(story, ids, reason):
     assert c is None and why == reason
 
 
-def test_too_long_candidates_are_rejected():
+def test_too_long_moment_keeps_its_hook_and_ends_at_the_latest_full_stop_that_fits():
     words, segments = make_transcript(filler(30))
     punct = cs.attach_punctuation(words, segments)
     sentences = cs.build_sentences(punct)
-    c, why = cs.evaluate_candidate(raw(0, 29), sentences, punct, 999.0)
-    assert c is None and why == "too_long"
+    c, why = cs.evaluate_candidate(raw(0, 29, hook_line=""), sentences, punct, 999.0)
+    assert why is None and c.length_adjustment == "trimmed_to_fit"
+    assert c.start_sentence == 0 and c.start == pytest.approx(punct[0]["start"], abs=0.06)
+    assert cs.MIN_CLIP_SECONDS <= c.speech_duration <= cs.MAX_CLIP_SECONDS
+    assert c.ends_on_sentence
+    # It is the LATEST full stop that fits: one more sentence would not.
+    one_more = cs.speech_seconds(punct[: sentences[c.end_sentence + 1].last_word + 1])
+    assert one_more > cs.MAX_CLIP_SECONDS
+    assert c.breakdown["length_penalty"] == cs.LENGTH_ADJUSTMENT_PENALTY["trimmed_to_fit"]
+
+
+def test_trimming_prefers_a_full_stop_over_a_later_pause():
+    words, segments = make_transcript(filler(30))
+    punct = cs.attach_punctuation(words, segments)
+    sentences = cs.build_sentences(punct)
+    plain, _ = cs.evaluate_candidate(raw(0, 29, hook_line=""), sentences, punct, 999.0)
+    k = plain.end_sentence
+    # Make the chosen ending non-terminal with no pause: the next-best
+    # full stop earlier wins over it.
+    sentences[k].terminal = False
+    sentences[k].pause_after = 0.1
+    moved, _ = cs.evaluate_candidate(raw(0, 29, hook_line=""), sentences, punct, 999.0)
+    assert moved.end_sentence < k and moved.ends_on_sentence
+
+
+def test_slightly_short_moment_is_extended_but_never_across_a_long_silence(story):
+    words, sentences = story
+    c, why = cs.evaluate_candidate(raw(0, 1), sentences, words, 200.0)
+    assert why is None and c.length_adjustment == "extended_to_fit"
+    assert c.speech_duration >= cs.MIN_CLIP_SECONDS
+    assert c.breakdown["length_penalty"] == cs.LENGTH_ADJUSTMENT_PENALTY["extended_to_fit"]
+
+    w2, seg2 = make_transcript(["A short line here.", "Another short one."], pause=3.0)
+    p2 = cs.attach_punctuation(w2, seg2)
+    s2 = cs.build_sentences(p2)
+    c2, why2 = cs.evaluate_candidate(raw(0, 0), s2, p2, 60.0)
+    assert c2 is None and why2 == "too_short"
+
+
+def test_when_nothing_fits_the_note_says_so_instead_of_blaming_quality():
+    result = cs.select_clips([], target=5, min_score=60,
+                             rejected=[{"title": "a", "score": None, "reason": "too_short"}],
+                             total_speech=400)
+    assert "usable length" in result.note and "strong enough" not in result.note
 
 
 def test_score_rewards_content_far_more_than_delivery(story):
