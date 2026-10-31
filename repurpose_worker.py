@@ -178,6 +178,11 @@ class Worker:
 
 
 def build_production_worker() -> Worker:
+    missing = [k for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "OPENAI_API_KEY")
+               if not os.environ.get(k)]
+    if missing:
+        sys.exit(f"Worker can't start: set {', '.join(missing)} in this service's Variables.")
+
     import repurpose as r
     from openai import OpenAI
     from coins import FEATURE_COSTS
@@ -187,9 +192,7 @@ def build_production_worker() -> Worker:
     import clip_selection
 
     if r.supabase_admin is None:
-        sys.exit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set for the worker.")
-    if not os.environ.get("OPENAI_API_KEY"):
-        sys.exit("OPENAI_API_KEY must be set for the worker.")
+        sys.exit("Worker can't start: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are invalid.")
 
     config = JobConfig.from_env(cost=FEATURE_COSTS["repurpose"]["cost"])
     store = JobStore(supabase_rpc(r.supabase_admin), config)

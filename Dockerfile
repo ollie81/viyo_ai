@@ -22,4 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # $PORT is injected by Railway at runtime â€” never hardcode a port number here.
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+# The same image runs two Railway services: the API (default) and the
+# AI Repurposer worker, selected by setting VIYO_PROCESS=worker on that
+# service. exec makes the chosen process PID 1 so Railway's SIGTERM
+# reaches it directly (the worker hands its job back on SIGTERM).
+CMD if [ "$VIYO_PROCESS" = "worker" ]; then exec python repurpose_worker.py; else exec uvicorn main:app --host 0.0.0.0 --port $PORT; fi
