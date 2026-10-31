@@ -154,24 +154,53 @@ _SIGNED_UPLOAD_TTL_SECONDS = 2 * 60 * 60
 
 
 def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
+    """
+    The clip-selection LLM call. Tries REPURPOSE_SELECTION_REASONING
+    first; if the model rejects that request outright (HTTP 400 — e.g. a
+    reasoning level it doesn't support), it falls back to the exact
+    settings every other call in this file already runs with in
+    production (reasoning "none" + temperature), and keeps using them for
+    the rest of the process instead of paying for a doomed request first
+    every time.
+    """
     import openai
 
+    state = {"effort": REPURPOSE_SELECTION_REASONING}
+
+    def create(messages: list[dict], effort: str):
+        kwargs = {"temperature": 0.3} if effort == "none" else {}
+        return client.chat.completions.create(
+            model=REPURPOSE_SELECTION_MODEL,
+            messages=messages,
+            reasoning_effort=effort,
+            max_completion_tokens=8000,
+            **kwargs,
+        )
+
     def call(messages: list[dict]) -> str:
-        kwargs = {}
-        if REPURPOSE_SELECTION_REASONING == "none":
-            kwargs["temperature"] = 0.3
+        effort = state["effort"]
         try:
-            response = client.chat.completions.create(
-                model=REPURPOSE_SELECTION_MODEL,
-                messages=messages,
-                reasoning_effort=REPURPOSE_SELECTION_REASONING,
-                max_completion_tokens=8000,
-                **kwargs,
-            )
+            response = create(messages, effort)
+        except openai.BadRequestError as e:
+            if effort == "none":
+                raise TransientJobError("selection_unavailable",
+                                        "Clip selection is temporarily unavailable.", f"LLM rejected request: {e}")
+            print(f"[WARN] selection model rejected reasoning_effort={effort!r} ({e}); "
+                  "falling back to 'none'")
+            state["effort"] = "none"
+            try:
+                response = create(messages, "none")
+            except openai.APIError as e2:
+                raise TransientJobError("selection_unavailable",
+                                        "Clip selection is temporarily unavailable.", f"LLM error: {e2}")
         except openai.APIError as e:
             raise TransientJobError("selection_unavailable",
                                     "Clip selection is temporarily unavailable.", f"LLM error: {e}")
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+        if not content.strip():
+            finish = getattr(response.choices[0], "finish_reason", None)
+            print(f"[WARN] selection model returned no text (finish_reason={finish})")
+        return content
 
     return call
 
