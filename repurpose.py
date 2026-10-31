@@ -114,18 +114,28 @@ QUOTE_CARD_SIZE = "1080x1080"
 # without this package drawtext has nothing to render text with at all.
 QUOTE_CARD_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# Text/vision model for the four gpt-4o-mini call sites below (highlight
-# selection, video critique, prompt-driven fallback, thumbnail pick) —
-# NOT the transcription call, which stays on whisper-1 (see its own
-# comment in _transcribe_with_openai for why). Luna is the direct,
-# cheaper successor to gpt-4o-mini's role: none of these four calls do
-# multi-step reasoning, so reasoning_effort="none" is passed at every
-# call site to keep behavior/cost/latency close to the old model rather
-# than paying for reasoning tokens on straightforward extraction and
-# generation tasks — Luna rejects `temperature` outright unless that's
-# set, and separately requires `max_completion_tokens` in place of the
-# older `max_tokens`.
-REPURPOSE_TEXT_MODEL = "gpt-6-luna"
+# Text/vision model for this file's chat calls (clip selection, footage
+# critique, description-only packaging, thumbnail pick) — not
+# transcription, which is whisper-1. Defaults to the same OPENAI_MODEL
+# the rest of the backend runs on in production (gpt-4o-mini), which is
+# known to work on this account. It used to be hard-coded to
+# "gpt-6-luna", which was never verified: the first live jobs failed on
+# every selection call, and the previous code would have hidden any such
+# failure by substituting a made-up clip.
+REPURPOSE_TEXT_MODEL = os.environ.get(
+    "REPURPOSE_TEXT_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+# Only for reasoning models (set alongside a model that supports it);
+# empty means the parameter isn't sent at all, which non-reasoning models
+# like gpt-4o-mini require.
+REPURPOSE_REASONING_EFFORT = os.environ.get("REPURPOSE_REASONING_EFFORT", "")
+
+
+def _llm_kwargs(temperature: float) -> dict:
+    # Reasoning models reject temperature; other models reject
+    # reasoning_effort. Send exactly one of them.
+    if REPURPOSE_REASONING_EFFORT:
+        return {"reasoning_effort": REPURPOSE_REASONING_EFFORT}
+    return {"temperature": temperature}
 
 # How many evenly-spaced frames to pull from a rendered clip as thumbnail
 # candidates. 5 is enough spread to catch a genuinely different moment
@@ -134,11 +144,7 @@ REPURPOSE_TEXT_MODEL = "gpt-6-luna"
 # block in the same request.
 THUMBNAIL_CANDIDATE_COUNT = 5
 
-# Clip selection gets a little reasoning (it's the step the whole
-# product's quality rests on); every other text call above stays at
-# "none". Both overridable without a deploy.
 REPURPOSE_SELECTION_MODEL = os.environ.get("REPURPOSE_SELECTION_MODEL", REPURPOSE_TEXT_MODEL)
-REPURPOSE_SELECTION_REASONING = os.environ.get("REPURPOSE_SELECTION_REASONING", "low")
 
 job_config = JobConfig.from_env(cost=FEATURE_COSTS["repurpose"]["cost"])
 job_store: Optional[JobStore] = JobStore(supabase_rpc(supabase_admin), job_config) if supabase_admin else None
@@ -155,41 +161,34 @@ _SIGNED_UPLOAD_TTL_SECONDS = 2 * 60 * 60
 
 def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
     """
-    The clip-selection LLM call. Tries REPURPOSE_SELECTION_REASONING
-    first; if the model rejects that request outright (HTTP 400 — e.g. a
-    reasoning level it doesn't support), it falls back to the exact
-    settings every other call in this file already runs with in
-    production (reasoning "none" + temperature), and keeps using them for
-    the rest of the process instead of paying for a doomed request first
-    every time.
+    The clip-selection LLM call. If the model rejects the request outright
+    (HTTP 400) while a reasoning level is configured, it retries once
+    without it and keeps it off for the rest of the process.
     """
     import openai
 
-    state = {"effort": REPURPOSE_SELECTION_REASONING}
+    state = {"reasoning": bool(REPURPOSE_REASONING_EFFORT)}
 
-    def create(messages: list[dict], effort: str):
-        kwargs = {"temperature": 0.3} if effort == "none" else {}
+    def create(messages: list[dict]):
+        kwargs = _llm_kwargs(0.3) if state["reasoning"] else {"temperature": 0.3}
         return client.chat.completions.create(
             model=REPURPOSE_SELECTION_MODEL,
             messages=messages,
-            reasoning_effort=effort,
             max_completion_tokens=8000,
             **kwargs,
         )
 
     def call(messages: list[dict]) -> str:
-        effort = state["effort"]
         try:
-            response = create(messages, effort)
+            response = create(messages)
         except openai.BadRequestError as e:
-            if effort == "none":
+            if not state["reasoning"]:
                 raise TransientJobError("selection_unavailable",
                                         "Clip selection is temporarily unavailable.", f"LLM rejected request: {e}")
-            print(f"[WARN] selection model rejected reasoning_effort={effort!r} ({e}); "
-                  "falling back to 'none'")
-            state["effort"] = "none"
+            print(f"[WARN] selection model rejected reasoning_effort ({e}); retrying without it")
+            state["reasoning"] = False
             try:
-                response = create(messages, "none")
+                response = create(messages)
             except openai.APIError as e2:
                 raise TransientJobError("selection_unavailable",
                                         "Clip selection is temporarily unavailable.", f"LLM error: {e2}")
@@ -198,8 +197,8 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
                                     "Clip selection is temporarily unavailable.", f"LLM error: {e}")
         content = response.choices[0].message.content or ""
         if not content.strip():
-            finish = getattr(response.choices[0], "finish_reason", None)
-            print(f"[WARN] selection model returned no text (finish_reason={finish})")
+            print(f"[WARN] selection model returned no text "
+                  f"(finish_reason={getattr(response.choices[0], 'finish_reason', None)})")
         return content
 
     return call
@@ -339,6 +338,9 @@ class RepurposeJobStatusResponse(BaseModel):
     progress: Optional[float] = None
     message: Optional[str] = None
     coins_refunded: Optional[int] = None
+    # Technical detail of the latest failed attempt (keys redacted), so a
+    # creator or support can report the real cause from a screenshot.
+    error_detail: Optional[str] = None
 
 
 class RepurposeUploadRequest(BaseModel):
@@ -500,8 +502,7 @@ def _highlights_from_prompt(creative_prompt: str, max_duration: float) -> Highli
                                               "specializes in retention-optimized hooks."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.5,
-            reasoning_effort="none",
+            **_llm_kwargs(0.5),
         )
         data = clip_selection.parse_json_object(response.choices[0].message.content or "")
         title = str(data.get("suggested_title", "")).strip()
@@ -609,8 +610,7 @@ def _critique_video(
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.4,
-            reasoning_effort="none",
+            **_llm_kwargs(0.4),
         )
         raw = response.choices[0].message.content.strip()
         data = json.loads(re.sub(r"```json|```", "", raw).strip())
@@ -1418,8 +1418,7 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
         completion = ai_client.chat.completions.create(
             model=REPURPOSE_TEXT_MODEL,
             messages=[{"role": "user", "content": content}],
-            temperature=0,
-            reasoning_effort="none",
+            **_llm_kwargs(0),
             max_completion_tokens=50,
         )
         raw = (completion.choices[0].message.content or "").strip()
@@ -1589,6 +1588,9 @@ async def get_repurpose_job(
         if refunded:
             error += f" Your {refunded} coins were refunded."
     result = job.get("result")
+    detail = job.get("last_error") if (status == "failed" or job.get("error_code")) else None
+    if detail:
+        detail = re.sub(r"(sk|key|eyJ)[-_A-Za-z0-9.*]{6,}", "[redacted]", str(detail))[:400]
     return RepurposeJobStatusResponse(
         status=_LEGACY_STATUS.get(status, "processing"),
         result=RepurposeResponse(**result) if result else None,
@@ -1597,4 +1599,5 @@ async def get_repurpose_job(
         progress=job.get("progress"),
         message=job.get("status_message") or ("Waiting for a processing slot" if status == "queued" else None),
         coins_refunded=refunded,
+        error_detail=detail,
     )

@@ -172,3 +172,18 @@ def test_other_users_cannot_read_a_job(api):
     job_id = api["as_user"](owner).post("/api/v1/repurpose", json={"source_path": path}).json()["job_id"]
     assert api["as_user"](other).get(f"/api/v1/repurpose/{job_id}").status_code == 403
     assert api["as_user"](other).get("/api/v1/repurpose/not-a-uuid").status_code == 404
+
+
+def test_failed_job_shows_redacted_error_detail_to_its_owner(api):
+    from repurpose_jobs import PermanentJobError
+    uid = make_user(api["db"], 100)
+    client = api["as_user"](uid)
+    path = upload(api, uid)["source_path"]
+    job_id = client.post("/api/v1/repurpose", json={"source_path": path}).json()["job_id"]
+    job = api["store"].claim("w")
+    api["store"].fail(job_id, job["lease_token"], PermanentJobError(
+        "selection_unavailable", "Clip selection failed.",
+        "LLM error: Error code: 401 - Incorrect API key provided: sk-proj-abc123SECRET456"), 1)
+    body = client.get(f"/api/v1/repurpose/{job_id}").json()
+    assert "401" in body["error_detail"]
+    assert "SECRET" not in body["error_detail"] and "[redacted]" in body["error_detail"]
