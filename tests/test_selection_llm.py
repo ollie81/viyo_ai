@@ -30,14 +30,14 @@ class FakeClient:
 
 
 def test_default_sends_temperature_and_no_reasoning(monkeypatch):
-    monkeypatch.setattr(r, "REPURPOSE_REASONING_EFFORT", "")
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "")
     client = FakeClient()
     assert r.selection_llm(client)([{"role": "user", "content": "x"}]) == '{"candidates": []}'
     assert "reasoning_effort" not in client.calls[0] and client.calls[0]["temperature"] == 0
 
 
 def test_rejected_reasoning_falls_back_once_and_sticks(monkeypatch):
-    monkeypatch.setattr(r, "REPURPOSE_REASONING_EFFORT", "low")
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "low")
     client = FakeClient(reject_reasoning=True)
     llm = r.selection_llm(client)
     llm([{"role": "user", "content": "x"}])
@@ -46,15 +46,20 @@ def test_rejected_reasoning_falls_back_once_and_sticks(monkeypatch):
 
 
 def test_rejection_without_reasoning_is_reported_not_looped(monkeypatch):
-    monkeypatch.setattr(r, "REPURPOSE_REASONING_EFFORT", "")
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "")
     client = FakeClient(reject_all=True)
     with pytest.raises(TransientJobError) as e:
         r.selection_llm(client)([{"role": "user", "content": "x"}])
     assert "rejected" in e.value.internal and len(client.calls) == 1
 
 
-def test_other_calls_never_send_both_parameters(monkeypatch):
-    monkeypatch.setattr(r, "REPURPOSE_REASONING_EFFORT", "")
+def test_selection_reasoning_never_leaks_into_the_other_calls(monkeypatch):
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "low")
     assert r._llm_kwargs(0.4) == {"temperature": 0.4}
-    monkeypatch.setattr(r, "REPURPOSE_REASONING_EFFORT", "low")
-    assert r._llm_kwargs(0.4) == {"reasoning_effort": "low"}
+
+
+def test_reasoning_model_gets_effort_and_no_temperature(monkeypatch):
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "low")
+    client = FakeClient()
+    r.selection_llm(client)([{"role": "user", "content": "x"}])
+    assert client.calls[0]["reasoning_effort"] == "low" and "temperature" not in client.calls[0]

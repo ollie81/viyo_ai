@@ -124,17 +124,15 @@ QUOTE_CARD_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # failure by substituting a made-up clip.
 REPURPOSE_TEXT_MODEL = os.environ.get(
     "REPURPOSE_TEXT_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
-# Only for reasoning models (set alongside a model that supports it);
-# empty means the parameter isn't sent at all, which non-reasoning models
-# like gpt-4o-mini require.
-REPURPOSE_REASONING_EFFORT = os.environ.get("REPURPOSE_REASONING_EFFORT", "")
+# Reasoning level for CLIP SELECTION only, set alongside a selection model
+# that supports it (e.g. a gpt-5.x model). Empty means the parameter isn't
+# sent, which non-reasoning models like gpt-4o-mini require. Kept separate
+# from the other calls in this file on purpose: those run on
+# REPURPOSE_TEXT_MODEL, which can be a different model that would reject it.
+REPURPOSE_SELECTION_REASONING_EFFORT = os.environ.get("REPURPOSE_SELECTION_REASONING_EFFORT", "")
 
 
 def _llm_kwargs(temperature: float) -> dict:
-    # Reasoning models reject temperature; other models reject
-    # reasoning_effort. Send exactly one of them.
-    if REPURPOSE_REASONING_EFFORT:
-        return {"reasoning_effort": REPURPOSE_REASONING_EFFORT}
     return {"temperature": temperature}
 
 # How many evenly-spaced frames to pull from a rendered clip as thumbnail
@@ -167,11 +165,14 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
     """
     import openai
 
-    state = {"reasoning": bool(REPURPOSE_REASONING_EFFORT)}
+    state = {"reasoning": bool(REPURPOSE_SELECTION_REASONING_EFFORT)}
 
     def create(messages: list[dict]):
-        # Temperature 0: the same video should get the same picks.
-        kwargs = _llm_kwargs(0) if state["reasoning"] else {"temperature": 0}
+        # Reasoning models reject temperature and non-reasoning models
+        # reject reasoning_effort, so send exactly one. Temperature 0 so
+        # the same video gets the same picks.
+        kwargs = ({"reasoning_effort": REPURPOSE_SELECTION_REASONING_EFFORT}
+                  if state["reasoning"] else {"temperature": 0})
         return client.chat.completions.create(
             model=REPURPOSE_SELECTION_MODEL,
             messages=messages,
