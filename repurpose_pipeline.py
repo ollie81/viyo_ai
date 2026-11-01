@@ -579,7 +579,9 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
                 except (LeaseLost, ShutdownRequested):
                     raise
                 except ClipRejected as e:
-                    qa_rejected.append({"title": clip.get("title"), "failed": e.failures})
+                    qa_rejected.append({"title": clip.get("title"), "failed": e.failures,
+                                        "measured": {k: v for k, v in e.report.get("checks", {}).items()
+                                                     if k in e.failures}})
                     print(f"[INFO] clip '{clip.get('title')}' failed quality control: {e.failures}")
                     continue
                 except StorageUnavailable as e:
@@ -596,7 +598,7 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
             raise PermanentJobError(
                 "no_clip_passed_quality_check",
                 "We found moments in your video, but none came out well enough to publish, so we didn't "
-                "keep any. Try a video with clearer audio or picture.", str(qa_rejected)[:1500])
+                "keep any. Try a video with clearer audio or picture.", json.dumps(qa_rejected, default=str)[:3500])
         if not results:
             raise TransientJobError("render_failed", "We couldn't render your clips.",
                                     "; ".join(render_failures)[:2000])
