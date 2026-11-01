@@ -46,7 +46,8 @@ Judge each clip as a viewer who has never seen the rest of the video:
   or there is distracting text. "visual_ok" is true/false (null if no frames).
 - verdict: "publish" if it is worth posting as it is, "fix" if it is usable only after a small change
   (say what), "reject" if it should not be posted.
-- issues: concrete problems, empty if none. Be specific and honest; do not praise by default.
+- issues: concrete problems, empty if none. If standalone is false you MUST say exactly what the viewer
+  would be missing (e.g. "refers to 'the study' never introduced"). Be specific and honest; do not praise by default.
 
 Return ONLY JSON: {{"reviews": [{{"id": int, "standalone": bool, "opening": int, "ending": int,
 "hook_accurate": bool|null, "visual_ok": bool|null, "visual": "short note", "verdict": "publish|fix|reject",
@@ -159,6 +160,7 @@ def apply_reviews(result: cs.SelectionResult, reviews: dict[int, dict], pool: li
         reason = reject_reason(rv)
         if reason:
             result.rejected.append({"title": c.title, "score": c.score, "reason": reason,
+                                    "verdict": rv.get("verdict"), "standalone": rv.get("standalone"),
                                     "opening": rv.get("opening"), "ending": rv.get("ending"),
                                     "issues": rv.get("issues"), "opens": c.transcript[:90]})
             continue
@@ -177,7 +179,9 @@ def apply_reviews(result: cs.SelectionResult, reviews: dict[int, dict], pool: li
 def reject_reason(rv: dict) -> Optional[str]:
     if rv.get("verdict") == "reject":
         return "review_rejected"
-    if rv.get("standalone") is False:
+    # "Not standalone" alone is a judgement call the model makes cheaply; it only
+    # rejects when the same review also withholds "publish" or names a concrete problem.
+    if rv.get("standalone") is False and (rv.get("verdict") != "publish" or rv.get("issues")):
         return "review_not_standalone"
     if rv.get("opening") is not None and rv["opening"] < MIN_OPENING:
         return "review_weak_opening"

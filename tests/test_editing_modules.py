@@ -113,7 +113,10 @@ def cand(title, start_s, end_s, score=80):
 def test_reject_reasons():
     assert clip_review.reject_reason({"verdict": "publish", "standalone": True, "opening": 8, "ending": 8}) is None
     assert clip_review.reject_reason({"verdict": "reject"}) == "review_rejected"
-    assert clip_review.reject_reason({"verdict": "publish", "standalone": False}) == "review_not_standalone"
+    assert clip_review.reject_reason({"verdict": "publish", "standalone": False}) is None
+    assert clip_review.reject_reason({"verdict": "fix", "standalone": False}) == "review_not_standalone"
+    assert clip_review.reject_reason({"verdict": "publish", "standalone": False,
+                                      "issues": ["refers to a study never introduced"]}) == "review_not_standalone"
     assert clip_review.reject_reason({"verdict": "publish", "opening": 3}) == "review_weak_opening"
     assert clip_review.reject_reason({"verdict": "publish", "ending": 2}) == "review_weak_ending"
     assert clip_review.reject_reason({"verdict": "publish", "visual_ok": False}) == "review_bad_visual"
