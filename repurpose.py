@@ -1593,7 +1593,7 @@ async def get_repurpose_job(
     result = job.get("result")
     detail = job.get("last_error") if (status == "failed" or job.get("error_code")) else None
     if detail:
-        detail = re.sub(r"(sk|key|eyJ)[-_A-Za-z0-9.*]{6,}", "[redacted]", str(detail))[:400]
+        detail = re.sub(r"(sk|key|eyJ)[-_A-Za-z0-9.*]{6,}", "[redacted]", str(detail))[:3500]
     return RepurposeJobStatusResponse(
         status=_LEGACY_STATUS.get(status, "processing"),
         result=RepurposeResponse(**result) if result else None,

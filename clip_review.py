@@ -158,7 +158,9 @@ def apply_reviews(result: cs.SelectionResult, reviews: dict[int, dict], pool: li
         c.review = {"status": "reviewed", **rv}
         reason = reject_reason(rv)
         if reason:
-            result.rejected.append({"title": c.title, "score": c.score, "reason": reason})
+            result.rejected.append({"title": c.title, "score": c.score, "reason": reason,
+                                    "opening": rv.get("opening"), "ending": rv.get("ending"),
+                                    "issues": rv.get("issues"), "opens": c.transcript[:90]})
             continue
         if rv.get("hook_accurate") is False and c.overlay_hook:
             c.overlay_hook, c.overlay_status = None, "removed_by_review"

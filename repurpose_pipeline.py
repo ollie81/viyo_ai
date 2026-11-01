@@ -15,6 +15,7 @@ doesn't pay for transcription, the LLM, or finished renders again.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 from dataclasses import dataclass
@@ -324,7 +325,9 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     summary["delivery_signal"] = amb.delivery is not None
     if not result.clips:
         raise PermanentJobError("no_strong_moments", result.note or
-                                "We didn't find a moment strong enough to stand on its own.", str(summary)[:1500])
+                                "We didn't find a moment strong enough to stand on its own.",
+                                json.dumps({"rejected": result.rejected[:10], "note": result.note,
+                                            "analysis": summary.get("analysis")}, default=str)[:3500])
 
     selection = {"clips": [c.to_dict() for c in result.clips],
                  "spares": [c.to_dict() for c in result.spares], "summary": summary}

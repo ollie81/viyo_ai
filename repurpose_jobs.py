@@ -171,7 +171,7 @@ class JobStore:
             "p_job_id": job_id, "p_lease": lease,
             "p_error_code": error.code,
             "p_user_error": error.user_message,
-            "p_internal_error": (error.internal or "")[:2000],
+            "p_internal_error": (error.internal or "")[:4000],
             "p_retryable": error.retryable,
             "p_retry_delay_seconds": self.retry_delay(attempts),
             "p_retention_days": self.config.result_retention_days,
