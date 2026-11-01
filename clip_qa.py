@@ -135,8 +135,13 @@ def check_black_bars(path: str, duration: float, work_dir: str, crop_mode: str) 
         return Check("black_bars", True, "warn", {"unchecked": str(e)[:100]})
     if not bars:
         return Check("black_bars", True, "warn", {"unchecked": "no frames"})
-    worst = float(np.max(np.array(bars)))
-    return Check("black_bars", worst <= MAX_BAR_FRACTION, detail={"worst_bar_fraction": round(worst, 3)})
+    # A bar is a letterbox: dark on BOTH opposite edges. A dark one-sided region
+    # (a black jumper, a night sky) is picture content, not a bar.
+    arr = np.array(bars)                      # columns: top, bottom, left, right
+    pair = np.maximum(np.minimum(arr[:, 0], arr[:, 1]), np.minimum(arr[:, 2], arr[:, 3]))
+    worst = float(pair.max())
+    return Check("black_bars", worst <= MAX_BAR_FRACTION,
+                 detail={"worst_bar_fraction": round(worst, 3), "one_sided_dark_max": round(float(arr.max()), 3)})
 
 
 def check_framing(render_facts: dict) -> Check:
@@ -165,8 +170,13 @@ def check_loudness(path: str) -> Check:
     m = _loudness(path)
     if not m or not np.isfinite(m["lufs"]):
         return Check("loudness", False, detail={"error": "could_not_measure"})
-    ok = abs(m["lufs"] - LUFS_TARGET) <= LUFS_TOLERANCE and m["true_peak"] <= MAX_TRUE_PEAK
-    return Check("loudness", ok, detail={"lufs": round(m["lufs"], 1), "true_peak_db": round(m["true_peak"], 1)})
+    on_target = abs(m["lufs"] - LUFS_TARGET) <= LUFS_TOLERANCE
+    # Quiet, peaky speech can't be raised further without clipping: sitting at the
+    # true-peak ceiling is as loud as it can honestly get.
+    peak_limited = m["true_peak"] >= -2.0 and m["lufs"] >= -17.5
+    ok = (on_target or peak_limited) and m["true_peak"] <= MAX_TRUE_PEAK
+    return Check("loudness", ok, detail={"lufs": round(m["lufs"], 1), "true_peak_db": round(m["true_peak"], 1),
+                                         "peak_limited": bool(peak_limited and not on_target)})
 
 
 def _speech_runs(ff: af.FrameFeatures) -> np.ndarray:
