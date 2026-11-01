@@ -187,7 +187,7 @@ def hook_dialogue(hook: str, upper: bool, style: str = "Hook") -> Optional[str]:
 
 
 def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFAULT_STYLE,
-              speaker_at=None, emphasis: bool = True) -> tuple[Optional[str], dict]:
+              speaker_at=None, emphasis: bool = True, shift: float = 0.0) -> tuple[Optional[str], dict]:
     """Returns (ASS text or None, facts). None means nothing to caption."""
     st = STYLES.get(style) or STYLES[DEFAULT_STYLE]
     remap = build_remap(blocks)
@@ -225,12 +225,12 @@ def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFA
         brk = _wrap(shown)
         next_start = remap(phrases[pi + 1][0].start) if pi + 1 < len(phrases) else total
         for i, w in enumerate(phrase):
-            start = remap(w.start)
+            start = max(0.0, remap(w.start) + shift)
             if i + 1 < len(phrase):
-                end = remap(phrase[i + 1].start)
+                end = max(0.0, remap(phrase[i + 1].start) + shift)
             else:
                 # Hold the last word a beat, but never into the next phrase.
-                end = min(remap(w.end) + TAIL_HOLD_SECONDS, max(next_start, remap(w.end)))
+                end = min(remap(w.end) + shift + TAIL_HOLD_SECONDS, max(next_start + shift, remap(w.end) + shift))
             end = max(start + MIN_WORD_SECONDS, end)
             base = colour_for.get(w.speaker, WHITE) if multi else WHITE
             parts = []

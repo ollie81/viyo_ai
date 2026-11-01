@@ -207,3 +207,21 @@ def test_caption_sync_passes_when_aligned_and_fails_when_late():
 def test_qa_report_fails_only_on_fail_severity():
     r = clip_qa.QAReport([clip_qa.Check("a", True), clip_qa.Check("b", False, "warn"), clip_qa.Check("c", False)])
     assert not r.passed and [c.name for c in r.failures] == ["c"] and [c.name for c in r.warnings] == ["b"]
+
+
+def test_measured_caption_offset_corrects_when_applied_as_a_shift():
+    speech = [(0.0, 4.0), (4.5, 9.0)]
+    ff = fake_features(speech, 9.5)
+    words, t = [], 0.0
+    for a, b in speech:                       # words 0.3 s EARLY relative to the audio
+        t = a - 0.3
+        while t + 0.4 < b - 0.3 + 0.01:
+            words.append(W("word", max(0.0, t), max(0.0, t) + 0.35))
+            t += 0.4
+    ass, _ = cp.build_ass(words, [(0.0, 9.5)])
+    first = clip_qa.check_caption_sync(ass, ff, 9.5)
+    off = first.detail["offset_s"]
+    assert abs(off) > 0.12
+    fixed, _ = cp.build_ass(words, [(0.0, 9.5)], shift=off)
+    after = clip_qa.check_caption_sync(fixed, ff, 9.5)
+    assert abs(after.detail["offset_s"]) < abs(off) and abs(after.detail["offset_s"]) <= 0.1

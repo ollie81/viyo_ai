@@ -423,9 +423,21 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str,
         qa_dict = report.to_dict()
         if report.passed:
             break
+        # Caption timing: whisper's word times can sit a few hundred ms off the
+        # audio. QC measured the offset, so shift the captions by it and re-render once.
+        cs_fail = [f for f in report.failures if f.name == "caption_sync"]
+        if (attempts == 1 and ass_text and len(report.failures) == 1 and cs_fail
+                and 0.12 < abs(cs_fail[0].detail.get("offset_s", 0)) <= 0.7):
+            shift = float(cs_fail[0].detail["offset_s"])
+            ass_text, cap_facts = captions.build_ass(punct, blocks, hook=overlay or "", style=deps.caption_style,
+                                                     speaker_at=speaker_at, shift=shift)
+            cap_facts["timing_shift_s"] = shift
+            with open(ass_path, "w", encoding="utf-8") as f:
+                f.write(ass_text)
+            continue
         # One regeneration: a framing failure is fixed by keeping the whole
         # frame instead of cropping it.
-        if attempts == 1 and report.failures and all(f.name == "framing" for f in report.failures):
+        if attempts <= 2 and report.failures and all(f.name == "framing" for f in report.failures):
             plan = clip_render.CropPlan(mode="fit", src_w=dims["width"], src_h=dims["height"], bars=plan.bars,
                                         crop_w=plan.crop_w, crop_h=plan.crop_h,
                                         pieces=[(0.0, 0.0, planned, 0.0)], facts={**plan.facts, "retry": "fit_after_framing"})
