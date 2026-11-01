@@ -11,7 +11,7 @@ A check is "fail" (the clip is rejected and a spare replaces it) or "warn"
   framing       sampled faces were not cut off by the crop
   loudness      integrated loudness near the target, no true-peak clipping
   silence       no long silent stretch, no dead start or end
-  speech_edges  the clip neither starts nor ends in the middle of a word
+  speech_end    the clip does not end in the middle of a word (speech_start only warns)
   caption_sync  captions cover the speech, don't appear over silence, and the
                 measured offset between them and the audio is small
   hook          the on-screen hook is still grounded in what is said
@@ -215,9 +215,11 @@ def check_silence_and_edges(ff: af.FrameFeatures, duration: float) -> list:
     last_in = float(np.max(ff.rms_db[-6:-3])) if len(ff.rms_db) >= 6 else last
     starts_mid = first_in > level - 6
     ends_mid = last_in > level - 6
-    edge = Check("speech_edges", not (starts_mid or ends_mid), "warn",
-                 detail={"starts_mid_word": bool(starts_mid), "ends_mid_word": bool(ends_mid)})
-    return [sil, edge]
+    # A clip begins right at a word onset, so loud first frames are normal (warn only).
+    # Loud speech at the very end means the clip is cut off mid-word: that is a failure.
+    start_edge = Check("speech_start", not starts_mid, "warn", detail={"starts_mid_word": bool(starts_mid)})
+    end_edge = Check("speech_end", not ends_mid, "fail", detail={"ends_mid_word": bool(ends_mid)})
+    return [sil, start_edge, end_edge]
 
 
 def check_caption_sync(ass_text: Optional[str], ff: af.FrameFeatures, duration: float) -> Check:

@@ -66,10 +66,12 @@ def source_video(tmp_path_factory):
     d = tmp_path_factory.mktemp("media")
     path = d / "talk.mp4"
     duration = SPEECH_END + 2
+    # Tone only while "speaking", silence in the pauses, like real speech.
+    gate = "+".join(f"between(t\\,{seg['start']}\\,{seg['end']})" for seg in SEGMENTS)
     subprocess.run([
         "ffmpeg", "-v", "error", "-y",
         "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate=30:duration={duration}",
-        "-f", "lavfi", "-i", f"aevalsrc=0.2*sin(2*PI*(140+40*sin(2*PI*0.3*t))*t):s=16000:d={duration}",
+        "-f", "lavfi", "-i", f"aevalsrc=0.2*sin(2*PI*(140+40*sin(2*PI*0.3*t))*t)*({gate}):s=16000:d={duration}",
         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", str(path),
     ], check=True)
     silent = d / "silent.mp4"
