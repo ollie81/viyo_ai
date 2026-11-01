@@ -780,6 +780,7 @@ class SelectionResult:
     note: str
     spares: list = field(default_factory=list)
     analysis: dict = field(default_factory=dict)
+    fixable: list = field(default_factory=list)   # reviewed 'fix': needs setup context
 
     def summary(self) -> dict:
         return {

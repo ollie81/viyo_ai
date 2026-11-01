@@ -158,6 +158,8 @@ def apply_reviews(result: cs.SelectionResult, reviews: dict[int, dict], pool: li
             continue
         c.review = {"status": "reviewed", **rv}
         reason = reject_reason(rv)
+        if reason == "review_not_standalone" and rv.get("verdict") == "fix":
+            result.fixable.append(c)
         if reason:
             result.rejected.append({"title": c.title, "score": c.score, "reason": reason,
                                     "verdict": rv.get("verdict"), "standalone": rv.get("standalone"),
@@ -190,3 +192,60 @@ def reject_reason(rv: dict) -> Optional[str]:
     if rv.get("visual_ok") is False:
         return "review_bad_visual"
     return None
+
+
+RECOVER_MAX = 4
+RECOVER_SENTENCES_BEFORE = (3, 5)
+
+
+def _raw_from(c: cs.Candidate, start_sentence: int) -> dict:
+    return {"start_sentence": start_sentence, "end_sentence": c.end_sentence, "category": c.category,
+            "scores": dict(c.rubric), "opens_mid_conversation": False, "title": c.title, "reason": c.reason,
+            "overlay_hook": "", "caption": c.caption, "hashtags": list(c.hashtags), "topic": c.topic}
+
+
+def recover_with_context(result: cs.SelectionResult, sentences: list, words: list, video_seconds: float,
+                         ctx: cs.AnalysisContext, labels: Optional[list], llm: Callable,
+                         frames_for: Optional[Callable] = None) -> dict:
+    """
+    A clip the editor marks "fix — the viewer is missing the setup" is what a
+    human editor would start a few sentences earlier. Do that (never inventing
+    anything: the added words are the speaker's own), score the longer clip like
+    any other, and have it reviewed again. It only joins the selection if it
+    then passes every check; otherwise it stays rejected.
+    """
+    if len(result.clips) >= result.target or not result.fixable:
+        return {"attempted": 0, "recovered": 0}
+    tried: list[cs.Candidate] = []
+    for c in sorted(result.fixable, key=lambda x: -x.score)[:RECOVER_MAX]:
+        for extra in RECOVER_SENTENCES_BEFORE:
+            s0 = max(0, c.start_sentence - extra)
+            if s0 == c.start_sentence:
+                continue
+            ext, why = cs.evaluate_candidate(_raw_from(c, s0), sentences, words, video_seconds, ctx)
+            if ext is None or ext.duration > cs.MAX_CLIP_SECONDS:
+                continue
+            ext.review = {"recovered_with_context_sentences": c.start_sentence - ext.start_sentence}
+            tried.append(ext)
+            break
+    if not tried:
+        return {"attempted": 0, "recovered": 0}
+    reviews = review_candidates(tried, sentences, labels, llm, frames_for)
+    recovered = 0
+    for i, ext in enumerate(tried):
+        rv = reviews.get(i)
+        if rv is None or reject_reason(rv) or ext.score < result.min_score:
+            result.rejected.append({"title": ext.title, "score": ext.score, "reason": "recovery_failed",
+                                    "issues": (rv or {}).get("issues")})
+            continue
+        if len(result.clips) >= result.target or cs._conflicts(ext, result.clips):
+            continue
+        ext.review = {"status": "reviewed", **rv, **ext.review}
+        result.clips.append(ext)
+        recovered += 1
+    result.clips.sort(key=lambda x: -x.score)
+    if len(result.clips) >= result.target:
+        result.note = ""
+    elif result.clips:
+        result.note = cs._selection_note(result.clips, result.target, result.clips, result.rejected)
+    return {"attempted": len(tried), "recovered": recovered}

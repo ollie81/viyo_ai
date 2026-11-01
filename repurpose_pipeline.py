@@ -269,7 +269,7 @@ def _analyse_media(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str
 
 
 def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, result, sentences: list,
-            amb, work_dir: str) -> dict:
+            amb, work_dir: str, duration: float) -> dict:
     pool = result.clips + result.spares
     if not deps.review or not pool:
         return {"reviewed": False}
@@ -285,11 +285,14 @@ def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, resul
                                             frames_for if run.timeline is not None and run.timeline.usable else None)
     before = len(result.clips)
     clip_review.apply_reviews(result, reviews, pool)
+    recovery = clip_review.recover_with_context(
+        result, sentences, run.punctuated or [], duration, amb, amb.speaker_labels, deps.llm,
+        frames_for if run.timeline is not None and run.timeline.usable else None)
     verdicts: dict = {}
     for rv in reviews.values():
         verdicts[rv["verdict"]] = verdicts.get(rv["verdict"], 0) + 1
     return {"reviewed": True, "clips_reviewed": len(reviews), "unreviewed": len(pool) - len(reviews),
-            "verdicts": verdicts, "changed_selection": before != len(result.clips) or bool(reviews)}
+            "verdicts": verdicts, "recovery": recovery, "changed_selection": before != len(result.clips) or bool(reviews)}
 
 
 def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, transcript: dict,
@@ -313,7 +316,7 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
         raise TransientJobError("selection_unavailable", "Clip selection is temporarily unavailable.", str(e))
 
     if result.clips and deps.analysis:
-        facts["review"] = _review(ctx, deps, run, path, result, sentences, amb, work_dir)
+        facts["review"] = _review(ctx, deps, run, path, result, sentences, amb, work_dir, duration)
 
     summary = result.summary()
     summary["analysis"] = {**(summary.get("analysis") or {}), **facts}

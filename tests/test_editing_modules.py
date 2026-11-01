@@ -225,3 +225,29 @@ def test_measured_caption_offset_corrects_when_applied_as_a_shift():
     fixed, _ = cp.build_ass(words, [(0.0, 9.5)], shift=off)
     after = clip_qa.check_caption_sync(fixed, ff, 9.5)
     assert abs(after.detail["offset_s"]) < abs(off) and abs(after.detail["offset_s"]) <= 0.1
+
+
+def test_fixable_clip_is_recovered_with_earlier_context_and_must_pass_review_again():
+    sents = [cs.Sentence(i, i * 6.0, i * 6.0 + 5, i * 10, i * 10 + 9, f"This is sentence {i} about lawyers and models.", True, 1.0)
+             for i in range(12)]
+    words = []
+    for s in sents:
+        for k in range(10):
+            words.append({"word": "w", "text": f"w{k}" + ("." if k == 9 else ""), "start": s.start + k * 0.5,
+                          "end": s.start + k * 0.5 + 0.4})
+    base = {"category": "insight", "scores": {k: 8 for k in cs.RUBRIC_KEYS}, "opens_mid_conversation": False,
+            "title": "T", "reason": "r", "overlay_hook": "", "caption": "c", "hashtags": ["a"], "topic": "x"}
+    c, why = cs.evaluate_candidate({**base, "start_sentence": 5, "end_sentence": 7}, sents, words, 80.0, cs.AnalysisContext())
+    assert c is not None, why
+    res = cs.SelectionResult([], 2, 0, 70.0, [], "", [], fixable=[c])
+    ok = lambda msgs: json.dumps({"reviews": [{"id": 0, "standalone": True, "opening": 8, "ending": 8, "hook_accurate": None,
+                                               "visual_ok": None, "visual": "", "verdict": "publish", "issues": []}]})
+    out = clip_review.recover_with_context(res, sents, words, 80.0, cs.AnalysisContext(), None, ok)
+    assert out["recovered"] == 1 and res.clips[0].start_sentence < 5
+    assert res.clips[0].review["status"] == "reviewed"
+    # a second review that still says "not standalone" must not let it in
+    res2 = cs.SelectionResult([], 2, 0, 70.0, [], "", [], fixable=[c])
+    bad = lambda msgs: json.dumps({"reviews": [{"id": 0, "standalone": False, "opening": 6, "ending": 6, "verdict": "fix",
+                                                "issues": ["still missing setup"]}]})
+    out2 = clip_review.recover_with_context(res2, sents, words, 80.0, cs.AnalysisContext(), None, bad)
+    assert out2["recovered"] == 0 and not res2.clips
