@@ -1,23 +1,28 @@
 """
-Phase 1 clip selection for the AI Repurposer.
+Clip selection for the AI Repurposer.
 
 Pipeline:
   1. attach_punctuation / build_sentences — whisper-1's word list has no
      punctuation, its segment text does; aligning the two gives sentences
      with exact word-level start/end times.
   2. propose_candidates — the LLM reads numbered sentences (in windows
-     for long videos) and proposes moments as sentence RANGES plus a
-     rubric score. It never types a timestamp, so it can't invent one:
-     boundaries always land on a real sentence start/end.
+     for long videos, each given a whole-video summary, the speaker
+     labels and topic map) and proposes moments as sentence RANGES plus a
+     rubric. It never types a timestamp, so it can't invent one.
   3. evaluate_candidate — every proposal is checked against the
-     transcript (length, dead air, verbatim hook) and scored:
-       75% content rubric (LLM), 15% vocal delivery relative to the
-       speaker's own baseline (audio_features), 10% structure,
-       minus a penalty if it needs earlier context.
+     transcript and scored on nine components:
+        hook, curiosity, emotional engagement, story completeness,
+        standalone context, information value  (LLM, harshly anchored)
+        pacing, visual quality, audio quality   (MEASURED from the media)
+     Emotional engagement blends the LLM's read with vocal delivery
+     measured against the speaker's own baseline (loudness alone never
+     counts). Components that can't be measured are left out and the
+     weights renormalised — unknown is never scored as good or bad.
   4. select_clips — best-first, no time overlap, no near-duplicate
-     topics, a quality floor, and a count cap that scales with how much
-     speech the video actually has. Fewer than asked is a valid result;
-     padding with weak clips is not.
+     topics, hard gates on the core components, and a count cap scaled to
+     how much speech there is. Fewer than asked is a valid result;
+     padding with weak clips is not. A few spares are kept so a clip that
+     later fails review or rendering QC can be replaced.
 
 Nothing here falls back to a made-up clip. If the LLM can't be reached
 or keeps returning garbage, SelectionUnavailable is raised and the job
@@ -33,17 +38,28 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
+import clip_text
+
 MIN_CLIP_SECONDS = 12.0
 MAX_CLIP_SECONDS = 60.0
 TARGET_MAX_CLIPS = 6
 # One clip per this much speech, at most. Keeps a 4-minute video from
 # being chopped into six thin slices just because six were asked for.
 SPEECH_SECONDS_PER_CLIP = 75.0
-DEFAULT_MIN_SCORE = 60
-# Separate floor on the LLM content score alone (0-100): delivery and
-# structure points must never lift a moment that's weak on substance
-# over the overall floor. 55 ~ a rubric average just above "ordinary".
-MIN_CONTENT_SCORE = 55
+# Rubric anchors: 7-8 = good/publishable, 5-6 = ordinary. Both floors sit
+# just above "ordinary" so a video with three good moments yields three
+# clips, not six.
+DEFAULT_MIN_SCORE = 62
+# Floor on the LLM-judged components alone (0-100): measured components
+# (pacing, visual, audio) must never lift a moment that's weak on
+# substance over the overall floor.
+MIN_CONTENT_SCORE = 62
+# A core component this low rejects the moment outright, whatever else
+# is good about it.
+CORE_GATE = 5
+MIN_AUDIO_QUALITY = 3.0
+SPARE_CANDIDATES = 3
+MAX_QUESTION_PREPEND_SECONDS = 14.0
 
 # A word gap longer than this inside a clip is dead air the renderer
 # will cut; counted here so the duration limits apply to what the
@@ -73,18 +89,19 @@ _LEADING_FILLERS = {
     "um", "umm", "uh", "uhh", "erm", "er", "ah", "hmm", "mm", "mhm",
     "so", "and", "but", "okay", "ok", "yeah", "well", "anyway", "anyways", "basically",
 }
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "so", "to", "of", "in", "on", "at", "for", "with",
-    "is", "are", "was", "were", "be", "been", "it", "that", "this", "i", "you", "we", "they",
-    "he", "she", "my", "your", "our", "their", "me", "us", "them", "do", "did", "does", "have",
-    "has", "had", "not", "no", "yes", "just", "like", "really", "very", "what", "when", "how",
-    "if", "then", "there", "here", "about", "from", "as", "by", "all", "can", "will", "would",
-}
+_STOPWORDS = clip_text.STOPWORDS
 
 CATEGORIES = {"story", "humor", "insight", "emotional", "hot_take", "advice", "hook", "other"}
-RUBRIC_KEYS = ("hook", "completeness", "standalone", "payoff", "emotional_pull")
-_RUBRIC_WEIGHTS = {"hook": 0.30, "completeness": 0.20, "standalone": 0.20, "payoff": 0.20,
-                   "emotional_pull": 0.10}
+# Judged by the LLM against explicit anchors.
+RUBRIC_KEYS = ("hook", "curiosity", "emotional", "completeness", "standalone", "information")
+# Measured from the media (not asked of the LLM).
+MEASURED_KEYS = ("pacing", "visual", "audio")
+COMPONENT_WEIGHTS = {
+    "hook": 0.18, "curiosity": 0.10, "emotional": 0.10, "completeness": 0.14,
+    "standalone": 0.14, "information": 0.10, "pacing": 0.08, "visual": 0.08, "audio": 0.08,
+}
+# Share of "emotional engagement" taken from measured vocal delivery.
+DELIVERY_BLEND = 0.25
 
 MAX_TITLE_CHARS = 80
 MAX_CAPTION_CHARS = 300
@@ -234,61 +251,99 @@ def _windows(sentences: list[Sentence]) -> list[tuple[int, int]]:
 
 
 SYSTEM_PROMPT = (
-    "You are a senior short-form video editor. You pick moments from long-form videos "
-    "(podcasts, talks, vlogs, interviews) that work as standalone vertical shorts on TikTok, "
-    "YouTube Shorts and Instagram Reels. You are strict: most moments in most videos are not "
-    "good enough, and you say so with low scores instead of inflating them. You never invent "
-    "content that is not in the transcript."
+    "You are a senior short-form video editor and story editor. You pick moments from long-form "
+    "videos (podcasts, talks, interviews, vlogs, tutorials) that work as standalone vertical shorts "
+    "on TikTok, YouTube Shorts and Instagram Reels. You are strict and you calibrate: most moments "
+    "in most videos are ordinary, and you say so with ordinary scores. Reserve 8+ for moments you "
+    "would genuinely stop scrolling for. You never invent content that is not in the transcript, "
+    "and you never put words in a speaker's mouth."
 )
 
 
+def _speaker_prefix(label: Optional[str]) -> str:
+    return f"{label} " if label else ""
+
+
 def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds: float,
-                     max_candidates: int) -> str:
+                     max_candidates: int, speaker_labels: Optional[list] = None,
+                     video_map: Optional[dict] = None) -> str:
     lines = [
-        f"S{s.id} [{_fmt_time(s.start)}-{_fmt_time(s.end)}] {s.text}"
+        f"S{s.id} {_speaker_prefix(speaker_labels[s.id] if speaker_labels else None)}"
+        f"[{_fmt_time(s.start)}-{_fmt_time(s.end)}] {s.text}"
         for s in sentences[lo: hi + 1]
     ]
+    context = ""
+    if video_map:
+        parts = []
+        if video_map.get("summary"):
+            parts.append(f"Whole-video summary: {video_map['summary']}")
+        if video_map.get("format"):
+            parts.append(f"Format: {video_map['format']}")
+        for sp in video_map.get("speakers") or []:
+            parts.append(f"Speaker {sp.get('label')}: {sp.get('role', 'unknown')} - {sp.get('description', '')}")
+        topics = video_map.get("topics") or []
+        if topics:
+            parts.append("Topic outline (sentence ranges): " + "; ".join(
+                f"S{t['start_sentence']}-S{t['end_sentence']} {t.get('kind', '')}: {t.get('title', '')}"
+                for t in topics[:30]))
+        if parts:
+            context = "VIDEO CONTEXT (from analysing the whole video):\n" + "\n".join(parts) + "\n\n"
+    labelled = ("Letters before a time range (A, B...) are speakers identified from their voices; "
+                "a missing letter means unknown.\n" if speaker_labels and any(speaker_labels) else "")
     return (
-        f"The video is {video_seconds / 60:.1f} minutes long. Below is the transcript for "
-        f"{_fmt_time(sentences[lo].start)}-{_fmt_time(sentences[hi].end)} as numbered sentences "
-        "with their real start/end times.\n\n"
+        f"The video is {video_seconds / 60:.1f} minutes long. {context}"
+        f"Below is the transcript for {_fmt_time(sentences[lo].start)}-{_fmt_time(sentences[hi].end)} "
+        f"as numbered sentences with their real start/end times. {labelled}\n"
         f"List the {max_candidates} best candidate moments in this part, best first. Include "
         "weaker ones too and score them honestly: low scores are expected and get filtered out "
         "later, so never inflate a score to justify including a moment. Return fewer only if "
         "this part doesn't contain that many distinct, complete moments.\n\n"
+        "WHAT MAKES A GOOD MOMENT\n"
+        "Surprising or counter-intuitive statements, funny exchanges, emotional or vulnerable "
+        "stories, controversial opinions with a reason, genuinely useful advice, an interesting "
+        "discovery, an unexpected reaction, a vivid story with tension, a clear explanation of "
+        "something people wonder about.\n\n"
         "RULES\n"
         "- A moment is a contiguous range of sentences: start_sentence..end_sentence "
         "(inclusive), using the S numbers below. Never use numbers outside this list.\n"
-        "- Target 15-55 seconds of speech. Shorter is fine when the moment is complete.\n"
-        "- It must open on a hook in its first sentence: a bold claim, a question, a "
-        "surprising fact, a conflict, a strong emotion, or the start of a story with "
-        "tension. Not a greeting, not a recap, not 'so as I was saying'.\n"
-        "- It must end when the thought completes: the punchline, the answer, the lesson, "
-        "the turn. Never end before the payoff or in the middle of a story.\n"
-        "- It must make sense to someone who never saw the rest of the video. If it relies "
-        "on something said earlier (unexplained 'he', 'that thing', 'like I said'), set "
-        "context_dependent to true.\n"
+        "- It needs a beginning, a middle and an end: it opens on its hook, builds, and stops when "
+        "the thought completes (the punchline, the answer, the lesson, the turn). Never end "
+        "before the payoff, and never start mid-thought.\n"
+        "- Target 15-55 seconds of speech.\n"
+        "- It must make sense to someone who has not seen the rest of the video. If the first "
+        "sentence is an answer to a question another speaker asked, or leans on something said "
+        "earlier ('that', 'he', 'like I said'), set opens_mid_conversation true, unless the "
+        "sentence restates what it's answering.\n"
+        "- Do NOT choose intros, outros, sponsor reads, housekeeping, small talk, or moments that "
+        "just repeat what was said earlier.\n"
         "- Moments must not overlap each other.\n"
         "- Loud or excited is not the same as interesting. Judge what is said.\n\n"
-        "RUBRIC (integers 0-10, be harsh; 5 = ordinary, 8+ = genuinely strong):\n"
-        "- hook: would the first 2 seconds stop a scrolling viewer?\n"
-        "- completeness: does it have a clear beginning, middle and end?\n"
-        "- standalone: does it work with zero prior context?\n"
-        "- payoff: is there a satisfying punchline, insight, answer or emotional beat?\n"
-        "- emotional_pull: humor, surprise, tension, inspiration, vulnerability.\n\n"
+        "RUBRIC - integers 0-10. Anchors: 9-10 = you would share this; 7-8 = good, publishable; "
+        "5-6 = ordinary, fine but forgettable; 3-4 = weak; 0-2 = unusable. At most about one in five "
+        "of your candidates should score 8 or more on any component.\n"
+        "- hook: would the first 2 seconds of THIS moment stop a scrolling viewer?\n"
+        "- curiosity: does it make the viewer need to hear what comes next?\n"
+        "- emotional: humor, surprise, tension, inspiration, vulnerability, conviction.\n"
+        "- completeness: clear beginning, middle and end; a satisfying close.\n"
+        "- standalone: understandable with zero prior context.\n"
+        "- information: does the viewer learn or take away something real?\n\n"
         "For each moment also write, in the SAME LANGUAGE as the transcript:\n"
         "- category: one of story, humor, insight, emotional, hot_take, advice, hook, other\n"
         "- title: short and specific, under 60 characters\n"
         "- reason: 1-2 sentences on why it works, citing what is actually said\n"
-        "- hook_line: the exact opening words of the moment, copied verbatim, max 12 words\n"
+        "- overlay_hook: optional on-screen text for the first 2 seconds, at most 9 words. It "
+        "must be a faithful teaser or the speaker's own strongest line, built ONLY from things the "
+        "speaker actually says in this moment: no new facts, no numbers they don't say, no claims "
+        "they don't make, no fabricated quotes. It must add something, not repeat the first "
+        "caption. Use an empty string if nothing faithful and compelling fits.\n"
         "- caption: a ready-to-post caption, 1-2 short lines, no hashtags, no quotes\n"
         "- hashtags: 3-6 specific lowercase tags without #\n"
         "- topic: 2-5 word label of what it is about\n\n"
         'Respond with ONLY a JSON object: {"candidates": [{"start_sentence": int, '
-        '"end_sentence": int, "category": str, "scores": {"hook": int, "completeness": int, '
-        '"standalone": int, "payoff": int, "emotional_pull": int}, "context_dependent": bool, '
-        '"title": str, "reason": str, "hook_line": str, "caption": str, "hashtags": [str], '
-        '"topic": str}]}\n\n'
+        '"end_sentence": int, "category": str, "scores": {"hook": int, "curiosity": int, '
+        '"emotional": int, "completeness": int, "standalone": int, "information": int}, '
+        '"opens_mid_conversation": bool, "title": str, "reason": str, "overlay_hook": str, '
+        '"caption": str, "hashtags": [str], "topic": str}]}\n\n'
         "TRANSCRIPT\n" + "\n".join(lines)
     )
 
@@ -312,7 +367,8 @@ LLMFn = Callable[[list[dict]], str]
 
 
 def propose_candidates(sentences: list[Sentence], video_seconds: float, target: int,
-                       llm: LLMFn, total_speech: float) -> list[dict]:
+                       llm: LLMFn, total_speech: float, speaker_labels: Optional[list] = None,
+                       video_map: Optional[dict] = None) -> list[dict]:
     """
     Raw candidate dicts (sentence ranges + rubric + packaging) from every
     window. Raises SelectionUnavailable if any window can't be read after
@@ -325,14 +381,14 @@ def propose_candidates(sentences: list[Sentence], video_seconds: float, target: 
     def window_quota(lo: int, hi: int) -> int:
         span = sentences[hi].end - sentences[lo].start
         share = span / max(video_seconds, 1.0)
-        return min(8, max(3, math.ceil(target * 1.5 * share) + 1))
+        return min(10, max(4, math.ceil(target * 2.0 * share) + 2))
 
     def run(window: tuple[int, int]) -> list[dict]:
         lo, hi = window
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _proposal_prompt(
-                sentences, lo, hi, video_seconds, window_quota(lo, hi))},
+                sentences, lo, hi, video_seconds, window_quota(lo, hi), speaker_labels, video_map)},
         ]
         last_error: Optional[Exception] = None
         for _ in range(2):
@@ -359,6 +415,23 @@ def propose_candidates(sentences: list[Sentence], video_seconds: float, target: 
 # ---------------------------------------------------------------- evaluation
 
 @dataclass
+class AnalysisContext:
+    """What was measured about the media, as callables over a time window,
+    so selection stays testable and optional signals can be absent."""
+    # (start, end, n_words) -> (0-100 delivery score, breakdown)
+    delivery: Optional[Callable[[float, float, int], tuple]] = None
+    # (start, end) -> (0-10 or None, facts)
+    audio_quality: Optional[Callable[[float, float], tuple]] = None
+    visual_quality: Optional[Callable[[float, float], tuple]] = None
+    # per-sentence speaker letters ("A"/"B"/None) when voices could be told apart
+    speaker_labels: Optional[list] = None
+    # whole-video understanding (summary, topics, speakers); see video_map.py
+    video_map: Optional[dict] = None
+    # (candidate) -> (points added to the score, info); from creator history
+    creator_prior: Optional[Callable] = None
+
+
+@dataclass
 class Candidate:
     start_sentence: int
     end_sentence: int
@@ -372,7 +445,7 @@ class Candidate:
     context_dependent: bool
     title: str
     reason: str
-    hook_line: str
+    hook_line: str                 # the clip's actual opening words, verbatim
     hook_line_verified: bool
     caption: str
     hashtags: list
@@ -383,11 +456,18 @@ class Candidate:
     # "" when the LLM's range fit as proposed; "trimmed_to_fit" /
     # "extended_to_fit" when the ending was moved to meet the length limits.
     length_adjustment: str = ""
+    overlay_hook: Optional[str] = None      # vetted on-screen hook, or None
+    overlay_status: str = "none_proposed"
+    opens_as_reply: bool = False
+    prepended_question: bool = False
+    speakers: list = field(default_factory=list)
+    components: dict = field(default_factory=dict)       # nine 0-10 scores (None = not measurable)
     content_score: int = 0
     delivery_score: int = 50
     structure_score: int = 0
     score: int = 0
     breakdown: dict = field(default_factory=dict)
+    review: dict = field(default_factory=dict)            # filled by clip_review
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -482,11 +562,35 @@ def _hook_is_verbatim(hook: str, clip_words: list[dict]) -> bool:
     return any(keys[i:i + n] == hook_keys for i in range(0, max(1, len(keys) - n + 1)))
 
 
+def _prepend_question(words: list[dict], sentences: list[Sentence], s0: int, s1: int,
+                      labels: Optional[list]) -> tuple[int, bool]:
+    """
+    A clip that opens as an answer ("Absolutely, and I think that...")
+    is unintelligible without the question. When the previous sentence IS
+    the other speaker's short question, start the clip there instead of
+    dropping the clip — the standard Q&A edit.
+    """
+    if s0 == 0:
+        return s0, False
+    prev = sentences[s0 - 1]
+    if not clip_text.is_question(prev.text):
+        return s0, False
+    if labels and labels[s0 - 1] and labels[s0] and labels[s0 - 1] == labels[s0]:
+        return s0, False   # the same person asked and answered: it's rhetorical
+    q_speech = speech_seconds(words[prev.first_word: prev.last_word + 1])
+    if q_speech > MAX_QUESTION_PREPEND_SECONDS or sentences[s0].start - prev.end > SOFT_SENTENCE_BREAK_GAP_SECONDS * 2:
+        return s0, False
+    if speech_seconds(words[prev.first_word: sentences[s1].last_word + 1]) > MAX_CLIP_SECONDS:
+        return s0, False
+    return s0 - 1, True
+
+
 def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
-                       video_seconds: float,
-                       delivery: Optional[Callable[[float, float, int], tuple[int, dict]]] = None,
+                       video_seconds: float, ctx: Optional[AnalysisContext] = None,
                        ) -> tuple[Optional[Candidate], Optional[str]]:
     """(candidate, None) if usable, else (None, rejection reason)."""
+    ctx = ctx or AnalysisContext()
+    labels = ctx.speaker_labels
     try:
         s0 = int(raw.get("start_sentence"))
         s1 = int(raw.get("end_sentence"))
@@ -496,7 +600,19 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     if not (0 <= s0 <= s1 < len(sentences)) or s0 < window[0] or s1 > window[1]:
         return None, "sentence_ids_out_of_range"
 
+    # Boilerplate (intro / outro / sponsor / housekeeping) from the video map.
+    if ctx.video_map and _mostly_boilerplate(ctx.video_map, s0, s1):
+        return None, "boilerplate"
+
+    first_text = sentences[s0].text
+    reply_opening = bool(raw.get("opens_mid_conversation")) or clip_text.opens_as_reply(first_text)
+    prepended = False
+    if reply_opening:
+        s0, prepended = _prepend_question(words, sentences, s0, s1, labels)
+
     first = _trim_leading_fillers(words, sentences[s0].first_word, sentences[s1].last_word)
+    if prepended:
+        first = sentences[s0].first_word
     s1, adjustment = _fit_length(words, sentences, first, s0, s1, window[1])
     if s1 is None:
         return None, adjustment
@@ -515,72 +631,126 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     if category not in CATEGORIES:
         category = "other"
 
-    hook_line = str(raw.get("hook_line", "")).strip()
-    verified = _hook_is_verbatim(hook_line, clip_words)
-    if not verified:
-        # Never show words on screen that weren't said: fall back to the
-        # clip's real opening words.
-        hook_line = " ".join(w["text"] for w in clip_words[:10])
-    hook_line = hook_line[:MAX_HOOK_LINE_CHARS]
+    transcript = " ".join(w["text"] for w in clip_words)
+    opening = " ".join(w["text"] for w in clip_words[:12])[:MAX_HOOK_LINE_CHARS]
+    overlay, overlay_status = clip_text.vet_overlay_hook(
+        str(raw.get("overlay_hook", "")), transcript, [w["text"] for w in clip_words])
+
+    # Still opening as a reply with no question to anchor it?
+    still_dependent = clip_text.opens_as_reply(sentences[s0].text) and not prepended
+    clip_speakers = sorted({labels[i] for i in range(s0, s1 + 1) if labels and labels[i]}) if labels else []
 
     cand = Candidate(
         start_sentence=s0, end_sentence=s1, start=round(start, 3), end=round(end, 3),
         duration=round(duration, 3), speech_duration=round(speech, 3),
         dead_air_ratio=round(max(0.0, 1 - speech / duration), 3) if duration > 0 else 0.0,
         category=category, rubric=rubric,
-        context_dependent=bool(raw.get("context_dependent", False)),
+        context_dependent=bool(raw.get("opens_mid_conversation", False)) and not prepended,
         title=str(raw.get("title", "")).strip()[:MAX_TITLE_CHARS],
         reason=str(raw.get("reason", "")).strip()[:600],
-        hook_line=hook_line, hook_line_verified=verified,
+        hook_line=opening, hook_line_verified=True,
         caption=str(raw.get("caption", "")).strip()[:MAX_CAPTION_CHARS],
         hashtags=clean_hashtags(raw.get("hashtags")),
         topic=str(raw.get("topic", "")).strip()[:60],
-        transcript=" ".join(w["text"] for w in clip_words),
+        transcript=transcript,
         ends_on_sentence=sentences[s1].terminal,
         end_pause=min(sentences[s1].pause_after, 99.0),
         length_adjustment=adjustment or "",
+        overlay_hook=overlay, overlay_status=overlay_status,
+        opens_as_reply=still_dependent, prepended_question=prepended, speakers=clip_speakers,
     )
     if not cand.title:
         return None, "missing_title"
 
-    if delivery is not None:
-        cand.delivery_score, delivery_breakdown = delivery(start, end, len(clip_words))
-    else:
-        delivery_breakdown = {"unavailable": True}
-
-    score_candidate(cand)
-    cand.breakdown["delivery"] = delivery_breakdown
+    score_candidate(cand, len(clip_words), ctx)
+    if cand.breakdown.get("gate"):
+        return None, cand.breakdown["gate"]
     return cand, None
 
 
-def score_candidate(c: Candidate) -> None:
-    c.content_score = int(round(10 * sum(_RUBRIC_WEIGHTS[k] * c.rubric[k] for k in RUBRIC_KEYS)))
-    structure = 100
-    penalties = {}
-    if not c.ends_on_sentence:
-        # Ending at a real pause usually sounds finished even without a
-        # full stop in the transcript; ending mid-flow does not.
-        if c.end_pause >= PAUSE_BREAK_SECONDS:
-            penalties["soft_sentence_end"] = 10
-        else:
-            penalties["no_sentence_end"] = 35
-    if c.dead_air_ratio > 0.25:
-        penalties["dead_air"] = 20
-    if c.speech_duration < 15:
-        penalties["very_short"] = 10
-    structure -= sum(penalties.values())
-    c.structure_score = max(0, structure)
+def _mostly_boilerplate(video_map: dict, s0: int, s1: int) -> bool:
+    n = s1 - s0 + 1
+    covered = 0
+    for r in video_map.get("avoid") or []:
+        lo, hi = int(r.get("start_sentence", -1)), int(r.get("end_sentence", -2))
+        covered += max(0, min(hi, s1) - max(lo, s0) + 1)
+    return n > 0 and covered / n >= 0.5
 
-    context_penalty = 15 if c.context_dependent else 0
-    length_penalty = LENGTH_ADJUSTMENT_PENALTY.get(c.length_adjustment, 0)
-    final = (0.75 * c.content_score + 0.15 * c.delivery_score + 0.10 * c.structure_score
-             - context_penalty - length_penalty)
-    c.score = max(0, min(100, int(round(final))))
+
+def score_candidate(c: Candidate, n_words: int, ctx: Optional[AnalysisContext] = None) -> None:
+    """
+    Fills c.components / c.score / c.breakdown. Components that couldn't be
+    measured are None and are dropped with the weights renormalised.
+    """
+    import audio_features
+    ctx = ctx or AnalysisContext()
+
+    delivery_score, delivery_info = (50, {"unavailable": True})
+    if ctx.delivery is not None:
+        delivery_score, delivery_info = ctx.delivery(c.start, c.end, n_words)
+    c.delivery_score = delivery_score
+
+    emotional = c.rubric["emotional"]
+    if ctx.delivery is not None and not delivery_info.get("unavailable"):
+        emotional = (1 - DELIVERY_BLEND) * emotional + DELIVERY_BLEND * (delivery_score / 10.0)
+
+    pacing, pacing_info = audio_features.pacing_score(n_words, c.duration, c.speech_duration)
+    audio, audio_info = (None, {"available": False})
+    if ctx.audio_quality is not None:
+        audio, audio_info = ctx.audio_quality(c.start, c.end)
+    visual, visual_info = (None, {"available": False})
+    if ctx.visual_quality is not None:
+        visual, visual_info = ctx.visual_quality(c.start, c.end)
+
+    c.components = {
+        "hook": c.rubric["hook"], "curiosity": c.rubric["curiosity"],
+        "emotional": round(emotional, 2), "completeness": c.rubric["completeness"],
+        "standalone": c.rubric["standalone"], "information": c.rubric["information"],
+        "pacing": pacing, "visual": visual, "audio": audio,
+    }
+
+    gate = None
+    if min(c.rubric["hook"], c.rubric["completeness"], c.rubric["standalone"]) < CORE_GATE:
+        gate = "weak_core"
+    elif audio is not None and audio < MIN_AUDIO_QUALITY:
+        gate = "poor_audio"
+
+    present = {k: v for k, v in c.components.items() if v is not None}
+    wsum = sum(COMPONENT_WEIGHTS[k] for k in present)
+    weighted = sum(COMPONENT_WEIGHTS[k] * v for k, v in present.items()) / wsum   # 0-10
+    llm_keys = [k for k in COMPONENT_WEIGHTS if k in RUBRIC_KEYS]
+    llm_w = sum(COMPONENT_WEIGHTS[k] for k in llm_keys)
+    c.content_score = int(round(10 * sum(COMPONENT_WEIGHTS[k] * c.components[k] for k in llm_keys) / llm_w))
+
+    penalties: dict = {}
+    if c.context_dependent:
+        penalties["needs_earlier_context"] = 12
+    if c.opens_as_reply:
+        penalties["opens_as_reply"] = 10
+    if c.length_adjustment:
+        penalties["length_" + c.length_adjustment] = {"trimmed_to_fit": 8, "extended_to_fit": 5}[c.length_adjustment]
+    if not c.ends_on_sentence:
+        penalties["soft_end" if c.end_pause >= PAUSE_BREAK_SECONDS else "no_sentence_end"] = (
+            2 if c.end_pause >= PAUSE_BREAK_SECONDS else 8)
+    if c.dead_air_ratio > 0.25:
+        penalties["dead_air"] = 5
+
+    prior_points, prior_info = (0.0, {"used": False, "reason": "no creator history supplied"})
+    if ctx.creator_prior is not None:
+        prior_points, prior_info = ctx.creator_prior(c)
+
+    c.structure_score = max(0, 100 - 5 * sum(penalties.values()))
+    c.score = int(round(max(0.0, min(100.0, 10 * weighted - sum(penalties.values()) + prior_points))))
     c.breakdown = {
-        "content": c.content_score, "delivery": c.delivery_score,
-        "structure": c.structure_score, "structure_penalties": penalties,
-        "context_penalty": context_penalty, "length_adjustment": c.length_adjustment or None,
-        "length_penalty": length_penalty, "rubric": dict(c.rubric),
+        "components": dict(c.components),
+        "weights": {k: COMPONENT_WEIGHTS[k] for k in present},
+        "content": c.content_score, "delivery": delivery_score,
+        "penalties": penalties, "creator_prior": prior_info,
+        "pacing": pacing_info, "audio": audio_info, "visual": visual_info,
+        "delivery_detail": delivery_info,
+        "length_adjustment": c.length_adjustment or None,
+        "rubric": dict(c.rubric),
+        "gate": gate,
     }
 
 
@@ -608,16 +778,20 @@ class SelectionResult:
     total_speech_seconds: float
     rejected: list[dict]
     note: str
+    spares: list = field(default_factory=list)
+    analysis: dict = field(default_factory=dict)
 
     def summary(self) -> dict:
         return {
             "target": self.target,
             "selected": len(self.clips),
+            "spares_kept": len(self.spares),
             "min_score": self.min_score,
             "speech_minutes": round(self.total_speech_seconds / 60, 1),
             "candidates_rejected": len(self.rejected),
             "rejected_reasons": _count_reasons(self.rejected),
             "note": self.note,
+            "analysis": self.analysis,
         }
 
 
@@ -628,46 +802,64 @@ def _count_reasons(rejected: list[dict]) -> dict:
     return counts
 
 
+def _conflicts(c: Candidate, others: list[Candidate]) -> Optional[str]:
+    if any(min(c.end, a.end) - max(c.start, a.start) > OVERLAP_TOLERANCE_SECONDS for a in others):
+        return "overlaps_better_clip"
+    words = _content_words(c.transcript)
+    if any(_jaccard(words, _content_words(a.transcript)) > DUPLICATE_TOPIC_SIMILARITY for a in others):
+        return "duplicate_topic"
+    return None
+
+
 def select_clips(candidates: list[Candidate], target: int, min_score: int,
-                 rejected: list[dict], total_speech: float) -> SelectionResult:
+                 rejected: list[dict], total_speech: float,
+                 spares: int = SPARE_CANDIDATES) -> SelectionResult:
+    """Best-first: the first `target` that clear every gate, then up to
+    `spares` more that also clear them (to replace a clip that later fails
+    review or rendering QC)."""
     accepted: list[Candidate] = []
+    reserve: list[Candidate] = []
     for c in sorted(candidates, key=lambda c: c.score, reverse=True):
-        if len(accepted) >= target:
-            rejected.append({"title": c.title, "score": c.score, "reason": "over_target"})
-            continue
         if c.score < min_score:
             rejected.append({"title": c.title, "score": c.score, "reason": "below_quality_floor"})
             continue
         if c.content_score < MIN_CONTENT_SCORE:
             rejected.append({"title": c.title, "score": c.score, "reason": "weak_content"})
             continue
-        if any(min(c.end, a.end) - max(c.start, a.start) > OVERLAP_TOLERANCE_SECONDS for a in accepted):
-            rejected.append({"title": c.title, "score": c.score, "reason": "overlaps_better_clip"})
+        why = _conflicts(c, accepted + reserve)
+        if why:
+            rejected.append({"title": c.title, "score": c.score, "reason": why})
             continue
-        words = _content_words(c.transcript)
-        if any(_jaccard(words, _content_words(a.transcript)) > DUPLICATE_TOPIC_SIMILARITY
-               for a in accepted):
-            rejected.append({"title": c.title, "score": c.score, "reason": "duplicate_topic"})
-            continue
-        accepted.append(c)
+        if len(accepted) < target:
+            accepted.append(c)
+        elif len(reserve) < spares:
+            reserve.append(c)
+        else:
+            rejected.append({"title": c.title, "score": c.score, "reason": "over_target"})
+    return SelectionResult(accepted, target, min_score, total_speech, rejected,
+                           _selection_note(accepted, target, candidates, rejected), reserve)
 
+
+LENGTH_REASONS = {"too_short", "too_long"}
+
+
+def _selection_note(accepted: list, target: int, candidates: list, rejected: list) -> str:
     if len(accepted) >= target:
-        note = ""
-    elif not accepted and not candidates and rejected:
-        note = ("We couldn't cut any moment from this video into a clip of a usable length "
+        return ""
+    if not accepted and not candidates and rejected and all(r["reason"] in LENGTH_REASONS for r in rejected):
+        return ("We couldn't cut any moment from this video into a clip of a usable length "
                 f"({int(MIN_CLIP_SECONDS)}-{int(MAX_CLIP_SECONDS)} seconds of speech).")
-    elif not accepted:
-        note = ("No moment in this video was strong enough to work as a standalone short "
+    if not accepted:
+        return ("No moment in this video was strong enough to work as a standalone short "
                 "without the rest of the video.")
-    else:
-        note = (f"Found {len(accepted)} of up to {target} possible clips — the other moments "
-                "weren't strong enough to stand on their own.")
-    return SelectionResult(accepted, target, min_score, total_speech, rejected, note)
+    return (f"Found {len(accepted)} of up to {target} possible clips — the other moments "
+            "weren't strong enough to stand on their own.")
 
 
 def run_selection(words: list[dict], segments: list[dict], video_seconds: float, llm: LLMFn,
-                  delivery: Optional[Callable[[float, float, int], tuple[int, dict]]] = None,
+                  ctx: Optional[AnalysisContext] = None,
                   min_score: int = DEFAULT_MIN_SCORE) -> SelectionResult:
+    ctx = ctx or AnalysisContext()
     punctuated = attach_punctuation(words, segments)
     sentences = build_sentences(punctuated)
     total_speech = speech_seconds(punctuated)
@@ -675,13 +867,16 @@ def run_selection(words: list[dict], segments: list[dict], video_seconds: float,
     if total_speech < MIN_CLIP_SECONDS or not sentences:
         return SelectionResult([], target, min_score, total_speech, [],
                                "There isn't enough speech in this video to make a clip.")
+    if ctx.speaker_labels is not None and len(ctx.speaker_labels) != len(sentences):
+        ctx.speaker_labels = None   # stale labels for a different sentence split: don't use
 
-    raw = propose_candidates(sentences, video_seconds, target, llm, total_speech)
+    raw = propose_candidates(sentences, video_seconds, target, llm, total_speech,
+                             ctx.speaker_labels, ctx.video_map)
     rejected: list[dict] = []
     candidates: list[Candidate] = []
     seen_ranges: set = set()
     for item in raw:
-        c, why = evaluate_candidate(item, sentences, punctuated, video_seconds, delivery)
+        c, why = evaluate_candidate(item, sentences, punctuated, video_seconds, ctx)
         if c is None:
             rejected.append({"title": str(item.get("title", ""))[:80], "score": None, "reason": why})
             continue
@@ -691,4 +886,10 @@ def run_selection(words: list[dict], segments: list[dict], video_seconds: float,
             continue
         seen_ranges.add(span)
         candidates.append(c)
-    return select_clips(candidates, target, min_score, rejected, total_speech)
+    result = select_clips(candidates, target, min_score, rejected, total_speech)
+    result.analysis = {"candidates_evaluated": len(raw),
+                       "candidates_passing_checks": len(candidates),
+                       "sentences": len(sentences),
+                       "speaker_labels_used": bool(ctx.speaker_labels and any(ctx.speaker_labels)),
+                       "video_map_used": bool(ctx.video_map)}
+    return result

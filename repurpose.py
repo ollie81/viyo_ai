@@ -1414,7 +1414,8 @@ def _pick_best_thumbnail(candidate_paths: list[str]) -> int:
     for path in candidate_paths:
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("ascii")
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}",
+                                                           "detail": "low"}})
 
     try:
         completion = ai_client.chat.completions.create(

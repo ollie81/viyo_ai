@@ -12,6 +12,7 @@ import threading
 import pytest
 
 import clip_selection as cs
+import clip_render
 import repurpose as r
 from conftest import connect, make_user, pg_rpc
 from repurpose_cleanup import run_maintenance
@@ -99,22 +100,31 @@ class Scripted:
 
     def llm(self, messages):
         self.llm_calls += 1
-        prompt = messages[-1]["content"]
-        ids = {int(m.group(1)): m.group(2) for m in re.finditer(r"^S(\d+) \[[^\]]+\] (.*)$", prompt, re.M)}
+        content = messages[-1]["content"]
+        prompt = content if isinstance(content, str) else content[0]["text"]
+        if "analysing a long video" in prompt:
+            return json.dumps({"summary": "A creator tells a story about freelancing and explains pricing.",
+                               "format": "talk", "speakers": [], "topics": [], "avoid": []})
+        if "strict senior editor" in prompt:
+            ids = [int(m.group(1)) for m in re.finditer(r"^--- CLIP (\d+)", prompt, re.M)]
+            return json.dumps({"reviews": [{"id": i, "standalone": True, "opening": 8, "ending": 8,
+                                            "hook_accurate": None, "visual_ok": None, "visual": "",
+                                            "verdict": "publish", "issues": []} for i in ids]})
+        ids = {int(m.group(1)): m.group(2) for m in re.finditer(r"^S(\d+) (?:[A-Z] )?\[[^\]]+\] (.*)$", prompt, re.M)}
         story_start = next(i for i, t in ids.items() if t.startswith("Nobody tells you"))
         pricing_start = next(i for i, t in ids.items() if t.startswith("Here is what nobody"))
-        good = {"hook": 8, "completeness": 8, "standalone": 8, "payoff": 8, "emotional_pull": 7}
+        good = {"hook": 8, "curiosity": 8, "emotional": 7, "completeness": 8, "standalone": 8, "information": 8}
         weak = {k: 3 for k in good}
         return json.dumps({"candidates": [
             {"start_sentence": story_start, "end_sentence": story_start + 7, "category": "story",
-             "scores": weak if self.weak else good, "context_dependent": False,
+             "scores": weak if self.weak else good, "opens_mid_conversation": False,
              "title": "The phone call that paid my rent", "reason": "Concrete stakes and a twist.",
-             "hook_line": "Nobody tells you that quitting your job", "caption": "Leverage.",
+             "overlay_hook": "", "caption": "Leverage.",
              "hashtags": ["freelance", "career"], "topic": "quitting"},
             {"start_sentence": pricing_start, "end_sentence": pricing_start + 7, "category": "insight",
-             "scores": weak if self.weak else dict(good, hook=7), "context_dependent": False,
+             "scores": weak if self.weak else dict(good, hook=7), "opens_mid_conversation": False,
              "title": "Stop competing on price", "reason": "Counter-intuitive and actionable.",
-             "hook_line": "Here is what nobody explains", "caption": "Raise your prices.",
+             "overlay_hook": "", "caption": "Raise your prices.",
              "hashtags": ["pricing"], "topic": "pricing"},
         ]})
 
@@ -127,7 +137,8 @@ def env(db, tmp_path, source_video):
     storage = LocalStorage(str(tmp_path / "storage"))
     scripted = Scripted()
     deps = PipelineDeps(storage=storage, transcribe_chunk=scripted.transcribe, llm=scripted.llm,
-                        max_input_bytes=500 * 1024 * 1024, max_input_seconds=1980, critique=False)
+                        max_input_bytes=500 * 1024 * 1024, max_input_seconds=1980, critique=False,
+                        analysis=False, review=False, qa=False)
     worker = Worker(store, deps, config, worker_id="test-worker")
     return {"db": db, "store": store, "storage": storage, "scripted": scripted,
             "worker": worker, "media": source_video}
@@ -196,20 +207,36 @@ def test_job_runs_end_to_end_and_produces_real_vertical_clips(env):
     assert [c["status"] for c in job["clips"]] == ["rendered", "rendered"]
 
 
+def test_full_analysis_pipeline_reviews_renders_and_passes_quality_control(env):
+    """Same job with whole-video analysis, editorial review and rendering QC switched on."""
+    env["worker"].deps.analysis = env["worker"].deps.review = env["worker"].deps.qa = True
+    uid, job_id = submit(env)
+    assert env["worker"].run_once()
+    job = job_row(env, job_id)
+    assert job["status"] == "succeeded", job.get("error_detail")
+    sel = job["result"]["selection"]
+    assert sel["analysis"]["visual"]["samples"] > 0
+    assert sel["analysis"]["video_map"]["summary"]
+    assert sel["analysis"]["review"]["reviewed"] is True
+    for row in job["clips"]:
+        qa = row["render_meta"]["qa"]
+        assert qa["checks"]["format"]["ok"] and qa["checks"]["loudness"]["ok"], qa
+
+
 # ---------------------------------------------------------------- retries & resume
 
 def test_retry_resumes_without_paying_for_transcription_or_selection_again(env, monkeypatch):
     uid, job_id = submit(env)
-    real_render = r._render_clip
+    real_render = clip_render.render
     attempts = {"n": 0}
 
     def flaky_render(*a, **kw):
         attempts["n"] += 1
         if attempts["n"] <= 2:
-            raise r.HTTPException(status_code=500, detail="encoder crashed")
+            raise clip_render.RenderError("encoder crashed")
         return real_render(*a, **kw)
 
-    monkeypatch.setattr(r, "_render_clip", flaky_render)
+    monkeypatch.setattr(clip_render, "render", flaky_render)
     env["worker"].run_once()
     job = job_row(env, job_id)
     assert job["status"] == "queued" and job["error_code"] == "render_failed"

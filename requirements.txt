@@ -48,3 +48,8 @@ opencv-python-headless==4.10.0.84
 # since series_covers.py imports it directly to recompress oversized
 # cover images before they're ever stored.
 Pillow==12.3.0
+
+# Local speaker identification (speakers.py): runs the WeSpeaker ResNet34
+# voice-embedding model on CPU. No paid API.
+onnxruntime==1.31.1
+numpy>=1.26

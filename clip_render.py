@@ -1,0 +1,340 @@
+"""
+Professional 9:16 rendering of a clip.
+
+  * Letterbox / pillarbox bars are cropped away first (measured, not assumed).
+  * Framing follows the people: faces were located across the WHOLE source
+    by video_analysis (YuNet). The clip is planned shot by shot — the crop
+    re-centres instantly at each camera cut or edit point (cuts are refined
+    to frame accuracy), holds still while the subject is still, and only
+    glides when they actually move (dead-band pan, no jitter).
+  * When the picture has no people (slides, screen share, b-roll) the full
+    frame is kept, fitted to the width over a blurred copy of itself —
+    nothing important is cropped off.
+  * Audio: rumble filter, micro-fades at every cut (no clicks), and
+    TWO-PASS loudness normalisation to -14 LUFS (measured, then applied
+    linearly), so levels are accurate rather than approximate.
+  * Each kept block is its own seeked input (bounded memory); encode is
+    libx264 high profile, CRF 20, faststart.
+
+Every decision is returned as facts (crop mode, tracked share, how many
+sampled faces would be cut off) so QC can verify it instead of trusting it.
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
+import video_analysis as va
+
+OUT_W, OUT_H = 1080, 1920
+TARGET_LUFS = -14.0
+NO_FACE_FIT_BELOW = 0.15        # face ratio under this: fit the frame instead of cropping
+FACE_PAD = 0.7                  # keep this multiple of the face width around the face centre
+DEADBAND = 0.18                 # fraction of crop width the subject may drift before the crop moves
+GLIDE_SECONDS = 1.2
+CUT_REFINE_FPS = 30
+
+
+class RenderError(Exception):
+    pass
+
+
+@dataclass
+class CropPlan:
+    mode: str = "center"                 # "track" | "center" | "fit"
+    src_w: int = 0
+    src_h: int = 0
+    bars: Optional[tuple] = None         # (x, y, w, h) crop of the source, or None
+    crop_w: int = 0
+    crop_h: int = 0
+    pieces: list = field(default_factory=list)   # (t0, x0, t1, x1) in OUTPUT time, source px of the bar-cropped frame
+    facts: dict = field(default_factory=dict)
+
+    def x_at(self, t: float) -> float:
+        for t0, x0, t1, x1 in self.pieces:
+            if t < t1:
+                if t1 <= t0:
+                    return x1
+                return x0 + (x1 - x0) * max(0.0, min(1.0, (t - t0) / (t1 - t0)))
+        return self.pieces[-1][3] if self.pieces else max(0.0, (self.src_w - self.crop_w) / 2)
+
+
+# ------------------------------------------------------------------ planning
+
+def refine_cut(path: str, approx: float, window: float = 1.1) -> float:
+    """Frame-accurate time of the camera cut near `approx` (sampled at 1 fps,
+    so it can be up to a second off). Falls back to `approx`."""
+    if cv2 is None:
+        return approx
+    try:
+        t0 = max(0.0, approx - window)
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{t0:.3f}", "-t", f"{window * 2:.3f}", "-i", path, "-an",
+             "-vf", f"fps={CUT_REFINE_FPS},scale=160:-2,setsar=1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+            capture_output=True, timeout=60)
+        raw = proc.stdout
+        # Frame height: derive from the byte count (160 wide).
+        info = va.probe_video(path)
+        h = int(round(160 * info["height"] / info["width"] / 2)) * 2
+        size = 160 * h * 3
+        n = len(raw) // size
+        if n < 3:
+            return approx
+        prev, best_d, best_i = None, 0.0, -1
+        for i in range(n):
+            frame = np.frombuffer(raw[i * size:(i + 1) * size], dtype=np.uint8).reshape(h, 160, 3)
+            hist = va._hist(frame)
+            if prev is not None:
+                d = va._bhattacharyya(prev, hist)
+                if d > best_d:
+                    best_d, best_i = d, i
+            prev = hist
+        if best_i >= 1 and best_d > va.CUT_DISTANCE:
+            return t0 + best_i / CUT_REFINE_FPS
+    except Exception:
+        pass
+    return approx
+
+
+def _output_map(blocks: list):
+    cum, total = [], 0.0
+    for b0, b1 in blocks:
+        cum.append(total)
+        total += b1 - b0
+
+    def to_out(t: float) -> Optional[float]:
+        for i, (b0, b1) in enumerate(blocks):
+            if b0 <= t < b1:
+                return cum[i] + (t - b0)
+        return None
+
+    return to_out, cum, total
+
+
+def _main_face(faces: list) -> Optional[va.Face]:
+    return max(faces, key=lambda f: f.w * f.h) if faces else None
+
+
+def plan_crop(timeline: Optional[va.VisualTimeline], blocks: list, src_w: int, src_h: int,
+              source_path: Optional[str] = None, refine: bool = True) -> CropPlan:
+    plan = CropPlan(src_w=src_w, src_h=src_h)
+    rect = va.crop_rect_for_bars(timeline, src_w, src_h) if timeline is not None and timeline.usable else None
+    bx, by, bw, bh = rect if rect else (0, 0, src_w, src_h)
+    plan.bars = rect
+    to_out, cum, total = _output_map(blocks)
+    start, end = blocks[0][0], blocks[-1][1]
+
+    vis = va.window_visual(timeline, start, end) if timeline is not None and timeline.usable else {"available": False}
+    face_ratio = vis.get("face_ratio", 0.0) if vis.get("available") else 0.0
+    plan.facts = {"bars_cropped": bool(rect), "visual_available": bool(vis.get("available")),
+                  "face_ratio": round(face_ratio, 2)}
+
+    # Source narrower than 9:16 is simply scaled to cover.
+    crop_h = bh
+    crop_w = int(round(crop_h * OUT_W / OUT_H / 2) * 2)
+    if crop_w >= bw:
+        plan.mode, plan.crop_w, plan.crop_h = "center", bw, int(round(bw * OUT_H / OUT_W / 2) * 2)
+        plan.crop_h = min(plan.crop_h, bh)
+        plan.pieces = [(0.0, 0.0, total, 0.0)]
+        return plan
+    plan.crop_w, plan.crop_h = crop_w, crop_h
+    centre = (bw - crop_w) / 2.0
+
+    if not vis.get("available") or face_ratio < NO_FACE_FIT_BELOW:
+        # No people to follow. Wide enough content is fitted, not cropped.
+        plan.mode = "fit" if vis.get("available") else "center"
+        plan.pieces = [(0.0, centre, total, centre)]
+        plan.facts["reason"] = "no_faces" if vis.get("available") else "no_visual_analysis"
+        return plan
+
+    # Boundaries where the framing may jump: camera cuts and block joins.
+    bounds = [0.0]
+    for ci in cum[1:]:
+        bounds.append(ci)
+    for ct in timeline.cuts_between(start, end):
+        o = to_out(ct)
+        if o is None:
+            continue
+        if refine and source_path:
+            r = refine_cut(source_path, ct)
+            o2 = to_out(r)
+            o = o2 if o2 is not None else o
+        bounds.append(o)
+    bounds = sorted(set(round(b, 3) for b in bounds if 0 <= b < total))
+    bounds.append(total)
+
+    # Samples (output time, face centre x in bar-cropped px, face box)
+    samples = []
+    t_idx = timeline.times
+    lo, hi = np.searchsorted(t_idx, [start, end])
+    for k in range(int(lo), int(hi)):
+        o = to_out(float(t_idx[k]))
+        if o is None:
+            continue
+        f = _main_face(timeline.faces[k])
+        if f is None:
+            continue
+        group = [x for x in timeline.faces[k] if x.w * x.h >= 0.35 * f.w * f.h]
+        xs0 = min(g.cx - g.w / 2 for g in group) * src_w - bx
+        xs1 = max(g.cx + g.w / 2 for g in group) * src_w - bx
+        # Two people side by side who both fit in the crop: frame them together.
+        if len(group) >= 2 and (xs1 - xs0) <= crop_w * (1 - 2 * 0.06):
+            cx = (xs0 + xs1) / 2
+        else:
+            cx = f.cx * src_w - bx
+        samples.append((o, cx, f))
+
+    pieces: list = []
+    tracked = 0.0
+    last_x = centre
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        seg = [(o, cx) for o, cx, _ in samples if a - 1e-6 <= o < b]
+        if not seg:
+            pieces.append((a, last_x, b, last_x))
+            continue
+        tracked += b - a
+        first = float(np.median([cx for _, cx in seg[:3]]))
+        cur = float(np.clip(first - crop_w / 2, 0, bw - crop_w))
+        pieces.append((a, cur, a, cur))
+        tcur = a
+        for o, cx in seg:
+            want = float(np.clip(cx - crop_w / 2, 0, bw - crop_w))
+            if abs(want - cur) > DEADBAND * crop_w:
+                t_move = min(max(o, tcur), b)
+                t_end = min(t_move + GLIDE_SECONDS, b)
+                if t_move > tcur:
+                    pieces.append((tcur, cur, t_move, cur))
+                pieces.append((t_move, cur, t_end, want))
+                cur, tcur = want, t_end
+        if b > tcur:
+            pieces.append((tcur, cur, b, cur))
+        last_x = cur
+    pieces = [p for p in pieces if p[2] > p[0] or p[0] == p[2]]
+    plan.pieces = pieces
+    plan.mode = "track"
+
+    # How many sampled faces would be cut off or touch the crop edge?
+    cut_off = 0
+    for o, cx, f in samples:
+        x = plan.x_at(o)
+        fl, fr = (f.cx - f.w / 2) * src_w - bx, (f.cx + f.w / 2) * src_w - bx
+        if fl < x - 1 or fr > x + crop_w + 1:
+            cut_off += 1
+    plan.facts.update({"tracked_share": round(tracked / total, 2) if total else 0.0,
+                       "face_samples": len(samples), "faces_cut_off": cut_off,
+                       "faces_cut_off_share": round(cut_off / len(samples), 3) if samples else 0.0,
+                       "crop_segments": len(bounds) - 1})
+    return plan
+
+
+def x_expression(plan: CropPlan) -> str:
+    """ffmpeg expression for crop x as a function of t (output time)."""
+    pieces = plan.pieces
+    if not pieces:
+        return f"{(plan.src_w - plan.crop_w) / 2:.1f}"
+    expr = f"{pieces[-1][3]:.1f}"
+    for t0, x0, t1, x1 in reversed(pieces):
+        if t1 <= t0:
+            continue
+        slope = (x1 - x0) / (t1 - t0)
+        seg = f"{x0:.1f}" if abs(slope) < 1e-9 else f"({x0:.1f}+{slope:.3f}*(t-{t0:.3f}))"
+        expr = f"if(lt(t,{t1:.3f}),{seg},{expr})"
+    return expr
+
+
+# ------------------------------------------------------------------ rendering
+
+def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[float]) -> str:
+    parts = []
+    if out_fps:
+        parts.append(f"fps={out_fps:g}")
+    if plan.bars:
+        x, y, w, h = plan.bars
+        parts.append(f"crop={w}:{h}:{x}:{y}")
+    if plan.mode == "fit":
+        chain = ",".join(parts) + "," if parts else ""
+        graph = (f"[vcat]{chain}split[bgsrc][fgsrc];"
+                 f"[bgsrc]scale=216:384:force_original_aspect_ratio=increase,crop=216:384,boxblur=6:2,"
+                 f"scale={OUT_W}:{OUT_H}:flags=bicubic[bg];"
+                 f"[fgsrc]scale={OUT_W}:-2:flags=lanczos[fg];"
+                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1")
+    else:
+        if plan.mode == "track":
+            crop = f"crop={plan.crop_w}:{plan.crop_h}:x='{x_expression(plan)}':y=0"
+        else:
+            crop = f"crop={plan.crop_w}:{plan.crop_h}:(iw-{plan.crop_w})/2:0"
+        parts += [crop, f"scale={OUT_W}:{OUT_H}:flags=lanczos", "setsar=1"]
+        graph = "[vcat]" + ",".join(parts)
+    if ass_path:
+        safe = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        graph += f",subtitles='{safe}'"
+    return graph
+
+
+def measure_loudness(inputs: list, filter_parts: list, concat_label: str) -> Optional[dict]:
+    """First loudnorm pass on the concatenated audio only."""
+    graph = ";".join(filter_parts + [f"[{concat_label}]highpass=f=70,loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11:"
+                                     f"print_format=json[aout]"])
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-filter_complex", graph, "-map", "[aout]",
+                        "-vn", "-f", "null", "-"], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        return None
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+        vals = {k: float(d[k]) for k in ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")}
+    except (KeyError, ValueError):
+        return None
+    if not all(np.isfinite(v) for v in vals.values()):   # silence yields -inf
+        return None
+    return vals
+
+
+def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Optional[str] = None,
+           src_fps: Optional[float] = None, timeout: float = 900) -> dict:
+    inputs: list = []
+    for b0, b1 in blocks:
+        inputs += ["-ss", f"{b0:.3f}", "-t", f"{b1 - b0:.3f}", "-i", source]
+    vparts, aparts = [], []
+    for i, (b0, b1) in enumerate(blocks):
+        d = b1 - b0
+        vparts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
+        fade = min(0.03, d / 4)
+        aparts.append(f"[{i}:a]asetpts=PTS-STARTPTS,afade=t=in:st=0:d={fade:.3f},"
+                      f"afade=t=out:st={max(0.0, d - fade):.3f}:d={fade:.3f}[a{i}]")
+    n = len(blocks)
+    cat_a = "".join(f"[a{i}]" for i in range(n))
+    a_only = aparts + [f"{cat_a}concat=n={n}:v=0:a=1[acat]"]
+    measured = measure_loudness(inputs, a_only, "acat")
+
+    out_fps = 30 if (src_fps and src_fps > 31) else None
+    if measured:
+        ln = (f"loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11:measured_I={measured['input_i']}:"
+              f"measured_TP={measured['input_tp']}:measured_LRA={measured['input_lra']}:"
+              f"measured_thresh={measured['input_thresh']}:offset={measured['target_offset']}:linear=true")
+    else:
+        ln = f"loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11"
+    graph = ";".join(vparts + aparts + [
+        "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vcat][acat0]",
+        _video_filter(plan, ass_path, out_fps) + "[vout]",
+        f"[acat0]highpass=f=70,{ln}[aout]"])
+    cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RenderError(r.stderr[-600:])
+    return {"loudness_two_pass": bool(measured), "measured_lufs_before": measured["input_i"] if measured else None,
+            "target_lufs": TARGET_LUFS, "crop_mode": plan.mode, **plan.facts}

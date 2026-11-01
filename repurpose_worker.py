@@ -190,6 +190,7 @@ def build_production_worker() -> Worker:
     from repurpose_storage import SupabaseStorage
     from transcription import openai_chunk_transcriber
     import clip_selection
+    import creator_insights
 
     if r.supabase_admin is None:
         sys.exit("Worker can't start: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are invalid.")
@@ -205,6 +206,8 @@ def build_production_worker() -> Worker:
         max_input_bytes=r.MAX_INPUT_SIZE_BYTES,
         max_input_seconds=r.MAX_INPUT_DURATION_SECONDS,
         min_clip_score=int(os.environ.get("REPURPOSE_MIN_CLIP_SCORE", clip_selection.DEFAULT_MIN_SCORE)),
+        caption_style=os.environ.get("REPURPOSE_CAPTION_STYLE", "bold"),
+        creator_prior_for=lambda user_id: creator_insights.load_prior(r.supabase_admin, user_id),
     )
     return Worker(store, deps, config, maintenance=lambda: run_maintenance(store, storage))
 

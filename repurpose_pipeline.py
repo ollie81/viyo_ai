@@ -22,7 +22,16 @@ from typing import Callable, Optional
 
 from fastapi import HTTPException
 
+import audio_features
+import captions
+import clip_qa
+import clip_render
+import clip_review
 import clip_selection
+import creator_insights
+import speakers
+import video_analysis
+import video_map
 from audio_features import build_baseline, decode_pcm, delivery_score, frame_features, window_stats
 from repurpose_jobs import JobStore, LeaseLost, PermanentJobError, ShutdownRequested, TransientJobError
 from repurpose_storage import CLIPS_BUCKET, SourceMissing, SourceTooLarge, StorageUnavailable
@@ -41,6 +50,14 @@ class PipelineDeps:
     # The footage critique is an extra LLM call the app already shows;
     # tests turn it off.
     critique: bool = True
+    # Whole-video analysis (pictures, voices, story map), editorial review and
+    # rendering QA. Tests that only exercise job plumbing turn these off.
+    analysis: bool = True
+    review: bool = True
+    qa: bool = True
+    caption_style: str = captions.DEFAULT_STYLE
+    # user_id -> creator_prior callable or None (see creator_insights)
+    creator_prior_for: Optional[Callable] = None
 
 
 class JobContext:
@@ -159,43 +176,158 @@ def _transcript(ctx: JobContext, deps: PipelineDeps, path: str, sha: str, durati
     return transcript
 
 
-def _delivery_scorer(path: str, words: list[dict], duration: float):
-    """Vocal-delivery scorer, or None if the audio can't be analysed — a
-    missing signal lowers precision, it doesn't fail the job."""
+class RunState:
+    """Analysis shared by the stages of ONE run. Nothing here is persisted:
+    after a crash it is recomputed, because the selection checkpoint already
+    holds everything the expensive stages decided."""
+
+    def __init__(self):
+        self.punctuated: Optional[list] = None
+        self.timeline: Optional[video_analysis.VisualTimeline] = None
+        self.speaker_map: Optional[speakers.SpeakerMap] = None
+        self.dims: Optional[dict] = None
+        self.fps: Optional[float] = None
+
+    def punct(self, words: list, segments: list) -> list:
+        if self.punctuated is None:
+            self.punctuated = clip_selection.attach_punctuation(words, segments)
+        return self.punctuated
+
+    def visual(self, path: str, duration: float) -> video_analysis.VisualTimeline:
+        if self.timeline is None:
+            self.timeline = video_analysis.analyze_video(path, duration)
+        return self.timeline
+
+    def dimensions(self, path: str) -> dict:
+        if self.dims is None:
+            self.dims = video_analysis.probe_video(path)
+        return self.dims
+
+
+def _analyse_media(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, words: list,
+                   segments: list, duration: float, user_id: str) -> tuple:
+    """Everything measured about the media. Each signal that can't be
+    produced is simply absent (and recorded) — it never fails the job."""
+    facts: dict = {}
+    amb = clip_selection.AnalysisContext()
+    sentences = clip_selection.build_sentences(run.punct(words, segments))
+    ff = None
     try:
-        ff = frame_features(decode_pcm(path, timeout=900))
+        ctx.stage("analyzing", 0.45, "Listening to the whole video")
+        samples = decode_pcm(path, timeout=900)
+        ff = frame_features(samples)
         baseline = build_baseline(ff, duration, [float(w["start"]) for w in words])
+
+        def delivery(start: float, end: float, n_words: int):
+            return delivery_score(window_stats(ff, start, end, n_words), baseline)
+
+        amb.delivery = delivery
+        amb.audio_quality = lambda s, e: audio_features.audio_quality_score(ff, s, e)
+        facts["audio_analysed"] = True
     except Exception as e:
-        print(f"[WARN] delivery analysis unavailable: {e}")
-        return None
+        samples = None
+        facts["audio_analysed"] = False
+        print(f"[WARN] audio analysis unavailable: {e}")
 
-    def score(start: float, end: float, n_words: int):
-        return delivery_score(window_stats(ff, start, end, n_words), baseline)
+    ctx.stage("analyzing", 0.47, "Watching the whole video")
+    timeline = run.visual(path, duration)
+    if timeline.usable:
+        amb.visual_quality = lambda s, e: video_analysis.visual_quality_score(video_analysis.window_visual(timeline, s, e))
+        facts["visual"] = {"samples": int(len(timeline.times)), "shots": len(timeline.shots),
+                           "camera_cuts": int(timeline.cut_before.sum()), "detector": timeline.detector,
+                           "bars": {k: round(v, 3) for k, v in timeline.bars.items()}}
+    else:
+        facts["visual"] = {"available": False}
 
-    return score
+    if samples is not None and ff is not None:
+        ctx.stage("analyzing", 0.49, "Telling the speakers apart")
+        try:
+            smap = speakers.estimate_speakers(samples, ff, sentences, timeline)
+            run.speaker_map = smap
+            facts["speakers"] = smap.summary()
+            if smap.reliable and smap.n_speakers >= 2:
+                amb.speaker_labels = smap.sentence_labels
+        except Exception as e:
+            facts["speakers"] = {"reliable": False, "note": f"unavailable: {str(e)[:80]}"}
+            print(f"[WARN] speaker analysis unavailable: {e}")
+
+    ctx.stage("analyzing", 0.51, "Understanding the story")
+    vm = video_map.build_video_map(sentences, amb.speaker_labels, deps.llm,
+                                   speakers_reliable=bool(amb.speaker_labels))
+    amb.video_map = vm
+    facts["video_map"] = ({"format": vm["format"], "topics": len(vm["topics"]), "avoided_stretches": len(vm["avoid"]),
+                           "summary": vm["summary"]} if vm else {"available": False})
+
+    if deps.creator_prior_for is not None:
+        try:
+            amb.creator_prior = deps.creator_prior_for(user_id)
+        except Exception as e:
+            print(f"[WARN] creator history unavailable: {e}")
+    facts["creator_prior"] = "applied" if amb.creator_prior else "no_history"
+    return amb, sentences, facts
 
 
-def _select(ctx: JobContext, deps: PipelineDeps, path: str, transcript: dict, duration: float) -> dict:
+def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, result, sentences: list,
+            amb, work_dir: str) -> dict:
+    pool = result.clips + result.spares
+    if not deps.review or not pool:
+        return {"reviewed": False}
+    ctx.stage("selecting", 0.57, "Reviewing the best moments like an editor")
+
+    def frames_for(c):
+        try:
+            return clip_review.extract_frames(path, c, work_dir)
+        except Exception:
+            return []
+
+    reviews = clip_review.review_candidates(pool, sentences, amb.speaker_labels, deps.llm,
+                                            frames_for if run.timeline is not None and run.timeline.usable else None)
+    before = len(result.clips)
+    clip_review.apply_reviews(result, reviews, pool)
+    verdicts: dict = {}
+    for rv in reviews.values():
+        verdicts[rv["verdict"]] = verdicts.get(rv["verdict"], 0) + 1
+    return {"reviewed": True, "clips_reviewed": len(reviews), "unreviewed": len(pool) - len(reviews),
+            "verdicts": verdicts, "changed_selection": before != len(result.clips) or bool(reviews)}
+
+
+def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, transcript: dict,
+            duration: float, work_dir: str) -> dict:
     existing = (ctx.job.get("checkpoint") or {}).get("selection")
     if existing:
         return existing
 
     words, segments = transcript.get("words") or [], transcript.get("segments") or []
-    ctx.stage("analyzing", 0.45, "Analysing delivery")
-    scorer = _delivery_scorer(path, words, duration)
+    sentences: list = []
+    facts: dict = {}
+    amb = clip_selection.AnalysisContext()
+    if deps.analysis:
+        amb, sentences, facts = _analyse_media(ctx, deps, run, path, words, segments, duration,
+                                               ctx.job["user_id"])
 
-    ctx.stage("selecting", 0.52, "Finding the strongest moments")
+    ctx.stage("selecting", 0.53, "Finding the strongest moments")
     try:
-        result = clip_selection.run_selection(words, segments, duration, deps.llm, scorer, deps.min_clip_score)
+        result = clip_selection.run_selection(words, segments, duration, deps.llm, amb, deps.min_clip_score)
     except clip_selection.SelectionUnavailable as e:
         raise TransientJobError("selection_unavailable", "Clip selection is temporarily unavailable.", str(e))
 
-    summary = result.summary()
-    summary["delivery_signal"] = scorer is not None
-    if not result.clips:
-        raise PermanentJobError("no_strong_moments", result.note, str(summary))
+    if result.clips and deps.analysis:
+        facts["review"] = _review(ctx, deps, run, path, result, sentences, amb, work_dir)
 
-    selection = {"clips": [c.to_dict() for c in result.clips], "summary": summary}
+    summary = result.summary()
+    summary["analysis"] = {**(summary.get("analysis") or {}), **facts}
+    summary["selected"] = len(result.clips)
+    summary["spares_kept"] = len(result.spares)
+    summary["candidates_rejected"] = len(result.rejected)
+    summary["rejected_reasons"] = clip_selection._count_reasons(result.rejected)
+    summary["note"] = result.note
+    summary["delivery_signal"] = amb.delivery is not None
+    if not result.clips:
+        raise PermanentJobError("no_strong_moments", result.note or
+                                "We didn't find a moment strong enough to stand on its own.", str(summary)[:1500])
+
+    selection = {"clips": [c.to_dict() for c in result.clips],
+                 "spares": [c.to_dict() for c in result.spares], "summary": summary}
     ctx.checkpoint({"selection": selection})
     for rank, c in enumerate(result.clips, start=1):
         ctx.save_clip({
@@ -231,26 +363,73 @@ def _prompt_selection(ctx: JobContext, job: dict, duration: float) -> dict:
     return selection
 
 
-def _render_one(ctx: JobContext, deps: PipelineDeps, source: str, work_dir: str, rank: int,
+class ClipRejected(Exception):
+    """A rendered clip failed quality control; the caller tries a spare."""
+
+    def __init__(self, failures: list, report: dict):
+        super().__init__(", ".join(failures))
+        self.failures = failures
+        self.report = report
+
+
+def _clip_words(punct: list, start: float, end: float) -> list:
+    return [w for w in punct if start <= (float(w["start"]) + float(w["end"])) / 2 < end]
+
+
+def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str, work_dir: str, rank: int,
                 clip: dict, transcript: dict) -> dict:
     import repurpose as r
     words, segments = transcript.get("words") or [], transcript.get("segments") or []
+    punct = run.punct(words, segments)
     blocks = r._find_speech_blocks(segments, clip["start"], clip["end"])
     dead_air = r._dead_air_removed_seconds(blocks)
     kept_before = sum(e - s for s, e in blocks)
     blocks, filler_count = r._remove_filler_words(blocks, words)
     filler_seconds = round(kept_before - sum(e - s for s, e in blocks), 2)
+    planned = clip_render_total = sum(e - s for s, e in blocks)
 
-    captions = os.path.join(work_dir, f"captions_{rank}.ass")
-    if not r._generate_ass(words, captions, blocks, clip.get("hook_line", "")):
-        captions = os.path.join(work_dir, f"captions_{rank}.srt")
-        r._generate_srt(segments, captions, blocks)
+    overlay = clip.get("overlay_hook")
+    smap = run.speaker_map
+    speaker_at = smap.label_at if smap is not None and smap.reliable and smap.n_speakers >= 2 else None
+    ass_text, cap_facts = captions.build_ass(punct, blocks, hook=overlay or "", style=deps.caption_style,
+                                             speaker_at=speaker_at)
+    ass_path = None
+    if ass_text:
+        ass_path = os.path.join(work_dir, f"captions_{rank}.ass")
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_text)
 
+    dims = run.dimensions(source)
+    timeline = run.visual(source, ctx.job.get("checkpoint", {}).get("source", {}).get("duration") or 0.0) \
+        if deps.analysis else None
     out = os.path.join(work_dir, f"clip_{rank}.mp4")
-    try:
-        r._render_clip(source, out, captions, blocks)
-    except HTTPException as e:
-        raise RuntimeError(str(e.detail))
+    plan = clip_render.plan_crop(timeline, blocks, dims["width"], dims["height"], source)
+    qa_dict: dict = {}
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            render_facts = clip_render.render(source, out, blocks, plan, ass_path, run.fps)
+        except clip_render.RenderError as e:
+            raise RuntimeError(str(e))
+        if not deps.qa:
+            break
+        c_words = _clip_words(punct, blocks[0][0], blocks[-1][1])
+        report = clip_qa.run_qa(out, planned, render_facts, ass_text, overlay, clip.get("transcript", ""),
+                                [str(w.get("text") or w.get("word")) for w in c_words], work_dir)
+        qa_dict = report.to_dict()
+        if report.passed:
+            break
+        # One regeneration: a framing failure is fixed by keeping the whole
+        # frame instead of cropping it.
+        if attempts == 1 and report.failures and all(f.name == "framing" for f in report.failures):
+            plan = clip_render.CropPlan(mode="fit", src_w=dims["width"], src_h=dims["height"], bars=plan.bars,
+                                        crop_w=plan.crop_w, crop_h=plan.crop_h,
+                                        pieces=[(0.0, 0.0, planned, 0.0)], facts={**plan.facts, "retry": "fit_after_framing"})
+            continue
+        if os.path.exists(out):
+            os.remove(out)
+        raise ClipRejected([f.name for f in report.failures], qa_dict)
 
     user_id, job_id = ctx.job["user_id"], ctx.job_id
     base = f"{user_id}/{job_id}/clip_{rank}"
@@ -277,7 +456,10 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, source: str, work_dir: str,
 
     render_meta = {"dead_air_removed_seconds": dead_air,
                    "filler_words_removed_seconds": filler_seconds,
-                   "filler_words_removed_count": filler_count}
+                   "filler_words_removed_count": filler_count,
+                   "render": render_facts, "captions": cap_facts, "qa": qa_dict,
+                   "overlay_hook": overlay, "overlay_status": clip.get("overlay_status"),
+                   "review": clip.get("review") or {}}
     ctx.save_clip({
         "rank": rank, "status": "rendered", "start_time": clip["start"], "end_time": clip["end"],
         "score": clip["score"], "score_breakdown": clip.get("breakdown"), "category": clip.get("category"),
@@ -287,11 +469,28 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, source: str, work_dir: str,
         "thumbnail_path": thumbnail_path, "thumbnail_url": thumbnail_url,
         "quote_card_path": quote_path, "quote_card_url": quote_url, "render_meta": render_meta,
     })
-    for f in (out,):
-        if os.path.exists(f):
-            os.remove(f)
+    if os.path.exists(out):
+        os.remove(out)
     return {"video_url": video_url, "thumbnail_url": thumbnail_url, "quote_card_url": quote_url,
             **render_meta}
+
+
+def _clip_from_row(row: dict) -> dict:
+    """Rebuild a clip dict from a saved row, for clips rendered before a restart."""
+    return {"start": row.get("start_time"), "end": row.get("end_time"), "score": row.get("score"),
+            "category": row.get("category"), "title": row.get("title") or "", "reason": row.get("reason") or "",
+            "hook_line": row.get("hook_line") or "", "caption": row.get("caption") or "",
+            "hashtags": row.get("hashtags") or [], "transcript": row.get("transcript") or "",
+            "breakdown": row.get("score_breakdown") or {}}
+
+
+def video_analysis_fps(path: str) -> Optional[float]:
+    import subprocess
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=avg_frame_rate", "-of", "default=nw=1:nk=1", path],
+                         capture_output=True, text=True, timeout=30).stdout.strip()
+    num, _, den = out.partition("/")
+    return float(num) / float(den) if den and float(den) else (float(num) if num else None)
 
 
 def _legacy_clip(clip: dict, rendered: dict) -> dict:
@@ -315,6 +514,7 @@ def _legacy_clip(clip: dict, rendered: dict) -> dict:
 
 def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
     job = ctx.job
+    run = RunState()
     with tempfile.TemporaryDirectory(prefix=f"repurpose_{ctx.job_id[:8]}_") as work:
         source = os.path.join(work, "source")
         ctx.stage("downloading", 0.0, "Downloading your video")
@@ -324,6 +524,10 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
         duration, has_audio = _probe(source, deps)
         sha = _sha256(source)
         ctx.checkpoint({"source": {"sha256": sha, "duration": duration, "has_audio": has_audio}})
+        try:
+            run.fps = video_analysis_fps(source)
+        except Exception:
+            run.fps = None
 
         if has_audio:
             ctx.stage("transcribing", 0.10, "Transcribing")
@@ -337,7 +541,7 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
                 "Try a video with sound, or describe the clip you want instead.")
 
         if transcript.get("words"):
-            selection = _select(ctx, deps, source, transcript, duration)
+            selection = _select(ctx, deps, run, source, transcript, duration, work)
         elif job.get("creative_prompt"):
             selection = _prompt_selection(ctx, job, duration)
         else:
@@ -347,29 +551,49 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
                 "Try a video with talking, or describe the clip you want instead.")
 
         existing = {c["rank"]: c for c in (ctx.store.get_job(ctx.job_id) or {}).get("clips", [])}
-        clips = selection["clips"]
+        queue = list(selection["clips"]) + list(selection.get("spares") or [])
+        target = len(selection["clips"])
         results: list[dict] = []
         render_failures: list[str] = []
-        for rank, clip in enumerate(clips, start=1):
-            ctx.stage("rendering", 0.60 + 0.37 * (rank - 1) / len(clips),
-                      f"Editing clip {rank} of {len(clips)}")
+        qa_rejected: list[dict] = []
+        used_spans: list[tuple] = []
+        for rank in range(1, target + 1):
+            ctx.stage("rendering", 0.60 + 0.37 * (rank - 1) / target, f"Editing clip {rank} of {target}")
             done = existing.get(rank)
             if done and done.get("status") == "rendered" and done.get("video_url"):
                 rendered = {"video_url": done["video_url"], "thumbnail_url": done.get("thumbnail_url"),
                             "quote_card_url": done.get("quote_card_url"), **(done.get("render_meta") or {})}
-            else:
+                used_spans.append((done.get("start_time"), done.get("end_time")))
+                results.append(_legacy_clip(_clip_from_row(done), rendered))
+                continue
+            while queue:
+                clip = queue.pop(0)
+                if any(a_ is not None and abs(clip["start"] - a_) < 0.5 and abs(clip["end"] - b_) < 0.5
+                       for a_, b_ in used_spans):
+                    continue    # already rendered before a restart
                 try:
-                    rendered = _render_one(ctx, deps, source, work, rank, clip, transcript)
+                    rendered = _render_one(ctx, deps, run, source, work, rank, clip, transcript)
                 except (LeaseLost, ShutdownRequested):
                     raise
+                except ClipRejected as e:
+                    qa_rejected.append({"title": clip.get("title"), "failed": e.failures})
+                    print(f"[INFO] clip '{clip.get('title')}' failed quality control: {e.failures}")
+                    continue
                 except StorageUnavailable as e:
                     raise TransientJobError("storage_unavailable", "Couldn't save your clips.", str(e))
                 except Exception as e:
                     render_failures.append(f"clip {rank}: {e}")
                     print(f"[WARN] render failed for clip {rank} of job {ctx.job_id}: {e}")
                     continue
-            results.append(_legacy_clip(clip, rendered))
+                used_spans.append((clip["start"], clip["end"]))
+                results.append(_legacy_clip(clip, rendered))
+                break
 
+        if not results and qa_rejected and not render_failures:
+            raise PermanentJobError(
+                "no_clip_passed_quality_check",
+                "We found moments in your video, but none came out well enough to publish, so we didn't "
+                "keep any. Try a video with clearer audio or picture.", str(qa_rejected)[:1500])
         if not results:
             raise TransientJobError("render_failed", "We couldn't render your clips.",
                                     "; ".join(render_failures)[:2000])
@@ -387,6 +611,11 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
         summary = dict(selection.get("summary") or {})
         if render_failures:
             summary["render_failures"] = len(render_failures)
+        if qa_rejected:
+            summary["quality_rejected"] = qa_rejected
+            if len(results) < target:
+                summary["note"] = (summary.get("note") or
+                                   "Some moments were dropped because they didn't pass our quality checks.")
         summary["delivered"] = len(results)
         return {
             "status": "success",

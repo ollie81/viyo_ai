@@ -20,6 +20,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
+# Voice-embedding model for speaker identification (26 MB). Best effort: if the
+# download fails the feature turns itself off and jobs still run.
+RUN python -c "import speakers; speakers.ensure_model()" || true
 
 # $PORT is injected by Railway at runtime â€” never hardcode a port number here.
 # The same image runs two Railway services: the API (default) and the

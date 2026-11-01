@@ -42,6 +42,7 @@ class FrameFeatures:
     rms_db: np.ndarray      # frame loudness, dBFS
     f0_hz: np.ndarray       # NaN where unvoiced
     speech: np.ndarray      # bool, frame above the speech floor
+    peak: Optional[np.ndarray] = None   # max |sample| per frame (clipping check)
 
 
 @dataclass
@@ -70,7 +71,7 @@ def frame_features(samples: np.ndarray, sr: int = SAMPLE_RATE) -> FrameFeatures:
     hop = int(sr * _HOP_SECONDS)
     if len(samples) < frame:
         empty = np.zeros(0)
-        return FrameFeatures(empty, empty, empty, empty.astype(bool))
+        return FrameFeatures(empty, empty, empty, empty.astype(bool), empty)
 
     n_frames = 1 + (len(samples) - frame) // hop
     min_lag = int(sr / _MAX_F0_HZ)
@@ -80,11 +81,13 @@ def frame_features(samples: np.ndarray, sr: int = SAMPLE_RATE) -> FrameFeatures:
 
     rms_db = np.empty(n_frames, dtype=np.float32)
     f0 = np.full(n_frames, np.nan, dtype=np.float32)
+    abs_peak = np.empty(n_frames, dtype=np.float32)
 
     for b0 in range(0, n_frames, _BATCH_FRAMES):
         b1 = min(n_frames, b0 + _BATCH_FRAMES)
         idx = (np.arange(b0, b1)[:, None] * hop) + np.arange(frame)[None, :]
         frames = samples[idx]
+        abs_peak[b0:b1] = np.abs(frames).max(axis=1)
         frames = frames - frames.mean(axis=1, keepdims=True)
 
         rms = np.sqrt(np.mean(frames ** 2, axis=1))
@@ -117,7 +120,7 @@ def frame_features(samples: np.ndarray, sr: int = SAMPLE_RATE) -> FrameFeatures:
     loud_ref = float(np.percentile(rms_db, 95)) if n_frames else 0.0
     speech = rms_db > (loud_ref - _SPEECH_FLOOR_BELOW_P95_DB)
     f0 = np.where(speech, f0, np.nan)
-    return FrameFeatures(times=times, rms_db=rms_db, f0_hz=f0, speech=speech)
+    return FrameFeatures(times=times, rms_db=rms_db, f0_hz=f0, speech=speech, peak=abs_peak)
 
 
 def _semitones(f0: np.ndarray) -> np.ndarray:
@@ -234,3 +237,49 @@ def delivery_score(ws: WindowStats, baseline: Baseline) -> tuple[int, dict]:
         "level_z": round(z_level, 2),
         "voiced_ratio": round(ws.voiced_ratio, 2),
     }
+
+
+def audio_quality_score(ff: FrameFeatures, start: float, end: float) -> tuple[Optional[float], dict]:
+    """
+    0-10 for how clean the audio is in [start, end], from three measured
+    things: speech-to-noise ratio (loud speech frames vs the quiet frames
+    around them), clipping, and how much of the window is speech at all.
+    (None, ...) when there isn't enough audio to judge.
+    """
+    if ff.times.size == 0 or end <= start:
+        return None, {"available": False}
+    lo, hi = np.searchsorted(ff.times, [start, end])
+    db, speech = ff.rms_db[lo:hi], ff.speech[lo:hi]
+    if db.size < 50 or speech.sum() < 25:
+        return None, {"available": False}
+    quiet = db[~speech]
+    floor = float(np.percentile(quiet, 50)) if quiet.size >= 10 else float(np.percentile(db, 5))
+    level = float(np.percentile(db[speech], 75))
+    snr = level - floor
+    clip_frac = float(np.mean(ff.peak[lo:hi] >= 0.985)) if ff.peak is not None else 0.0
+    s_snr = float(np.clip((snr - 10.0) / 30.0, 0, 1))              # 10 dB -> 0, 40 dB -> 1
+    s_clip = float(np.clip(1.0 - clip_frac / 0.02, 0, 1))          # 2%+ clipped frames -> 0
+    s_speech = float(np.clip(speech.mean() / 0.6, 0, 1))
+    score = 10 * (0.6 * s_snr + 0.25 * s_clip + 0.15 * s_speech)
+    return round(score, 2), {"available": True, "snr_db": round(snr, 1), "clipped_frame_share": round(clip_frac, 4),
+                             "speech_share": round(float(speech.mean()), 2)}
+
+
+def pacing_score(word_count: int, duration: float, speech_seconds_: float) -> tuple[float, dict]:
+    """
+    0-10 for how the clip moves. Short-form works best around 2.2-3.4
+    words/second of actual speech with little dead air; much slower drags,
+    much faster is hard to follow.
+    """
+    if duration <= 0 or speech_seconds_ <= 0:
+        return 0.0, {"words_per_second": 0.0, "dead_air_share": 1.0}
+    wps = word_count / speech_seconds_
+    dead = max(0.0, 1.0 - speech_seconds_ / duration)
+    if wps < 2.2:
+        s_rate = max(0.0, (wps - 1.2) / 1.0)
+    elif wps <= 3.4:
+        s_rate = 1.0
+    else:
+        s_rate = max(0.0, 1.0 - (wps - 3.4) / 1.6)
+    s_dead = float(np.clip(1.0 - dead / 0.3, 0, 1))
+    return round(10 * (0.7 * s_rate + 0.3 * s_dead), 2), {"words_per_second": round(wps, 2), "dead_air_share": round(dead, 3)}

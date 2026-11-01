@@ -1,8 +1,9 @@
 """
 Deterministic tests for clip_selection. The LLM is faked here, so these
 check the code's own guarantees — boundaries on real sentences, honest
-counts, no overlap, no invented hook text, no fabricated fallback — not
-the quality of any model's judgement (see eval/ for that).
+counts, no overlap, no invented hook text, hard quality gates, no
+fabricated fallback — not the quality of any model's judgement (see
+eval/ and the live acceptance run for that).
 """
 import json
 import re
@@ -45,6 +46,25 @@ def filler(n):
     return [f"This is filler sentence number {i} about the weather and other things." for i in range(n)]
 
 
+GOOD = {"hook": 8, "curiosity": 7, "emotional": 7, "completeness": 8, "standalone": 8, "information": 7}
+
+
+def raw(s0, s1, **kw):
+    base = {"start_sentence": s0, "end_sentence": s1, "category": "story",
+            "scores": dict(GOOD), "opens_mid_conversation": False, "title": "Quit your job",
+            "reason": "Real stakes.", "overlay_hook": "", "caption": "c",
+            "hashtags": ["#Career", "career", "money!"], "topic": "quitting"}
+    base.update(kw)
+    return base
+
+
+@pytest.fixture
+def story():
+    words, segments = make_transcript(STORY)
+    punct = cs.attach_punctuation(words, segments)
+    return punct, cs.build_sentences(punct)
+
+
 # ---------------------------------------------------------------- sentences
 
 def test_punctuation_is_recovered_from_segments_and_sentences_split_on_it():
@@ -54,7 +74,6 @@ def test_punctuation_is_recovered_from_segments_and_sentences_split_on_it():
     assert len(sentences) == len(STORY)
     assert sentences[0].text.endswith("part.")
     assert all(s.terminal for s in sentences)
-    # Sentence times are the real word times, not estimates.
     assert sentences[1].start == words[sentences[1].first_word]["start"]
     assert sentences[-1].end == words[-1]["end"]
 
@@ -79,17 +98,6 @@ def test_run_on_speech_is_split_at_pauses_and_clause_commas():
     words, segments = make_transcript([long_run])
     assert all(len(s.text.split()) <= cs.MAX_SENTENCE_WORDS
                for s in cs.build_sentences(cs.attach_punctuation(words, segments)))
-
-
-def test_ending_at_a_pause_is_penalised_less_than_ending_mid_flow(story):
-    words, sentences = story
-    sentences[7].terminal = False
-    sentences[7].pause_after = 1.0
-    at_pause, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
-    sentences[7].pause_after = 0.1
-    mid_flow, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
-    assert at_pause.breakdown["structure_penalties"] == {"soft_sentence_end": 10}
-    assert at_pause.score > mid_flow.score
 
 
 def test_abbreviations_do_not_end_sentences():
@@ -119,23 +127,6 @@ def test_windows_cover_every_sentence_and_overlap():
 
 # ---------------------------------------------------------------- evaluation
 
-def raw(s0, s1, **kw):
-    base = {"start_sentence": s0, "end_sentence": s1, "category": "story",
-            "scores": {"hook": 8, "completeness": 8, "standalone": 8, "payoff": 8, "emotional_pull": 7},
-            "context_dependent": False, "title": "Quit your job", "reason": "Real stakes.",
-            "hook_line": "Nobody tells you that quitting your job", "caption": "c",
-            "hashtags": ["#Career", "career", "money!"], "topic": "quitting"}
-    base.update(kw)
-    return base
-
-
-@pytest.fixture
-def story():
-    words, segments = make_transcript(STORY)
-    punct = cs.attach_punctuation(words, segments)
-    return punct, cs.build_sentences(punct)
-
-
 def test_candidate_boundaries_are_real_word_times(story):
     words, sentences = story
     c, why = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
@@ -148,7 +139,7 @@ def test_candidate_boundaries_are_real_word_times(story):
 
 def test_leading_filler_is_trimmed_from_the_clip_start(story):
     words, sentences = story
-    c, why = cs.evaluate_candidate(raw(1, 7, hook_line="the hard part starts"), sentences, words, 200.0)
+    c, why = cs.evaluate_candidate(raw(1, 7), sentences, words, 200.0)
     assert why is None
     first = words[sentences[1].first_word: sentences[1].first_word + 3]
     assert [w["text"].lower().strip(",.") for w in first[:2]] == ["um", "so"]
@@ -156,11 +147,10 @@ def test_leading_filler_is_trimmed_from_the_clip_start(story):
     assert c.transcript.lower().startswith("the hard part")
 
 
-def test_hook_line_that_was_not_said_is_replaced_with_real_words(story):
+def test_opening_line_is_the_clips_real_first_words(story):
     words, sentences = story
-    c, _ = cs.evaluate_candidate(raw(0, 7, hook_line="You won't believe this secret"), sentences, words, 200.0)
-    assert c.hook_line_verified is False
-    assert c.hook_line.lower().startswith("nobody tells you")
+    c, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
+    assert c.hook_line.lower().startswith("nobody tells you that quitting")
 
 
 @pytest.mark.parametrize("ids,reason", [((9, 12), "sentence_ids_out_of_range"),
@@ -175,28 +165,25 @@ def test_too_long_moment_keeps_its_hook_and_ends_at_the_latest_full_stop_that_fi
     words, segments = make_transcript(filler(30))
     punct = cs.attach_punctuation(words, segments)
     sentences = cs.build_sentences(punct)
-    c, why = cs.evaluate_candidate(raw(0, 29, hook_line=""), sentences, punct, 999.0)
+    c, why = cs.evaluate_candidate(raw(0, 29), sentences, punct, 999.0)
     assert why is None and c.length_adjustment == "trimmed_to_fit"
     assert c.start_sentence == 0 and c.start == pytest.approx(punct[0]["start"], abs=0.06)
     assert cs.MIN_CLIP_SECONDS <= c.speech_duration <= cs.MAX_CLIP_SECONDS
     assert c.ends_on_sentence
-    # It is the LATEST full stop that fits: one more sentence would not.
     one_more = cs.speech_seconds(punct[: sentences[c.end_sentence + 1].last_word + 1])
     assert one_more > cs.MAX_CLIP_SECONDS
-    assert c.breakdown["length_penalty"] == cs.LENGTH_ADJUSTMENT_PENALTY["trimmed_to_fit"]
+    assert c.breakdown["penalties"]["length_trimmed_to_fit"] == 8
 
 
 def test_trimming_prefers_a_full_stop_over_a_later_pause():
     words, segments = make_transcript(filler(30))
     punct = cs.attach_punctuation(words, segments)
     sentences = cs.build_sentences(punct)
-    plain, _ = cs.evaluate_candidate(raw(0, 29, hook_line=""), sentences, punct, 999.0)
+    plain, _ = cs.evaluate_candidate(raw(0, 29), sentences, punct, 999.0)
     k = plain.end_sentence
-    # Make the chosen ending non-terminal with no pause: the next-best
-    # full stop earlier wins over it.
     sentences[k].terminal = False
     sentences[k].pause_after = 0.1
-    moved, _ = cs.evaluate_candidate(raw(0, 29, hook_line=""), sentences, punct, 999.0)
+    moved, _ = cs.evaluate_candidate(raw(0, 29), sentences, punct, 999.0)
     assert moved.end_sentence < k and moved.ends_on_sentence
 
 
@@ -205,7 +192,7 @@ def test_slightly_short_moment_is_extended_but_never_across_a_long_silence(story
     c, why = cs.evaluate_candidate(raw(0, 1), sentences, words, 200.0)
     assert why is None and c.length_adjustment == "extended_to_fit"
     assert c.speech_duration >= cs.MIN_CLIP_SECONDS
-    assert c.breakdown["length_penalty"] == cs.LENGTH_ADJUSTMENT_PENALTY["extended_to_fit"]
+    assert c.breakdown["penalties"]["length_extended_to_fit"] == 5
 
     w2, seg2 = make_transcript(["A short line here.", "Another short one."], pause=3.0)
     p2 = cs.attach_punctuation(w2, seg2)
@@ -221,41 +208,161 @@ def test_when_nothing_fits_the_note_says_so_instead_of_blaming_quality():
     assert "usable length" in result.note and "strong enough" not in result.note
 
 
-def test_score_rewards_content_far_more_than_delivery(story):
+# ---------------------------------------------------------------- scoring
+
+def ctx_with(delivery=None, audio=None, visual=None, **kw):
+    return cs.AnalysisContext(
+        delivery=(lambda s, e, n: (delivery, {})) if delivery is not None else None,
+        audio_quality=(lambda s, e: (audio, {"available": audio is not None})) if audio is not None else None,
+        visual_quality=(lambda s, e: (visual, {"available": visual is not None})) if visual is not None else None,
+        **kw)
+
+
+def test_all_nine_components_are_reported_and_weights_sum_to_one(story):
     words, sentences = story
-    strong_quiet, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0,
-                                            delivery=lambda s, e, n: (20, {}))
-    weak_loud, _ = cs.evaluate_candidate(
-        raw(0, 7, scores={k: 4 for k in cs.RUBRIC_KEYS}), sentences, words, 200.0,
-        delivery=lambda s, e, n: (100, {}))
-    assert strong_quiet.score > weak_loud.score
-    rejected = []
-    result = cs.select_clips([weak_loud], 6, cs.DEFAULT_MIN_SCORE, rejected, 600)
-    assert result.clips == [], "great delivery must not rescue weak content"
-    assert rejected[0]["reason"] in {"below_quality_floor", "weak_content"}
+    assert sum(cs.COMPONENT_WEIGHTS.values()) == pytest.approx(1.0)
+    c, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx_with(delivery=60, audio=8, visual=7))
+    assert set(c.components) == {"hook", "curiosity", "emotional", "completeness", "standalone",
+                                 "information", "pacing", "visual", "audio"}
+    assert all(v is not None for v in c.components.values())
+    assert set(c.breakdown["weights"]) == set(c.components)
+
+
+def test_unmeasurable_components_are_left_out_not_scored_as_good_or_bad(story):
+    words, sentences = story
+    none, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
+    assert none.components["visual"] is None and none.components["audio"] is None
+    assert "visual" not in none.breakdown["weights"]
+    assert sum(none.breakdown["weights"].values()) < 1.0
+    up, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx_with(audio=10, visual=10))
+    down, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx_with(audio=6, visual=1))
+    assert up.score > none.score > down.score
+
+
+def test_loudness_alone_cannot_rescue_weak_content(story):
+    words, sentences = story
+    weak = {k: 4 for k in cs.RUBRIC_KEYS}
+    strong_quiet, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx_with(delivery=20))
+    weak_loud, why = cs.evaluate_candidate(raw(0, 7, scores=weak), sentences, words, 200.0, ctx_with(delivery=100))
+    assert why == "weak_core" and weak_loud is None
+    middling = {"hook": 6, "curiosity": 5, "emotional": 5, "completeness": 6, "standalone": 6, "information": 5}
+    m, _ = cs.evaluate_candidate(raw(0, 7, scores=middling), sentences, words, 200.0, ctx_with(delivery=100))
+    result = cs.select_clips([m], 6, cs.DEFAULT_MIN_SCORE, [], 600)
+    assert result.clips == [], "great delivery must not rescue ordinary content"
+    assert strong_quiet.score > m.score
+
+
+@pytest.mark.parametrize("scores", [
+    {**GOOD, "hook": 4},
+    {**GOOD, "completeness": 3},
+    {**GOOD, "standalone": 4},
+])
+def test_a_weak_core_component_rejects_the_moment_outright(story, scores):
+    words, sentences = story
+    c, why = cs.evaluate_candidate(raw(0, 7, scores=scores), sentences, words, 200.0)
+    assert c is None and why == "weak_core"
+
+
+def test_poor_audio_rejects_the_moment(story):
+    words, sentences = story
+    c, why = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx_with(audio=2.0))
+    assert c is None and why == "poor_audio"
 
 
 def test_context_dependence_and_missing_sentence_end_are_penalised(story):
     words, sentences = story
     base, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
-    dependent, _ = cs.evaluate_candidate(raw(0, 7, context_dependent=True), sentences, words, 200.0)
-    assert dependent.score == base.score - 15
+    dependent, _ = cs.evaluate_candidate(raw(0, 7, opens_mid_conversation=True), sentences, words, 200.0)
+    assert dependent.score == base.score - 12
     sentences[7].terminal = False
     sentences[7].pause_after = 0.1
     cut_off, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
     assert cut_off.score < base.score
-    assert cut_off.breakdown["structure_penalties"]["no_sentence_end"] == 35
+    assert cut_off.breakdown["penalties"]["no_sentence_end"] == 8
+
+
+def test_ending_at_a_pause_is_penalised_less_than_ending_mid_flow(story):
+    words, sentences = story
+    sentences[7].terminal = False
+    sentences[7].pause_after = 1.0
+    at_pause, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
+    sentences[7].pause_after = 0.1
+    mid_flow, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
+    assert at_pause.breakdown["penalties"] == {"soft_end": 2}
+    assert at_pause.score > mid_flow.score
+
+
+def test_creator_history_prior_is_bounded_and_reported(story):
+    words, sentences = story
+    ctx = cs.AnalysisContext(creator_prior=lambda c: (4.0, {"used": True}))
+    base, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
+    boosted, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx)
+    assert boosted.score == base.score + 4 and boosted.breakdown["creator_prior"] == {"used": True}
+    assert base.breakdown["creator_prior"]["used"] is False
+
+
+# ---------------------------------------------------------------- hooks and openings
+
+def test_overlay_hook_must_be_grounded_in_what_is_said(story):
+    words, sentences = story
+    good, _ = cs.evaluate_candidate(
+        raw(0, 7, overlay_hook="The hard part starts when the money stops"), sentences, words, 200.0)
+    assert good.overlay_hook == "The hard part starts when the money stops" and good.overlay_status == "ok"
+    invented, _ = cs.evaluate_candidate(
+        raw(0, 7, overlay_hook="He made a million dollars overnight"), sentences, words, 200.0)
+    assert invented.overlay_hook is None and invented.overlay_status == "not_grounded"
+    repeat, _ = cs.evaluate_candidate(
+        raw(0, 7, overlay_hook="Nobody tells you quitting is the easy part"), sentences, words, 200.0)
+    assert repeat.overlay_hook is None and repeat.overlay_status == "repeats_opening"
+    none, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0)
+    assert none.overlay_hook is None and none.overlay_status == "none_proposed"
+
+
+QA = [
+    "So what is the one mistake you see every new founder make?",
+    "Absolutely, and I think the biggest mistake is hiring too fast before you have any customers.",
+    "Every new hire adds cost long before they add revenue, and most startups never recover from that.",
+    "The fix is boring: stay small, talk to customers every single day, and only hire when the pain is obvious.",
+]
+
+
+def test_a_clip_that_opens_as_an_answer_gets_the_question_prepended():
+    words, segments = make_transcript(QA, words_per_second=2.2)
+    punct = cs.attach_punctuation(words, segments)
+    sentences = cs.build_sentences(punct)
+    ctx = cs.AnalysisContext(speaker_labels=["A", "B", "B", "B"])
+    c, why = cs.evaluate_candidate(raw(1, 3), sentences, punct, 100.0, ctx)
+    assert why is None and c.prepended_question and c.start_sentence == 0
+    assert c.transcript.startswith("So what is the one mistake")
+    assert c.speakers == ["A", "B"] and not c.opens_as_reply
+
+
+def test_the_same_person_asking_and_answering_is_not_treated_as_a_question_to_prepend():
+    words, segments = make_transcript(QA, words_per_second=2.2)
+    punct = cs.attach_punctuation(words, segments)
+    sentences = cs.build_sentences(punct)
+    ctx = cs.AnalysisContext(speaker_labels=["A", "A", "A", "A"])
+    c, _ = cs.evaluate_candidate(raw(1, 3), sentences, punct, 100.0, ctx)
+    assert not c.prepended_question and c.opens_as_reply
+    assert c.breakdown["penalties"]["opens_as_reply"] == 10
+
+
+def test_boilerplate_ranges_from_the_video_map_are_rejected(story):
+    words, sentences = story
+    ctx = cs.AnalysisContext(video_map={"avoid": [{"start_sentence": 0, "end_sentence": 7, "kind": "sponsor"}]})
+    c, why = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx)
+    assert c is None and why == "boilerplate"
 
 
 # ---------------------------------------------------------------- selection
 
 def cand(start, end, score, text, title="t", content=80):
-    return cs.Candidate(content_score=content,
+    return cs.Candidate(
         start_sentence=0, end_sentence=0, start=start, end=end, duration=end - start,
-        speech_duration=end - start, dead_air_ratio=0, category="insight", rubric={},
-        context_dependent=False, title=title, reason="", hook_line="", hook_line_verified=True,
-        caption="", hashtags=[], topic="", transcript=text, ends_on_sentence=True, end_pause=1.0,
-        score=score)
+        speech_duration=end - start, dead_air_ratio=0, category="insight",
+        rubric={}, context_dependent=False, title=title, reason="", hook_line="",
+        hook_line_verified=True, caption="", hashtags=[], topic="", transcript=text,
+        ends_on_sentence=True, end_pause=1.0, content_score=content, score=score)
 
 
 def test_selection_is_best_first_without_overlap_or_duplicates():
@@ -274,14 +381,24 @@ def test_selection_is_best_first_without_overlap_or_duplicates():
     assert "Found 2 of up to 6" in result.note
 
 
-def test_selection_never_exceeds_target():
-    topics = ["pricing freelancers invoices", "morning routines energy", "camera lighting setup",
-              "negotiating salary offers", "learning languages quickly", "marathon training plan",
-              "startup fundraising mistakes", "cooking cheap meals", "sleep schedule science",
-              "public speaking nerves"]
-    cands = [cand(i * 40, i * 40 + 30, 90 - i, topics[i]) for i in range(10)]
+TOPICS = ["pricing freelancers invoices", "morning routines energy", "camera lighting setup",
+          "negotiating salary offers", "learning languages quickly", "marathon training plan",
+          "startup fundraising mistakes", "cooking cheap meals", "sleep schedule science",
+          "public speaking nerves"]
+
+
+def test_selection_never_exceeds_target_and_keeps_a_few_spares():
+    cands = [cand(i * 40, i * 40 + 30, 90 - i, TOPICS[i]) for i in range(10)]
     result = cs.select_clips(cands, target=3, min_score=55, rejected=[], total_speech=240)
     assert len(result.clips) == 3 and result.note == ""
+    assert len(result.spares) == cs.SPARE_CANDIDATES
+    assert min(c.score for c in result.clips) >= max(c.score for c in result.spares)
+
+
+def test_spares_still_have_to_clear_every_gate():
+    cands = [cand(0, 30, 90, TOPICS[0]), cand(40, 70, 50, TOPICS[1])]
+    result = cs.select_clips(cands, target=1, min_score=60, rejected=[], total_speech=100)
+    assert result.spares == []
 
 
 # ---------------------------------------------------------------- end to end with a fake LLM
@@ -315,6 +432,39 @@ def test_run_selection_returns_strong_clips_from_real_sentence_ranges():
     assert c.start == pytest.approx(words[0]["start"], abs=0.06)
 
 
+def test_the_prompt_carries_the_whole_video_context_and_speaker_labels():
+    words, segments = make_transcript(STORY + filler(40))
+    n = len(cs.build_sentences(cs.attach_punctuation(words, segments)))
+    seen = []
+
+    def respond(prompt):
+        seen.append(prompt)
+        return json.dumps({"candidates": []})
+
+    ctx = cs.AnalysisContext(
+        speaker_labels=["A" if i % 2 else "B" for i in range(n)],
+        video_map={"summary": "A founder tells how quitting nearly broke him.", "format": "talk",
+                   "speakers": [{"label": "A", "role": "host", "description": "asks questions"}],
+                   "topics": [{"start_sentence": 0, "end_sentence": 7, "kind": "story", "title": "Quitting"}]})
+    cs.run_selection(words, segments, 400.0, fake_llm([respond]), ctx)
+    p = seen[0]
+    assert "VIDEO CONTEXT" in p and "nearly broke him" in p and "Speaker A: host" in p
+    assert re.search(r"^S0 [AB] \[", p, re.M), "sentences carry speaker letters"
+    assert "overlay_hook" in p and "9-10 = you would share this" in p
+
+
+def test_stale_speaker_labels_for_a_different_sentence_split_are_ignored():
+    words, segments = make_transcript(STORY + filler(40))
+    seen = []
+
+    def respond(prompt):
+        seen.append(prompt)
+        return json.dumps({"candidates": []})
+
+    cs.run_selection(words, segments, 400.0, fake_llm([respond]), cs.AnalysisContext(speaker_labels=["A", "B"]))
+    assert not re.search(r"^S0 [AB] \[", seen[0], re.M)
+
+
 def test_garbage_llm_output_is_retried_once_then_raises():
     words, segments = make_transcript(STORY + filler(20))
     llm = fake_llm(["not json at all"])
@@ -333,8 +483,7 @@ def test_recovers_when_the_retry_is_valid():
 def test_no_good_moments_gives_zero_clips_and_an_honest_note():
     words, segments = make_transcript(filler(60))
     weak = {k: 3 for k in cs.RUBRIC_KEYS}
-    llm = fake_llm([lambda p: json.dumps({"candidates": [
-        raw(ids_in(p)[0], ids_in(p)[0] + 5, scores=weak, hook_line="")]})])
+    llm = fake_llm([lambda p: json.dumps({"candidates": [raw(ids_in(p)[0], ids_in(p)[0] + 5, scores=weak)]})])
     result = cs.run_selection(words, segments, 300.0, llm)
     assert result.clips == []
     assert "No moment" in result.note
