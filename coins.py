@@ -45,6 +45,7 @@ FEATURE_COSTS: dict[str, dict] = {
     "spotlight": {"cost": 25, "free_per_day": 0, "label": "Discover Spotlight"},
     "boost_series": {"cost": 60, "free_per_day": 0, "label": "Boost Series"},
     "glow_up_analysis": {"cost": 10, "free_per_day": 0, "label": "Glow Up"},
+    "glow_up_preview": {"cost": 20, "free_per_day": 0, "label": "Glow Up Preview"},
 }
 
 _FREE_TASTE_WINDOW_HOURS = 24

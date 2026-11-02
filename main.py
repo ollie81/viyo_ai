@@ -199,6 +199,8 @@ except Exception as _ads_studio_import_error:
 try:
     from glow_up import router as glow_up_router
     app.include_router(glow_up_router)
+    from glow_up_preview import router as glow_up_preview_router
+    app.include_router(glow_up_preview_router)
 except Exception as _glow_up_import_error:
     print(f"[WARN] Glow Up router not loaded: {_glow_up_import_error}")
 try:

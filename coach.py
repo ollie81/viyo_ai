@@ -1103,6 +1103,7 @@ async def trending(
 _DELETE_TABLES = {
     "video_coach_messages": "user_id",
     "glow_up_sessions": "user_id",
+    "glow_up_previews": "user_id",
     "posts": "user_id",
     "profiles": "id",
 }
@@ -1113,7 +1114,7 @@ _DELETE_TABLES = {
 # PROCESSED_BUCKET). This previously deleted DB rows referencing this
 # content but left the actual files in Storage forever — a real gap in
 # what the app's Privacy screen claims about deleting your data.
-_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos"]
+_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos", "glow-up-previews"]
 
 
 def _purge_storage(user_id: str) -> list[str]:

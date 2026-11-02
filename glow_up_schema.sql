@@ -28,3 +28,36 @@ create policy "glow_up_sessions_owner_delete" on public.glow_up_sessions
   for delete using (auth.uid() = user_id);
 
 -- No insert/update policies: only the backend writes these rows.
+
+-- ---------------------------------------------------------------------
+-- Stage 2: saved AI hairstyle previews (only when the user taps Save).
+-- The selfie itself is still never stored.
+
+create table if not exists public.glow_up_previews (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  kind text not null,
+  style text not null,
+  image_path text not null
+);
+
+create index if not exists glow_up_previews_user_idx
+  on public.glow_up_previews (user_id, created_at desc);
+
+alter table public.glow_up_previews enable row level security;
+
+drop policy if exists "glow_up_previews_owner_read" on public.glow_up_previews;
+create policy "glow_up_previews_owner_read" on public.glow_up_previews
+  for select using (auth.uid() = user_id);
+
+drop policy if exists "glow_up_previews_owner_delete" on public.glow_up_previews;
+create policy "glow_up_previews_owner_delete" on public.glow_up_previews
+  for delete using (auth.uid() = user_id);
+
+-- Private bucket: no public links; the backend hands out 1-hour signed links.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('glow-up-previews', 'glow-up-previews', false, 5242880, array['image/jpeg'])
+on conflict (id) do update
+  set public = false, file_size_limit = excluded.file_size_limit,
+      allowed_mime_types = excluded.allowed_mime_types;

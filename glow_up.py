@@ -127,7 +127,8 @@ def check_single_face(jpeg: bytes) -> dict:
         raise PhotoProblem("Please use a photo with only you in it.")
     if main.w < MIN_FACE_WIDTH:
         raise PhotoProblem("Your face is too small in that photo. Move closer to the camera.")
-    return {"faces": len(faces), "face_width": round(main.w, 3), "detector": detector}
+    return {"faces": len(faces), "face_width": round(main.w, 3), "face_height": round(main.h, 3),
+            "cx": round(main.cx, 3), "cy": round(main.cy, 3), "detector": detector}
 
 
 def moderate(data_url: str) -> bool:
