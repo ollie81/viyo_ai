@@ -46,14 +46,15 @@ TARGET_MAX_CLIPS = 6
 # One clip per this much speech, at most. Keeps a 4-minute video from
 # being chopped into six thin slices just because six were asked for.
 SPEECH_SECONDS_PER_CLIP = 75.0
-# Rubric anchors: 7-8 = good/publishable, 5-6 = ordinary. Both floors sit
-# just above "ordinary" so a video with three good moments yields three
-# clips, not six.
-DEFAULT_MIN_SCORE = 62
+# Rubric anchors: 7-8 = good/publishable, 5-6 = ordinary. The floors sit at
+# the top of "ordinary": the model's scores for the same video wander by
+# about +-10 between runs, so a higher floor made a decent tutorial pass or
+# fail on luck. The editor review and the render checks still gate every clip.
+DEFAULT_MIN_SCORE = 56
 # Floor on the LLM-judged components alone (0-100): measured components
 # (pacing, visual, audio) must never lift a moment that's weak on
 # substance over the overall floor.
-MIN_CONTENT_SCORE = 62
+MIN_CONTENT_SCORE = 56
 # A core component this low rejects the moment outright, whatever else
 # is good about it.
 CORE_GATE = 5

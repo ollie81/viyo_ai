@@ -245,7 +245,7 @@ def test_loudness_alone_cannot_rescue_weak_content(story):
     strong_quiet, _ = cs.evaluate_candidate(raw(0, 7), sentences, words, 200.0, ctx_with(delivery=20))
     weak_loud, why = cs.evaluate_candidate(raw(0, 7, scores=weak), sentences, words, 200.0, ctx_with(delivery=100))
     assert why == "weak_core" and weak_loud is None
-    middling = {"hook": 6, "curiosity": 5, "emotional": 5, "completeness": 6, "standalone": 6, "information": 5}
+    middling = {"hook": 5, "curiosity": 5, "emotional": 5, "completeness": 5, "standalone": 6, "information": 5}
     m, _ = cs.evaluate_candidate(raw(0, 7, scores=middling), sentences, words, 200.0, ctx_with(delivery=100))
     result = cs.select_clips([m], 6, cs.DEFAULT_MIN_SCORE, [], 600)
     assert result.clips == [], "great delivery must not rescue ordinary content"
