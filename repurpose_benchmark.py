@@ -42,8 +42,12 @@ PRICES = {
     "gpt-6-luna": (0.10, 0.01, 0.50),
     "gpt-6.1-terra": (1.00, 0.05, 5.00),
     "gpt-6.1-sol": (2.00, 0.10, 10.00),
+    "gpt-5.6-luna": (0.20, 0.02, 1.20),
+    "gpt-5.6-terra": (2.00, 0.20, 12.00),
+    "gpt-5.6-sol": (4.00, 0.40, 20.00),
 }
-REASONING_MODELS = {"gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra"}
+REASONING_MODELS = {"gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra",
+                    "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}
 
 
 async def _user(authorization: str = Header(None)) -> str:
