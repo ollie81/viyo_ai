@@ -187,7 +187,7 @@ def build_production_worker() -> Worker:
     from openai import OpenAI
     from coins import FEATURE_COSTS
     from repurpose_cleanup import run_maintenance
-    from repurpose_storage import SupabaseStorage
+    from repurpose_storage import RoutingStorage, SupabaseStorage
     from transcription import openai_chunk_transcriber
     import clip_selection
     import creator_insights
@@ -197,7 +197,7 @@ def build_production_worker() -> Worker:
 
     config = JobConfig.from_env(cost=FEATURE_COSTS["repurpose"]["cost"])
     store = JobStore(supabase_rpc(r.supabase_admin), config)
-    storage = SupabaseStorage(r.supabase_admin, r.SUPABASE_URL)
+    storage = RoutingStorage(SupabaseStorage(r.supabase_admin, r.SUPABASE_URL))
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=300, max_retries=2)
     deps = PipelineDeps(
         storage=storage,

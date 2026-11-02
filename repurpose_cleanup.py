@@ -61,7 +61,7 @@ def run_maintenance(store: JobStore, storage) -> dict:
 
     try:
         import repurpose
-        if repurpose.supabase_admin is not None and storage.__class__.__name__ == "SupabaseStorage":
+        if repurpose.supabase_admin is not None and storage.__class__.__name__ in ("SupabaseStorage", "RoutingStorage"):
             repurpose._cleanup_expired_repurpose_jobs()
     except Exception as e:
         print(f"[WARN] cleanup: legacy job sweep failed: {e}")

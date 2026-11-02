@@ -251,3 +251,57 @@ def test_fixable_clip_is_recovered_with_earlier_context_and_must_pass_review_aga
                                                 "issues": ["still missing setup"]}]})
     out2 = clip_review.recover_with_context(res2, sents, words, 80.0, cs.AnalysisContext(), None, bad)
     assert out2["recovered"] == 0 and not res2.clips
+
+
+# ------------------------------------------------------------------ Bunny source storage
+def test_routing_storage_reads_and_deletes_bunny_sources_only(tmp_path, monkeypatch):
+    import repurpose_storage as rs
+    calls = {}
+
+    class Base:
+        def download(self, *a):
+            calls["base_download"] = a
+            return 1
+
+        def remove(self, bucket, paths):
+            calls["base_remove"] = (bucket, paths)
+
+    class B:
+        BUNNY_STREAM_PULL_ZONE = "vz-x.b-cdn.net"
+
+        class BunnyError(Exception):
+            pass
+
+        class BunnyVideoNotFound(BunnyError):
+            pass
+        info = {"status": 4}
+
+        def get_video_info(self, vid):
+            if vid == "gone":
+                raise self.BunnyVideoNotFound(vid)
+            return dict(self.info)
+
+        is_finished = staticmethod(lambda i: i["status"] in (4, 8))
+        is_failed = staticmethod(lambda i: i["status"] in (5, 6))
+        source_download_url = staticmethod(lambda vid, info: f"https://vz-x.b-cdn.net/{vid}/play_720p.mp4")
+
+        def delete_video(self, vid):
+            calls.setdefault("deleted", []).append(vid)
+            return True
+
+    seen = {}
+    monkeypatch.setattr(rs, "stream_url_to_file", lambda url, dest, mx, host: seen.update(url=url, host=host) or 7)
+    st = rs.RoutingStorage(Base(), B())
+    st.download("repurpose-sources", "u/a.mp4", "d", 10)
+    assert "base_download" in calls
+    assert st.download("bunny", "user1/abc", "d", 10) == 7
+    assert seen == {"url": "https://vz-x.b-cdn.net/abc/play_720p.mp4", "host": "vz-x.b-cdn.net"}
+    with pytest.raises(rs.SourceMissing):
+        st.download("bunny", "user1/gone", "d", 10)
+    B.info = {"status": 2}
+    with pytest.raises(rs.StorageUnavailable):
+        st.download("bunny", "user1/abc", "d", 10)
+    st.remove("bunny", ["user1/abc", "user1/def"])
+    assert calls["deleted"] == ["abc", "def"]
+    st.remove("repurpose-sources", ["u/a.mp4"])
+    assert calls["base_remove"] == ("repurpose-sources", ["u/a.mp4"])

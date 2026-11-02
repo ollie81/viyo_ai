@@ -147,24 +147,16 @@ class CreateBunnyVideoResponse(BaseModel):
     thumbnail_url: str
 
 
-@router.post("/videos/bunny/create", response_model=CreateBunnyVideoResponse)
-async def create_bunny_video(
-    req: CreateBunnyVideoRequest, user_id: str = Depends(_get_current_user_id_no_guest)
-):
-    """
-    Called right before the client starts a video upload — creates the
-    Bunny-side video object and returns a single-video, time-boxed TUS
-    credential for it. 503 (not a 500) when Bunny isn't configured at
-    all, so the Flutter client can tell "not set up yet, fall back to
-    Supabase Storage" apart from "Bunny itself is having a problem."
-    """
+def create_upload(title: str) -> "CreateBunnyVideoResponse":
+    """Creates the Bunny-side video object and a single-video, time-boxed TUS
+    credential. Shared by the posting flow and the AI Repurposer."""
     if not _configured():
         raise HTTPException(status_code=503, detail="Bunny Stream is not configured.")
 
     try:
         resp = requests.post(
             f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos",
-            json={"title": (req.title or "Untitled")[:200]},
+            json={"title": (title or "Untitled")[:200]},
             headers={"AccessKey": BUNNY_STREAM_API_KEY, "Content-Type": "application/json"},
             timeout=15,
         )
@@ -190,6 +182,73 @@ async def create_bunny_video(
         playback_url=_playback_url(video_id),
         thumbnail_url=_thumbnail_url(video_id),
     )
+
+
+@router.post("/videos/bunny/create", response_model=CreateBunnyVideoResponse)
+async def create_bunny_video(
+    req: CreateBunnyVideoRequest, user_id: str = Depends(_get_current_user_id_no_guest)
+):
+    """
+    Called right before the client starts a video upload — creates the
+    Bunny-side video object and returns a single-video, time-boxed TUS
+    credential for it. 503 (not a 500) when Bunny isn't configured at
+    all, so the Flutter client can tell "not set up yet, fall back to
+    Supabase Storage" apart from "Bunny itself is having a problem."
+    """
+    return create_upload(req.title)
+
+
+# --- Used by the AI Repurposer (server-side only) -------------------------
+
+class BunnyError(Exception):
+    pass
+
+
+class BunnyVideoNotFound(BunnyError):
+    pass
+
+
+def get_video_info(video_id: str) -> dict:
+    """Bunny's own record of a video. Raises BunnyVideoNotFound / BunnyError."""
+    if not _configured():
+        raise BunnyError("Bunny Stream is not configured")
+    try:
+        resp = requests.get(
+            f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos/{video_id}",
+            headers={"AccessKey": BUNNY_STREAM_API_KEY}, timeout=20)
+    except requests.RequestException as e:
+        raise BunnyError(str(e))
+    if resp.status_code == 404:
+        raise BunnyVideoNotFound(video_id)
+    if resp.status_code != 200:
+        raise BunnyError(f"HTTP {resp.status_code}")
+    return resp.json()
+
+
+def is_finished(info: dict) -> bool:
+    return int(info.get("status", 0)) in _STATUS_FINISHED
+
+
+def is_failed(info: dict) -> bool:
+    return int(info.get("status", 0)) in _STATUS_FAILED
+
+
+def source_download_url(video_id: str, info: dict) -> str:
+    """The best MP4 rendition Bunny made (MP4 Fallback must be on)."""
+    return _playback_url(video_id, _pick_resolution(info.get("availableResolutions") or ""))
+
+
+def delete_video(video_id: str) -> bool:
+    """True if the video is gone afterwards (including 'was already gone')."""
+    if not _configured():
+        return False
+    try:
+        resp = requests.delete(
+            f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos/{video_id}",
+            headers={"AccessKey": BUNNY_STREAM_API_KEY}, timeout=20)
+    except requests.RequestException:
+        return False
+    return resp.status_code in (200, 204, 404)
 
 
 class BunnyVideoStatusResponse(BaseModel):

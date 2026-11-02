@@ -151,6 +151,62 @@ class SupabaseStorage:
             self._bucket(bucket).remove(paths)
 
 
+BUNNY_BUCKET = "bunny"     # sources uploaded to Bunny Stream: path is "<user_id>/<bunny video id>"
+
+
+class RoutingStorage:
+    """Supabase Storage for everything, except sources whose bucket is
+    "bunny": those are read from (and removed from) the creator's Bunny
+    Stream library. Bunny has no 50 MB upload cap, which a Free-plan
+    Supabase project does.
+
+    Only this library's own pull-zone host is ever downloaded from, and
+    only videos the backend registered for that user at upload time."""
+
+    def __init__(self, base, bunny=None):
+        self._base = base
+        self._bunny = bunny
+
+    def _b(self):
+        if self._bunny is None:
+            import bunny_stream
+            self._bunny = bunny_stream
+        return self._bunny
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    @staticmethod
+    def _video_id(path: str) -> str:
+        return path.rsplit("/", 1)[-1]
+
+    def download(self, bucket: str, path: str, dest: str, max_bytes: int) -> int:
+        if bucket != BUNNY_BUCKET:
+            return self._base.download(bucket, path, dest, max_bytes)
+        b = self._b()
+        video_id = self._video_id(path)
+        try:
+            info = b.get_video_info(video_id)
+        except b.BunnyVideoNotFound:
+            raise SourceMissing(f"bunny video {video_id} not found")
+        except b.BunnyError as e:
+            raise StorageUnavailable(f"bunny: {e}")
+        if b.is_failed(info):
+            raise SourceMissing("bunny could not process this video")
+        if not b.is_finished(info):
+            raise StorageUnavailable("bunny is still processing this video")
+        return stream_url_to_file(b.source_download_url(video_id, info), dest, max_bytes,
+                                  b.BUNNY_STREAM_PULL_ZONE)
+
+    def remove(self, bucket: str, paths: list) -> None:
+        if bucket != BUNNY_BUCKET:
+            return self._base.remove(bucket, paths)
+        b = self._b()
+        failed = [p for p in paths if not b.delete_video(self._video_id(p))]
+        if failed:
+            raise StorageUnavailable(f"could not delete {len(failed)} bunny videos")
+
+
 class LocalStorage:
     """Directory-backed stand-in with the same interface, for tests and
     local runs. Public URLs are file:// paths."""

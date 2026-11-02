@@ -227,6 +227,8 @@ class RepurposeRequest(BaseModel):
     # video_url is a public posts-media URL, still accepted so app
     # versions released before the private bucket keep working.
     source_path: Optional[str] = Field(None, max_length=300)
+    # "bunny" when source_path is "<user_id>/<bunny video id>" from POST /repurpose/bunny-uploads.
+    source: Optional[str] = Field(None, max_length=10)
     video_url: Optional[str] = Field(None, description="Legacy: public Supabase Storage URL")
     # One per "Create clips" tap. Re-sending the same value (a retried
     # request after a timeout) returns the same job without a second charge.
@@ -1489,6 +1491,75 @@ async def create_repurpose_upload(
     )
 
 
+class RepurposeBunnyUploadRequest(BaseModel):
+    size_bytes: int = Field(..., gt=0)
+
+
+class RepurposeBunnyUploadResponse(BaseModel):
+    video_id: str
+    library_id: str
+    upload_endpoint: str
+    authorization_signature: str
+    authorization_expire: int
+    playback_url: str
+    thumbnail_url: str
+    source_path: str
+    max_bytes: int
+
+
+@router.post("/repurpose/bunny-uploads", response_model=RepurposeBunnyUploadResponse)
+async def create_repurpose_bunny_upload(
+    req: RepurposeBunnyUploadRequest,
+    user_id: str = Depends(_get_current_user_id),
+):
+    """
+    Step 1 (Bunny route): creates a video in the Bunny Stream library and
+    returns a single-video upload credential. Used instead of the Supabase
+    signed upload when the video is bigger than the storage plan's upload
+    cap. The video is registered to this user, so only they can start a job
+    from it. Nothing is charged here.
+    """
+    _require_jobs()
+    if req.size_bytes > MAX_INPUT_SIZE_BYTES:
+        raise HTTPException(status_code=400,
+                            detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)} MB.")
+    import bunny_stream
+    ticket = bunny_stream.create_upload("AI Repurposer source")
+    path = f"{user_id}/{ticket.video_id}"
+    try:
+        job_store.register_upload(user_id, "bunny", path, req.size_bytes, "video/mp4")
+    except Exception as e:
+        bunny_stream.delete_video(ticket.video_id)
+        raise HTTPException(status_code=502, detail=f"Could not prepare the upload: {e}")
+    return RepurposeBunnyUploadResponse(**ticket.model_dump(), source_path=path, max_bytes=MAX_INPUT_SIZE_BYTES)
+
+
+def _check_bunny_source(user_id: str, source_path: str) -> None:
+    """Rejects (400/502) unless this user's Bunny video exists, is fully
+    processed, and is within the size and length limits."""
+    import bunny_stream
+    if not source_path.startswith(f"{user_id}/"):
+        raise HTTPException(status_code=400, detail=_CREATE_ERRORS["unknown_upload"][1])
+    video_id = source_path.rsplit("/", 1)[-1]
+    try:
+        info = bunny_stream.get_video_info(video_id)
+    except bunny_stream.BunnyVideoNotFound:
+        raise HTTPException(status_code=400, detail="Your video hasn't finished uploading. Please try again.")
+    except bunny_stream.BunnyError as e:
+        raise HTTPException(status_code=502, detail=f"Could not check your video: {e}")
+    if bunny_stream.is_failed(info):
+        raise HTTPException(status_code=400, detail="We couldn't process that video. Try a different file.")
+    if not bunny_stream.is_finished(info):
+        raise HTTPException(status_code=400,
+                            detail="Your video is still being prepared. Please try again in a moment.")
+    if int(info.get("storageSize") or 0) > MAX_INPUT_SIZE_BYTES:
+        raise HTTPException(status_code=400,
+                            detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)} MB.")
+    if float(info.get("length") or 0) > MAX_INPUT_DURATION_SECONDS:
+        raise HTTPException(status_code=400,
+                            detail=f"This video is too long — the limit is {MAX_INPUT_DURATION_SECONDS // 60} minutes.")
+
+
 _CREATE_ERRORS = {
     "daily_limit": (429, None),
     "profile_not_found": (404, "Your profile couldn't be found."),
@@ -1512,7 +1583,10 @@ async def repurpose_video(
     if bool(req.source_path) == bool(req.video_url):
         raise HTTPException(status_code=400, detail="Send exactly one of source_path or video_url.")
 
-    if req.source_path:
+    if req.source_path and req.source == "bunny":
+        _check_bunny_source(user_id, req.source_path)
+        kind, bucket, path, url = "private_upload", "bunny", req.source_path, None
+    elif req.source_path:
         if not req.source_path.startswith(f"{user_id}/"):
             raise HTTPException(status_code=400, detail=_CREATE_ERRORS["unknown_upload"][1])
         size = storage.object_size(SOURCE_BUCKET, req.source_path)

@@ -187,3 +187,93 @@ def test_failed_job_shows_redacted_error_detail_to_its_owner(api):
     body = client.get(f"/api/v1/repurpose/{job_id}").json()
     assert "401" in body["error_detail"]
     assert "SECRET" not in body["error_detail"] and "[redacted]" in body["error_detail"]
+
+
+# ---------------------------------------------------------------- Bunny route
+
+class FakeBunny:
+    """Stands in for bunny_stream: one video whose state the test controls."""
+    class BunnyError(Exception):
+        pass
+
+    class BunnyVideoNotFound(BunnyError):
+        pass
+
+    def __init__(self):
+        self.videos = {}
+        self.deleted = []
+
+    def create_upload(self, title):
+        import types
+        vid = f"vid{len(self.videos) + 1:04d}"
+        self.videos[vid] = {"status": 4, "storageSize": 50_000_000, "length": 600}
+        data = dict(video_id=vid, library_id="1", upload_endpoint="https://tus", authorization_signature="s",
+                    authorization_expire=1, playback_url="p", thumbnail_url="t")
+        return types.SimpleNamespace(video_id=vid, model_dump=lambda: data)
+
+    def get_video_info(self, vid):
+        if vid not in self.videos:
+            raise self.BunnyVideoNotFound(vid)
+        return self.videos[vid]
+
+    def is_finished(self, info):
+        return info["status"] in (4, 8)
+
+    def is_failed(self, info):
+        return info["status"] in (5, 6)
+
+    def delete_video(self, vid):
+        self.deleted.append(vid)
+        return True
+
+
+@pytest.fixture
+def bunny(monkeypatch):
+    import sys
+    fake = FakeBunny()
+    monkeypatch.setitem(sys.modules, "bunny_stream", fake)
+    return fake
+
+
+def test_bunny_upload_is_registered_to_the_caller_and_start_uses_it(api, bunny):
+    uid = make_user(api["db"], 100)
+    client = api["as_user"](uid)
+    t = client.post("/api/v1/repurpose/bunny-uploads", json={"size_bytes": 80_000_000})
+    assert t.status_code == 200, t.text
+    ticket = t.json()
+    assert ticket["source_path"] == f"{uid}/{ticket['video_id']}"
+    row = api["db"].execute("select user_id, bucket from repurpose_uploads where source_path=%s",
+                            (ticket["source_path"],)).fetchone()
+    assert str(row[0]) == str(uid) and row[1] == "bunny"
+    started = client.post("/api/v1/repurpose", json={"source_path": ticket["source_path"], "source": "bunny",
+                                                     "client_request_id": "bunny-tap-1"})
+    assert started.status_code == 200, started.text
+    job = api["db"].execute("select source_bucket, source_kind from repurpose_jobs where id=%s",
+                            (started.json()["job_id"],)).fetchone()
+    assert tuple(job) == ("bunny", "private_upload")
+
+
+def test_bunny_start_refuses_someone_elses_video_and_unfinished_ones(api, bunny):
+    a, b = make_user(api["db"], 100), make_user(api["db"], 100)
+    ticket = api["as_user"](a).post("/api/v1/repurpose/bunny-uploads", json={"size_bytes": 1000}).json()
+    # another user can't start a job from it
+    other = api["as_user"](b).post("/api/v1/repurpose", json={"source_path": ticket["source_path"],
+                                                              "source": "bunny", "client_request_id": "x-tap-0001"})
+    assert other.status_code == 400
+    # still processing -> asked to wait, nothing charged
+    bunny.videos[ticket["video_id"]]["status"] = 2
+    wait = api["as_user"](a).post("/api/v1/repurpose", json={"source_path": ticket["source_path"],
+                                                             "source": "bunny", "client_request_id": "x-tap-0002"})
+    assert wait.status_code == 400 and "still being prepared" in wait.json()["detail"]
+    bal = api["db"].execute("select points_balance from profiles where id=%s", (a,)).fetchone()[0]
+    assert bal == 100
+
+
+def test_bunny_start_enforces_size_and_length_limits(api, bunny):
+    uid = make_user(api["db"], 100)
+    client = api["as_user"](uid)
+    ticket = client.post("/api/v1/repurpose/bunny-uploads", json={"size_bytes": 1000}).json()
+    bunny.videos[ticket["video_id"]]["length"] = 99999
+    resp = client.post("/api/v1/repurpose", json={"source_path": ticket["source_path"], "source": "bunny",
+                                                  "client_request_id": "x-tap-0003"})
+    assert resp.status_code == 400 and "too long" in resp.json()["detail"]
