@@ -281,13 +281,15 @@ def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, resul
         except Exception:
             return []
 
+    summary_text = (amb.video_map or {}).get("summary")
     reviews = clip_review.review_candidates(pool, sentences, amb.speaker_labels, deps.llm,
-                                            frames_for if run.timeline is not None and run.timeline.usable else None)
+                                            frames_for if run.timeline is not None and run.timeline.usable else None,
+                                            summary_text)
     before = len(result.clips)
     clip_review.apply_reviews(result, reviews, pool)
     recovery = clip_review.recover_with_context(
         result, sentences, run.punctuated or [], duration, amb, amb.speaker_labels, deps.llm,
-        frames_for if run.timeline is not None and run.timeline.usable else None)
+        frames_for if run.timeline is not None and run.timeline.usable else None, summary_text)
     verdicts: dict = {}
     for rv in reviews.values():
         verdicts[rv["verdict"]] = verdicts.get(rv["verdict"], 0) + 1

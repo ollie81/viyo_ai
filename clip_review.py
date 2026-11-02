@@ -36,8 +36,12 @@ PROMPT = """You are a strict senior editor doing final review of short clips cut
 For each clip you get: what was said just BEFORE it (context the viewer will NOT see), the clip's own
 transcript, the sentence AFTER it, the on-screen hook (if any) and sometimes 3 frames from the clip.
 
-Judge each clip as a viewer who has never seen the rest of the video:
-- standalone: true only if it is fully understandable with no prior context.
+{context}Judge each clip as a viewer who has never seen the rest of the video, but who WILL see the post's title
+and caption, so the general topic is known:
+- standalone: false ONLY if the viewer could not follow the clip's main point without hearing something
+  else first (e.g. it answers a question never asked, or leans on a specific thing never named). Passing
+  references to the speaker's own experiences, jokes, or things the topic already implies do NOT make a
+  clip non-standalone.
 - opening 0-10: would the first two seconds make someone keep watching?
 - ending 0-10: does it close the thought satisfyingly, rather than stop abruptly or trail off?
 - hook_accurate: true/false whether the on-screen hook says only what the speaker actually says (null if no hook).
@@ -90,13 +94,15 @@ def extract_frames(source_path: str, c: cs.Candidate, work_dir: str, n: int = 3)
 
 
 def review_candidates(cands: list, sentences: list, labels: Optional[list], llm: Callable[[list], str],
-                      frames_for: Optional[Callable[[cs.Candidate], list]] = None) -> dict[int, dict]:
+                      frames_for: Optional[Callable[[cs.Candidate], list]] = None,
+                      video_summary: Optional[str] = None) -> dict[int, dict]:
     """Returns {index in `cands`: review}. Missing index = not reviewed."""
     results: dict[int, dict] = {}
 
     def run(batch: list[tuple[int, cs.Candidate]]) -> dict[int, dict]:
         blocks = "\n".join(_clip_block(c, i, sentences, labels) for i, c in batch)
-        content: list = [{"type": "text", "text": PROMPT.format(clips=blocks)}]
+        context = f"WHAT THE WHOLE VIDEO IS ABOUT: {video_summary}\n\n" if video_summary else ""
+        content: list = [{"type": "text", "text": PROMPT.format(clips=blocks, context=context)}]
         if frames_for is not None:
             for i, c in batch:
                 imgs = frames_for(c)
@@ -206,7 +212,7 @@ def _raw_from(c: cs.Candidate, start_sentence: int) -> dict:
 
 def recover_with_context(result: cs.SelectionResult, sentences: list, words: list, video_seconds: float,
                          ctx: cs.AnalysisContext, labels: Optional[list], llm: Callable,
-                         frames_for: Optional[Callable] = None) -> dict:
+                         frames_for: Optional[Callable] = None, video_summary: Optional[str] = None) -> dict:
     """
     A clip the editor marks "fix — the viewer is missing the setup" is what a
     human editor would start a few sentences earlier. Do that (never inventing
@@ -230,7 +236,7 @@ def recover_with_context(result: cs.SelectionResult, sentences: list, words: lis
             break
     if not tried:
         return {"attempted": 0, "recovered": 0}
-    reviews = review_candidates(tried, sentences, labels, llm, frames_for)
+    reviews = review_candidates(tried, sentences, labels, llm, frames_for, video_summary)
     recovered = 0
     for i, ext in enumerate(tried):
         rv = reviews.get(i)
