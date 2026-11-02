@@ -90,3 +90,16 @@ def test_long_titles_are_cut_to_the_limit():
     tl = timeline(n=240, busy=[(60, 120)])
     res = vm.select(tl, 240.0, fake_llm(title="one two three four five six seven eight nine ten"), lambda w: [])
     assert len(res.clips[0]["title"].split()) == vm.MAX_TITLE_WORDS
+
+
+def test_hashtags_are_not_repeated_inside_the_caption():
+    tl = timeline(n=240, busy=[(60, 120)])
+
+    def llm(messages):
+        text = messages[0]["content"][0]["text"]
+        ids = [int(x) for x in __import__("re").findall(r"--- CANDIDATE (\d+)", text)]
+        return json.dumps({"reviews": [{"id": i, "appeal": 8, "complete": 7, "what": "x", "title": "Caramel pour",
+                                        "caption": "Storing the deliciousness! #cooking #caramel",
+                                        "hashtags": ["cooking", "caramel"], "verdict": "publish"} for i in ids]})
+    c = vm.select(tl, 240.0, llm, lambda w: []).clips[0]
+    assert c["caption"] == "Storing the deliciousness!" and c["hashtags"] == ["cooking", "caramel"]

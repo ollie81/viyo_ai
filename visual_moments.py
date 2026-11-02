@@ -166,7 +166,7 @@ For each candidate return:
 - what: one sentence saying what happens, ONLY from what is visible
 - title: an on-screen title of at most 7 words describing what is visible. No claims, no numbers
   or facts you cannot see, no clickbait that isn't true.
-- caption: one ready-to-post line; hashtags: 3-5 lowercase tags without #
+- caption: one ready-to-post line with NO hashtags in it; hashtags: 3-5 lowercase tags without #
 - verdict: "publish" or "reject"
 
 Return ONLY JSON: {{"reviews": [{{"id": int, "appeal": int, "complete": int, "what": str,
@@ -231,7 +231,7 @@ def review(wins: list[Window], llm: Callable, frames_for: Callable[[Window], lis
             continue
         w.review = {"appeal": n(r.get("appeal")), "complete": n(r.get("complete")),
                     "what": str(r.get("what", ""))[:300], "title": _clean_title(r.get("title")),
-                    "caption": str(r.get("caption", ""))[:300],
+                    "caption": re.sub(r"\s*#\w+", "", str(r.get("caption", ""))).strip()[:300],
                     "hashtags": cs.clean_hashtags(r.get("hashtags")),
                     "verdict": "reject" if str(r.get("verdict", "")).lower() == "reject" else "publish"}
     return len(got)
