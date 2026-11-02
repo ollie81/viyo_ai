@@ -6,7 +6,7 @@ Privacy by design:
     (save_photo=true, off by default). Without consent it is dropped when the
     request ends. With consent it goes to the PRIVATE glow-up-photos bucket at
     <user_id>/<session_id>.jpg, re-encoded without metadata, readable only
-    through 1-hour signed links issued to its owner, and deleted with its
+    through 15-minute signed links issued to its owner, and deleted with its
     session, on its own ("remove photo"), or with the account.
   * The text suggestions are saved (save=true, the default) with the chosen
     look, style direction and date, so they can be reopened later.
@@ -48,7 +48,7 @@ GLOW_UP_MODEL = os.environ.get("GLOW_UP_MODEL", os.environ.get("OPENAI_MODEL", "
 # downsizes to 512 px and produced generic advice in testing (missed grey hair).
 IMAGE_DETAIL = os.environ.get("GLOW_UP_IMAGE_DETAIL", "high")
 PHOTOS_BUCKET = "glow-up-photos"          # private; only with explicit consent
-SIGNED_URL_SECONDS = 3600
+SIGNED_URL_SECONDS = 900          # 15 min; the app asks for a fresh link each time it opens a Glow Up
 STYLE_GOALS = {"everyday", "professional", "bold", "minimal", "event"}
 PRESENTATIONS = {"feminine", "masculine", "neutral", "any"}
 
