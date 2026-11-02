@@ -1102,6 +1102,7 @@ async def trending(
 
 _DELETE_TABLES = {
     "video_coach_messages": "user_id",
+    "glow_up_sessions": "user_id",
     "posts": "user_id",
     "profiles": "id",
 }

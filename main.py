@@ -197,6 +197,11 @@ except Exception as _ads_studio_import_error:
 # `from studio import ...` for its reused Gemini/image/cast/scene
 # helpers — same isolation reasoning as Ads Studio's try/except above.
 try:
+    from glow_up import router as glow_up_router
+    app.include_router(glow_up_router)
+except Exception as _glow_up_import_error:
+    print(f"[WARN] Glow Up router not loaded: {_glow_up_import_error}")
+try:
     from drama_creator import router as drama_creator_router
 
     app.include_router(drama_creator_router)
