@@ -1114,7 +1114,7 @@ _DELETE_TABLES = {
 # PROCESSED_BUCKET). This previously deleted DB rows referencing this
 # content but left the actual files in Storage forever — a real gap in
 # what the app's Privacy screen claims about deleting your data.
-_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos", "glow-up-previews"]
+_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos", "glow-up-previews", "glow-up-photos"]
 
 
 def _purge_storage(user_id: str) -> list[str]:

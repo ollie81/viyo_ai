@@ -14,6 +14,8 @@ import coins
 import glow_up as g
 
 GOOD = {
+    "observed": {"hair_length": "short", "hair_texture": "wavy", "hair_color": "grey",
+                 "face_shape": "oval", "visible_style": "dark crew-neck jumper"},
     "summary": "A clean, low-maintenance look would suit your easy-going style.",
     "hair": [{"name": "Textured crop", "why": "Works with the natural wave on top.", "how_to_ask": "Short sides, 3 cm on top."},
              {"name": "Mid-length layers", "why": "Keeps movement.", "how_to_ask": "Long layers, no thinning."},
@@ -33,25 +35,96 @@ def jpeg_b64(size=(640, 640), color=(180, 140, 120)):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-class FakeTable:
-    def __init__(self, store):
-        self.store = store
+class FakeQuery:
+    """Just enough of supabase-py: filters really filter, so ownership is tested."""
 
-    def insert(self, row):
-        self.store.append(row)
+    def __init__(self, db, missing_photo_col=False):
+        self.db, self.filters, self.op, self.payload, self.cols = db, {}, "select", None, ""
+        self.missing = missing_photo_col
+
+    def select(self, cols="*"):
+        self.op, self.cols = "select", cols
         return self
 
+    def insert(self, row):
+        self.op, self.payload = "insert", row
+        return self
+
+    def update(self, vals):
+        self.op, self.payload = "update", vals
+        return self
+
+    def delete(self):
+        self.op = "delete"
+        return self
+
+    def eq(self, k, v):
+        self.filters[k] = v
+        return self
+
+    def order(self, *a, **k):
+        return self
+
+    def limit(self, *a):
+        return self
+
+    def _match(self, r):
+        return all(r.get(k) == v for k, v in self.filters.items())
+
     def execute(self):
-        return type("R", (), {"data": [{"id": "sess-1"}]})()
+        R = lambda d: type("R", (), {"data": d})()
+        if self.missing and ("photo_path" in self.cols or (self.payload and "photo_path" in self.payload)):
+            raise Exception('column glow_up_sessions.photo_path does not exist')
+        if self.op == "insert":
+            row = dict(self.payload, id=f"sess-{len(self.db.rows) + 1}", created_at="2026-11-02T10:00:00Z")
+            self.db.rows.append(row)
+            return R([row])
+        hits = [r for r in self.db.rows if self._match(r)]
+        if self.op == "update":
+            if self.db.fail_update:
+                raise Exception("update failed")
+            for r in hits:
+                r.update(self.payload)
+            return R(hits)
+        if self.op == "delete":
+            self.db.rows = [r for r in self.db.rows if not self._match(r)]
+            return R(hits)
+        return R([dict(r) for r in hits])
+
+
+class FakeBucket:
+    def __init__(self, db):
+        self.db = db
+
+    def upload(self, path, data, file_options=None):
+        self.db.files[path] = data
+
+    def remove(self, paths):
+        for p in paths:
+            self.db.files.pop(p, None)
+
+    def list(self, prefix):
+        return [{"name": k.split("/", 1)[1]} for k in self.db.files if k.startswith(prefix + "/")]
+
+    def create_signed_url(self, path, secs):
+        return {"signedURL": f"https://signed.example/{path}?token=x&expires={secs}"}
 
 
 class FakeAdmin:
     def __init__(self):
-        self.rows = []
+        self.rows, self.files = [], {}
+        self.fail_update = False
+        self.missing_photo_col = False
+        self.storage = type("S", (), {"from_": lambda s_, b: self._bucket(b)})()
+        self.buckets_used = set()
+
+    def _bucket(self, name):
+        self.buckets_used.add(name)
+        return FakeBucket(self)
 
     def table(self, name):
         assert name == "glow_up_sessions"
-        return FakeTable(self.rows)
+        return FakeQuery(self, self.missing_photo_col)
 
 
 @pytest.fixture
@@ -84,8 +157,9 @@ def api(monkeypatch):
 
     app = FastAPI()
     app.include_router(g.router)
-    app.dependency_overrides[g._user_no_guest] = lambda: "user-1"
-    app.dependency_overrides[g._user] = lambda: "user-1"
+    state["user"] = "user-1"
+    app.dependency_overrides[g._user_no_guest] = lambda: state["user"]
+    app.dependency_overrides[g._user] = lambda: state["user"]
     return TestClient(app), state, admin
 
 
@@ -103,8 +177,10 @@ def test_happy_path_charges_10_and_saves_text_only(api):
     assert state["charged"] == [10] and state["refunded"] == []
     assert state["seen"]["jpeg"]
     saved = admin.rows[0]
-    assert set(saved) == {"user_id", "recommendations", "style_goal", "presentation"}
+    assert {"user_id", "recommendations", "style_goal", "presentation"} <= set(saved)
+    assert not saved.get("photo_path") and admin.files == {}, "no photo without consent"
     assert "base64" not in json.dumps(saved)
+    assert r.json()["photo_saved"] is False and r.json()["photo_url"] is None
 
 
 def test_price_is_10_coins_with_no_free_use():
@@ -203,3 +279,127 @@ def test_face_check_on_a_real_frame(tmp_path):
     pair.save(buf, format="JPEG")
     with pytest.raises(g.PhotoProblem):
         g.check_single_face(g.normalise_image(buf.getvalue()))
+
+
+
+# ------------------------------------------------------------------ history & optional photo
+
+def test_photo_is_saved_privately_only_with_consent(api):
+    client, state, admin = api
+    r = post(client, save_photo=True)
+    body = r.json()
+    assert r.status_code == 200 and body["photo_saved"] is True
+    sid = body["session_id"]
+    path = f"user-1/{sid}.jpg"
+    assert list(admin.files) == [path] and admin.rows[0]["photo_path"] == path
+    assert admin.buckets_used == {"glow-up-photos"}
+    assert body["photo_url"].startswith("https://signed.example/") and "token=" in body["photo_url"]
+    stored = Image.open(io.BytesIO(admin.files[path]))
+    assert stored.format == "JPEG" and len(stored.getexif()) == 0
+
+
+def test_photo_consent_also_saves_the_ideas(api):
+    client, state, admin = api
+    r = post(client, save=False, save_photo=True)
+    assert r.json()["saved"] is True and r.json()["photo_saved"] is True
+
+
+def test_failed_attach_removes_the_uploaded_photo(api):
+    client, state, admin = api
+    admin.fail_update = True
+    r = post(client, save_photo=True)
+    assert r.status_code == 200 and r.json()["photo_saved"] is False and admin.files == {}
+
+
+def test_history_keeps_every_session_with_look_direction_date_and_photo_link(api):
+    client, state, admin = api
+    post(client, style_goal="professional", presentation="masculine")
+    post(client, style_goal="bold", presentation="any", save_photo=True)
+    lst = client.get("/api/v1/glow-up/sessions").json()["sessions"]
+    assert len(lst) == 2
+    assert {(x["style_goal"], x["presentation"]) for x in lst} == {("professional", "masculine"), ("bold", "any")}
+    assert all(x["created_at"] for x in lst)
+    with_photo = [x for x in lst if x["has_photo"]]
+    assert len(with_photo) == 1 and with_photo[0]["photo_url"].startswith("https://signed.example/")
+    one = client.get(f"/api/v1/glow-up/sessions/{lst[0]['id']}").json()
+    assert one["recommendations"]["summary"] == GOOD["summary"]
+
+
+def test_deleting_a_session_deletes_its_photo(api):
+    client, state, admin = api
+    sid = post(client, save_photo=True).json()["session_id"]
+    r = client.delete(f"/api/v1/glow-up/sessions/{sid}")
+    assert r.json() == {"deleted": True, "photo_deleted": True}
+    assert admin.rows == [] and admin.files == {}
+
+
+def test_removing_only_the_photo_keeps_the_ideas(api):
+    client, state, admin = api
+    sid = post(client, save_photo=True).json()["session_id"]
+    assert client.delete(f"/api/v1/glow-up/sessions/{sid}/photo").json() == {"photo_deleted": True}
+    assert admin.files == {} and admin.rows[0]["photo_path"] is None
+    assert client.get(f"/api/v1/glow-up/sessions/{sid}").json()["has_photo"] is False
+
+
+def test_delete_all_removes_every_photo_including_leftovers(api):
+    client, state, admin = api
+    post(client, save_photo=True)
+    post(client, save_photo=True)
+    admin.files["user-1/orphan.jpg"] = b"x"
+    client.delete("/api/v1/glow-up/sessions")
+    assert admin.rows == [] and admin.files == {}
+
+
+def test_another_user_cannot_see_open_or_delete_your_sessions_or_photos(api):
+    client, state, admin = api
+    sid = post(client, save_photo=True).json()["session_id"]
+    state["user"] = "intruder"
+    assert client.get("/api/v1/glow-up/sessions").json()["sessions"] == []
+    assert client.get(f"/api/v1/glow-up/sessions/{sid}").status_code == 404
+    assert client.delete(f"/api/v1/glow-up/sessions/{sid}").status_code == 404
+    assert client.delete(f"/api/v1/glow-up/sessions/{sid}/photo").status_code == 404
+    client.delete("/api/v1/glow-up/sessions")
+    assert len(admin.rows) == 1 and len(admin.files) == 1, "the owner's data is untouched"
+
+
+def test_history_still_works_before_the_photo_column_exists(api):
+    client, state, admin = api
+    admin.missing_photo_col = True
+    r = post(client)
+    assert r.status_code == 200 and r.json()["saved"] is True
+    lst = client.get("/api/v1/glow-up/sessions").json()["sessions"]
+    assert len(lst) == 1 and lst[0]["has_photo"] is False
+
+
+# ------------------------------------------------------------------ the model call itself
+
+def test_model_gets_the_photo_at_high_detail_with_the_preferences(monkeypatch):
+    sent = {}
+
+    class Completions:
+        def create(self, **kw):
+            sent.update(kw)
+            msg = type("M", (), {"content": json.dumps(GOOD)})()
+            return type("R", (), {"choices": [type("C", (), {"message": msg})()]})()
+
+    fake = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    monkeypatch.setattr(g, "_get_client", lambda: fake)
+    url = "data:image/jpeg;base64," + jpeg_b64()
+    g.ask_model(url, "professional", "feminine")
+    parts = sent["messages"][1]["content"]
+    image = next(p for p in parts if p["type"] == "image_url")["image_url"]
+    text = next(p for p in parts if p["type"] == "text")["text"]
+    assert image["url"] == url and image["detail"] == "high"
+    assert "professional" in text and "feminine" in text and '"observed"' in text
+    assert sent["response_format"] == {"type": "json_object"}
+
+
+def test_answer_without_observations_is_retried():
+    calls = []
+    no_obs = {k: v for k, v in GOOD.items() if k != "observed"}
+
+    def llm(url, goal, pres, reminder=""):
+        calls.append(reminder)
+        return json.dumps(no_obs if len(calls) == 1 else GOOD)
+    res = g.get_suggestions("data:", None, None, llm)
+    assert res.observed.hair_color == "grey" and len(calls) == 2 and "observed" in calls[1]

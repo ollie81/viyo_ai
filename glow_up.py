@@ -2,9 +2,14 @@
 Viyo Glow Up — Stage 1: style suggestions from a selfie.
 
 Privacy by design:
-  * The selfie is NEVER stored. It arrives in the request, is checked and
-    sent to the vision model, and is dropped when the request ends. Only the
-    text suggestions are saved, and only if the user asks (save=true).
+  * The selfie is NOT stored unless the user explicitly opts in
+    (save_photo=true, off by default). Without consent it is dropped when the
+    request ends. With consent it goes to the PRIVATE glow-up-photos bucket at
+    <user_id>/<session_id>.jpg, re-encoded without metadata, readable only
+    through 1-hour signed links issued to its owner, and deleted with its
+    session, on its own ("remove photo"), or with the account.
+  * The text suggestions are saved (save=true, the default) with the chosen
+    look, style direction and date, so they can be reopened later.
   * 18+ only: every request must carry age_confirmed=true.
   * Saved suggestions can be deleted one by one or all at once, and are
     removed with the account (coach.py's account deletion).
@@ -39,7 +44,11 @@ MAX_SIDE = 1024
 MIN_FACE_WIDTH = 0.08          # share of image width; smaller and the advice would be guesswork
 SECOND_FACE_RATIO = 0.5        # another face at least this big = more than one person
 GLOW_UP_MODEL = os.environ.get("GLOW_UP_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
-IMAGE_DETAIL = os.environ.get("GLOW_UP_IMAGE_DETAIL", "low")
+# "high" lets the model see hair texture, colour and length properly; "low"
+# downsizes to 512 px and produced generic advice in testing (missed grey hair).
+IMAGE_DETAIL = os.environ.get("GLOW_UP_IMAGE_DETAIL", "high")
+PHOTOS_BUCKET = "glow-up-photos"          # private; only with explicit consent
+SIGNED_URL_SECONDS = 3600
 STYLE_GOALS = {"everyday", "professional", "bold", "minimal", "event"}
 PRESENTATIONS = {"feminine", "masculine", "neutral", "any"}
 
@@ -152,7 +161,19 @@ class StyleIdea(BaseModel):
     why: str = Field(..., max_length=300)
 
 
+class Observed(BaseModel):
+    """What the model says it can actually see. Shown to the user, so advice
+    is visibly grounded in their photo rather than generic."""
+    hair_length: str = Field(..., max_length=60)
+    hair_texture: str = Field(..., max_length=60)
+    hair_color: str = Field(..., max_length=60)
+    face_shape: str = Field(..., max_length=60)
+    visible_style: str = Field(..., max_length=160)
+
+
 class GlowUpResult(BaseModel):
+    # Optional only so sessions saved before this field existed still load.
+    observed: Optional[Observed] = None
     summary: str = Field(..., max_length=500)
     hair: list[HairIdea] = Field(..., min_length=2, max_length=4)
     grooming: list[str] = Field(..., min_length=2, max_length=6)
@@ -173,10 +194,17 @@ RULES = """Hard rules — breaking any of them makes the answer unusable:
 - Don't frame anything as a flaw to fix. Frame every suggestion as an option to try.
 - Don't assume gender. Follow the style direction below if one is given; otherwise keep suggestions open.
 - Be specific (named cuts, lengths, products by type, cuts of clothing), not generic.
+- Describe only what you can see. If something isn't visible (e.g. hair hidden by a hat), say "not visible"
+  and don't guess.
+- Each hair, style and colour idea must fit what you observed; mention the observed detail in "why".
 - If there isn't one clear, front-facing face in the photo, return only {"status": "no_clear_face"}."""
 
-FORMAT = """Return ONLY JSON:
-{"summary": "1-2 encouraging sentences on a style direction that suits them",
+FORMAT = """First look carefully and describe only what is visible. Then base every suggestion on it.
+Return ONLY JSON:
+{"observed": {"hair_length": "e.g. short / chin-length / long", "hair_texture": "straight / wavy / curly / coily",
+              "hair_color": "as visible", "face_shape": "oval / round / square / heart / long / diamond",
+              "visible_style": "what they are wearing in the photo, briefly"},
+ "summary": "1-2 encouraging sentences on a style direction that suits them",
  "hair": [{"name": "named cut or style", "why": "why it suits what you see", "how_to_ask": "what to tell the barber/stylist"}],  (3 ideas)
  "grooming": ["practical tip"],  (3-5 tips: hair care, styling products, brows/beard if relevant, skincare basics)
  "style": [{"item": "clothing cut or piece", "why": "why it works"}],  (3-5 ideas)
@@ -238,6 +266,9 @@ def get_suggestions(data_url: str, style_goal: Optional[str], presentation: Opti
         except (ValidationError, TypeError):
             reminder = "\n\nYour last answer didn't match the JSON format exactly. Follow it precisely."
             continue
+        if result.observed is None:
+            reminder = "\n\nInclude the \"observed\" section describing what is visible."
+            continue
         if respectful(result):
             return result
         reminder = ("\n\nYour last answer broke the hard rules (it judged looks, weight, age, ethnicity, "
@@ -253,6 +284,8 @@ class AnalyzeRequest(BaseModel):
     style_goal: Optional[str] = None
     presentation: Optional[str] = None
     save: bool = True
+    # Off unless the user explicitly turns it on. Implies save=True.
+    save_photo: bool = False
 
 
 class AnalyzeResponse(BaseModel):
@@ -260,6 +293,8 @@ class AnalyzeResponse(BaseModel):
     saved: bool
     session_id: Optional[str] = None
     coins_charged: int
+    photo_saved: bool = False
+    photo_url: Optional[str] = None       # short-lived private link, only when photo_saved
 
 
 def _decode_b64(s: str) -> bytes:
@@ -308,10 +343,12 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(_user_no_guest)):
         raise HTTPException(status_code=502,
                             detail="We couldn't create your suggestions right now. Your coins were refunded.")
     finally:
-        del jpeg, data_url    # the photo is never kept
+        # The photo is kept past this point only with explicit consent.
+        keep_photo = jpeg if req.save_photo else None
+        del jpeg, data_url
 
     saved, session_id = False, None
-    if req.save and admin is not None:
+    if (req.save or req.save_photo) and admin is not None:
         try:
             row = admin.table("glow_up_sessions").insert({
                 "user_id": user_id, "recommendations": result.model_dump(),
@@ -320,42 +357,160 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(_user_no_guest)):
             session_id = (row.data or [{}])[0].get("id")
             saved = session_id is not None
         except Exception as e:
-            print(f"[WARN] glow up: could not save suggestions: {e}")
-    return AnalyzeResponse(result=result, saved=saved, session_id=session_id, coins_charged=charged)
+            print(f"[WARN] glow up: could not save suggestions: {str(e)[:300]}")
+    photo_saved, photo_url = False, None
+    if keep_photo is not None and saved:
+        photo_saved, photo_url = _store_photo(admin, user_id, session_id, keep_photo)
+    keep_photo = None
+    return AnalyzeResponse(result=result, saved=saved, session_id=session_id, coins_charged=charged,
+                           photo_saved=photo_saved, photo_url=photo_url)
+
+
+def _signed(admin, path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        r = admin.storage.from_(PHOTOS_BUCKET).create_signed_url(path, SIGNED_URL_SECONDS)
+        return r.get("signedURL") or r.get("signedUrl")
+    except Exception:
+        return None
+
+
+def _store_photo(admin, user_id: str, session_id: str, jpeg: bytes) -> tuple[bool, Optional[str]]:
+    """Private bucket, path tied to the owner and session. If attaching it to
+    the session fails, the file is removed again so nothing is orphaned."""
+    path = f"{user_id}/{session_id}.jpg"
+    try:
+        admin.storage.from_(PHOTOS_BUCKET).upload(path, jpeg, file_options={"content-type": "image/jpeg"})
+    except Exception as e:
+        print(f"[WARN] glow up: could not store photo: {str(e)[:300]}")
+        return False, None
+    try:
+        admin.table("glow_up_sessions").update({"photo_path": path}).eq("id", session_id).eq("user_id", user_id).execute()
+    except Exception as e:
+        print(f"[WARN] glow up: could not attach photo to session: {str(e)[:300]}")
+        try:
+            admin.storage.from_(PHOTOS_BUCKET).remove([path])
+        except Exception:
+            pass
+        return False, None
+    return True, _signed(admin, path)
+
+
+def _remove_photos(admin, paths: list) -> None:
+    paths = [p for p in paths if p]
+    if paths:
+        admin.storage.from_(PHOTOS_BUCKET).remove(paths)
+
+
+def _session_out(admin, row: dict) -> dict:
+    path = row.get("photo_path")
+    return {"id": row["id"], "created_at": row.get("created_at"), "style_goal": row.get("style_goal"),
+            "presentation": row.get("presentation"), "recommendations": row.get("recommendations"),
+            "has_photo": bool(path), "photo_url": _signed(admin, path)}
+
+
+_SESSION_COLS = "id, created_at, style_goal, presentation, recommendations, photo_path"
+_SESSION_COLS_OLD = "id, created_at, style_goal, presentation, recommendations"
+
+
+def _select_sessions(admin, user_id: str, session_id: Optional[str] = None) -> list:
+    """Owner's rows only. Works before and after the photo_path column exists."""
+    for cols in (_SESSION_COLS, _SESSION_COLS_OLD):
+        try:
+            q = admin.table("glow_up_sessions").select(cols).eq("user_id", user_id)
+            if session_id:
+                q = q.eq("id", session_id)
+            return q.order("created_at", desc=True).limit(50).execute().data or []
+        except Exception as e:
+            last = e
+            if "photo_path" not in str(e):
+                break
+    raise last
+
+
+def _admin_or_503():
+    admin = _get_admin()
+    if admin is None:
+        raise HTTPException(status_code=503, detail="Glow Up is not configured.")
+    return admin
 
 
 @router.get("/sessions")
 async def list_sessions(user_id: str = Depends(_user)):
-    admin = _get_admin()
-    if admin is None:
-        raise HTTPException(status_code=503, detail="Glow Up is not configured.")
+    admin = _admin_or_503()
     try:
-        rows = (admin.table("glow_up_sessions").select("id, created_at, style_goal, presentation, recommendations")
-                .eq("user_id", user_id).order("created_at", desc=True).limit(50).execute())
+        rows = _select_sessions(admin, user_id)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not load your Glow Ups: {e}")
-    return {"sessions": rows.data or []}
+        print(f"[WARN] glow up: list failed: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="Could not load your Glow Ups. Please try again.")
+    return {"sessions": [_session_out(admin, r) for r in rows]}
+
+
+@router.get("/sessions/{session_id}")
+async def get_session(session_id: str, user_id: str = Depends(_user)):
+    admin = _admin_or_503()
+    try:
+        rows = _select_sessions(admin, user_id, session_id)
+    except Exception as e:
+        print(f"[WARN] glow up: get failed: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="Could not load this Glow Up. Please try again.")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Glow Up not found.")
+    return _session_out(admin, rows[0])
+
+
+@router.delete("/sessions/{session_id}/photo")
+async def delete_session_photo(session_id: str, user_id: str = Depends(_user)):
+    """Removes only the saved photo; the ideas stay."""
+    admin = _admin_or_503()
+    rows = _select_sessions(admin, user_id, session_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Glow Up not found.")
+    path = rows[0].get("photo_path")
+    try:
+        _remove_photos(admin, [path])
+        if path:
+            admin.table("glow_up_sessions").update({"photo_path": None}).eq("id", session_id).eq("user_id", user_id).execute()
+    except Exception as e:
+        print(f"[WARN] glow up: photo delete failed: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="Could not delete the photo. Please try again.")
+    return {"photo_deleted": bool(path)}
 
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user_id: str = Depends(_user)):
-    admin = _get_admin()
-    if admin is None:
-        raise HTTPException(status_code=503, detail="Glow Up is not configured.")
+    """Deletes the session and its saved photo (if any)."""
+    admin = _admin_or_503()
     try:
+        rows = _select_sessions(admin, user_id, session_id)
+        if not rows:
+            raise HTTPException(status_code=404, detail="Glow Up not found.")
+        path = rows[0].get("photo_path")
+        _remove_photos(admin, [path])          # photo first: never leave a file without its session
         admin.table("glow_up_sessions").delete().eq("id", session_id).eq("user_id", user_id).execute()
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not delete: {e}")
-    return {"deleted": True}
+        print(f"[WARN] glow up: delete failed: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="Could not delete. Please try again.")
+    return {"deleted": True, "photo_deleted": bool(path)}
 
 
 @router.delete("/sessions")
 async def delete_all_sessions(user_id: str = Depends(_user)):
-    admin = _get_admin()
-    if admin is None:
-        raise HTTPException(status_code=503, detail="Glow Up is not configured.")
+    admin = _admin_or_503()
     try:
+        rows = _select_sessions(admin, user_id)
+        _remove_photos(admin, [r.get("photo_path") for r in rows])
+        # Anything else under this user's folder (e.g. left by a failed save) goes too.
+        try:
+            leftovers = admin.storage.from_(PHOTOS_BUCKET).list(user_id) or []
+            _remove_photos(admin, [f"{user_id}/{f['name']}" for f in leftovers if f.get("name")])
+        except Exception:
+            pass
         admin.table("glow_up_sessions").delete().eq("user_id", user_id).execute()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not delete: {e}")
+        print(f"[WARN] glow up: delete all failed: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="Could not delete. Please try again.")
     return {"deleted": True}

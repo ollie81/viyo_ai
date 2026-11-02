@@ -61,3 +61,17 @@ values ('glow-up-previews', 'glow-up-previews', false, 5242880, array['image/jpe
 on conflict (id) do update
   set public = false, file_size_limit = excluded.file_size_limit,
       allowed_mime_types = excluded.allowed_mime_types;
+
+-- ---------------------------------------------------------------------
+-- Optional photo saving (only with explicit consent; off by default).
+
+alter table public.glow_up_sessions add column if not exists photo_path text;
+
+-- Private bucket: no public links. No storage policies are created, so
+-- signed-in users cannot read or list it directly; only the backend
+-- (service role) can, and it hands the owner 1-hour signed links.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('glow-up-photos', 'glow-up-photos', false, 5242880, array['image/jpeg'])
+on conflict (id) do update
+  set public = false, file_size_limit = excluded.file_size_limit,
+      allowed_mime_types = excluded.allowed_mime_types;
