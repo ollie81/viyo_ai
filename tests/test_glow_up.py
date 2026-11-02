@@ -98,10 +98,15 @@ class FakeBucket:
 
     def upload(self, path, data, file_options=None):
         self.db.files[path] = data
+        self.db.file_options[path] = dict(file_options or {})
 
     def remove(self, paths):
+        out = []
         for p in paths:
-            self.db.files.pop(p, None)
+            if p in self.db.files and not self.db.stuck:
+                self.db.files.pop(p)
+                out.append({"name": p})
+        return out
 
     def list(self, prefix):
         return [{"name": k.split("/", 1)[1]} for k in self.db.files if k.startswith(prefix + "/")]
@@ -112,7 +117,8 @@ class FakeBucket:
 
 class FakeAdmin:
     def __init__(self):
-        self.rows, self.files = [], {}
+        self.rows, self.files, self.file_options = [], {}, {}
+        self.stuck = False                    # simulate storage refusing to delete
         self.fail_update = False
         self.missing_photo_col = False
         self.storage = type("S", (), {"from_": lambda s_, b: self._bucket(b)})()
@@ -403,3 +409,22 @@ def test_answer_without_observations_is_retried():
         return json.dumps(no_obs if len(calls) == 1 else GOOD)
     res = g.get_suggestions("data:", None, None, llm)
     assert res.observed.hair_color == "grey" and len(calls) == 2 and "observed" in calls[1]
+
+
+
+def test_saved_photo_is_never_cached_by_the_cdn(api):
+    client, state, admin = api
+    sid = post(client, save_photo=True).json()["session_id"]
+    assert admin.file_options[f"user-1/{sid}.jpg"]["cache-control"] == "0"
+
+
+def test_delete_reports_failure_if_storage_kept_the_photo(api):
+    client, state, admin = api
+    sid = post(client, save_photo=True).json()["session_id"]
+    admin.stuck = True
+    r = client.delete(f"/api/v1/glow-up/sessions/{sid}")
+    assert r.status_code == 502, "must not claim the photo was deleted"
+    assert len(admin.rows) == 1, "session kept so the photo is never orphaned"
+    admin.stuck = False
+    assert client.delete(f"/api/v1/glow-up/sessions/{sid}").json()["photo_deleted"] is True
+    assert admin.files == {}

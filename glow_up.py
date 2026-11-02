@@ -381,7 +381,10 @@ def _store_photo(admin, user_id: str, session_id: str, jpeg: bytes) -> tuple[boo
     the session fails, the file is removed again so nothing is orphaned."""
     path = f"{user_id}/{session_id}.jpg"
     try:
-        admin.storage.from_(PHOTOS_BUCKET).upload(path, jpeg, file_options={"content-type": "image/jpeg"})
+        # cache-control 0: the CDN must never keep a copy, so a deleted photo
+        # stops loading at once, even through a link issued earlier.
+        admin.storage.from_(PHOTOS_BUCKET).upload(
+            path, jpeg, file_options={"content-type": "image/jpeg", "cache-control": "0"})
     except Exception as e:
         print(f"[WARN] glow up: could not store photo: {str(e)[:300]}")
         return False, None
@@ -398,9 +401,17 @@ def _store_photo(admin, user_id: str, session_id: str, jpeg: bytes) -> tuple[boo
 
 
 def _remove_photos(admin, paths: list) -> None:
+    """Deletes the files and confirms storage actually removed each one
+    (storage answers with the objects it deleted). Raises if any remain, so
+    nobody is ever told a photo was deleted when it wasn't."""
     paths = [p for p in paths if p]
-    if paths:
-        admin.storage.from_(PHOTOS_BUCKET).remove(paths)
+    if not paths:
+        return
+    removed = admin.storage.from_(PHOTOS_BUCKET).remove(paths) or []
+    gone = {r.get("name") for r in removed if isinstance(r, dict)}
+    missing = [p for p in paths if p not in gone]
+    if missing:
+        raise RuntimeError(f"storage did not delete {len(missing)} photo(s)")
 
 
 def _session_out(admin, row: dict) -> dict:
