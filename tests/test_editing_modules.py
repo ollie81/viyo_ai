@@ -306,3 +306,40 @@ def test_routing_storage_reads_and_deletes_bunny_sources_only(tmp_path, monkeypa
     assert calls["deleted"] == ["abc", "def"]
     st.remove("repurpose-sources", ["u/a.mp4"])
     assert calls["base_remove"] == ("repurpose-sources", ["u/a.mp4"])
+
+
+# ------------------------------------------------------------------ hooks
+import hooks as hk
+
+
+def hook_cand(transcript, overlay=None):
+    return types.SimpleNamespace(title="T", transcript=transcript, overlay_hook=overlay, overlay_status="none_proposed")
+
+
+TUTORIAL = ("Second, you want to make sure that your breath is fresh. I always carry a mint before a date. "
+            "Bad breath ruins everything, trust me. Brush your teeth and your tongue too.")
+
+
+def test_written_hook_is_used_only_when_grounded():
+    c = hook_cand(TUTORIAL)
+    llm = lambda m: json.dumps({"hooks": [{"id": 0, "options": [
+        "Doctors say 90% of dates fail",            # invented: rejected
+        "Bad breath ruins everything",               # grounded: used
+    ]}]})
+    stats = hk.fill_missing_hooks([c], llm)
+    assert c.overlay_hook == "Bad breath ruins everything" and c.overlay_status == "written"
+    assert stats["written"] == 1
+
+
+def test_quote_fallback_when_the_model_fails_and_never_the_opening():
+    c = hook_cand(TUTORIAL)
+    hk.fill_missing_hooks([c], lambda m: "not json")
+    assert c.overlay_status == "quoted" and c.overlay_hook
+    assert c.overlay_hook.lower() in TUTORIAL.lower()           # verbatim from the clip
+    assert not c.overlay_hook.lower().startswith("second")      # not the opening line
+
+
+def test_existing_hook_is_left_alone():
+    c = hook_cand(TUTORIAL, overlay="Fresh breath first")
+    stats = hk.fill_missing_hooks([c], lambda m: (_ for _ in ()).throw(AssertionError("no call needed")))
+    assert c.overlay_hook == "Fresh breath first" and stats["already_had"] == 1

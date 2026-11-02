@@ -30,6 +30,7 @@ import clip_render
 import clip_review
 import clip_selection
 import creator_insights
+import hooks
 import speakers
 import video_analysis
 import video_map
@@ -319,6 +320,10 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
 
     if result.clips and deps.analysis:
         facts["review"] = _review(ctx, deps, run, path, result, sentences, amb, work_dir, duration)
+
+    if result.clips:
+        ctx.stage("selecting", 0.59, "Writing the hooks")
+        facts["hooks"] = hooks.fill_missing_hooks(result.clips + result.spares, deps.llm)
 
     summary = result.summary()
     summary["analysis"] = {**(summary.get("analysis") or {}), **facts}
