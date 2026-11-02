@@ -197,6 +197,11 @@ except Exception as _ads_studio_import_error:
 # `from studio import ...` for its reused Gemini/image/cast/scene
 # helpers — same isolation reasoning as Ads Studio's try/except above.
 try:
+    from repurpose_benchmark import router as repurpose_benchmark_router
+    app.include_router(repurpose_benchmark_router)
+except Exception as _bench_import_error:
+    print(f"[WARN] Repurpose benchmark router not loaded: {_bench_import_error}")
+try:
     from glow_up import router as glow_up_router
     app.include_router(glow_up_router)
     from glow_up_preview import router as glow_up_preview_router
