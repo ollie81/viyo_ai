@@ -494,3 +494,18 @@ def test_too_little_speech_never_calls_the_llm():
     llm = fake_llm(["{}"])
     result = cs.run_selection(words, segments, 30.0, llm)
     assert result.clips == [] and llm.calls == []
+
+
+def test_list_marker_opening_is_dropped_but_real_first_words_are_kept():
+    def w(texts, t0=0.0):
+        out, t = [], t0
+        for x in texts:
+            out.append({"word": x.strip(",."), "text": x, "start": t, "end": t + 0.3})
+            t += 0.35
+        return out
+    a = w(["Second,", "make", "sure", "your", "breath", "is", "fresh."])
+    assert cs._trim_leading_fillers(a, 0, len(a) - 1) == 1
+    b = w(["First", "impressions", "matter", "more", "than", "you", "think."])
+    assert cs._trim_leading_fillers(b, 0, len(b) - 1) == 0
+    c = w(["So,", "next,", "you", "want", "to", "relax."])
+    assert cs._trim_leading_fillers(c, 0, len(c) - 1) == 2

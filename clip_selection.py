@@ -492,10 +492,24 @@ def _int_score(v) -> int:
         return 0
 
 
+# Numbered-list markers ("Second, make sure...") point back at an earlier
+# item the viewer never sees. Dropped at the start of a clip only when
+# followed by a comma, so "First impressions matter" is left alone.
+_LEADING_LIST_MARKERS = {
+    "first", "firstly", "second", "secondly", "third", "thirdly", "fourth", "fifth",
+    "next", "lastly", "finally", "also", "additionally",
+}
+
+
+def _is_leading_skip(token: str) -> bool:
+    k = _key(token)
+    return k in _LEADING_FILLERS or (k in _LEADING_LIST_MARKERS and token.rstrip().endswith(","))
+
+
 def _trim_leading_fillers(words: list[dict], first: int, last: int) -> int:
     i = first
     limit = float(words[first]["start"]) + MAX_LEADING_FILLER_SKIP_SECONDS
-    while i < last and _key(words[i]["text"]) in _LEADING_FILLERS and float(words[i + 1]["start"]) <= limit:
+    while i < last and _is_leading_skip(words[i]["text"]) and float(words[i + 1]["start"]) <= limit:
         i += 1
     return i
 

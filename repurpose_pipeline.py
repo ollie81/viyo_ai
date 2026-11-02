@@ -522,6 +522,8 @@ def _legacy_clip(clip: dict, rendered: dict) -> dict:
             "suggested_title": clip["title"], "score": clip["score"],
             "caption": clip.get("caption", ""), "hashtags": clip.get("hashtags") or [],
             "hook_line": clip.get("hook_line", ""), "category": clip.get("category"),
+            # The text actually burned across the top of the clip, or None.
+            "overlay_hook": clip.get("overlay_hook") or rendered.get("overlay_hook"),
             "transcript": clip.get("transcript", ""), "score_breakdown": clip.get("breakdown") or {},
         },
         "dead_air_removed_seconds": rendered.get("dead_air_removed_seconds", 0.0),

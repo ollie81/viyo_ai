@@ -260,10 +260,11 @@ class HighlightSegment(BaseModel):
     # empty so an older/partial model response can't fail the batch.
     caption: str = ""
     hashtags: list[str] = []
-    # The exact words the clip opens on. Used to burn the hook across
-    # the opening seconds (see _generate_ass) and to show the creator
-    # what the AI thinks is doing the work in the first 2 seconds.
+    # The exact words the clip opens on (what viewers hear first).
     hook_line: str = ""
+    # The short line burned across the top of the opening seconds, built
+    # only from what the speaker says. None when no faithful hook fit.
+    overlay_hook: Optional[str] = None
     category: Optional[str] = None
     # What's said in the clip, word for word.
     transcript: str = ""
