@@ -290,12 +290,13 @@ def test_routing_storage_reads_and_deletes_bunny_sources_only(tmp_path, monkeypa
             return True
 
     seen = {}
-    monkeypatch.setattr(rs, "stream_url_to_file", lambda url, dest, mx, host: seen.update(url=url, host=host) or 7)
+    monkeypatch.setattr(rs, "stream_url_to_file", lambda url, dest, mx, host, headers=None: seen.update(url=url, host=host, headers=headers) or 7)
     st = rs.RoutingStorage(Base(), B())
     st.download("repurpose-sources", "u/a.mp4", "d", 10)
     assert "base_download" in calls
     assert st.download("bunny", "user1/abc", "d", 10) == 7
-    assert seen == {"url": "https://vz-x.b-cdn.net/abc/play_720p.mp4", "host": "vz-x.b-cdn.net"}
+    assert seen["url"] == "https://vz-x.b-cdn.net/abc/play_720p.mp4" and seen["host"] == "vz-x.b-cdn.net"
+    assert seen["headers"]["Referer"].startswith("https://")
     with pytest.raises(rs.SourceMissing):
         st.download("bunny", "user1/gone", "d", 10)
     B.info = {"status": 2}

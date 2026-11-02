@@ -38,7 +38,8 @@ class StorageUnavailable(Exception):
     """Network/provider trouble — retryable."""
 
 
-def stream_url_to_file(url: str, dest: str, max_bytes: int, allowed_host: Optional[str]) -> int:
+def stream_url_to_file(url: str, dest: str, max_bytes: int, allowed_host: Optional[str],
+                       headers: Optional[dict] = None) -> int:
     """
     Streams `url` to `dest`, enforcing `max_bytes` while downloading (not
     after), and refusing any URL — including a redirect target — that
@@ -51,7 +52,8 @@ def stream_url_to_file(url: str, dest: str, max_bytes: int, allowed_host: Option
 
     check(url)
     try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_CONNECT_TIMEOUT_SECONDS) as resp:
+        request = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_CONNECT_TIMEOUT_SECONDS) as resp:
             check(resp.geturl())
             length = resp.headers.get("Content-Length")
             if length and int(length) > max_bytes:
@@ -195,8 +197,12 @@ class RoutingStorage:
             raise SourceMissing("bunny could not process this video")
         if not b.is_finished(info):
             raise StorageUnavailable("bunny is still processing this video")
+        # The library's pull zone may have hotlink protection on (it blocks any
+        # request that doesn't come from one of the allowed sites), so identify
+        # as the app, exactly as a browser playing the video would.
+        referer = os.environ.get("BUNNY_DOWNLOAD_REFERER", "https://viyo-xi.vercel.app/")
         return stream_url_to_file(b.source_download_url(video_id, info), dest, max_bytes,
-                                  b.BUNNY_STREAM_PULL_ZONE)
+                                  b.BUNNY_STREAM_PULL_ZONE, {"Referer": referer})
 
     def remove(self, bucket: str, paths: list) -> None:
         if bucket != BUNNY_BUCKET:
