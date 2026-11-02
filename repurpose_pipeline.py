@@ -33,6 +33,7 @@ import creator_insights
 import hooks
 import speakers
 import video_analysis
+import visual_moments
 import video_map
 from audio_features import build_baseline, decode_pcm, delivery_score, frame_features, window_stats
 from repurpose_jobs import JobStore, LeaseLost, PermanentJobError, ShutdownRequested, TransientJobError
@@ -189,6 +190,8 @@ class RunState:
         self.speaker_map: Optional[speakers.SpeakerMap] = None
         self.dims: Optional[dict] = None
         self.fps: Optional[float] = None
+        self.has_audio: bool = True
+        self.mode: str = "speech"
 
     def punct(self, words: list, segments: list) -> list:
         if self.punctuated is None:
@@ -352,39 +355,6 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     return selection
 
 
-def _prompt_selection(ctx: JobContext, job: dict, duration: float) -> dict:
-    """Silent/music-only video with a creator description: one clip,
-    packaged from the description (see repurpose._highlights_from_prompt)."""
-    existing = (ctx.job.get("checkpoint") or {}).get("selection")
-    if existing:
-        return existing
-    import repurpose as r
-    ctx.stage("selecting", 0.52, "Writing your clip from your description")
-    h = r._highlights_from_prompt(job["creative_prompt"], duration)
-    clip = {
-        "start": h.start_time, "end": h.end_time, "score": h.score, "category": "prompt",
-        "title": h.suggested_title, "reason": h.reason, "hook_line": h.hook_line,
-        "caption": h.caption, "hashtags": h.hashtags, "transcript": "", "breakdown": {},
-    }
-    selection = {"clips": [clip], "summary": {"target": 1, "selected": 1, "note": "",
-                                              "from_creative_prompt": True}}
-    ctx.checkpoint({"selection": selection})
-    ctx.save_clip({"rank": 1, "status": "selected", "start_time": clip["start"], "end_time": clip["end"],
-                   "score": clip["score"], "category": "prompt", "title": clip["title"],
-                   "reason": clip["reason"], "hook_line": clip["hook_line"], "caption": clip["caption"],
-                   "hashtags": clip["hashtags"], "transcript": ""})
-    return selection
-
-
-class ClipRejected(Exception):
-    """A rendered clip failed quality control; the caller tries a spare."""
-
-    def __init__(self, failures: list, report: dict):
-        super().__init__(", ".join(failures))
-        self.failures = failures
-        self.report = report
-
-
 def _clip_words(punct: list, start: float, end: float) -> list:
     return [w for w in punct if start <= (float(w["start"]) + float(w["end"])) / 2 < end]
 
@@ -422,14 +392,16 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str,
     while True:
         attempts += 1
         try:
-            render_facts = clip_render.render(source, out, blocks, plan, ass_path, run.fps)
+            render_facts = clip_render.render(source, out, blocks, plan, ass_path, run.fps,
+                                              has_audio=run.has_audio)
         except clip_render.RenderError as e:
             raise RuntimeError(str(e))
         if not deps.qa:
             break
         c_words = _clip_words(punct, blocks[0][0], blocks[-1][1])
         report = clip_qa.run_qa(out, planned, render_facts, ass_text, overlay, clip.get("transcript", ""),
-                                [str(w.get("text") or w.get("word")) for w in c_words], work_dir)
+                                [str(w.get("text") or w.get("word")) for w in c_words], work_dir,
+                                mode=run.mode, has_audio=run.has_audio)
         qa_dict = report.to_dict()
         if report.passed:
             break
@@ -539,6 +511,69 @@ def _legacy_clip(clip: dict, rendered: dict) -> dict:
     }
 
 
+MIN_SPEECH_SECONDS = 30.0
+MIN_SPEECH_SHARE = 0.15
+
+
+def _has_real_speech(transcript: dict, duration: float) -> bool:
+    """Talking mode needs real talking. A few transcribed words over music or
+    kitchen noise (the speech model hears "lyrics" in noise) aren't enough."""
+    words = transcript.get("words") or []
+    if not words:
+        return False
+    spoken = clip_selection.speech_seconds(clip_selection.attach_punctuation(words, transcript.get("segments") or []))
+    return spoken >= MIN_SPEECH_SECONDS or spoken >= MIN_SPEECH_SHARE * duration and spoken >= 8.0
+
+
+def _visual_select(ctx: JobContext, deps: PipelineDeps, run: "RunState", path: str, duration: float,
+                   work_dir: str, guidance: str) -> dict:
+    existing = (ctx.job.get("checkpoint") or {}).get("selection")
+    if existing:
+        return existing
+    ctx.stage("analyzing", 0.45, "Watching the whole video")
+    timeline = run.visual(path, duration)
+    if not timeline.usable:
+        raise PermanentJobError("unreadable_video", "We couldn't read the picture in this video.",
+                                "visual analysis returned no frames")
+    ff = None
+    if run.has_audio:
+        try:
+            ff = frame_features(decode_pcm(path, timeout=900))
+        except Exception as e:
+            print(f"[WARN] sound analysis unavailable: {e}")
+
+    def frames_for(w):
+        try:
+            return clip_review.extract_frames(path, w, work_dir)
+        except Exception:
+            return []
+
+    ctx.stage("selecting", 0.53, "Finding the best-looking moments")
+    try:
+        result = visual_moments.select(timeline, duration, deps.llm, frames_for, ff=ff, guidance=guidance,
+                                       refine_cut=lambda t: clip_render.refine_cut(path, t),
+                                       min_score=deps.min_clip_score)
+    except clip_selection.SelectionUnavailable as e:
+        raise TransientJobError("selection_unavailable", "Clip selection is temporarily unavailable.", str(e))
+    summary = {"target": result.target, "selected": len(result.clips), "spares_kept": len(result.spares),
+               "min_score": deps.min_clip_score, "candidates_rejected": len(result.rejected),
+               "note": result.note, "mode": "visual", "analysis": result.analysis}
+    if not result.clips:
+        raise PermanentJobError("no_strong_moments", result.note,
+                                json.dumps({"rejected": result.rejected[:10], "analysis": result.analysis},
+                                           default=str)[:3500])
+    selection = {"clips": result.clips, "spares": result.spares, "summary": summary}
+    ctx.checkpoint({"selection": selection})
+    for rank, c in enumerate(result.clips, start=1):
+        ctx.save_clip({
+            "rank": rank, "status": "selected", "start_time": c["start"], "end_time": c["end"],
+            "score": c["score"], "score_breakdown": c["breakdown"], "category": c["category"],
+            "title": c["title"], "reason": c["reason"], "hook_line": "",
+            "caption": c["caption"], "hashtags": c["hashtags"], "transcript": "",
+        })
+    return selection
+
+
 def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
     job = ctx.job
     run = RunState()
@@ -556,26 +591,21 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
         except Exception:
             run.fps = None
 
+        run.has_audio = has_audio
         if has_audio:
             ctx.stage("transcribing", 0.10, "Transcribing")
             transcript = _transcript(ctx, deps, source, sha, duration, work)
-        elif job.get("creative_prompt"):
+        else:
             transcript = {"text": "", "segments": [], "words": []}
-        else:
-            raise PermanentJobError(
-                "no_audio",
-                "This video has no audio track — the AI Repurposer needs speech to find moments. "
-                "Try a video with sound, or describe the clip you want instead.")
 
-        if transcript.get("words"):
+        if _has_real_speech(transcript, duration):
             selection = _select(ctx, deps, run, source, transcript, duration, work)
-        elif job.get("creative_prompt"):
-            selection = _prompt_selection(ctx, job, duration)
         else:
-            raise PermanentJobError(
-                "no_speech",
-                "We couldn't hear any speech in this video, so there are no moments to clip. "
-                "Try a video with talking, or describe the clip you want instead.")
+            # No talking (or only a few words over music): pick by what is seen.
+            run.mode = "visual"
+            transcript = {"text": "", "segments": [], "words": []}
+            selection = _visual_select(ctx, deps, run, source, duration, work, job.get("creative_prompt") or "")
+        run.mode = (selection.get("summary") or {}).get("mode", run.mode) or "speech"
 
         existing = {c["rank"]: c for c in (ctx.store.get_job(ctx.job_id) or {}).get("clips", [])}
         queue = list(selection["clips"]) + list(selection.get("spares") or [])

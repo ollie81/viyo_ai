@@ -104,6 +104,13 @@ class Scripted:
         self.llm_calls += 1
         content = messages[-1]["content"]
         prompt = content if isinstance(content, str) else content[0]["text"]
+        if "NO talking" in prompt:
+            ids = [int(m.group(1)) for m in re.finditer(r"--- CANDIDATE (\d+)", prompt)]
+            return json.dumps({"reviews": [{"id": i, "appeal": 3 if self.weak else 8, "complete": 7,
+                                            "what": "Colour bars sweep across the screen.",
+                                            "title": "Colour bars sweep across the screen",
+                                            "caption": "Mesmerising.", "hashtags": ["satisfying"],
+                                            "verdict": "publish"} for i in ids]})
         if "analysing a long video" in prompt:
             return json.dumps({"summary": "A creator tells a story about freelancing and explains pricing.",
                                "format": "talk", "speakers": [], "topics": [], "avoid": []})
@@ -269,13 +276,34 @@ def test_persistent_transient_failure_exhausts_attempts_then_refunds_once(env):
 
 # ---------------------------------------------------------------- honest failures
 
-def test_video_without_audio_fails_permanently_with_refund(env):
+def test_video_without_any_sound_gets_visual_clips(env):
+    """No talking and no audio track: clips are chosen from the picture."""
+    env["worker"].deps.qa = True
+    uid, job_id = submit(env, video="silent")
+    assert env["worker"].run_once()
+    job = job_row(env, job_id)
+    assert job["status"] == "succeeded", job.get("last_error")
+    assert env["scripted"].transcribe_calls == 0, "nothing to transcribe"
+    assert balance(env, uid) == 60
+    result = job["result"]
+    assert result["selection"]["mode"] == "visual"
+    clip = result["clips"][0]
+    assert clip["highlight"]["category"] == "visual"
+    assert clip["highlight"]["overlay_hook"] == "Colour bars sweep across the screen"
+    info = probe(local_path(clip["processed_video_url"]))
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (1080, 1920)
+    assert any(s["codec_type"] == "audio" for s in info["streams"]), "silent track added for players"
+    r.RepurposeResponse(**result)
+
+
+def test_silent_video_with_no_good_moment_is_refunded(env):
+    env["scripted"].weak = True
     uid, job_id = submit(env, video="silent")
     env["worker"].run_once()
     job = job_row(env, job_id)
-    assert job["status"] == "failed" and job["error_code"] == "no_audio"
-    assert job["attempts"] == 1 and balance(env, uid) == 100
-    assert env["scripted"].transcribe_calls == 0
+    assert job["status"] == "failed" and job["error_code"] == "no_strong_moments"
+    assert balance(env, uid) == 100
 
 
 def test_no_strong_moments_is_reported_and_refunded_never_faked(env):

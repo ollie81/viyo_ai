@@ -303,7 +303,9 @@ def measure_loudness(inputs: list, filter_parts: list, concat_label: str) -> Opt
 
 
 def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Optional[str] = None,
-           src_fps: Optional[float] = None, timeout: float = 900) -> dict:
+           src_fps: Optional[float] = None, timeout: float = 900, has_audio: bool = True) -> dict:
+    if not has_audio:
+        return _render_silent(source, out, blocks, plan, ass_path, src_fps, timeout)
     inputs: list = []
     for b0, b1 in blocks:
         inputs += ["-ss", f"{b0:.3f}", "-t", f"{b1 - b0:.3f}", "-i", source]
@@ -338,3 +340,27 @@ def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Option
         raise RenderError(r.stderr[-600:])
     return {"loudness_two_pass": bool(measured), "measured_lufs_before": measured["input_i"] if measured else None,
             "target_lufs": TARGET_LUFS, "crop_mode": plan.mode, **plan.facts}
+
+
+def _render_silent(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Optional[str],
+                   src_fps: Optional[float], timeout: float) -> dict:
+    """Source without an audio track: render the picture and add a silent
+    stereo track, so every clip plays the same way in players and apps."""
+    inputs: list = []
+    for b0, b1 in blocks:
+        inputs += ["-ss", f"{b0:.3f}", "-t", f"{b1 - b0:.3f}", "-i", source]
+    n = len(blocks)
+    total = sum(b1 - b0 for b0, b1 in blocks)
+    inputs += ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
+    vparts = [f"[{i}:v]setpts=PTS-STARTPTS[v{i}]" for i in range(n)]
+    out_fps = 30 if (src_fps and src_fps > 31) else None
+    graph = ";".join(vparts + ["".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vcat]",
+                               _video_filter(plan, ass_path, out_fps) + "[vout]"])
+    cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", f"{n}:a",
+           "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-shortest", "-movflags", "+faststart", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RenderError(r.stderr[-600:])
+    return {"loudness_two_pass": False, "measured_lufs_before": None, "target_lufs": None,
+            "silent_source": True, "crop_mode": plan.mode, **plan.facts}

@@ -265,7 +265,8 @@ def check_hook(hook: Optional[str], clip_text_: str, clip_words: list) -> Check:
 
 
 def run_qa(path: str, planned_seconds: float, render_facts: dict, ass_text: Optional[str],
-           hook: Optional[str], transcript: str, clip_words: list, work_dir: str) -> QAReport:
+           hook: Optional[str], transcript: str, clip_words: list, work_dir: str,
+           mode: str = "speech", has_audio: bool = True) -> QAReport:
     rep = QAReport()
     fmt = check_format(path, planned_seconds)
     rep.checks.append(fmt)
@@ -274,7 +275,12 @@ def run_qa(path: str, planned_seconds: float, render_facts: dict, ass_text: Opti
     duration = float(fmt.detail.get("duration") or planned_seconds)
     rep.checks.append(check_black_bars(path, duration, work_dir, render_facts.get("crop_mode", "")))
     rep.checks.append(check_framing(render_facts))
-    rep.checks.append(check_loudness(path))
+    if has_audio:
+        rep.checks.append(check_loudness(path))
+    if mode == "visual":
+        # No speech to check: no captions to sync, and silence is expected.
+        # The on-screen title came from the frames, not a transcript.
+        return rep
     try:
         ff = af.frame_features(af.decode_pcm(path, timeout=300))
         rep.checks.extend(check_silence_and_edges(ff, duration))
