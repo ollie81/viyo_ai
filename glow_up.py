@@ -292,7 +292,7 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(_user_no_guest)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Glow Up is temporarily unavailable. Nothing was charged. ({e})")
+        raise HTTPException(status_code=503, detail="Glow Up is temporarily unavailable. Nothing was charged.")
 
     import coins
     admin = _get_admin()
@@ -304,8 +304,9 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(_user_no_guest)):
         raise HTTPException(status_code=400, detail=e.message + " Your coins were refunded.")
     except Exception as e:
         coins.refund_feature(admin, user_id, FEATURE, charged)
+        print(f"[WARN] glow up analysis failed for {user_id}: {str(e)[:500]}")
         raise HTTPException(status_code=502,
-                            detail=f"We couldn't create your suggestions right now. Your coins were refunded. ({e})")
+                            detail="We couldn't create your suggestions right now. Your coins were refunded.")
     finally:
         del jpeg, data_url    # the photo is never kept
 

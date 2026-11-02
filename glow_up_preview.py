@@ -185,7 +185,7 @@ async def preview(req: PreviewRequest, user_id: str = Depends(g._user_no_guest))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Previews are temporarily unavailable. Nothing was charged. ({e})")
+        raise HTTPException(status_code=503, detail="Previews are temporarily unavailable. Nothing was charged.")
 
     import coins
     charged = coins.spend_on_feature(admin, user_id, FEATURE)
@@ -202,8 +202,9 @@ async def preview(req: PreviewRequest, user_id: str = Depends(g._user_no_guest))
         out = stamp(out)
     except Exception as e:
         coins.refund_feature(admin, user_id, FEATURE, charged)
+        print(f"[WARN] glow up preview failed for {user_id}: {str(e)[:500]}")
         raise HTTPException(status_code=502,
-                            detail=f"We couldn't make a realistic preview this time. Your coins were refunded. ({e})")
+                            detail="We couldn't make a realistic preview this time. Your coins were refunded.")
     finally:
         del jpeg, data_url            # the selfie is never kept
 
