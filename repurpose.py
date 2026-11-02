@@ -1552,9 +1552,9 @@ def _check_bunny_source(user_id: str, source_path: str) -> None:
     if not bunny_stream.is_finished(info):
         raise HTTPException(status_code=400,
                             detail="Your video is still being prepared. Please try again in a moment.")
-    if int(info.get("storageSize") or 0) > MAX_INPUT_SIZE_BYTES:
-        raise HTTPException(status_code=400,
-                            detail=f"Video too large — max {MAX_INPUT_SIZE_BYTES // (1024 * 1024)} MB.")
+    # No size check on Bunny's own "storageSize": it counts every rendition Bunny
+    # made, so it dwarfs the original. The declared size was capped at ticket
+    # time and the download itself is capped while streaming.
     if float(info.get("length") or 0) > MAX_INPUT_DURATION_SECONDS:
         raise HTTPException(status_code=400,
                             detail=f"This video is too long — the limit is {MAX_INPUT_DURATION_SECONDS // 60} minutes.")

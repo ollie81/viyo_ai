@@ -206,7 +206,7 @@ class FakeBunny:
     def create_upload(self, title):
         import types
         vid = f"vid{len(self.videos) + 1:04d}"
-        self.videos[vid] = {"status": 4, "storageSize": 50_000_000, "length": 600}
+        self.videos[vid] = {"status": 4, "storageSize": 5_000_000_000, "length": 600}
         data = dict(video_id=vid, library_id="1", upload_endpoint="https://tus", authorization_signature="s",
                     authorization_expire=1, playback_url="p", thumbnail_url="t")
         return types.SimpleNamespace(video_id=vid, model_dump=lambda: data)
