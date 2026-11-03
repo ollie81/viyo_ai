@@ -141,7 +141,8 @@ class Scripted:
 @pytest.fixture
 def env(db, tmp_path, source_video):
     config = JobConfig(cost=40, daily_limit=50, max_attempts=3, heartbeat_seconds=1,
-                       stale_seconds=60, retry_base_delay_seconds=0, result_retention_days=30)
+                       stale_seconds=60, retry_base_delay_seconds=0, result_retention_days=30,
+                       free_trial_daily_cap=0, free_trial_max_seconds=600)
     store = JobStore(pg_rpc(connect()), config)
     storage = LocalStorage(str(tmp_path / "storage"))
     scripted = Scripted()
@@ -330,6 +331,17 @@ def test_clips_failing_quality_control_are_dropped_and_refunded(env, monkeypatch
     assert job["error_code"] == "no_clip_passed_quality_check", job.get("last_error")
     assert "loudness" in (job.get("last_error") or job.get("error_detail") or "")
     assert balance(env, uid) == 100
+
+
+def test_free_video_longer_than_the_limit_is_refused_before_any_ai_work(env):
+    import dataclasses
+    env["store"].config = dataclasses.replace(env["store"].config, free_trial_max_seconds=5)
+    uid, job_id = submit(env)
+    env["db"].execute("update repurpose_jobs set free_trial=true, coins_charged=0 where id=%s", (job_id,))
+    env["worker"].run_once()
+    job = job_row(env, job_id)
+    assert job["status"] == "failed" and job["error_code"] == "free_trial_too_long"
+    assert env["scripted"].transcribe_calls == 0, "no transcription paid for"
 
 
 def test_no_strong_moments_is_reported_and_refunded_never_faked(env):

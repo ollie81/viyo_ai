@@ -593,6 +593,12 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
 
         ctx.stage("probing", 0.08, "Checking your video")
         duration, has_audio = _probe(source, deps)
+        free_max = ctx.store.config.free_trial_max_seconds
+        if job.get("free_trial") and duration > free_max:
+            raise PermanentJobError(
+                "free_trial_too_long",
+                f"Your free video can be up to {free_max // 60} minutes long. Try a shorter video. "
+                f"Your free try is still available.", f"{duration:.0f}s")
         sha = _sha256(source)
         ctx.checkpoint({"source": {"sha256": sha, "duration": duration, "has_audio": has_audio}})
         try:

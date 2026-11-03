@@ -750,3 +750,76 @@ on conflict (id) do update
 select id, public, file_size_limit, allowed_mime_types
   from storage.buckets
  where id in ('repurpose-sources', 'processed-videos', 'posts-media');
+
+-- ---------------------------------------------------------------------
+-- Free first video: every account gets one AI Repurposer run without
+-- coins, capped app-wide per day. A free run that fails doesn't use up
+-- the free try. Safe to re-run.
+
+alter table public.repurpose_jobs add column if not exists free_trial boolean not null default false;
+
+create index if not exists repurpose_jobs_free_trial_idx
+  on public.repurpose_jobs (created_at) where free_trial;
+
+create or replace function public.repurpose_free_trial_status(p_user_id uuid, p_daily_cap int)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_used boolean;
+  v_today int;
+begin
+  select exists (select 1 from public.repurpose_jobs
+                  where user_id = p_user_id and free_trial and status <> 'failed') into v_used;
+  select count(*) into v_today from public.repurpose_jobs
+   where free_trial and created_at > now() - interval '24 hours';
+  return jsonb_build_object('eligible', not v_used and v_today < p_daily_cap,
+                            'used', v_used, 'sold_out', v_today >= p_daily_cap);
+end;
+$$;
+
+create or replace function public.repurpose_create_free_job(
+  p_user_id uuid,
+  p_daily_cap int,
+  p_daily_limit int,
+  p_max_attempts int,
+  p_source_kind text,
+  p_source_bucket text,
+  p_source_path text,
+  p_source_url text,
+  p_creative_prompt text,
+  p_client_request_id text
+) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_status jsonb;
+  v_out jsonb;
+begin
+  -- One free-job creation at a time app-wide, so the daily cap holds;
+  -- the profile row lock in repurpose_create_job serializes the user.
+  perform pg_advisory_xact_lock(hashtext('repurpose_free_trial'));
+  perform 1 from public.profiles where id = p_user_id for update;
+  if p_client_request_id is not null and exists (
+       select 1 from public.repurpose_jobs
+        where user_id = p_user_id and client_request_id = p_client_request_id) then
+    return public.repurpose_create_job(p_user_id, 0, p_daily_limit, p_max_attempts, p_source_kind,
+                                       p_source_bucket, p_source_path, p_source_url,
+                                       p_creative_prompt, p_client_request_id);
+  end if;
+  v_status := public.repurpose_free_trial_status(p_user_id, p_daily_cap);
+  if not (v_status->>'eligible')::boolean then
+    return jsonb_build_object('ok', false, 'error', 'free_trial_unavailable');
+  end if;
+  v_out := public.repurpose_create_job(p_user_id, 0, p_daily_limit, p_max_attempts, p_source_kind,
+                                       p_source_bucket, p_source_path, p_source_url,
+                                       p_creative_prompt, p_client_request_id);
+  if (v_out->>'ok')::boolean and (v_out->>'created')::boolean then
+    update public.repurpose_jobs set free_trial = true where id = (v_out->>'job_id')::uuid;
+    v_out := v_out || jsonb_build_object('free_trial', true);
+  end if;
+  return v_out;
+end;
+$$;
+
+revoke all on function public.repurpose_free_trial_status(uuid, int) from public, anon, authenticated;
+revoke all on function public.repurpose_create_free_job(uuid, int, int, int, text, text, text, text, text, text)
+  from public, anon, authenticated;

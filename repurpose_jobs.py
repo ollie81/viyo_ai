@@ -84,6 +84,10 @@ class JobConfig:
     transcript_retention_days: int = 30
     maintenance_interval_seconds: int = 300
     idle_poll_seconds: float = 3.0
+    # Free first video: one coin-free run per account, at most this many
+    # app-wide per day (0 turns it off), for videos up to this long.
+    free_trial_daily_cap: int = 20
+    free_trial_max_seconds: int = 600
 
     @classmethod
     def from_env(cls, cost: int) -> "JobConfig":
@@ -100,6 +104,8 @@ class JobConfig:
             orphan_upload_hours=_env_int("REPURPOSE_ORPHAN_UPLOAD_HOURS", cls.orphan_upload_hours),
             transcript_retention_days=_env_int("REPURPOSE_TRANSCRIPT_RETENTION_DAYS", cls.transcript_retention_days),
             maintenance_interval_seconds=_env_int("REPURPOSE_MAINTENANCE_SECONDS", cls.maintenance_interval_seconds),
+            free_trial_daily_cap=_env_int("REPURPOSE_FREE_TRIAL_DAILY_CAP", cls.free_trial_daily_cap),
+            free_trial_max_seconds=_env_int("REPURPOSE_FREE_TRIAL_MAX_SECONDS", cls.free_trial_max_seconds),
         )
 
 
@@ -133,6 +139,48 @@ class JobStore:
             "p_creative_prompt": creative_prompt,
             "p_client_request_id": client_request_id,
         })
+
+    def free_trial_status(self, user_id: str) -> dict:
+        """{'eligible', 'used', 'sold_out'}; never eligible when switched off
+        or when the database doesn't have the free-trial functions yet."""
+        off = {"eligible": False, "used": False, "sold_out": False}
+        if self.config.free_trial_daily_cap <= 0 or self.config.cost <= 0:
+            return off
+        try:
+            out = self._rpc("repurpose_free_trial_status", {
+                "p_user_id": user_id, "p_daily_cap": self.config.free_trial_daily_cap})
+        except Exception as e:
+            print(f"[WARN] free trial status unavailable: {e}")
+            return off
+        return out or off
+
+    def create_free_job(self, user_id: str, *, source_kind: str, source_bucket: Optional[str],
+                        source_path: Optional[str], source_url: Optional[str],
+                        creative_prompt: Optional[str], client_request_id: Optional[str]) -> Optional[dict]:
+        """Starts the account's free first video. None when it isn't available
+        (already used, sold out today, switched off, or not migrated yet), so
+        the caller falls back to the normal paid path."""
+        if self.config.free_trial_daily_cap <= 0 or self.config.cost <= 0:
+            return None
+        try:
+            out = self._rpc("repurpose_create_free_job", {
+                "p_user_id": user_id,
+                "p_daily_cap": self.config.free_trial_daily_cap,
+                "p_daily_limit": self.config.daily_limit,
+                "p_max_attempts": self.config.max_attempts,
+                "p_source_kind": source_kind,
+                "p_source_bucket": source_bucket,
+                "p_source_path": source_path,
+                "p_source_url": source_url,
+                "p_creative_prompt": creative_prompt,
+                "p_client_request_id": client_request_id,
+            })
+        except Exception as e:
+            print(f"[WARN] free trial unavailable: {e}")
+            return None
+        if not out or out.get("error") == "free_trial_unavailable":
+            return None
+        return out
 
     def get_job(self, job_id: str) -> Optional[dict]:
         return self._rpc("repurpose_get_job", {"p_job_id": job_id})

@@ -332,6 +332,7 @@ class RepurposeResponse(BaseModel):
 class RepurposeJobStartResponse(BaseModel):
     job_id: str
     status: str  # always "processing" — a job was just created
+    free_trial: bool = False   # this run is the account's free first video
 
 
 class RepurposeJobStatusResponse(BaseModel):
@@ -1600,13 +1601,15 @@ async def repurpose_video(
         _validate_storage_url(req.video_url)
         kind, bucket, path, url = "legacy_public_url", None, None, req.video_url
 
-    try:
-        outcome = store.create_job(
-            user_id, source_kind=kind, source_bucket=bucket, source_path=path, source_url=url,
-            creative_prompt=req.creative_prompt, client_request_id=req.client_request_id,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not start job: {e}")
+    job_args = dict(source_kind=kind, source_bucket=bucket, source_path=path, source_url=url,
+                    creative_prompt=req.creative_prompt, client_request_id=req.client_request_id)
+    # The account's free first video, when it's still available; otherwise paid.
+    outcome = store.create_free_job(user_id, **job_args)
+    if outcome is None:
+        try:
+            outcome = store.create_job(user_id, **job_args)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not start job: {e}")
 
     if not outcome.get("ok"):
         error = outcome.get("error")
@@ -1623,7 +1626,17 @@ async def repurpose_video(
         status, message = _CREATE_ERRORS.get(error, (400, "Could not start the job."))
         raise HTTPException(status_code=status, detail=message)
 
-    return RepurposeJobStartResponse(job_id=str(outcome["job_id"]), status="processing")
+    return RepurposeJobStartResponse(job_id=str(outcome["job_id"]), status="processing",
+                                     free_trial=bool(outcome.get("free_trial")))
+
+
+@router.get("/repurpose/free-trial")
+async def repurpose_free_trial(user_id: str = Depends(_get_current_user_id)):
+    """Whether this account's next AI Repurposer run is its free first video."""
+    status = _require_jobs().free_trial_status(user_id)
+    return {"eligible": bool(status.get("eligible")), "used": bool(status.get("used")),
+            "sold_out": bool(status.get("sold_out")),
+            "max_minutes": job_config.free_trial_max_seconds // 60}
 
 
 _LEGACY_STATUS = {"queued": "processing", "processing": "processing",

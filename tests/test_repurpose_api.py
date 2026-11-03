@@ -15,7 +15,7 @@ from repurpose_storage import SOURCE_BUCKET, LocalStorage
 
 @pytest.fixture
 def api(db, tmp_path, monkeypatch):
-    store = JobStore(pg_rpc(connect()), JobConfig(cost=40, daily_limit=5))
+    store = JobStore(pg_rpc(connect()), JobConfig(cost=40, daily_limit=5, free_trial_daily_cap=0))
     storage = LocalStorage(str(tmp_path))
     monkeypatch.setattr(r, "job_store", store)
     monkeypatch.setattr(r, "storage", storage)
@@ -74,7 +74,8 @@ def test_create_charges_once_per_client_request_id(api):
     first = client.post("/api/v1/repurpose", json=body)
     second = client.post("/api/v1/repurpose", json=body)
     assert first.status_code == second.status_code == 200
-    assert first.json() == second.json() == {"job_id": first.json()["job_id"], "status": "processing"}
+    assert first.json() == second.json() == {"job_id": first.json()["job_id"], "status": "processing",
+                                             "free_trial": False}
     bal = api["db"].execute("select points_balance from profiles where id=%s", (uid,)).fetchone()[0]
     assert bal == 60
 
@@ -277,3 +278,62 @@ def test_bunny_start_enforces_size_and_length_limits(api, bunny):
     resp = client.post("/api/v1/repurpose", json={"source_path": ticket["source_path"], "source": "bunny",
                                                   "client_request_id": "x-tap-0003"})
     assert resp.status_code == 400 and "too long" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------- free first video
+
+def _free(api, cap=2):
+    import dataclasses
+    api["store"].config = dataclasses.replace(api["store"].config, free_trial_daily_cap=cap)
+    return api
+
+
+def _bal(api, uid):
+    return api["db"].execute("select points_balance from profiles where id=%s", (uid,)).fetchone()[0]
+
+
+def test_first_video_is_free_once_then_paid(api):
+    _free(api)
+    uid = make_user(api["db"], 0)
+    client = api["as_user"](uid)
+    assert client.get("/api/v1/repurpose/free-trial").json()["eligible"] is True
+    first = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"],
+                                                   "client_request_id": "free-tap-1"})
+    assert first.status_code == 200 and first.json()["free_trial"] is True
+    again = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"],
+                                                   "client_request_id": "free-tap-1"})
+    assert again.json()["job_id"] == first.json()["job_id"], "same tap, same job"
+    assert _bal(api, uid) == 0
+    status = client.get("/api/v1/repurpose/free-trial").json()
+    assert status["eligible"] is False and status["used"] is True
+    second = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"]})
+    assert second.status_code == 402, "second video needs coins"
+
+
+def test_failed_free_video_gives_the_try_back(api):
+    _free(api)
+    uid = make_user(api["db"], 0)
+    client = api["as_user"](uid)
+    job = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"]}).json()
+    api["db"].execute("update repurpose_jobs set status='failed' where id=%s", (job["job_id"],))
+    assert client.get("/api/v1/repurpose/free-trial").json()["eligible"] is True
+    assert api["db"].execute("select repurpose_refund_job(%s)", (job["job_id"],)).fetchone()[0] == 0
+    assert _bal(api, uid) == 0, "nothing to refund on a free run"
+
+
+def test_free_videos_stop_at_the_daily_cap(api):
+    _free(api, cap=2)
+    users = [make_user(api["db"], 0) for _ in range(3)]
+    codes = [api["as_user"](u).post("/api/v1/repurpose",
+                                    json={"source_path": upload(api, u)["source_path"]}).status_code
+             for u in users]
+    assert codes == [200, 200, 402]
+    assert api["as_user"](users[2]).get("/api/v1/repurpose/free-trial").json()["sold_out"] is True
+
+
+def test_free_trial_switched_off_means_normal_charging(api):
+    uid = make_user(api["db"], 100)
+    client = api["as_user"](uid)
+    assert client.get("/api/v1/repurpose/free-trial").json()["eligible"] is False
+    resp = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"]})
+    assert resp.json()["free_trial"] is False and _bal(api, uid) == 60
