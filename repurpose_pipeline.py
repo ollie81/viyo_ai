@@ -355,6 +355,15 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     return selection
 
 
+class ClipRejected(Exception):
+    """A rendered clip failed quality control; the caller tries a spare."""
+
+    def __init__(self, failures: list, report: dict):
+        super().__init__(", ".join(failures))
+        self.failures = failures
+        self.report = report
+
+
 def _clip_words(punct: list, start: float, end: float) -> list:
     return [w for w in punct if start <= (float(w["start"]) + float(w["end"])) / 2 < end]
 

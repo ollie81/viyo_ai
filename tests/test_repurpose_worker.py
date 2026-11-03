@@ -306,6 +306,32 @@ def test_silent_video_with_no_good_moment_is_refunded(env):
     assert balance(env, uid) == 100
 
 
+def test_clips_failing_quality_control_are_dropped_and_refunded(env, monkeypatch):
+    """A clip QC rejects goes through the spare path; if none pass, refund."""
+    import clip_qa
+
+    class Fail:
+        name = "loudness"
+        detail = {}
+
+    class Report:
+        passed = False
+        failures = [Fail()]
+
+        def to_dict(self):
+            return {"passed": False, "checks": {"loudness": {"ok": False}}}
+
+    monkeypatch.setattr(clip_qa, "run_qa", lambda *a, **k: Report())
+    env["worker"].deps.qa = True
+    uid, job_id = submit(env)
+    env["worker"].run_once()
+    job = job_row(env, job_id)
+    assert job["status"] == "failed", job
+    assert job["error_code"] == "no_clip_passed_quality_check", job.get("last_error")
+    assert "loudness" in (job.get("last_error") or job.get("error_detail") or "")
+    assert balance(env, uid) == 100
+
+
 def test_no_strong_moments_is_reported_and_refunded_never_faked(env):
     env["scripted"].weak = True
     uid, job_id = submit(env)
