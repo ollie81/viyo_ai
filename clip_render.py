@@ -281,6 +281,18 @@ def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[flo
     return graph
 
 
+# loudnorm's linear mode can overshoot its true-peak target on speech with
+# sharp transients (measured: up to +2.8 dBTP), which clips on phones. A
+# lookahead limiter at -2 dBFS, running at loudnorm's 192 kHz output rate
+# where sample peaks track true peaks closely, keeps the result under the
+# QC ceiling with room for AAC overshoot. auto-level stays off so it never
+# raises the gain.
+_LIMIT = "alimiter=limit=0.79:attack=2:release=60:level=false"
+# Measured: a single alimiter still let isolated transients through (up to
+# +0.8 dBTP, depending on where they fall in a frame); a second pass catches them.
+PEAK_LIMITER = f"{_LIMIT},{_LIMIT}"
+
+
 def measure_loudness(inputs: list, filter_parts: list, concat_label: str) -> Optional[dict]:
     """First loudnorm pass on the concatenated audio only."""
     graph = ";".join(filter_parts + [f"[{concat_label}]highpass=f=70,loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11:"
@@ -331,7 +343,7 @@ def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Option
     graph = ";".join(vparts + aparts + [
         "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vcat][acat0]",
         _video_filter(plan, ass_path, out_fps) + "[vout]",
-        f"[acat0]highpass=f=70,{ln}[aout]"])
+        f"[acat0]highpass=f=70,{ln},{PEAK_LIMITER}[aout]"])
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart", out]
