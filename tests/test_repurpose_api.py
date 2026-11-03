@@ -302,7 +302,7 @@ def test_first_video_is_free_once_then_paid(api):
     assert first.status_code == 200 and first.json()["free_trial"] is True
     again = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"],
                                                    "client_request_id": "free-tap-1"})
-    assert again.json()["job_id"] == first.json()["job_id"], "same tap, same job"
+    assert again.json() == first.json(), "same tap, same job, same answer"
     assert _bal(api, uid) == 0
     status = client.get("/api/v1/repurpose/free-trial").json()
     assert status["eligible"] is False and status["used"] is True

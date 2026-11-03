@@ -1630,8 +1630,14 @@ async def repurpose_video(
         status, message = _CREATE_ERRORS.get(error, (400, "Could not start the job."))
         raise HTTPException(status_code=status, detail=message)
 
-    return RepurposeJobStartResponse(job_id=str(outcome["job_id"]), status="processing",
-                                     free_trial=bool(outcome.get("free_trial")))
+    free = bool(outcome.get("free_trial"))
+    if not free and outcome.get("created") is False:
+        # A re-sent tap returns the existing job; report whether that job was free.
+        try:
+            free = bool((store.get_job(str(outcome["job_id"])) or {}).get("free_trial"))
+        except Exception:
+            free = False
+    return RepurposeJobStartResponse(job_id=str(outcome["job_id"]), status="processing", free_trial=free)
 
 
 @router.get("/repurpose/free-trial")
