@@ -281,21 +281,50 @@ def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[flo
     return graph
 
 
-# loudnorm's linear mode can overshoot its true-peak target on speech with
-# sharp transients (measured: up to +2.8 dBTP), which clips on phones. A
-# lookahead limiter at -2 dBFS, running at loudnorm's 192 kHz output rate
-# where sample peaks track true peaks closely, keeps the result under the
-# QC ceiling with room for AAC overshoot. auto-level stays off so it never
-# raises the gain.
-_LIMIT = "alimiter=limit=0.79:attack=2:release=60:level=false"
-# Measured: a single alimiter still let isolated transients through (up to
-# +0.8 dBTP, depending on where they fall in a frame); a second pass catches them.
+# Peak control. Measured on real uploads: loudnorm's linear mode let speech
+# transients through at up to +2.8 dBTP, and the AAC encoder adds up to
+# ~1.7 dB on top of a clean signal. Two lookahead limiters at -3 dBFS
+# (one alone still missed isolated transients) keep the encoded clip under
+# the QC ceiling. auto-level stays off so the limiter never raises the gain.
+_LIMIT = "alimiter=limit=0.71:attack=2:release=60:level=false"
 PEAK_LIMITER = f"{_LIMIT},{_LIMIT}"
 
+# A stereo track with one channel effectively silent (a lav mic wired to one
+# side) plays in one ear only on headphones, and the AAC encoder overshoots
+# badly on it. Copy the live channel to both sides before normalising.
+DEAD_CHANNEL_DB = 30.0
 
-def measure_loudness(inputs: list, filter_parts: list, concat_label: str) -> Optional[dict]:
+
+def channel_fix(inputs: list, filter_parts: list, concat_label: str) -> str:
+    """'' normally; a pan filter (with trailing comma) when one stereo channel is silent."""
+    graph = ";".join(filter_parts + [f"[{concat_label}]astats=measure_overall=none:"
+                                     f"measure_perchannel=RMS_level[aout]"])
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-filter_complex", graph,
+                            "-map", "[aout]", "-vn", "-f", "null", "-"], capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return ""
+    levels = []
+    for m in re.finditer(r"RMS level dB:\s*(\S+)", r.stderr):
+        try:
+            levels.append(float(m.group(1)))
+        except ValueError:            # "-inf" parses; anything else is ignored
+            pass
+    if r.returncode != 0 or len(levels) != 2:
+        return ""
+    left, right = levels
+    if not np.isfinite(left) and not np.isfinite(right):
+        return ""
+    if not np.isfinite(right) or left - right > DEAD_CHANNEL_DB:
+        return "pan=stereo|c0=c0|c1=c0,"
+    if not np.isfinite(left) or right - left > DEAD_CHANNEL_DB:
+        return "pan=stereo|c0=c1|c1=c1,"
+    return ""
+
+
+def measure_loudness(inputs: list, filter_parts: list, concat_label: str, pre: str = "") -> Optional[dict]:
     """First loudnorm pass on the concatenated audio only."""
-    graph = ";".join(filter_parts + [f"[{concat_label}]highpass=f=70,loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11:"
+    graph = ";".join(filter_parts + [f"[{concat_label}]{pre}highpass=f=70,loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11:"
                                      f"print_format=json[aout]"])
     r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-filter_complex", graph, "-map", "[aout]",
                         "-vn", "-f", "null", "-"], capture_output=True, text=True, timeout=600)
@@ -331,7 +360,8 @@ def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Option
     n = len(blocks)
     cat_a = "".join(f"[a{i}]" for i in range(n))
     a_only = aparts + [f"{cat_a}concat=n={n}:v=0:a=1[acat]"]
-    measured = measure_loudness(inputs, a_only, "acat")
+    pre = channel_fix(inputs, a_only, "acat")
+    measured = measure_loudness(inputs, a_only, "acat", pre)
 
     out_fps = 30 if (src_fps and src_fps > 31) else None
     if measured:
@@ -343,14 +373,14 @@ def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Option
     graph = ";".join(vparts + aparts + [
         "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vcat][acat0]",
         _video_filter(plan, ass_path, out_fps) + "[vout]",
-        f"[acat0]highpass=f=70,{ln},{PEAK_LIMITER}[aout]"])
+        f"[acat0]{pre}highpass=f=70,{ln},{PEAK_LIMITER}[aout]"])
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart", out]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RenderError(r.stderr[-600:])
-    return {"loudness_two_pass": bool(measured), "measured_lufs_before": measured["input_i"] if measured else None,
+    return {"loudness_two_pass": bool(measured), "mono_channel_copied": bool(pre), "measured_lufs_before": measured["input_i"] if measured else None,
             "target_lufs": TARGET_LUFS, "crop_mode": plan.mode, **plan.facts}
 
 

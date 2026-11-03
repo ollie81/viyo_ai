@@ -343,3 +343,16 @@ def test_existing_hook_is_left_alone():
     c = hook_cand(TUTORIAL, overlay="Fresh breath first")
     stats = hk.fill_missing_hooks([c], lambda m: (_ for _ in ()).throw(AssertionError("no call needed")))
     assert c.overlay_hook == "Fresh breath first" and stats["already_had"] == 1
+
+
+def test_one_sided_stereo_is_copied_to_both_ears(tmp_path):
+    import subprocess
+    lopsided, balanced = str(tmp_path / "l.wav"), str(tmp_path / "b.wav")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=2", "-f", "lavfi",
+                    "-i", "anullsrc=r=44100:cl=mono:d=2", "-filter_complex", "[0][1]amerge=inputs=2",
+                    "-t", "2", lopsided], check=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=2", "-ac", "2", balanced],
+                   check=True)
+    parts = ["[0:a]anull[acat]"]
+    assert cr.channel_fix(["-i", lopsided], parts, "acat") == "pan=stereo|c0=c0|c1=c0,"
+    assert cr.channel_fix(["-i", balanced], parts, "acat") == ""
