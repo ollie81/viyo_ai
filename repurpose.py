@@ -62,7 +62,7 @@ from supabase import create_client, Client
 import clip_selection
 from coins import FEATURE_COSTS
 from repurpose_jobs import JobConfig, JobStore, TransientJobError, supabase_rpc
-from repurpose_storage import SOURCE_BUCKET, SupabaseStorage
+from repurpose_storage import CLIPS_BUCKET, SOURCE_BUCKET, SupabaseStorage
 
 # Speaker-tracking crop is optional: this app runs fine without it (the
 # reframe just falls back to a fixed center crop, same as before this
@@ -1638,6 +1638,51 @@ async def repurpose_video(
         except Exception:
             free = False
     return RepurposeJobStartResponse(job_id=str(outcome["job_id"]), status="processing", free_trial=free)
+
+
+class BrandedClipResponse(BaseModel):
+    url: str
+
+
+@router.post("/repurpose/{job_id}/clips/{rank}/branded", response_model=BrandedClipResponse)
+async def branded_clip(job_id: str, rank: int, user_id: str = Depends(_get_current_user_id)):
+    """A copy of one finished clip with a small "Made with Viyo" tag, for
+    downloading or sharing outside the app. Made once, then reused."""
+    import asyncio
+    import tempfile
+    import clip_brand
+
+    store = _require_jobs()
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    job = store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    if str(job.get("user_id")) != user_id:
+        raise HTTPException(status_code=403, detail="Not your clip.")
+    clip = next((c for c in job.get("clips") or [] if c.get("rank") == rank and c.get("video_url")), None)
+    if clip is None or storage is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    src_path = f"{user_id}/{job_id}/clip_{rank}.mp4"
+    out_path = f"{user_id}/{job_id}/clip_{rank}_viyo.mp4"
+    if storage.object_size(CLIPS_BUCKET, out_path):
+        return BrandedClipResponse(url=storage.public_url(CLIPS_BUCKET, out_path))
+
+    def make() -> str:
+        with tempfile.TemporaryDirectory(prefix="brand_") as work:
+            src, out = os.path.join(work, "in.mp4"), os.path.join(work, "out.mp4")
+            storage.download(CLIPS_BUCKET, src_path, src, 300 * 1024 * 1024)
+            clip_brand.brand_clip(src, out)
+            return storage.upload(CLIPS_BUCKET, out_path, out, "video/mp4")
+
+    try:
+        url = await asyncio.to_thread(make)
+    except Exception as e:
+        print(f"[WARN] branded clip {job_id}/{rank}: {e}")
+        raise HTTPException(status_code=502, detail="Couldn't add the Viyo tag right now. Try again.")
+    return BrandedClipResponse(url=url)
 
 
 @router.get("/repurpose/free-trial")

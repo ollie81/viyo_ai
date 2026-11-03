@@ -202,6 +202,11 @@ try:
 except Exception as _bench_import_error:
     print(f"[WARN] Repurpose benchmark router not loaded: {_bench_import_error}")
 try:
+    from share_pages import router as share_pages_router
+    app.include_router(share_pages_router)
+except Exception as _share_import_error:
+    print(f"[WARN] Share pages router not loaded: {_share_import_error}")
+try:
     from glow_up import router as glow_up_router
     app.include_router(glow_up_router)
     from glow_up_preview import router as glow_up_preview_router
