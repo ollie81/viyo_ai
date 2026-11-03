@@ -229,7 +229,7 @@ def recover_with_context(result: cs.SelectionResult, sentences: list, words: lis
             if s0 == c.start_sentence:
                 continue
             ext, why = cs.evaluate_candidate(_raw_from(c, s0), sentences, words, video_seconds, ctx)
-            if ext is None or ext.duration > cs.MAX_CLIP_SECONDS:
+            if ext is None or ext.duration > cs.MAX_CLIP_SECONDS or cs.over_length_choice(ext, ctx.length_pref):
                 continue
             ext.review = {"recovered_with_context_sentences": c.start_sentence - ext.start_sentence}
             tried.append(ext)

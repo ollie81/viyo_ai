@@ -48,6 +48,15 @@ MAX_CLIP_SECONDS = 60.0
 # the one inside the preferred range ranks first.
 LENGTH_PREFS = {"short": (15, 30), "medium": (30, 45), "long": (45, 60)}
 LENGTH_FIT_BONUS = 4
+# With Short or Medium chosen, a clip longer than this is only kept when it's
+# one of the strongest moments; otherwise a tighter moment is used instead.
+LENGTH_SOFT_CAP = {"short": 40.0, "medium": 55.0}
+LENGTH_CAP_EXEMPT_SCORE = 80
+
+
+def over_length_choice(c: "Candidate", length_pref: Optional[str]) -> bool:
+    cap = LENGTH_SOFT_CAP.get(length_pref or "")
+    return bool(cap) and c.duration > cap and c.score < LENGTH_CAP_EXEMPT_SCORE
 TARGET_MAX_CLIPS = 6
 # One clip per this much speech, at most. Keeps a 4-minute video from
 # being chopped into six thin slices just because six were asked for.
@@ -276,6 +285,13 @@ def _length_rule(length_pref: Optional[str]) -> str:
     if not band:
         return "- Target 15-55 seconds of speech.\n"
     lo, hi = band
+    cap = LENGTH_SOFT_CAP.get(length_pref or "")
+    if cap:
+        return (f"- The creator chose {length_pref.upper()} clips: about {lo}-{hi} seconds of speech. A clip "
+                "as short as 15 seconds is fine when the point lands in that time. Stay under "
+                f"{int(cap)} seconds: only an exceptional moment may run longer. When a good moment runs "
+                "long, find the tightest stretch of it that still opens on its hook and ends on its "
+                "payoff, and propose that instead. Never end before the payoff.\n")
     return (f"- The creator prefers clips of about {lo}-{hi} seconds of speech. Aim for that, but a "
             "strong hook and a complete payoff matter more: if a moment needs longer to land, keep it "
             f"(up to {int(MAX_CLIP_SECONDS)} seconds), and never cut a moment before its payoff just to "
@@ -864,6 +880,9 @@ def select_clips(candidates: list[Candidate], target: int, min_score: int,
         return c.score
 
     for c in sorted(candidates, key=rank, reverse=True):
+        if over_length_choice(c, length_pref):
+            rejected.append({"title": c.title, "score": c.score, "reason": "longer_than_chosen_length"})
+            continue
         if c.score < min_score:
             rejected.append({"title": c.title, "score": c.score, "reason": "below_quality_floor"})
             continue
@@ -893,6 +912,9 @@ def _selection_note(accepted: list, target: int, candidates: list, rejected: lis
     if not accepted and not candidates and rejected and all(r["reason"] in LENGTH_REASONS for r in rejected):
         return ("We couldn't cut any moment from this video into a clip of a usable length "
                 f"({int(MIN_CLIP_SECONDS)}-{int(MAX_CLIP_SECONDS)} seconds of speech).")
+    if not accepted and any(r["reason"] == "longer_than_chosen_length" for r in rejected):
+        return ("The good moments in this video need more time than the clip length you chose. "
+                "Try Medium, Long or Auto.")
     if not accepted:
         return ("No moment in this video was strong enough to work as a standalone short "
                 "without the rest of the video.")

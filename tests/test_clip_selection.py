@@ -528,5 +528,35 @@ def test_preferred_length_breaks_near_ties_but_never_beats_a_clearly_better_clip
 
 def test_length_preference_is_a_target_in_the_prompt_not_a_cut_off():
     rule = cs._length_rule("short")
-    assert "15-30 seconds" in rule and "never cut a moment before its payoff" in rule
+    assert "15-30 seconds" in rule and "Never end before the payoff" in rule
     assert cs._length_rule(None) == cs._length_rule("auto") == "- Target 15-55 seconds of speech.\n"
+
+
+def test_short_choice_keeps_long_clips_only_for_standout_moments():
+    long_ok = cand(0, 52, 75, "a good but long explanation of pricing work", "long_ok")
+    long_star = cand(100, 155, 85, "an exceptional story with a twist at the end", "star")
+    tight = cand(200, 222, 66, "a tight point about saying no to clients", "tight")
+    rejected = []
+    pick = cs.select_clips([long_ok, long_star, tight], target=3, min_score=55, rejected=rejected,
+                           total_speech=600, length_pref="short")
+    titles = {c.title for c in pick.clips}
+    assert titles == {"star", "tight"}, "52 s at 75 is too long for Short; 55 s at 85 is a standout"
+    assert {"title": "long_ok", "score": 75, "reason": "longer_than_chosen_length"} in rejected
+    medium = cs.select_clips([long_ok, tight], target=2, min_score=55, rejected=[], total_speech=600,
+                             length_pref="medium")
+    assert {c.title for c in medium.clips} == {"long_ok", "tight"}, "52 s fits Medium's 55 s limit"
+    auto = cs.select_clips([long_ok, tight], target=2, min_score=55, rejected=[], total_speech=600)
+    assert len(auto.clips) == 2
+
+
+def test_short_choice_with_only_long_moments_says_so():
+    only_long = cand(0, 50, 75, "a good but long explanation of pricing work", "long")
+    pick = cs.select_clips([only_long], target=1, min_score=55, rejected=[], total_speech=300, length_pref="short")
+    assert not pick.clips and "Try Medium, Long or Auto" in pick.note
+
+
+def test_short_prompt_allows_15_second_clips_and_names_the_limit():
+    rule = cs._length_rule("short")
+    assert "as short as 15 seconds" in rule and "Stay under 40 seconds" in rule
+    assert "Stay under 55 seconds" in cs._length_rule("medium")
+    assert "Stay under" not in cs._length_rule("long")
