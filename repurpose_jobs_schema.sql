@@ -200,6 +200,12 @@ create trigger repurpose_clips_touch before update on public.repurpose_clips
 -- Returns {"ok": true, "job_id", "created", "coins_charged"} or
 -- {"ok": false, "error": "insufficient_coins" | "daily_limit" |
 --  "profile_not_found" | "unknown_upload" | "upload_already_used", ...}.
+alter table public.repurpose_jobs add column if not exists clip_length text;
+
+-- The signature gained p_clip_length; drop the old one so there is no
+-- ambiguous overload left behind on databases that already had it.
+drop function if exists public.repurpose_create_job(uuid, int, int, int, text, text, text, text, text, text);
+
 create or replace function public.repurpose_create_job(
   p_user_id uuid,
   p_cost int,
@@ -210,7 +216,8 @@ create or replace function public.repurpose_create_job(
   p_source_path text,
   p_source_url text,
   p_creative_prompt text,
-  p_client_request_id text
+  p_client_request_id text,
+  p_clip_length text default null
 ) returns jsonb
 language plpgsql security definer set search_path = public as $$
 declare
@@ -270,10 +277,11 @@ begin
 
   insert into public.repurpose_jobs (
     user_id, client_request_id, source_kind, source_bucket, source_path,
-    source_url, creative_prompt, coins_charged, max_attempts
+    source_url, creative_prompt, coins_charged, max_attempts, clip_length
   ) values (
     p_user_id, p_client_request_id, p_source_kind, p_source_bucket, p_source_path,
-    p_source_url, p_creative_prompt, p_cost, p_max_attempts
+    p_source_url, p_creative_prompt, p_cost, p_max_attempts,
+    case when p_clip_length in ('short', 'medium', 'long') then p_clip_length end
   ) returning id into v_job_id;
 
   if p_cost > 0 then
@@ -703,7 +711,7 @@ grant execute on function public.repurpose_expired_jobs(int) to service_role;
 grant execute on function public.repurpose_delete_jobs(uuid[]) to service_role;
 grant execute on function public.repurpose_prune_transcripts(int) to service_role;
 
-revoke all on function public.repurpose_create_job(uuid, int, int, int, text, text, text, text, text, text) from public, anon, authenticated;
+revoke all on function public.repurpose_create_job(uuid, int, int, int, text, text, text, text, text, text, text) from public, anon, authenticated;
 revoke all on function public.repurpose_claim_job(text, int) from public, anon, authenticated;
 revoke all on function public.repurpose_heartbeat(uuid, uuid, text, double precision, text, jsonb) from public, anon, authenticated;
 revoke all on function public.repurpose_refund_job(uuid) from public, anon, authenticated;
@@ -712,7 +720,7 @@ revoke all on function public.repurpose_fail_job(uuid, uuid, text, text, text, b
 revoke all on function public.repurpose_release_job(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.repurpose_sweep(int, int) from public, anon, authenticated;
 
-grant execute on function public.repurpose_create_job(uuid, int, int, int, text, text, text, text, text, text) to service_role;
+grant execute on function public.repurpose_create_job(uuid, int, int, int, text, text, text, text, text, text, text) to service_role;
 grant execute on function public.repurpose_claim_job(text, int) to service_role;
 grant execute on function public.repurpose_heartbeat(uuid, uuid, text, double precision, text, jsonb) to service_role;
 grant execute on function public.repurpose_refund_job(uuid) to service_role;
@@ -777,6 +785,8 @@ begin
 end;
 $$;
 
+drop function if exists public.repurpose_create_free_job(uuid, int, int, int, text, text, text, text, text, text);
+
 create or replace function public.repurpose_create_free_job(
   p_user_id uuid,
   p_daily_cap int,
@@ -787,7 +797,8 @@ create or replace function public.repurpose_create_free_job(
   p_source_path text,
   p_source_url text,
   p_creative_prompt text,
-  p_client_request_id text
+  p_client_request_id text,
+  p_clip_length text default null
 ) returns jsonb
 language plpgsql security definer set search_path = public as $$
 declare
@@ -803,7 +814,7 @@ begin
         where user_id = p_user_id and client_request_id = p_client_request_id) then
     return public.repurpose_create_job(p_user_id, 0, p_daily_limit, p_max_attempts, p_source_kind,
                                        p_source_bucket, p_source_path, p_source_url,
-                                       p_creative_prompt, p_client_request_id);
+                                       p_creative_prompt, p_client_request_id, p_clip_length);
   end if;
   v_status := public.repurpose_free_trial_status(p_user_id, p_daily_cap);
   if not (v_status->>'eligible')::boolean then
@@ -811,7 +822,7 @@ begin
   end if;
   v_out := public.repurpose_create_job(p_user_id, 0, p_daily_limit, p_max_attempts, p_source_kind,
                                        p_source_bucket, p_source_path, p_source_url,
-                                       p_creative_prompt, p_client_request_id);
+                                       p_creative_prompt, p_client_request_id, p_clip_length);
   if (v_out->>'ok')::boolean and (v_out->>'created')::boolean then
     update public.repurpose_jobs set free_trial = true where id = (v_out->>'job_id')::uuid;
     v_out := v_out || jsonb_build_object('free_trial', true);
@@ -821,5 +832,8 @@ end;
 $$;
 
 revoke all on function public.repurpose_free_trial_status(uuid, int) from public, anon, authenticated;
-revoke all on function public.repurpose_create_free_job(uuid, int, int, int, text, text, text, text, text, text)
+revoke all on function public.repurpose_create_free_job(uuid, int, int, int, text, text, text, text, text, text, text)
   from public, anon, authenticated;
+grant execute on function public.repurpose_free_trial_status(uuid, int) to service_role;
+grant execute on function public.repurpose_create_free_job(uuid, int, int, int, text, text, text, text, text, text, text)
+  to service_role;

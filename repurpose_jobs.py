@@ -124,10 +124,23 @@ class JobStore:
             "p_bytes": size, "p_content_type": content_type,
         })
 
+    def _rpc_with_length(self, fn: str, args: dict, clip_length: Optional[str]):
+        """Calls fn with p_clip_length when a length was chosen. A database
+        that predates the clip-length migration rejects the parameter, so
+        retry without it (the job then uses the automatic length)."""
+        if not clip_length:
+            return self._rpc(fn, args)
+        try:
+            return self._rpc(fn, {**args, "p_clip_length": clip_length})
+        except Exception as e:
+            print(f"[WARN] {fn} without clip length (database not migrated?): {e}")
+            return self._rpc(fn, args)
+
     def create_job(self, user_id: str, *, source_kind: str, source_bucket: Optional[str],
                    source_path: Optional[str], source_url: Optional[str],
-                   creative_prompt: Optional[str], client_request_id: Optional[str]) -> dict:
-        return self._rpc("repurpose_create_job", {
+                   creative_prompt: Optional[str], client_request_id: Optional[str],
+                   clip_length: Optional[str] = None) -> dict:
+        return self._rpc_with_length("repurpose_create_job", {
             "p_user_id": user_id,
             "p_cost": self.config.cost,
             "p_daily_limit": self.config.daily_limit,
@@ -138,7 +151,7 @@ class JobStore:
             "p_source_url": source_url,
             "p_creative_prompt": creative_prompt,
             "p_client_request_id": client_request_id,
-        })
+        }, clip_length)
 
     def free_trial_status(self, user_id: str) -> dict:
         """{'eligible', 'used', 'sold_out'}; never eligible when switched off
@@ -156,14 +169,15 @@ class JobStore:
 
     def create_free_job(self, user_id: str, *, source_kind: str, source_bucket: Optional[str],
                         source_path: Optional[str], source_url: Optional[str],
-                        creative_prompt: Optional[str], client_request_id: Optional[str]) -> Optional[dict]:
+                        creative_prompt: Optional[str], client_request_id: Optional[str],
+                        clip_length: Optional[str] = None) -> Optional[dict]:
         """Starts the account's free first video. None when it isn't available
         (already used, sold out today, switched off, or not migrated yet), so
         the caller falls back to the normal paid path."""
         if self.config.free_trial_daily_cap <= 0 or self.config.cost <= 0:
             return None
         try:
-            out = self._rpc("repurpose_create_free_job", {
+            out = self._rpc_with_length("repurpose_create_free_job", {
                 "p_user_id": user_id,
                 "p_daily_cap": self.config.free_trial_daily_cap,
                 "p_daily_limit": self.config.daily_limit,
@@ -174,7 +188,7 @@ class JobStore:
                 "p_source_url": source_url,
                 "p_creative_prompt": creative_prompt,
                 "p_client_request_id": client_request_id,
-            })
+            }, clip_length)
         except Exception as e:
             print(f"[WARN] free trial unavailable: {e}")
             return None

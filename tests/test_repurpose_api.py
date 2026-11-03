@@ -337,3 +337,16 @@ def test_free_trial_switched_off_means_normal_charging(api):
     assert client.get("/api/v1/repurpose/free-trial").json()["eligible"] is False
     resp = client.post("/api/v1/repurpose", json={"source_path": upload(api, uid)["source_path"]})
     assert resp.json()["free_trial"] is False and _bal(api, uid) == 60
+
+
+def test_clip_length_choice_is_saved_on_the_job(api):
+    uid = make_user(api["db"], 200)
+    client = api["as_user"](uid)
+    for choice, saved in [("short", "short"), ("auto", None), (None, None)]:
+        body = {"source_path": upload(api, uid)["source_path"]}
+        if choice:
+            body["clip_length"] = choice
+        job = client.post("/api/v1/repurpose", json=body).json()["job_id"]
+        row = api["db"].execute("select clip_length from repurpose_jobs where id=%s", (job,)).fetchone()
+        assert row[0] == saved, choice
+    assert client.post("/api/v1/repurpose", json={"source_path": "x", "clip_length": "huge"}).status_code == 422

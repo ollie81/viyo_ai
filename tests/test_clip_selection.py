@@ -509,3 +509,24 @@ def test_list_marker_opening_is_dropped_but_real_first_words_are_kept():
     assert cs._trim_leading_fillers(b, 0, len(b) - 1) == 0
     c = w(["So,", "next,", "you", "want", "to", "relax."])
     assert cs._trim_leading_fillers(c, 0, len(c) - 1) == 2
+
+
+def test_preferred_length_breaks_near_ties_but_never_beats_a_clearly_better_clip():
+    long_good = cand(0, 55, 72, "a long story with a real payoff at the very end", "long")
+    short_close = cand(100, 125, 70, "a short sharp insight about pricing work", "short")
+    pick = cs.select_clips([long_good, short_close], target=1, min_score=55, rejected=[],
+                           total_speech=600, length_pref="short")
+    assert pick.clips[0].title == "short", "about as good and the length asked for"
+    long_better = cand(0, 55, 85, "a long story with a real payoff at the very end", "long")
+    pick = cs.select_clips([long_better, short_close], target=1, min_score=55, rejected=[],
+                           total_speech=600, length_pref="short")
+    assert pick.clips[0].title == "long", "a clearly stronger moment keeps its length"
+    pick = cs.select_clips([long_good, short_close], target=1, min_score=55, rejected=[],
+                           total_speech=600)
+    assert pick.clips[0].title == "long", "no preference: best score wins"
+
+
+def test_length_preference_is_a_target_in_the_prompt_not_a_cut_off():
+    rule = cs._length_rule("short")
+    assert "15-30 seconds" in rule and "never cut a moment before its payoff" in rule
+    assert cs._length_rule(None) == cs._length_rule("auto") == "- Target 15-55 seconds of speech.\n"

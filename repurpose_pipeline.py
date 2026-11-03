@@ -314,6 +314,9 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     if deps.analysis:
         amb, sentences, facts = _analyse_media(ctx, deps, run, path, words, segments, duration,
                                                ctx.job["user_id"])
+    pref = ctx.job.get("clip_length")
+    amb.length_pref = pref if pref in clip_selection.LENGTH_PREFS else None
+    facts["clip_length"] = amb.length_pref or "auto"
 
     ctx.stage("selecting", 0.53, "Finding the strongest moments")
     try:

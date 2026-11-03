@@ -52,7 +52,7 @@ import subprocess
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
@@ -241,6 +241,9 @@ class RepurposeRequest(BaseModel):
     # look like instead of the upload being rejected outright. See
     # _highlights_from_prompt.
     creative_prompt: Optional[str] = Field(None, max_length=500)
+    # Preferred clip length. A target, not a cut-off: a moment that needs a
+    # little longer to land its hook and payoff keeps it (60 s maximum).
+    clip_length: Optional[Literal["auto", "short", "medium", "long"]] = None
 
 
 class HighlightSegment(BaseModel):
@@ -1602,7 +1605,8 @@ async def repurpose_video(
         kind, bucket, path, url = "legacy_public_url", None, None, req.video_url
 
     job_args = dict(source_kind=kind, source_bucket=bucket, source_path=path, source_url=url,
-                    creative_prompt=req.creative_prompt, client_request_id=req.client_request_id)
+                    creative_prompt=req.creative_prompt, client_request_id=req.client_request_id,
+                    clip_length=None if req.clip_length in (None, "auto") else req.clip_length)
     # The account's free first video, when it's still available; otherwise paid.
     outcome = store.create_free_job(user_id, **job_args)
     if outcome is None:

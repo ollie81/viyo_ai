@@ -42,6 +42,12 @@ import clip_text
 
 MIN_CLIP_SECONDS = 12.0
 MAX_CLIP_SECONDS = 60.0
+# The creator's preferred length (seconds of speech). A target only: the
+# hard limits above still apply, and a moment that needs longer to land its
+# hook and payoff keeps it. Between two moments of about the same quality,
+# the one inside the preferred range ranks first.
+LENGTH_PREFS = {"short": (15, 30), "medium": (30, 45), "long": (45, 60)}
+LENGTH_FIT_BONUS = 4
 TARGET_MAX_CLIPS = 6
 # One clip per this much speech, at most. Keeps a 4-minute video from
 # being chopped into six thin slices just because six were asked for.
@@ -265,9 +271,20 @@ def _speaker_prefix(label: Optional[str]) -> str:
     return f"{label} " if label else ""
 
 
+def _length_rule(length_pref: Optional[str]) -> str:
+    band = LENGTH_PREFS.get(length_pref or "")
+    if not band:
+        return "- Target 15-55 seconds of speech.\n"
+    lo, hi = band
+    return (f"- The creator prefers clips of about {lo}-{hi} seconds of speech. Aim for that, but a "
+            "strong hook and a complete payoff matter more: if a moment needs longer to land, keep it "
+            f"(up to {int(MAX_CLIP_SECONDS)} seconds), and never cut a moment before its payoff just to "
+            "make it shorter.\n")
+
+
 def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds: float,
                      max_candidates: int, speaker_labels: Optional[list] = None,
-                     video_map: Optional[dict] = None) -> str:
+                     video_map: Optional[dict] = None, length_pref: Optional[str] = None) -> str:
     lines = [
         f"S{s.id} {_speaker_prefix(speaker_labels[s.id] if speaker_labels else None)}"
         f"[{_fmt_time(s.start)}-{_fmt_time(s.end)}] {s.text}"
@@ -310,7 +327,7 @@ def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds:
         "- It needs a beginning, a middle and an end: it opens on its hook, builds, and stops when "
         "the thought completes (the punchline, the answer, the lesson, the turn). Never end "
         "before the payoff, and never start mid-thought.\n"
-        "- Target 15-55 seconds of speech.\n"
+        + _length_rule(length_pref) +
         "- It must make sense to someone who has not seen the rest of the video. If the first "
         "sentence is an answer to a question another speaker asked, or leans on something said "
         "earlier ('that', 'he', 'like I said'), set opens_mid_conversation true, unless the "
@@ -369,7 +386,7 @@ LLMFn = Callable[[list[dict]], str]
 
 def propose_candidates(sentences: list[Sentence], video_seconds: float, target: int,
                        llm: LLMFn, total_speech: float, speaker_labels: Optional[list] = None,
-                       video_map: Optional[dict] = None) -> list[dict]:
+                       video_map: Optional[dict] = None, length_pref: Optional[str] = None) -> list[dict]:
     """
     Raw candidate dicts (sentence ranges + rubric + packaging) from every
     window. Raises SelectionUnavailable if any window can't be read after
@@ -389,7 +406,8 @@ def propose_candidates(sentences: list[Sentence], video_seconds: float, target: 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _proposal_prompt(
-                sentences, lo, hi, video_seconds, window_quota(lo, hi), speaker_labels, video_map)},
+                sentences, lo, hi, video_seconds, window_quota(lo, hi), speaker_labels, video_map,
+                length_pref)},
         ]
         last_error: Optional[Exception] = None
         for _ in range(2):
@@ -430,6 +448,8 @@ class AnalysisContext:
     video_map: Optional[dict] = None
     # (candidate) -> (points added to the score, info); from creator history
     creator_prior: Optional[Callable] = None
+    # "short" / "medium" / "long" (see LENGTH_PREFS); None lets the moment decide
+    length_pref: Optional[str] = None
 
 
 @dataclass
@@ -829,13 +849,21 @@ def _conflicts(c: Candidate, others: list[Candidate]) -> Optional[str]:
 
 def select_clips(candidates: list[Candidate], target: int, min_score: int,
                  rejected: list[dict], total_speech: float,
-                 spares: int = SPARE_CANDIDATES) -> SelectionResult:
+                 spares: int = SPARE_CANDIDATES, length_pref: Optional[str] = None) -> SelectionResult:
     """Best-first: the first `target` that clear every gate, then up to
     `spares` more that also clear them (to replace a clip that later fails
     review or rendering QC)."""
     accepted: list[Candidate] = []
     reserve: list[Candidate] = []
-    for c in sorted(candidates, key=lambda c: c.score, reverse=True):
+    band = LENGTH_PREFS.get(length_pref or "")
+
+    def rank(c: Candidate) -> float:
+        # Ordering only: the quality floors below still use the real score.
+        if band and band[0] <= c.speech_duration <= band[1]:
+            return c.score + LENGTH_FIT_BONUS
+        return c.score
+
+    for c in sorted(candidates, key=rank, reverse=True):
         if c.score < min_score:
             rejected.append({"title": c.title, "score": c.score, "reason": "below_quality_floor"})
             continue
@@ -887,7 +915,7 @@ def run_selection(words: list[dict], segments: list[dict], video_seconds: float,
         ctx.speaker_labels = None   # stale labels for a different sentence split: don't use
 
     raw = propose_candidates(sentences, video_seconds, target, llm, total_speech,
-                             ctx.speaker_labels, ctx.video_map)
+                             ctx.speaker_labels, ctx.video_map, ctx.length_pref)
     rejected: list[dict] = []
     candidates: list[Candidate] = []
     seen_ranges: set = set()
@@ -902,7 +930,8 @@ def run_selection(words: list[dict], segments: list[dict], video_seconds: float,
             continue
         seen_ranges.add(span)
         candidates.append(c)
-    result = select_clips(candidates, target, min_score, rejected, total_speech)
+    result = select_clips(candidates, target, min_score, rejected, total_speech,
+                          length_pref=ctx.length_pref)
     result.analysis = {"candidates_evaluated": len(raw),
                        "candidates_passing_checks": len(candidates),
                        "sentences": len(sentences),
