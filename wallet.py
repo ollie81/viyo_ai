@@ -349,6 +349,20 @@ def _settle(request_id: str, new_status: str, earnings_status: str, note: Option
          .eq("withdrawal_request_id", request_id).execute())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not update withdrawal: {e}")
+    try:
+        from notify import notify
+        usd = float(req.get("usd_amount") or coins_to_usd(req.get("coins") or 0))
+        if new_status == "paid":
+            notify(str(req["creator_id"]), "payout_paid",
+                   f"Your ${usd:.2f} payout was sent to {req.get('payout_destination') or 'you'}.",
+                   entity_id=request_id, push_title="Payout sent 💸", admin=supabase_admin)
+        else:
+            reason = f" Note: {note}" if note else ""
+            notify(str(req["creator_id"]), "payout_rejected",
+                   f"Your ${usd:.2f} withdrawal couldn't be sent. Check your payout details and request again.{reason}",
+                   entity_id=request_id, push_title="Withdrawal not sent", admin=supabase_admin)
+    except Exception as e:
+        print(f"[WARN] payout notification failed for {request_id}: {e}")
     return {"id": request_id, "status": new_status}
 
 

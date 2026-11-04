@@ -213,6 +213,9 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
 
     # Cash only from the bought part of what the viewer spent.
     creator_share = round(bought * CREATOR_SHARE)
+    _notify_unlock(episode["user_id"], user_id, post_id,
+                   series_title if series.get("content_type") in SINGLE_ASSET_CONTENT_TYPES
+                   else f"{series_title}, episode {episode_number}", creator_share)
     if creator_share <= 0:
         return UnlockEpisodeResponse(unlocked=True, coins_spent=price)
 
@@ -239,6 +242,19 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
                 )
 
     return UnlockEpisodeResponse(unlocked=True, coins_spent=price)
+
+
+def _notify_unlock(creator_id: str, viewer_id: str, post_id: str, what: str, earned_coins: int) -> None:
+    """Tells the creator a viewer unlocked their work, and what they earned."""
+    try:
+        from notify import display_name, notify
+        from wallet import coins_to_usd
+        who = display_name(viewer_id, supabase_admin)
+        earned = f" You earned ${coins_to_usd(earned_coins):.2f}." if earned_coins > 0 else ""
+        notify(creator_id, "unlock", f"{who} unlocked {what}.{earned}", actor_id=viewer_id, post_id=post_id,
+               push_title="Someone unlocked your drama 🎬", admin=supabase_admin)
+    except Exception as e:
+        print(f"[WARN] unlock notification for {creator_id} failed: {e}")
 
 
 def _bought_coins_spent(user_id: str, price: float) -> float:
@@ -376,6 +392,8 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
     # Cash only from the bought part, spread evenly over the episodes.
     creator_share = round(bought / len(claimed_ids) * CREATOR_SHARE)
     creator_id = series["user_id"]
+    _notify_unlock(creator_id, user_id, claimed_ids[0],
+                   f"{len(claimed_ids)} episodes of {series_title}", creator_share * len(claimed_ids))
     for post_id in (claimed_ids if creator_share > 0 else []):
         for attempt in range(2):
             try:

@@ -67,8 +67,11 @@ class Heartbeat(threading.Thread):
 
 class Worker:
     def __init__(self, store: JobStore, deps: PipelineDeps, config: JobConfig,
-                 worker_id: Optional[str] = None, maintenance=None):
+                 worker_id: Optional[str] = None, maintenance=None, notifier=None):
         self.store, self.deps, self.config = store, deps, config
+        # (user_id, type, message, job_id) -> None; tells the creator when
+        # clips are ready or a job failed for good. None in tests.
+        self.notifier = notifier
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self.maintenance = maintenance
         self._stop = threading.Event()
@@ -128,8 +131,12 @@ class Worker:
         try:
             result = process_job(ctx, self.deps)
             if self.store.complete(job["id"], job["lease_token"], result):
+                n = len(result.get("clips", []))
                 print(f"[INFO] job {job['id']} succeeded in {time.monotonic() - started:.0f}s "
-                      f"with {len(result.get('clips', []))} clips")
+                      f"with {n} clips")
+                self._notify(job, "clips_ready",
+                             f"Your {n} AI clip{'s' if n != 1 else ''} {'are' if n != 1 else 'is'} ready. "
+                             "Tap to watch, download or post.")
             else:
                 print(f"[WARN] job {job['id']} finished but the lease was gone; result discarded")
         except LeaseLost:
@@ -161,8 +168,20 @@ class Worker:
         elif outcome.get("final"):
             print(f"[INFO] job {job['id']} failed permanently ({error.code}); "
                   f"refunded {outcome.get('refunded', 0)} coins")
+            refunded = outcome.get("refunded") or 0
+            self._notify(job, "clips_failed",
+                         f"We couldn't make clips from your video: {error.user_message}"
+                         + (f" Your {refunded} coins were refunded." if refunded else ""))
         else:
             print(f"[INFO] job {job['id']} will retry ({error.code}): {error.internal[:300]}")
+
+    def _notify(self, job: dict, notif_type: str, message: str) -> None:
+        if self.notifier is None:
+            return
+        try:
+            self.notifier(str(job["user_id"]), notif_type, message, str(job["id"]))
+        except Exception as e:
+            print(f"[WARN] job {job['id']}: notification failed: {e}")
 
     def _maybe_maintain(self) -> None:
         if self.maintenance is None:
@@ -209,7 +228,12 @@ def build_production_worker() -> Worker:
         caption_style=os.environ.get("REPURPOSE_CAPTION_STYLE", "bold"),
         creator_prior_for=lambda user_id: creator_insights.load_prior(r.supabase_admin, user_id),
     )
-    return Worker(store, deps, config, maintenance=lambda: run_maintenance(store, storage))
+    def notifier(user_id: str, notif_type: str, message: str, job_id: str) -> None:
+        from notify import notify
+        title = "Your clips are ready 🎬" if notif_type == "clips_ready" else "Couldn't make your clips"
+        notify(user_id, notif_type, message, entity_id=job_id, push_title=title, admin=r.supabase_admin)
+
+    return Worker(store, deps, config, maintenance=lambda: run_maintenance(store, storage), notifier=notifier)
 
 
 def main() -> None:
