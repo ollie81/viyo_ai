@@ -240,7 +240,10 @@ app.add_middleware(
     # fetch" shape as the allow_methods bug below. Scoped to this
     # project's own "viyo"-prefixed Vercel subdomains specifically,
     # not *.vercel.app generally.
-    allow_origin_regex=r"^https://viyo[a-z0-9-]*\.vercel\.app$",
+    # Plus Viyo's own domain (viyo.site and www.viyo.site), where the web
+    # app is served at /app/ — without it every browser call from there
+    # (likes, comments, AI tools, coins) was refused.
+    allow_origin_regex=r"^https://(viyo[a-z0-9-]*\.vercel\.app|(www\.)?viyo\.site)$",
     # Every method any router in this app actually exposes (GET for
     # reads like conversations/spotlight/repurpose-job-polling, POST for
     # writes, DELETE for the one endpoint that has it) — was locked to
