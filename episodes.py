@@ -198,6 +198,7 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
     # debited — nothing else has happened yet except the unlock row
     # above, which is removed so a failed charge never leaves a "free"
     # unlock behind.
+    bought = _bought_coins_spent(user_id, price)
     try:
         debit_coins(
             supabase_admin, user_id, price, "episode_unlock",
@@ -210,7 +211,10 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
             pass
         raise
 
-    creator_share = round(price * CREATOR_SHARE)
+    # Cash only from the bought part of what the viewer spent.
+    creator_share = round(bought * CREATOR_SHARE)
+    if creator_share <= 0:
+        return UnlockEpisodeResponse(unlocked=True, coins_spent=price)
 
     # The viewer already has what they paid for at this point (the
     # unlock row exists) — a failure crediting the creator's earnings
@@ -235,6 +239,22 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
                 )
 
     return UnlockEpisodeResponse(unlocked=True, coins_spent=price)
+
+
+def _bought_coins_spent(user_id: str, price: float) -> float:
+    """How much of a `price`-coin spend will come from coins the viewer
+    BOUGHT (free coins are spent first). Read just before the debit. Only
+    this part earns the creator cash; see wallet.paid_portion."""
+    from wallet import paid_portion
+    try:
+        row = (supabase_admin.table("profiles").select("points_balance,paid_coins")
+               .eq("id", user_id).single().execute()).data or {}
+    except Exception as e:
+        # Database not migrated yet (no paid_coins column): earn nothing
+        # rather than pay cash for coins that may have been free.
+        print(f"[WARN] paid coin balance unavailable for {user_id}, creator earns nothing on this unlock: {e}")
+        return 0.0
+    return paid_portion(price, row.get("points_balance") or 0, row.get("paid_coins") or 0)
 
 
 class UnlockBundleResponse(BaseModel):
@@ -340,6 +360,7 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
 
     total_cost = per_episode_price * len(claimed_ids)
 
+    bought = _bought_coins_spent(user_id, total_cost)
     try:
         debit_coins(
             supabase_admin, user_id, total_cost, "series_bundle_unlock",
@@ -352,9 +373,10 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
             pass
         raise
 
-    creator_share = round(per_episode_price * CREATOR_SHARE)
+    # Cash only from the bought part, spread evenly over the episodes.
+    creator_share = round(bought / len(claimed_ids) * CREATOR_SHARE)
     creator_id = series["user_id"]
-    for post_id in claimed_ids:
+    for post_id in (claimed_ids if creator_share > 0 else []):
         for attempt in range(2):
             try:
                 supabase_admin.table("creator_earnings").insert({

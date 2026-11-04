@@ -20,6 +20,20 @@ create table if not exists public.transactions (
   description text,
   created_at timestamptz not null default now()
 );
+create table if not exists public.creator_earnings (
+  id uuid primary key default gen_random_uuid(),
+  creator_id uuid not null,
+  source_post_id uuid,
+  coins int not null,
+  status text not null default 'available',
+  created_at timestamptz not null default now()
+);
+create table if not exists public.withdrawal_requests (
+  id uuid primary key default gen_random_uuid(),
+  creator_id uuid not null,
+  coins int not null,
+  created_at timestamptz not null default now()
+);
 create table if not exists public.posts (
   id uuid primary key default gen_random_uuid(),
   user_id uuid,
