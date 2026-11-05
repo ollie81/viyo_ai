@@ -18,6 +18,7 @@ def studio_schema(migrated):
     conn = connect()
     conn.execute((ROOT / "creator_studio_schema.sql").read_text())
     conn.execute((ROOT / "creator_studio_sound.sql").read_text())
+    conn.execute((ROOT / "creator_studio_breakdown.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated
@@ -309,9 +310,10 @@ def test_editing_lines_clears_the_old_voice_track(env):
     u = make_user(db)
     grant(client, u, 300)
     pid = new_project(client, u)
+    client.post(f"/api/v1/studio/projects/{pid}/characters", headers=H(u), json={"name": "Maya"})
     s = client.post(f"/api/v1/studio/projects/{pid}/scenes", headers=H(u),
                     json={"visual": "x", "dialogue": [{"character": "Maya", "text": "Hello there"}]}).json()
-    start(client, u, pid, "voice", [s["id"]])
+    assert start(client, u, pid, "voice", [s["id"]]).status_code == 200
     run(gen)
     s2 = client.patch(f"/api/v1/studio/scenes/{s['id']}", headers=H(u),
                       json={"dialogue": [{"character": "Maya", "text": "Goodbye"}]}).json()

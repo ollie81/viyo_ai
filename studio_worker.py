@@ -140,39 +140,59 @@ class StudioWorker:
             raise JobFailed("no_script", "Write or paste a script first.")
         if not ai_mod.moderate_text(script):
             raise JobFailed("content_blocked", "This script can't be made on Viyo. Please change it.")
-        brief = {k: project[k] for k in ("title", "kind", "aspect_ratio", "visual_style", "target_seconds")}
+        brief = {k: project.get(k) for k in ("title", "kind", "aspect_ratio", "visual_style", "target_seconds", "language")}
+        brief["language"] = brief.get("language") or "English"
         data, cost = self.ai.breakdown(brief, script)
         chars = data.get("characters") or []
         scenes = data.get("scenes") or []
         if not scenes:
             raise JobFailed("empty", "The AI couldn't find any scenes in this script.", absorbed=cost)
+
         existing = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
         used = {c["voice"] for c in existing.values() if c.get("voice")}
+        new_chars, describe = [], []
         for i, c in enumerate(chars[:20]):
             name = (c.get("name") or "").strip()[:60]
-            if not name or name.lower() == "narrator":
+            if not name or is_narrator(name) or name.lower() in {x["name"].lower() for x in new_chars}:
                 continue
             row = existing.get(name.lower())
             if row:
-                if not row.get("description"):
-                    self.store.update("studio_characters", {"id": row["id"]}, {"description": c.get("description", "")[:1200]})
+                # An existing character keeps its voice and look. Only an
+                # empty description is filled in.
+                if not row.get("description") and c.get("description"):
+                    describe.append({"id": row["id"], "description": c["description"][:1200]})
                 continue
-            voice = pick_voice(c.get("gender", ""), used)
+            voice = pick_voice(c.get("gender", ""), used)   # assigned once, here, and kept
             used.add(voice)
-            self.store.insert("studio_characters", [{"project_id": project["id"], "owner_id": project["owner_id"],
-                                                     "name": name, "description": (c.get("description") or "")[:1200],
-                                                     "voice": voice, "position": i}])
-        self.store.delete("studio_scenes", {"project_id": project["id"]})
-        rows = []
-        for i, s in enumerate(scenes[:80]):
+            new_chars.append({"name": name, "description": (c.get("description") or "")[:1200],
+                              "voice": voice, "position": i})
+
+        incoming = []
+        for s in scenes[:80]:
             dialogue = [{"character": (d.get("character") or "")[:60], "text": (d.get("text") or "")[:600]}
                         for d in (s.get("dialogue") or []) if (d.get("text") or "").strip()][:12]
-            rows.append({"project_id": project["id"], "owner_id": project["owner_id"], "position": i,
-                         "heading": (s.get("heading") or "")[:200], "visual": (s.get("visual") or "")[:2000],
-                         "dialogue": dialogue,
-                         "duration_seconds": min(12, max(2, float(s.get("duration_seconds") or 5)))})
-        self.store.insert("studio_scenes", rows)
-        return {"characters": len(chars), "scenes": len(rows)}, cost
+            incoming.append({"heading": (s.get("heading") or "")[:200], "visual": (s.get("visual") or "")[:2000],
+                             "dialogue": dialogue,
+                             "duration_seconds": min(12, max(2, float(s.get("duration_seconds") or 5)))})
+        current = self.store.select("studio_scenes", {"project_id": project["id"]})
+        plan = plan_breakdown(current, incoming)
+        try:
+            r = self.store.rpc("studio_apply_breakdown", {
+                "p_project": project["id"], "p_owner": project["owner_id"], "p_job": job["id"],
+                "p_characters": new_chars, "p_describe": describe, "p_keep": plan["keep"],
+                "p_insert": plan["insert"], "p_archive": plan["archive"]})
+        except Exception as e:
+            msg = str(e).lower()
+            if "studio_apply_breakdown" in msg and ("could not find" in msg or "does not exist" in msg):
+                print(f"[ERROR] studio breakdown {job['id']}: creator_studio_breakdown.sql not run: {str(e)[:200]}")
+                raise JobFailed("not_ready", "Scene lists are being updated on Viyo. Please try again later. "
+                                             "Your credits were returned.", absorbed=cost)
+            raise
+        if not r or not r.get("ok"):
+            raise JobFailed("not_found", "This production no longer exists.", absorbed=cost)
+        return {"characters": len(chars), "scenes": len(incoming), "kept": len(plan["keep"]),
+                "added": len(plan["insert"]), "set_aside": len(plan["archive"]),
+                "kept_pictures": plan["kept_pictures"], "kept_voice": plan["kept_voice"]}, cost
 
     def do_portrait(self, job, project):
         ch = self.store.one("studio_characters", {"id": job["character_id"]})
@@ -213,15 +233,39 @@ class StudioWorker:
         if not lines:
             raise JobFailed("no_dialogue", "This scene has no lines to voice.")
         cast = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
+        # Work out every line's voice before spending anything. A character
+        # keeps its saved voice; a bad or missing one stops the job (credits
+        # returned) instead of quietly using another voice.
+        voices = []
+        for line in lines:
+            speaker = speaker_name(line.get("character") or "")
+            if not speaker or is_narrator(speaker):
+                voices.append(NARRATOR_VOICE)
+                continue
+            ch = cast.get(speaker.lower())
+            if ch is None:
+                print(f"[WARN] studio voice job {job['id']}: no character named {speaker!r} in project {project['id']}")
+                raise JobFailed("unknown_character",
+                                f"\"{speaker}\" speaks in this scene but isn't in your cast. Add them to the cast "
+                                "or change the line. Your credits were returned.")
+            voice = (ch.get("voice") or "").strip()
+            if not voice:
+                # Never had a voice (made before voices were assigned):
+                # give it one now and save it, so it stays the same from here on.
+                voice = pick_voice("", {c.get("voice") for c in cast.values() if c.get("voice")})
+                self.store.update("studio_characters", {"id": ch["id"]}, {"voice": voice})
+                ch["voice"] = voice
+            elif voice not in ai_mod.VOICE_NAMES:
+                print(f"[WARN] studio voice job {job['id']}: character {ch['id']} has unknown voice {voice!r}")
+                raise JobFailed("invalid_voice",
+                                f"{ch['name']}'s voice (\"{voice}\") isn't available. Choose a new voice for "
+                                f"{ch['name']} in the cast, then try again. Your credits were returned.")
+            voices.append(voice)
         total = pricing.voice_cost(0)
         seconds_total = 0.0
         with tempfile.TemporaryDirectory() as tmp:
             wavs = []
-            for i, line in enumerate(lines):
-                ch = cast.get((line.get("character") or "").strip().lower())
-                voice = (ch or {}).get("voice") or NARRATOR_VOICE
-                if voice not in ai_mod.VOICE_NAMES:
-                    voice = NARRATOR_VOICE
+            for i, (line, voice) in enumerate(zip(lines, voices)):
                 wav, secs, cost = self.ai.voice(line["text"], voice)
                 seconds_total += secs
                 p = os.path.join(tmp, f"l{i}.wav")
@@ -250,7 +294,8 @@ class StudioWorker:
         notes = " ".join(f"{c['name']}: {c['description']}." for c in characters_in_scene(scene, cast))
         prompt = (f"{scene['visual'] or scene['heading']}. {notes} Style: {project['visual_style'] or 'cinematic'}. "
                   "Natural, subtle motion. No text, captions or watermarks. Do not add music.")
-        data, cost = self.ai.video(prompt, frame, project["aspect_ratio"])
+        seconds = pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
+        data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
                           duration_seconds=cost.units.get("video_seconds"))
         self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
@@ -328,6 +373,83 @@ def characters_in_scene(scene: dict, cast: list[dict]) -> list[dict]:
     text = " ".join([scene.get("visual") or "", scene.get("heading") or ""] +
                     [d.get("character") or "" for d in scene.get("dialogue") or []]).lower()
     return [c for c in cast if c.get("name") and re.search(rf"\b{re.escape(c['name'].lower())}\b", text)]
+
+
+# ------------------------------------------------------------ breakdown plan
+
+NARRATOR_NAMES = {"narrator", "narration", "voice over", "voiceover", "vo"}
+
+
+def speaker_name(raw: str) -> str:
+    """'DANIEL (V.O.)' -> 'DANIEL'. Screenplay extensions aren't part of the name."""
+    return re.sub(r"\s*\((?:v\.?\s*o\.?|o\.?\s*s\.?|o\.?\s*c\.?|cont'?d|contd)\)\s*", " ", raw, flags=re.I).strip()
+
+
+def is_narrator(name: str) -> bool:
+    return re.sub(r"[^a-z ]", "", (name or "").lower()).strip() in NARRATOR_NAMES
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[\W_]+", " ", (text or "").lower()).strip()
+
+
+def _lines_key(dialogue) -> tuple:
+    return tuple((_norm(speaker_name(d.get("character") or "")), _norm(d.get("text") or ""))
+                 for d in (dialogue or []) if (d.get("text") or "").strip())
+
+
+def _has_work(s: dict) -> bool:
+    return bool(s.get("image_path") or s.get("video_path") or s.get("audio_path"))
+
+
+def plan_breakdown(current: list[dict], incoming: list[dict]) -> dict:
+    """Matches a new scene list against the scenes a project already has.
+
+    - Same place and the same lines: the existing scene is kept as it is,
+      with its picture, video and voice. Only its order changes (and, if it
+      has no picture yet, its description and length are updated).
+    - Same place, different lines: a new scene is made that reuses the old
+      picture/video (the place hasn't changed) but not the voice (the words
+      have). The old scene is set aside in the archive with everything.
+    - Anything else: new scenes are added; old ones are set aside.
+    Nothing is deleted outright."""
+    pool = sorted(current, key=lambda s: s.get("position") or 0)
+    used: set = set()
+    keep, insert = [], []
+    kept_pictures = kept_voice = 0
+    matched: dict[int, dict] = {}
+    for i, s in enumerate(incoming):          # pass 1: same place, same lines
+        for old in pool:
+            if old["id"] in used:
+                continue
+            if _norm(old.get("heading")) == _norm(s["heading"]) and _lines_key(old.get("dialogue")) == _lines_key(s["dialogue"]):
+                used.add(old["id"])
+                matched[i] = old
+                break
+    for i, s in enumerate(incoming):
+        old = matched.get(i)
+        if old is not None:
+            row = {"id": old["id"], "position": i}
+            if not (old.get("image_path") or old.get("video_path")):
+                row.update(visual=s["visual"], duration_seconds=s["duration_seconds"])
+            keep.append(row)
+            kept_pictures += bool(old.get("image_path") or old.get("video_path"))
+            kept_voice += bool(old.get("audio_path"))
+            continue
+        row = dict(s, position=i, mode="still", image_path=None, video_path=None)
+        for old in pool:                       # pass 2: same place, new lines
+            if old["id"] in used or not _norm(s["heading"]) or _norm(old.get("heading")) != _norm(s["heading"]):
+                continue
+            if old.get("image_path") or old.get("video_path"):
+                used.add(old["id"])
+                row.update(image_path=old.get("image_path"), video_path=old.get("video_path"),
+                           mode=old.get("mode") or "still")
+                kept_pictures += 1
+            break
+        insert.append(row)
+    archive = [s["id"] for s in pool if s["id"] not in {k["id"] for k in keep}]
+    return {"keep": keep, "insert": insert, "archive": archive,
+            "kept_pictures": kept_pictures, "kept_voice": kept_voice}
 
 
 def pick_voice(gender: str, used: set) -> str:

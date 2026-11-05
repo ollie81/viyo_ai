@@ -31,7 +31,7 @@ MIN_CREDITS = 1
 TEXT_MODEL = os.environ.get("STUDIO_TEXT_MODEL", "gemini-3.8-flash")
 IMAGE_MODEL = os.environ.get("STUDIO_IMAGE_MODEL", "gemini-3.1-flash-image")
 TTS_MODEL = os.environ.get("STUDIO_TTS_MODEL", "gemini-3.8-flash-tts")
-VIDEO_MODEL = os.environ.get("STUDIO_VIDEO_MODEL", "gemini-omni-1.1-flash")
+VIDEO_MODEL = os.environ.get("STUDIO_VIDEO_MODEL", "gemini-omni-1.2-flash")
 
 # (valid_from, prices). The last row whose date has started applies.
 _PRICE_TABLE: list[tuple[str, dict]] = [
@@ -40,7 +40,7 @@ _PRICE_TABLE: list[tuple[str, dict]] = [
         "image_input_per_m": 0.50, "image_per_1k_image": 0.067,          # gemini-3.1-flash-image
         "image_per_2k_image": 0.101,
         "tts_audio_per_m": 9.00, "tts_tokens_per_second": 25,            # gemini-3.8-flash-tts
-        "video_input_per_m": 1.50, "video_output_per_m": 17.50,          # gemini-omni-1.1-flash
+        "video_input_per_m": 1.50, "video_output_per_m": 12.00,          # gemini-omni-1.2-flash ($0.07/s at 720p)
         "video_tokens_per_second_720p": 5792,
         # Railway compute and Supabase storage are our own estimates
         # (Railway ~$20 per vCPU-month; Supabase $0.021 per GB-month).
@@ -188,8 +188,23 @@ def estimate_voice(text: str) -> Cost:
     return voice_cost(words / 2.4 + 0.6)
 
 
+VIDEO_MIN_SECONDS, VIDEO_MAX_SECONDS = 3, 15   # Omni 1.2 accepts "3s".."15s" (default 10s)
+
+
+def video_seconds_for(scene_seconds) -> int:
+    """The clip length we ask Omni for: the scene's length, rounded up,
+    within what the model accepts. Asked for explicitly so the estimate,
+    the hold and the bill all use the same number."""
+    import math
+    try:
+        s = math.ceil(float(scene_seconds))
+    except (TypeError, ValueError):
+        s = 8
+    return max(VIDEO_MIN_SECONDS, min(VIDEO_MAX_SECONDS, s))
+
+
 def estimate_video(seconds: float = 8.0) -> Cost:
-    return video_cost(seconds, input_tokens=1800)
+    return video_cost(video_seconds_for(seconds), input_tokens=1800)
 
 
 def hold_credits(kind: str, cost: Cost) -> int:

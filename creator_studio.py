@@ -222,6 +222,10 @@ class JobRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     request_id: str = Field(..., min_length=8, max_length=80)
+    # A new scene list for a project that already has scenes must be
+    # confirmed: unchanged scenes keep their work, changed ones are set
+    # aside (never deleted).
+    confirm_replace: bool = False
 
 
 class EstimateRequest(BaseModel):
@@ -384,6 +388,9 @@ async def archive_project(project_id: str, user_id: str = Depends(creator)):
 async def add_character(project_id: str, body: CharacterIn, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
     voice = body.voice if body.voice in studio_ai.VOICE_NAMES else ""
+    if not voice:   # every character gets its one voice when it's created
+        from studio_worker import pick_voice
+        voice = pick_voice("", {c.get("voice") for c in get_store().select("studio_characters", {"project_id": p["id"]})})
     row = get_store().insert("studio_characters", [{"project_id": p["id"], "owner_id": user_id, "name": body.name.strip(),
                                                     "description": body.description, "voice": voice,
                                                     "position": 999}])[0]
@@ -508,9 +515,9 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict]) -> tuple[pricing.
             (None if (target["visual"] or target["heading"]).strip() else "Describe what this scene shows first.")
     if kind == "voice":
         text = " ".join(d.get("text", "") for d in target.get("dialogue") or [])
-        return pricing.estimate_voice(text), (None if text.strip() else "This scene has no lines.")
+        return pricing.estimate_voice(text), (_voice_problem(target, cast) if text.strip() else "This scene has no lines.")
     if kind == "video":
-        return pricing.estimate_video(8.0), None
+        return pricing.estimate_video(target.get("duration_seconds") or 8.0), None
     if kind == "render":
         scenes = get_store().select("studio_scenes", {"project_id": p["id"]})
         secs = sum(max(float(s["duration_seconds"]), float(s.get("audio_seconds") or 0) + 0.5) for s in scenes)
@@ -521,8 +528,26 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict]) -> tuple[pricing.
     raise HTTPException(status_code=400, detail="Unknown job type.")
 
 
+def _voice_problem(scene: dict, cast: list[dict]) -> Optional[str]:
+    """Same checks the worker makes, before any credits are held."""
+    from studio_worker import is_narrator, speaker_name
+    by_name = {c["name"].strip().lower(): c for c in cast}
+    for d in scene.get("dialogue") or []:
+        if not (d.get("text") or "").strip():
+            continue
+        speaker = speaker_name(d.get("character") or "")
+        if not speaker or is_narrator(speaker):
+            continue
+        ch = by_name.get(speaker.lower())
+        if ch is None:
+            return f"\"{speaker}\" speaks in this scene but isn't in your cast."
+        if ch.get("voice") and ch["voice"] not in studio_ai.VOICE_NAMES:
+            return f"{ch['name']}'s voice isn't available. Choose a new voice for {ch['name']}."
+    return None
+
+
 def _quote(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
-    cast = get_store().select("studio_characters", {"project_id": p["id"]}) if kind == "image" else []
+    cast = get_store().select("studio_characters", {"project_id": p["id"]}) if kind in ("image", "voice") else []
     items = []
     for t in _targets(kind, p, target_ids):
         cost, reason = _price(kind, p, t, cast)
@@ -547,6 +572,17 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
     p = _project(project_id, user_id)
     _rate_limit(user_id)
     st = get_store()
+    if body.kind == "breakdown" and not body.confirm_replace:
+        scenes = st.select("studio_scenes", {"project_id": p["id"]})
+        if scenes:
+            pics = sum(1 for s in scenes if s.get("image_path") or s.get("video_path"))
+            voiced = sum(1 for s in scenes if s.get("audio_path"))
+            raise HTTPException(status_code=409, detail={
+                "code": "confirm_replace", "scenes": len(scenes), "with_pictures": pics, "with_voice": voiced,
+                "message": (f"This production already has {len(scenes)} scene{'s' if len(scenes) != 1 else ''}"
+                            f" ({pics} with pictures, {voiced} with voice). A new scene list keeps every scene that "
+                            "hasn't changed, with its pictures and voice. Scenes that change are replaced, and the "
+                            "old versions are saved, not deleted.")})
     created, problems = [], []
     for item in _quote(body.kind, p, body.target_ids):
         if item["blocked"]:

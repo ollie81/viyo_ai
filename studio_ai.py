@@ -61,7 +61,7 @@ class StudioAI(Protocol):
     def breakdown(self, brief: dict, script: str) -> tuple[dict, pricing.Cost]: ...
     def image(self, prompt: str, references: list[bytes], aspect_ratio: str, size: str = "1K") -> tuple[bytes, str, pricing.Cost]: ...
     def voice(self, text: str, voice: str) -> tuple[bytes, float, pricing.Cost]: ...
-    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str) -> tuple[bytes, pricing.Cost]: ...
+    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8) -> tuple[bytes, pricing.Cost]: ...
 
 
 # ---------------------------------------------------------------- prompts
@@ -104,13 +104,18 @@ BREAKDOWN_SCHEMA = {
 
 
 def breakdown_prompt(b: dict, script: str) -> str:
+    lang = b.get("language") or "English"
     return f"""Break this screenplay into a shot list for an AI-made {b.get('kind')} ({b.get('aspect_ratio')}).
 Visual style: {b.get('visual_style') or 'cinematic, realistic'}.
+The production language is {lang}.
 For each scene give: the heading, ONE visual prompt describing a single strong shot (characters by name, action, setting, lighting, framing),
 the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over),
 and a duration in seconds (2-12; long enough for its lines).
 Describe every character visually so they can be drawn the same way every time.
-Keep the dialogue in the screenplay's language.
+
+Language rules:
+- Dialogue: copy every spoken line in {lang}, word for word as the screenplay has it. Never translate dialogue into English or any other language.
+- Visual prompts and character descriptions: write them in English, because they are instructions for the image and video models. Keep character names exactly as written.
 
 SCREENPLAY:
 {script}"""
@@ -143,6 +148,8 @@ def _classify(e: Exception) -> Exception:
         return ProviderBusy(str(e)[:300])
     if any(k in text for k in ("safety", "blocked", "prohibited", "policy")):
         return PolicyBlocked(str(e)[:300])
+    if any(k in text for k in ("404", "not_found", "not found", "is not supported", "invalid_argument")):
+        return ProviderError("The AI model rejected the request (" + str(e)[:200] + "). Your credits were returned.")
     return ProviderError(str(e)[:300])
 
 
@@ -231,10 +238,12 @@ class GoogleStudioAI:
                     return _pcm_to_wav(pcm, rate), seconds, pricing.voice_cost(seconds)
         raise PolicyBlocked("No audio came back for this line.")
 
-    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str):
-        """Gemini Omni Flash (Interactions API). Not yet verified with a live
-        call: it costs real money, so it's tested only with fakes until the
-        creator-approved test run."""
+    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8):
+        """Gemini Omni 1.2 Flash (Interactions API), request shape from
+        Google's Omni docs (5 Nov 2026). Not yet verified with a live call:
+        it costs real money, so it's tested only with fakes until the
+        approved test run."""
+        seconds = pricing.video_seconds_for(seconds)
         inp: list = []
         if first_frame:
             inp.append({"type": "image", "data": base64.b64encode(first_frame).decode(), "mime_type": "image/png"})
@@ -242,7 +251,8 @@ class GoogleStudioAI:
         try:
             inter = self.client.interactions.create(
                 model=pricing.VIDEO_MODEL, input=inp,
-                response_format={"type": "video", "aspect_ratio": aspect_ratio, "resolution": "720p"})
+                response_format={"type": "video", "aspect_ratio": aspect_ratio, "resolution": "720p",
+                                 "duration": f"{seconds}s"})
         except Exception as e:
             raise _classify(e)
         out = getattr(inter, "output_video", None)
@@ -250,7 +260,7 @@ class GoogleStudioAI:
         if not data:
             raise PolicyBlocked("No video came back for this scene.")
         video = base64.b64decode(data) if isinstance(data, str) else data
-        seconds = _probe_seconds(video) or 8.0
+        seconds = _probe_seconds(video) or float(seconds)
         usage = getattr(inter, "usage", None) or getattr(inter, "usage_metadata", None)
         out_tokens = getattr(usage, "output_tokens", None) or getattr(usage, "candidates_token_count", None)
         in_tokens = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_token_count", None) or 0
@@ -297,6 +307,11 @@ class FakeStudioAI:
 
     def breakdown(self, brief, script):
         self.calls.append(("breakdown",))
+        self.last_breakdown_brief = dict(brief)
+        self.last_breakdown_prompt = breakdown_prompt(brief, script)
+        if getattr(self, "breakdown_result", None) is not None:
+            self._maybe_fail("breakdown")
+            return self.breakdown_result, pricing.text_cost(1400, 1800)
         self._maybe_fail("breakdown")
         return {
             "characters": [{"name": "Maya", "description": "Woman in her 20s, short black hair, red jacket", "gender": "female"},
@@ -326,8 +341,9 @@ class FakeStudioAI:
         pcm = b"\x00\x00" * int(rate * seconds)
         return _pcm_to_wav(pcm, rate), seconds, pricing.voice_cost(seconds)
 
-    def video(self, prompt, first_frame, aspect_ratio):
-        self.calls.append(("video", aspect_ratio))
+    def video(self, prompt, first_frame, aspect_ratio, seconds=8):
+        self.calls.append(("video", aspect_ratio, seconds))
+        self.last_video_model = pricing.VIDEO_MODEL
         self._maybe_fail("video")
         size = "720x1280" if aspect_ratio == "9:16" else "1280x720"
         with tempfile.TemporaryDirectory() as d:
@@ -355,9 +371,9 @@ def moderate_text(text: str) -> bool:
         return True
 
 
-def omni_clip(prompt: str, image_url: Optional[str], aspect_ratio: str) -> tuple[bytes, float, int]:
+def omni_clip(prompt: str, image_url: Optional[str], aspect_ratio: str, seconds: int = 8) -> tuple[bytes, float, int]:
     """For the admin Studio and Ads Studio, which used the Veo 3.1 preview
-    models Google shut down on 22 Oct 2026: one Gemini Omni Flash clip.
+    models Google shut down on 22 Oct 2026: one Gemini Omni 1.2 Flash clip.
     Returns (mp4 bytes, seconds, cost in US cents). Raises ProviderBusy /
     PolicyBlocked / ProviderError."""
     import requests
@@ -369,5 +385,5 @@ def omni_clip(prompt: str, image_url: Optional[str], aspect_ratio: str) -> tuple
             frame = r.content
         except Exception as e:
             raise ProviderError(f"could not fetch the starting image: {e}")
-    data, cost = GoogleStudioAI().video(prompt, frame, "16:9" if aspect_ratio == "16:9" else "9:16")
+    data, cost = GoogleStudioAI().video(prompt, frame, "16:9" if aspect_ratio == "16:9" else "9:16", seconds)
     return data, float(cost.units.get("video_seconds") or 8.0), max(1, round(cost.provider_cost_usd * 100))

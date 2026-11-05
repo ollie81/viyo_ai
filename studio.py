@@ -175,8 +175,8 @@ GEMINI_TTS_LINE_COST_USD_CENTS = 1
 # Verified against ai.google.dev/gemini-api/docs/pricing's published
 # per-second rates (720p); re-check there before trusting this for
 # real budgeting, same caveat as the text/image costs above.
-VEO_MODEL = "gemini-omni-1.1-flash"  # Veo 3.1 previews were shut down 22 Oct 2026
-VEO_PRICE_PER_SEC_USD_CENTS = 10  # Omni Flash 720p: $17.50/M output tokens x 5,792 tokens/s
+VEO_MODEL = "gemini-omni-1.2-flash"  # Veo 3.1 previews were shut down 22 Oct 2026
+VEO_PRICE_PER_SEC_USD_CENTS = 7  # Omni 1.2 Flash 720p: $12/M output tokens x 5,792 tokens/s = $0.0695/s
 # Veo only accepts 4, 6 or 8 second clips — no arbitrary duration.
 VEO_ALLOWED_DURATIONS = (4, 6, 8)
 # Generation is an async operation polled to completion rather than a
@@ -1896,7 +1896,7 @@ async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
 
     import studio_ai as _studio_ai
     try:
-        video_bytes, _omni_seconds, _omni_cents = _studio_ai.omni_clip(prompt, scene_row["image_url"], "9:16")
+        video_bytes, _omni_seconds, _omni_cents = _studio_ai.omni_clip(prompt, scene_row["image_url"], "9:16", duration)
     except _studio_ai.ProviderBusy as e:
         raise HTTPException(status_code=503, detail=f"The video model is busy. Try again in a minute. ({e})")
     except (_studio_ai.PolicyBlocked, _studio_ai.ProviderError) as e:

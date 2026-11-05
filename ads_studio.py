@@ -127,11 +127,11 @@ router = APIRouter(prefix="/api/v1/admin/ads-studio", tags=["ads_studio"])
 # letting an admin select it.
 VEO_TIERS: dict[str, dict] = {
     # Google shut down the Veo 3.1 preview models on 22 Oct 2026; every
-    # tier now uses its replacement, Gemini Omni Flash (720p, about
-    # $0.10/s). Tier keys are kept so saved campaigns stay valid.
-    "lite": {"model": "gemini-omni-1.1-flash", "price_per_sec_cents": 10, "label": "Omni Flash"},
-    "fast": {"model": "gemini-omni-1.1-flash", "price_per_sec_cents": 10, "label": "Omni Flash"},
-    "standard": {"model": "gemini-omni-1.1-flash", "price_per_sec_cents": 10, "label": "Omni Flash"},
+    # tier now uses its replacement, Gemini Omni 1.2 Flash (720p, about
+    # $0.07/s). Tier keys are kept so saved campaigns stay valid.
+    "lite": {"model": "gemini-omni-1.2-flash", "price_per_sec_cents": 7, "label": "Omni Flash"},
+    "fast": {"model": "gemini-omni-1.2-flash", "price_per_sec_cents": 7, "label": "Omni Flash"},
+    "standard": {"model": "gemini-omni-1.2-flash", "price_per_sec_cents": 7, "label": "Omni Flash"},
 }
 DEFAULT_VEO_TIER = "lite"
 
@@ -1394,7 +1394,7 @@ def _generate_ad_scene_video(
         )
     import studio_ai as _studio_ai
     try:
-        video_bytes, _omni_seconds, _omni_cents = _studio_ai.omni_clip(prompt, image_url, veo_aspect)
+        video_bytes, _omni_seconds, _omni_cents = _studio_ai.omni_clip(prompt, image_url, veo_aspect, duration)
     except _studio_ai.ProviderBusy as e:
         raise HTTPException(status_code=503, detail=f"The video model is busy. Try again in a minute. ({e})")
     except (_studio_ai.PolicyBlocked, _studio_ai.ProviderError) as e:
