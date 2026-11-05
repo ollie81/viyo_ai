@@ -1118,11 +1118,14 @@ _DELETE_TABLES = {
 # PROCESSED_BUCKET). This previously deleted DB rows referencing this
 # content but left the actual files in Storage forever — a real gap in
 # what the app's Privacy screen claims about deleting your data.
-_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos", "glow-up-previews", "glow-up-photos"]
+_STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos", "glow-up-previews", "glow-up-photos",
+                             "creator-studio"]
 
 
 def _purge_storage(user_id: str) -> list[str]:
-    """Removes every file under this user's prefix in each bucket above.
+    """Removes every file under this user's prefix in each bucket above,
+    including files in sub-folders (Viyo Studio keeps
+    <user>/<project>/<kind>/<file>).
 
     Best-effort per bucket: a failure on one doesn't stop the others,
     and the caller doesn't fail the whole deletion over a storage
@@ -1131,12 +1134,46 @@ def _purge_storage(user_id: str) -> list[str]:
     errors = []
     for bucket in _STORAGE_BUCKETS_TO_PURGE:
         try:
-            files = supabase_admin.storage.from_(bucket).list(user_id)
-            paths = [f"{user_id}/{f['name']}" for f in files if f.get("name")]
-            if paths:
-                supabase_admin.storage.from_(bucket).remove(paths)
+            paths = _list_files(supabase_admin.storage.from_(bucket), user_id)
+            for i in range(0, len(paths), 500):
+                supabase_admin.storage.from_(bucket).remove(paths[i:i + 500])
         except Exception as e:
             errors.append(f"storage:{bucket}: {e}")
+    return errors
+
+
+def _list_files(store, prefix: str, depth: int = 0) -> list[str]:
+    """All file paths under prefix. Storage lists folders as entries with
+    no id, so those are walked into (a few levels deep at most)."""
+    out = []
+    for f in store.list(prefix, {"limit": 1000}) or []:
+        name = f.get("name")
+        if not name:
+            continue
+        path = f"{prefix}/{name}"
+        if f.get("id") is None and depth < 4:
+            out += _list_files(store, path, depth + 1)
+        else:
+            out.append(path)
+    return out
+
+
+def _purge_bunny(user_id: str) -> list[str]:
+    """Deletes the user's videos from Bunny Stream: their posts' videos
+    and their Viyo Studio films."""
+    errors, video_ids = [], set()
+    for table, column, field in (("posts", "user_id", "bunny_video_id"),
+                                 ("studio_renders", "owner_id", "bunny_video_id")):
+        try:
+            rows = supabase_admin.table(table).select(field).eq(column, user_id).execute().data or []
+            video_ids |= {r[field] for r in rows if r.get(field)}
+        except Exception as e:
+            errors.append(f"bunny list {table}: {e}")
+    if video_ids:
+        import bunny_stream
+        for vid in video_ids:
+            if not bunny_stream.delete_video(vid):
+                errors.append(f"bunny delete {vid}")
     return errors
 
 
@@ -1150,7 +1187,8 @@ async def delete_account(
             detail="Account service is not configured.",
         )
 
-    cleanup_errors = []
+    # Videos on Bunny first: the rows that point at them are deleted next.
+    cleanup_errors = _purge_bunny(user_id)
     for table, column in _DELETE_TABLES.items():
         try:
             supabase_admin.table(table).delete().eq(column, user_id).execute()
