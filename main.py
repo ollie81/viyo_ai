@@ -202,6 +202,11 @@ try:
 except Exception as _bench_import_error:
     print(f"[WARN] Repurpose benchmark router not loaded: {_bench_import_error}")
 try:
+    from creator_studio import router as creator_studio_router
+    app.include_router(creator_studio_router)
+except Exception as _studio_err:
+    print(f"[WARN] Creator Studio router not loaded: {_studio_err}")
+try:
     from creator_downloads import router as creator_downloads_router
     app.include_router(creator_downloads_router)
 except Exception as _dl_err:

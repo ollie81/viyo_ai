@@ -1,0 +1,197 @@
+"""
+Creator Studio pricing: what each operation really costs, and what the
+creator pays for it in Studio credits.
+
+    credits = max(MIN_CREDITS, ceil(cost_usd / (1 - target_margin) / USD_PER_CREDIT))
+
+  * cost_usd = provider cost + attributable compute + storage for the
+    included retention period. Nothing else is added: no hidden reserve.
+    Failures the provider bills anyway are absorbed by Viyo and recorded.
+  * Payment fees are NOT in here. They're covered when credits are bought
+    (see pack_price), because a fee depends on the payment, not on what
+    the credits are later spent on.
+  * 1 credit = $0.01 of value Viyo actually receives.
+
+Provider prices are the official list prices checked on PRICE_CHECKED
+(Google's Gemini API pricing page). Each price row has a date range so
+history is preserved; every usage row stores the exact prices used.
+"""
+from __future__ import annotations
+
+import datetime
+import math
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+PRICE_CHECKED = "2026-11-05"
+USD_PER_CREDIT = 0.01
+MIN_CREDITS = 1
+
+TEXT_MODEL = os.environ.get("STUDIO_TEXT_MODEL", "gemini-3.8-flash")
+IMAGE_MODEL = os.environ.get("STUDIO_IMAGE_MODEL", "gemini-3.1-flash-image")
+TTS_MODEL = os.environ.get("STUDIO_TTS_MODEL", "gemini-3.8-flash-tts")
+VIDEO_MODEL = os.environ.get("STUDIO_VIDEO_MODEL", "gemini-omni-1.1-flash")
+
+# (valid_from, prices). The last row whose date has started applies.
+_PRICE_TABLE: list[tuple[str, dict]] = [
+    ("2026-11-01", {
+        "text_input_per_m": 0.75, "text_output_per_m": 3.75,            # gemini-3.8-flash
+        "image_input_per_m": 0.50, "image_per_1k_image": 0.067,          # gemini-3.1-flash-image
+        "tts_audio_per_m": 9.00, "tts_tokens_per_second": 25,            # gemini-3.8-flash-tts
+        "video_input_per_m": 1.50, "video_output_per_m": 17.50,          # gemini-omni-1.1-flash
+        "video_tokens_per_second_720p": 5792,
+        # Railway compute and Supabase storage are our own estimates
+        # (Railway ~$20 per vCPU-month; Supabase $0.021 per GB-month).
+        "cpu_per_second": 20.0 / (30 * 24 * 3600),
+        "storage_per_gb_month": 0.021,
+    }),
+    ("2027-01-01", {
+        "text_input_per_m": 1.50, "text_output_per_m": 7.50,
+        "tts_audio_per_m": 18.00,
+    }),
+]
+
+STORAGE_MONTHS_INCLUDED = 3
+
+
+def prices(on: Optional[datetime.date] = None) -> dict:
+    day = (on or datetime.datetime.now(datetime.timezone.utc).date()).isoformat()
+    merged: dict = {}
+    for start, row in _PRICE_TABLE:
+        if start <= day:
+            merged.update(row)
+    return merged
+
+
+def price_version(on: Optional[datetime.date] = None) -> str:
+    day = (on or datetime.datetime.now(datetime.timezone.utc).date()).isoformat()
+    return max(start for start, _ in _PRICE_TABLE if start <= day)
+
+
+def target_margin() -> float:
+    try:
+        m = float(os.environ.get("STUDIO_TARGET_MARGIN", "0.25"))
+    except ValueError:
+        m = 0.25
+    return min(max(m, 0.0), 0.8)
+
+
+def credits_for(cost_usd: float, margin: Optional[float] = None) -> int:
+    m = target_margin() if margin is None else margin
+    if cost_usd <= 0:
+        return MIN_CREDITS
+    # Round to micro-cents first so float noise never adds a credit.
+    raw = round(cost_usd / (1 - m) / USD_PER_CREDIT, 6)
+    return max(MIN_CREDITS, math.ceil(raw))
+
+
+def pack_price(credits: int, pct_fee: float, fixed_fee: float) -> float:
+    """What to charge for a pack so Viyo receives credits x $0.01 after the
+    payment provider's fee."""
+    return round((credits * USD_PER_CREDIT + fixed_fee) / (1 - pct_fee), 2)
+
+
+# ---------------------------------------------------------------- estimates
+
+@dataclass
+class Cost:
+    """A priced operation. `provider_cost_usd` is the provider's bill;
+    infra and storage are our own attributable costs."""
+    provider: str
+    model: str
+    units: dict = field(default_factory=dict)
+    provider_cost_usd: float = 0.0
+    infra_cost_usd: float = 0.0
+    storage_cost_usd: float = 0.0
+
+    @property
+    def total_usd(self) -> float:
+        return self.provider_cost_usd + self.infra_cost_usd + self.storage_cost_usd
+
+    @property
+    def credits(self) -> int:
+        return credits_for(self.total_usd)
+
+    def usage(self) -> dict:
+        p = prices()
+        return {"provider": self.provider, "model": self.model, "units": self.units, "prices": p,
+                "price_version": price_version(), "provider_cost_usd": round(self.provider_cost_usd, 6),
+                "infra_cost_usd": round(self.infra_cost_usd, 6), "storage_cost_usd": round(self.storage_cost_usd, 6)}
+
+
+def text_cost(input_tokens: int, output_tokens: int) -> Cost:
+    p = prices()
+    return Cost("google", TEXT_MODEL, {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                input_tokens * p["text_input_per_m"] / 1e6 + output_tokens * p["text_output_per_m"] / 1e6)
+
+
+def image_cost(images: int = 1, input_tokens: int = 0) -> Cost:
+    p = prices()
+    return Cost("google", IMAGE_MODEL, {"images": images, "input_tokens": input_tokens},
+                images * p["image_per_1k_image"] + input_tokens * p["image_input_per_m"] / 1e6,
+                storage_cost_usd=storage_cost(1.5 * 1024 * 1024 * images))
+
+
+def voice_cost(audio_seconds: float) -> Cost:
+    p = prices()
+    tokens = audio_seconds * p["tts_tokens_per_second"]
+    return Cost("google", TTS_MODEL, {"audio_seconds": round(audio_seconds, 2), "audio_tokens": round(tokens)},
+                tokens * p["tts_audio_per_m"] / 1e6,
+                storage_cost_usd=storage_cost(audio_seconds * 48_000))
+
+
+def video_cost(seconds: float, output_tokens: Optional[int] = None, input_tokens: int = 0) -> Cost:
+    p = prices()
+    out = output_tokens if output_tokens is not None else seconds * p["video_tokens_per_second_720p"]
+    return Cost("google", VIDEO_MODEL, {"video_seconds": round(seconds, 2), "output_tokens": round(out),
+                                        "input_tokens": input_tokens},
+                out * p["video_output_per_m"] / 1e6 + input_tokens * p["video_input_per_m"] / 1e6,
+                storage_cost_usd=storage_cost(seconds * 1_000_000))
+
+
+def render_cost(output_seconds: float, output_bytes: Optional[int] = None) -> Cost:
+    """Our own compute (ffmpeg on the worker) plus storing the master."""
+    p = prices()
+    cpu_seconds = max(30.0, output_seconds * 3.0)
+    size = output_bytes if output_bytes is not None else output_seconds * 1_000_000
+    return Cost("viyo", "ffmpeg", {"cpu_seconds": round(cpu_seconds), "output_seconds": round(output_seconds, 2),
+                                   "bytes": int(size)},
+                0.0, infra_cost_usd=cpu_seconds * p["cpu_per_second"], storage_cost_usd=storage_cost(size))
+
+
+def storage_cost(num_bytes: float) -> float:
+    return num_bytes / (1024 ** 3) * prices()["storage_per_gb_month"] * STORAGE_MONTHS_INCLUDED
+
+
+# How many tokens the text steps usually use. Thinking is capped (see
+# studio_ai.THINKING_BUDGET) so these stay predictable; the job holds
+# HOLD_FACTOR x the estimate and only the real usage is kept.
+THINKING_BUDGET = 1024
+HOLD_FACTOR = 1.6
+
+
+def estimate_script(target_seconds: int, brief_chars: int) -> Cost:
+    return text_cost(800 + brief_chars // 3, THINKING_BUDGET + 900 + int(target_seconds * 9))
+
+
+def estimate_breakdown(script_chars: int, target_seconds: int) -> Cost:
+    scenes = max(3, target_seconds // 6)
+    return text_cost(1200 + script_chars // 3, THINKING_BUDGET + 400 + scenes * 260)
+
+
+def estimate_voice(text: str) -> Cost:
+    words = max(1, len(text.split()))
+    return voice_cost(words / 2.4 + 0.6)
+
+
+def estimate_video(seconds: float = 8.0) -> Cost:
+    return video_cost(seconds, input_tokens=1800)
+
+
+def hold_credits(kind: str, cost: Cost) -> int:
+    """Credits to hold for a job: text jobs vary, so a margin is held and
+    the unused part returned; fixed-price items hold exactly the price."""
+    if kind in ("script", "breakdown"):
+        return credits_for(cost.total_usd * HOLD_FACTOR)
+    return cost.credits

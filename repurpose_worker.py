@@ -254,6 +254,11 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    try:
+        import studio_worker
+        studio_worker.start_production()
+    except Exception as e:  # never let the Studio stop the Repurposer
+        print(f"[WARN] Creator Studio worker not started: {e}")
     worker.run_forever()
 
 

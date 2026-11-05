@@ -1,0 +1,351 @@
+"""
+Creator Studio worker: runs queued Studio jobs, one lane at a time
+("generation" = AI provider calls, "render" = ffmpeg), alongside the
+Repurposer in the existing worker service.
+
+For each job: claim -> heartbeat while working -> do the work and save
+the files -> complete (keep the real cost, return the rest of the hold)
+or fail (return everything; retry only when the provider was busy).
+"""
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+import threading
+import time
+import traceback
+from typing import Optional
+
+import studio_ai as ai_mod
+import studio_pricing as pricing
+import studio_render as render
+from studio_store import Files, Store, new_path
+
+NARRATOR_VOICE = "Charon"
+
+
+def _now() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+class JobFailed(Exception):
+    def __init__(self, code: str, message: str, retry: bool = False, absorbed: Optional[pricing.Cost] = None):
+        super().__init__(message)
+        self.code, self.message, self.retry, self.absorbed = code, message, retry, absorbed
+
+
+class StudioWorker:
+    def __init__(self, store: Store, files: Files, ai, lane: str, heartbeat_seconds: int = 20,
+                 stale_seconds: int = 180):
+        self.store, self.files, self.ai, self.lane = store, files, ai, lane
+        self.heartbeat_seconds, self.stale_seconds = heartbeat_seconds, stale_seconds
+        self._stop = threading.Event()
+
+    # ------------------------------------------------------------ loop
+
+    def run_forever(self, idle_seconds: float = 3.0) -> None:
+        while not self._stop.is_set():
+            try:
+                worked = self.run_once()
+            except Exception as e:
+                # e.g. the Studio SQL hasn't been run yet: back off quietly.
+                print(f"[ERROR] studio {self.lane} loop: {str(e)[:200]}")
+                self._stop.wait(60)
+                continue
+            if not worked:
+                self._stop.wait(idle_seconds)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> bool:
+        job = self.store.rpc("studio_claim_job", {"p_lane": self.lane, "p_stale_seconds": self.stale_seconds})
+        if not job:
+            return False
+        self.run_job(job)
+        return True
+
+    def run_job(self, job: dict) -> None:
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(self.heartbeat_seconds):
+                try:
+                    if not self.store.rpc("studio_heartbeat", {"p_job_id": job["id"], "p_lease": job["lease"],
+                                                               "p_provider_job_id": None}):
+                        return
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=beat, daemon=True)
+        t.start()
+        try:
+            output, cost = self.handle(job)
+            credits = min(cost.credits, int(job["estimated_credits"])) if job["kind"] not in ("script", "breakdown") \
+                else cost.credits
+            self.store.rpc("studio_complete_job", {"p_job_id": job["id"], "p_lease": job["lease"], "p_output": output,
+                                                   "p_credits": credits, "p_usage": cost.usage()})
+        except JobFailed as e:
+            self._fail(job, e.code, e.message, e.retry, e.absorbed)
+        except ai_mod.ProviderBusy as e:
+            self._fail(job, "provider_busy", "The AI service is busy. Trying again shortly.", True)
+            print(f"[WARN] studio job {job['id']} busy: {e}")
+        except ai_mod.PolicyBlocked as e:
+            self._fail(job, "content_blocked", str(e) or "The AI refused this content. Try rewording it.", False)
+        except Exception as e:
+            traceback.print_exc()
+            self._fail(job, "failed", "Something went wrong making this. Your credits were returned.", False)
+        finally:
+            stop.set()
+
+    def _fail(self, job, code, message, retry, absorbed=None):
+        self.store.rpc("studio_fail_job", {"p_job_id": job["id"], "p_lease": job["lease"], "p_code": code,
+                                           "p_message": message[:400], "p_retry": retry,
+                                           "p_absorbed_usage": absorbed.usage() if absorbed else None})
+
+    # ------------------------------------------------------------ handlers
+
+    def handle(self, job: dict) -> tuple[dict, pricing.Cost]:
+        project = self.store.one("studio_projects", {"id": job["project_id"]})
+        if not project or project["owner_id"] != job["owner_id"]:
+            raise JobFailed("not_found", "This production no longer exists.")
+        fn = getattr(self, f"do_{job['kind']}", None)
+        if fn is None:
+            raise JobFailed("unknown_job", "Unknown job type.")
+        return fn(job, project)
+
+    def _save(self, job, project, kind: str, ext: str, data: bytes, content_type: str, **asset) -> str:
+        path = new_path(job["owner_id"], project["id"], kind, ext)
+        self.files.put(path, data, content_type)
+        self.store.insert("studio_assets", [{"owner_id": job["owner_id"], "project_id": project["id"],
+                                             "job_id": job["id"], "kind": kind, "path": path,
+                                             "bytes": len(data), **asset}])
+        return path
+
+    def do_script(self, job, project):
+        brief = {k: project[k] for k in ("title", "logline", "genre", "kind", "aspect_ratio", "target_seconds",
+                                         "language", "visual_style")}
+        if not ai_mod.moderate_text(f"{project['title']}\n{project['logline']}"):
+            raise JobFailed("content_blocked", "This idea can't be made on Viyo. Please change it.")
+        text, cost = self.ai.write_script(brief)
+        self.store.update("studio_projects", {"id": project["id"]}, {"script": text, "updated_at": _now()})
+        return {"chars": len(text)}, cost
+
+    def do_breakdown(self, job, project):
+        script = project["script"].strip()
+        if not script:
+            raise JobFailed("no_script", "Write or paste a script first.")
+        if not ai_mod.moderate_text(script):
+            raise JobFailed("content_blocked", "This script can't be made on Viyo. Please change it.")
+        brief = {k: project[k] for k in ("title", "kind", "aspect_ratio", "visual_style", "target_seconds")}
+        data, cost = self.ai.breakdown(brief, script)
+        chars = data.get("characters") or []
+        scenes = data.get("scenes") or []
+        if not scenes:
+            raise JobFailed("empty", "The AI couldn't find any scenes in this script.", absorbed=cost)
+        existing = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
+        used = {c["voice"] for c in existing.values() if c.get("voice")}
+        for i, c in enumerate(chars[:20]):
+            name = (c.get("name") or "").strip()[:60]
+            if not name or name.lower() == "narrator":
+                continue
+            row = existing.get(name.lower())
+            if row:
+                if not row.get("description"):
+                    self.store.update("studio_characters", {"id": row["id"]}, {"description": c.get("description", "")[:1200]})
+                continue
+            voice = pick_voice(c.get("gender", ""), used)
+            used.add(voice)
+            self.store.insert("studio_characters", [{"project_id": project["id"], "owner_id": project["owner_id"],
+                                                     "name": name, "description": (c.get("description") or "")[:1200],
+                                                     "voice": voice, "position": i}])
+        self.store.delete("studio_scenes", {"project_id": project["id"]})
+        rows = []
+        for i, s in enumerate(scenes[:80]):
+            dialogue = [{"character": (d.get("character") or "")[:60], "text": (d.get("text") or "")[:600]}
+                        for d in (s.get("dialogue") or []) if (d.get("text") or "").strip()][:12]
+            rows.append({"project_id": project["id"], "owner_id": project["owner_id"], "position": i,
+                         "heading": (s.get("heading") or "")[:200], "visual": (s.get("visual") or "")[:2000],
+                         "dialogue": dialogue,
+                         "duration_seconds": min(12, max(2, float(s.get("duration_seconds") or 5)))})
+        self.store.insert("studio_scenes", rows)
+        return {"characters": len(chars), "scenes": len(rows)}, cost
+
+    def do_portrait(self, job, project):
+        ch = self.store.one("studio_characters", {"id": job["character_id"]})
+        if not ch or ch["project_id"] != project["id"]:
+            raise JobFailed("not_found", "That character no longer exists.")
+        prompt = (f"Character reference portrait for a {project['genre'] or 'drama'} production. {ch['name']}: "
+                  f"{ch['description']}. Waist-up, facing the camera, face fully visible, neutral studio background, "
+                  f"soft even light. Style: {project['visual_style'] or 'cinematic, realistic'}. No text.")
+        data, mime, cost = self.ai.image(prompt, [], "9:16")
+        ext = "png" if "png" in mime else "jpg"
+        path = self._save(job, project, "portrait", ext, data, mime, character_id=ch["id"])
+        self.store.update("studio_characters", {"id": ch["id"]}, {"reference_path": path})
+        return {"path": path}, cost
+
+    def do_image(self, job, project):
+        scene = self._scene(job, project)
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        in_scene = characters_in_scene(scene, cast)
+        refs = []
+        for c in in_scene:
+            if c.get("reference_path"):
+                try:
+                    refs.append(self.files.get(c["reference_path"]))
+                except Exception:
+                    pass
+        notes = " ".join(f"{c['name']}: {c['description']}." for c in in_scene)
+        prompt = ai_mod.image_prompt(scene["visual"] or scene["heading"], project["visual_style"],
+                                     project["aspect_ratio"], notes)
+        data, mime, cost = self.ai.image(prompt, refs[:4], project["aspect_ratio"])
+        ext = "png" if "png" in mime else "jpg"
+        path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
+        self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
+        return {"path": path}, cost
+
+    def do_voice(self, job, project):
+        scene = self._scene(job, project)
+        lines = [d for d in scene["dialogue"] if (d.get("text") or "").strip()]
+        if not lines:
+            raise JobFailed("no_dialogue", "This scene has no lines to voice.")
+        cast = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
+        total = pricing.voice_cost(0)
+        seconds_total = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            wavs = []
+            for i, line in enumerate(lines):
+                ch = cast.get((line.get("character") or "").strip().lower())
+                voice = (ch or {}).get("voice") or NARRATOR_VOICE
+                if voice not in ai_mod.VOICE_NAMES:
+                    voice = NARRATOR_VOICE
+                wav, secs, cost = self.ai.voice(line["text"], voice)
+                seconds_total += secs
+                p = os.path.join(tmp, f"l{i}.wav")
+                with open(p, "wb") as f:
+                    f.write(wav)
+                wavs.append(p)
+            out = os.path.join(tmp, "scene.m4a")
+            dur = render.join_audio(wavs, out)
+            with open(out, "rb") as f:
+                data = f.read()
+        total = pricing.voice_cost(seconds_total)
+        path = self._save(job, project, "audio", "m4a", data, "audio/mp4", scene_id=scene["id"], duration_seconds=round(dur, 2))
+        self.store.update("studio_scenes", {"id": scene["id"]}, {"audio_path": path, "audio_seconds": round(dur, 2),
+                                                                 "updated_at": _now()})
+        return {"path": path, "seconds": round(dur, 2)}, total
+
+    def do_video(self, job, project):
+        scene = self._scene(job, project)
+        frame = None
+        if scene.get("image_path"):
+            try:
+                frame = self.files.get(scene["image_path"])
+            except Exception:
+                frame = None
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        notes = " ".join(f"{c['name']}: {c['description']}." for c in characters_in_scene(scene, cast))
+        prompt = (f"{scene['visual'] or scene['heading']}. {notes} Style: {project['visual_style'] or 'cinematic'}. "
+                  "Natural, subtle motion. No text, captions or watermarks. Do not add music.")
+        data, cost = self.ai.video(prompt, frame, project["aspect_ratio"])
+        path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
+                          duration_seconds=cost.units.get("video_seconds"))
+        self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
+        return {"path": path}, cost
+
+    def do_render(self, job, project):
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
+        if not scenes:
+            raise JobFailed("no_scenes", "Add scenes before rendering.")
+        missing = [s["position"] + 1 for s in scenes if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))]
+        if missing:
+            raise JobFailed("not_ready", f"Scene {missing[0]} has no picture yet. Generate it first.")
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = []
+            for s in scenes:
+                def fetch(path, name):
+                    if not path:
+                        return None
+                    local = os.path.join(tmp, name)
+                    self.files.get_to(path, local)
+                    return local
+                n = s["position"]
+                use_video = s["mode"] == "video" and s.get("video_path")
+                inputs.append(render.SceneInput(
+                    duration=float(s["duration_seconds"]),
+                    image=None if use_video else fetch(s["image_path"], f"img{n}"),
+                    video=fetch(s["video_path"], f"vid{n}.mp4") if use_video else None,
+                    audio=fetch(s.get("audio_path"), f"aud{n}.m4a"),
+                    audio_seconds=float(s["audio_seconds"]) if s.get("audio_seconds") else None,
+                    lines=tuple(d["text"] for d in s["dialogue"] if d.get("text"))))
+            out = os.path.join(tmp, "film.mp4")
+            info = render.render_film(inputs, project["aspect_ratio"], out, tmp, captions=bool(project.get("captions", True)))
+            prev = self.store.select("studio_renders", {"project_id": project["id"]}, order="version", desc=True, limit=1)
+            version = (prev[0]["version"] + 1) if prev else 1
+            path = f"{job['owner_id']}/{project['id']}/render/v{version:03d}.mp4"
+            self.files.put_file(path, out, "video/mp4")
+        self.store.insert("studio_assets", [{"owner_id": job["owner_id"], "project_id": project["id"], "job_id": job["id"],
+                                             "kind": "render", "path": path, "bytes": info["bytes"],
+                                             "duration_seconds": info["duration"], "width": info["width"], "height": info["height"]}])
+        self.store.insert("studio_renders", [{"project_id": project["id"], "owner_id": job["owner_id"], "job_id": job["id"],
+                                              "version": version, "path": path, "aspect_ratio": project["aspect_ratio"],
+                                              "width": info["width"], "height": info["height"],
+                                              "duration_seconds": info["duration"], "bytes": info["bytes"],
+                                              "sha256": info["sha256"]}])
+        return {"path": path, "version": version, **info}, pricing.render_cost(info["duration"], info["bytes"])
+
+    def _scene(self, job, project):
+        scene = self.store.one("studio_scenes", {"id": job["scene_id"]})
+        if not scene or scene["project_id"] != project["id"]:
+            raise JobFailed("not_found", "That scene no longer exists.")
+        return scene
+
+
+def characters_in_scene(scene: dict, cast: list[dict]) -> list[dict]:
+    text = " ".join([scene.get("visual") or "", scene.get("heading") or ""] +
+                    [d.get("character") or "" for d in scene.get("dialogue") or []]).lower()
+    return [c for c in cast if c.get("name") and re.search(rf"\b{re.escape(c['name'].lower())}\b", text)]
+
+
+def pick_voice(gender: str, used: set) -> str:
+    g = (gender or "").lower()
+    pool = [v[0] for v in ai_mod.VOICES if g in ("male", "female") and v[1] == g] or [v[0] for v in ai_mod.VOICES]
+    for v in pool:
+        if v not in used:
+            return v
+    return pool[len(used) % len(pool)]
+
+
+def start_background(store: Store, files: Files, ai) -> list[StudioWorker]:
+    """Starts one thread per lane. Called from the worker service."""
+    workers = [StudioWorker(store, files, ai, "generation"), StudioWorker(store, files, ai, "render")]
+    for w in workers:
+        threading.Thread(target=w.run_forever, name=f"studio-{w.lane}", daemon=True).start()
+    return workers
+
+
+class LazyGoogleAI:
+    """Builds the Gemini client on first use, so a missing key fails (and
+    refunds) individual jobs instead of stopping the worker."""
+
+    def __init__(self):
+        self._ai = None
+
+    def __getattr__(self, name):
+        if self._ai is None:
+            self._ai = ai_mod.GoogleStudioAI()
+        return getattr(self._ai, name)
+
+
+def start_production() -> list[StudioWorker]:
+    if os.environ.get("STUDIO_WORKER", "on").lower() == "off":
+        print("[INFO] Creator Studio worker off (STUDIO_WORKER=off)")
+        return []
+    from studio_store import SupabaseFiles, SupabaseStore
+    from supabase import create_client
+    admin = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+    workers = start_background(SupabaseStore(admin), SupabaseFiles(admin), LazyGoogleAI())
+    print("[INFO] Creator Studio worker started (generation + render lanes)")
+    return workers
