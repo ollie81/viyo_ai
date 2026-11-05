@@ -59,7 +59,7 @@ class ProviderError(Exception):
 class StudioAI(Protocol):
     def write_script(self, brief: dict) -> tuple[str, pricing.Cost]: ...
     def breakdown(self, brief: dict, script: str) -> tuple[dict, pricing.Cost]: ...
-    def image(self, prompt: str, references: list[bytes], aspect_ratio: str) -> tuple[bytes, str, pricing.Cost]: ...
+    def image(self, prompt: str, references: list[bytes], aspect_ratio: str, size: str = "1K") -> tuple[bytes, str, pricing.Cost]: ...
     def voice(self, text: str, voice: str) -> tuple[bytes, float, pricing.Cost]: ...
     def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str) -> tuple[bytes, pricing.Cost]: ...
 
@@ -190,7 +190,7 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return data, pricing.text_cost(i, o)
 
-    def image(self, prompt: str, references: list[bytes], aspect_ratio: str):
+    def image(self, prompt: str, references: list[bytes], aspect_ratio: str, size: str = "1K"):
         from google.genai import types
         parts = [types.Part.from_bytes(data=r, mime_type="image/png") for r in references[:4]]
         parts.append(types.Part.from_text(text=prompt))
@@ -198,7 +198,8 @@ class GoogleStudioAI:
             resp = self.client.models.generate_content(
                 model=pricing.IMAGE_MODEL, contents=parts,
                 config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"],
-                                                   image_config=types.ImageConfig(aspect_ratio=aspect_ratio)))
+                                                   image_config=types.ImageConfig(aspect_ratio=aspect_ratio,
+                                                                                  image_size=size)))
         except Exception as e:
             raise _classify(e)
         for cand in resp.candidates or []:
@@ -206,7 +207,7 @@ class GoogleStudioAI:
                 if part.inline_data is not None and part.inline_data.data:
                     u = getattr(resp, "usage_metadata", None)
                     return part.inline_data.data, part.inline_data.mime_type or "image/png", \
-                        pricing.image_cost(1, (u.prompt_token_count or 0) if u else 0)
+                        pricing.image_cost(1, (u.prompt_token_count or 0) if u else 0, size)
         raise PolicyBlocked("No image came back for this prompt. Try rewording the scene.")
 
     def voice(self, text: str, voice: str):
@@ -307,14 +308,15 @@ class FakeStudioAI:
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
 
-    def image(self, prompt, references, aspect_ratio):
+    def image(self, prompt, references, aspect_ratio, size="1K"):
         self.calls.append(("image", aspect_ratio, len(references)))
+        self.last_image_size = size
         self._maybe_fail("image")
         from PIL import Image
         w, h = (540, 960) if aspect_ratio == "9:16" else (960, 540)
         buf = io.BytesIO()
         Image.new("RGB", (w, h), (40, 30, 90)).save(buf, "PNG")
-        return buf.getvalue(), "image/png", pricing.image_cost(1, 300)
+        return buf.getvalue(), "image/png", pricing.image_cost(1, 300, size)
 
     def voice(self, text, voice):
         self.calls.append(("voice", voice))
@@ -351,3 +353,21 @@ def moderate_text(text: str) -> bool:
     except Exception as e:
         print(f"[WARN] moderation unavailable, allowing: {e}")
         return True
+
+
+def omni_clip(prompt: str, image_url: Optional[str], aspect_ratio: str) -> tuple[bytes, float, int]:
+    """For the admin Studio and Ads Studio, which used the Veo 3.1 preview
+    models Google shut down on 22 Oct 2026: one Gemini Omni Flash clip.
+    Returns (mp4 bytes, seconds, cost in US cents). Raises ProviderBusy /
+    PolicyBlocked / ProviderError."""
+    import requests
+    frame = None
+    if image_url:
+        try:
+            r = requests.get(image_url, timeout=30)
+            r.raise_for_status()
+            frame = r.content
+        except Exception as e:
+            raise ProviderError(f"could not fetch the starting image: {e}")
+    data, cost = GoogleStudioAI().video(prompt, frame, "16:9" if aspect_ratio == "16:9" else "9:16")
+    return data, float(cost.units.get("video_seconds") or 8.0), max(1, round(cost.provider_cost_usd * 100))

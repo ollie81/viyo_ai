@@ -145,15 +145,15 @@ GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
 # re-check https://ai.google.dev/gemini-api/docs/pricing before
 # trusting it for real budgeting. This is best-effort cost *tracking*
 # against the daily cap, not a billing-accurate invoice.
-GEMINI_TEXT_INPUT_USD_PER_1M_TOKENS = 0.30
-GEMINI_TEXT_OUTPUT_USD_PER_1M_TOKENS = 2.50
+GEMINI_TEXT_INPUT_USD_PER_1M_TOKENS = 0.75
+GEMINI_TEXT_OUTPUT_USD_PER_1M_TOKENS = 3.75
 
 # Gemini's image model bills image output as a fixed ~1290-token chunk
 # per image rather than exposing a separate per-image price, so this
 # is a flat per-call estimate (~1290 tokens x the output rate above,
 # rounded up) rather than computed from usage_metadata like the text
 # calls below are.
-GEMINI_IMAGE_COST_USD_CENTS = 4
+GEMINI_IMAGE_COST_USD_CENTS = 7  # $0.067 per 1K image
 
 # Same reasoning as the image cost above: Gemini's TTS pricing isn't
 # broken out in official per-token docs in a way that's reliably
@@ -175,8 +175,8 @@ GEMINI_TTS_LINE_COST_USD_CENTS = 1
 # Verified against ai.google.dev/gemini-api/docs/pricing's published
 # per-second rates (720p); re-check there before trusting this for
 # real budgeting, same caveat as the text/image costs above.
-VEO_MODEL = "veo-3.1-lite-generate-preview"
-VEO_PRICE_PER_SEC_USD_CENTS = 5
+VEO_MODEL = "gemini-omni-1.1-flash"  # Veo 3.1 previews were shut down 22 Oct 2026
+VEO_PRICE_PER_SEC_USD_CENTS = 10  # Omni Flash 720p: $17.50/M output tokens x 5,792 tokens/s
 # Veo only accepts 4, 6 or 8 second clips — no arbitrary duration.
 VEO_ALLOWED_DURATIONS = (4, 6, 8)
 # Generation is an async operation polled to completion rather than a
@@ -1886,7 +1886,6 @@ async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
     estimated_cost_cents = duration * VEO_PRICE_PER_SEC_USD_CENTS
     _check_daily_cap(estimated_cost_cents)
 
-    veo_image = _fetch_veo_image(scene_row["image_url"])
     prompt = (
         "Animate this image into a short cinematic video clip for a vertical short-drama series. "
         f"Camera shot: {scene_row.get('camera_shot') or 'medium'} shot. "
@@ -1895,49 +1894,15 @@ async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
         "reference image. No text, no captions, no watermark."
     )
 
+    import studio_ai as _studio_ai
     try:
-        operation = _gemini_client.models.generate_videos(
-            model=VEO_MODEL,
-            prompt=prompt,
-            image=veo_image,
-            config=types.GenerateVideosConfig(aspect_ratio="9:16", duration_seconds=duration),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Veo video generation failed to start: {e}")
-
-    waited = 0
-    while not operation.done:
-        if waited >= VEO_MAX_POLL_SECONDS:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    "Veo is still rendering after several minutes. It may still finish on Google's "
-                    "end — wait a bit and check back rather than retrying right away."
-                ),
-            )
-        time.sleep(VEO_POLL_INTERVAL_SECONDS)
-        waited += VEO_POLL_INTERVAL_SECONDS
-        try:
-            operation = _gemini_client.operations.get(operation)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Could not check Veo generation status: {e}")
-
-    if getattr(operation, "error", None):
-        raise HTTPException(status_code=502, detail=f"Veo video generation failed: {operation.error}")
-
-    generated_videos = (operation.response.generated_videos if operation.response else None) or []
-    if not generated_videos or not generated_videos[0].video:
-        raise HTTPException(status_code=502, detail="Veo did not return a video.")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        video_path = os.path.join(tmp, "veo_output.mp4")
-        try:
-            _gemini_client.files.download(file=generated_videos[0].video, destination=video_path)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Could not download Veo's generated video: {e}")
-        with open(video_path, "rb") as f:
-            video_bytes = f.read()
-
+        video_bytes, _omni_seconds, _omni_cents = _studio_ai.omni_clip(prompt, scene_row["image_url"], "9:16")
+    except _studio_ai.ProviderBusy as e:
+        raise HTTPException(status_code=503, detail=f"The video model is busy. Try again in a minute. ({e})")
+    except (_studio_ai.PolicyBlocked, _studio_ai.ProviderError) as e:
+        raise HTTPException(status_code=502, detail=f"Scene video failed: {e}")
+    duration = int(round(_omni_seconds))
+    estimated_cost_cents = _omni_cents
     path = f"scenes/{scene_id}/{uuid.uuid4().hex}.mp4"
     try:
         supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(

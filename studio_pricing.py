@@ -38,6 +38,7 @@ _PRICE_TABLE: list[tuple[str, dict]] = [
     ("2026-11-01", {
         "text_input_per_m": 0.75, "text_output_per_m": 3.75,            # gemini-3.8-flash
         "image_input_per_m": 0.50, "image_per_1k_image": 0.067,          # gemini-3.1-flash-image
+        "image_per_2k_image": 0.101,
         "tts_audio_per_m": 9.00, "tts_tokens_per_second": 25,            # gemini-3.8-flash-tts
         "video_input_per_m": 1.50, "video_output_per_m": 17.50,          # gemini-omni-1.1-flash
         "video_tokens_per_second_720p": 5792,
@@ -126,11 +127,13 @@ def text_cost(input_tokens: int, output_tokens: int) -> Cost:
                 input_tokens * p["text_input_per_m"] / 1e6 + output_tokens * p["text_output_per_m"] / 1e6)
 
 
-def image_cost(images: int = 1, input_tokens: int = 0) -> Cost:
+def image_cost(images: int = 1, input_tokens: int = 0, size: str = "1K") -> Cost:
+    """size "2K" is the High quality setting (sharper on 1080p video)."""
     p = prices()
-    return Cost("google", IMAGE_MODEL, {"images": images, "input_tokens": input_tokens},
-                images * p["image_per_1k_image"] + input_tokens * p["image_input_per_m"] / 1e6,
-                storage_cost_usd=storage_cost(1.5 * 1024 * 1024 * images))
+    per = p["image_per_2k_image"] if size == "2K" else p["image_per_1k_image"]
+    return Cost("google", IMAGE_MODEL, {"images": images, "input_tokens": input_tokens, "size": size},
+                images * per + input_tokens * p["image_input_per_m"] / 1e6,
+                storage_cost_usd=storage_cost((4 if size == "2K" else 1.5) * 1024 * 1024 * images))
 
 
 def voice_cost(audio_seconds: float) -> Cost:

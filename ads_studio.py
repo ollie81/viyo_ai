@@ -126,9 +126,12 @@ router = APIRouter(prefix="/api/v1/admin/ads-studio", tags=["ads_studio"])
 # close to the whole default daily cap) — the Flutter picker warns before
 # letting an admin select it.
 VEO_TIERS: dict[str, dict] = {
-    "lite": {"model": "veo-3.1-lite-generate-preview", "price_per_sec_cents": 5, "label": "Lite"},
-    "fast": {"model": "veo-3.1-fast-generate-preview", "price_per_sec_cents": 10, "label": "Fast"},
-    "standard": {"model": "veo-3.1-generate-preview", "price_per_sec_cents": 40, "label": "Standard"},
+    # Google shut down the Veo 3.1 preview models on 22 Oct 2026; every
+    # tier now uses its replacement, Gemini Omni Flash (720p, about
+    # $0.10/s). Tier keys are kept so saved campaigns stay valid.
+    "lite": {"model": "gemini-omni-1.1-flash", "price_per_sec_cents": 10, "label": "Omni Flash"},
+    "fast": {"model": "gemini-omni-1.1-flash", "price_per_sec_cents": 10, "label": "Omni Flash"},
+    "standard": {"model": "gemini-omni-1.1-flash", "price_per_sec_cents": 10, "label": "Omni Flash"},
 }
 DEFAULT_VEO_TIER = "lite"
 
@@ -1375,7 +1378,6 @@ def _generate_ad_scene_video(
     cost_cents = duration * tier["price_per_sec_cents"]
     _check_daily_cap(cost_cents)
 
-    veo_image = _fetch_veo_image(image_url)
     if dialogue:
         prompt = (
             "Animate this image into a short video clip for a marketing video, with the subject speaking "
@@ -1390,43 +1392,15 @@ def _generate_ad_scene_video(
             "Subtle, natural motion — keep framing and subject consistent with the reference image. "
             "No text, no captions, no watermark."
         )
+    import studio_ai as _studio_ai
     try:
-        operation = _gemini_client.models.generate_videos(
-            model=tier["model"],
-            prompt=prompt,
-            image=veo_image,
-            config=types.GenerateVideosConfig(aspect_ratio=veo_aspect, duration_seconds=duration),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Veo video generation failed to start: {e}")
-
-    waited = 0
-    while not operation.done:
-        if waited >= VEO_MAX_POLL_SECONDS:
-            raise HTTPException(status_code=504, detail="Veo is still rendering after several minutes.")
-        import time as _time
-        _time.sleep(VEO_POLL_INTERVAL_SECONDS)
-        waited += VEO_POLL_INTERVAL_SECONDS
-        try:
-            operation = _gemini_client.operations.get(operation)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Could not check Veo generation status: {e}")
-
-    if getattr(operation, "error", None):
-        raise HTTPException(status_code=502, detail=f"Veo video generation failed: {operation.error}")
-    generated_videos = (operation.response.generated_videos if operation.response else None) or []
-    if not generated_videos or not generated_videos[0].video:
-        raise HTTPException(status_code=502, detail="Veo did not return a video.")
-
-    import tempfile as _tempfile
-    with _tempfile.TemporaryDirectory() as tmp:
-        video_path = os.path.join(tmp, "veo_output.mp4")
-        try:
-            _gemini_client.files.download(file=generated_videos[0].video, destination=video_path)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Could not download Veo's generated video: {e}")
-        with open(video_path, "rb") as f:
-            video_bytes = f.read()
+        video_bytes, _omni_seconds, _omni_cents = _studio_ai.omni_clip(prompt, image_url, veo_aspect)
+    except _studio_ai.ProviderBusy as e:
+        raise HTTPException(status_code=503, detail=f"The video model is busy. Try again in a minute. ({e})")
+    except (_studio_ai.PolicyBlocked, _studio_ai.ProviderError) as e:
+        raise HTTPException(status_code=502, detail=f"Ad scene video failed: {e}")
+    duration = int(round(_omni_seconds))
+    cost_cents = _omni_cents
     url = _upload_video_preview(video_bytes, f"ads/{campaign_id}/scenes/{uuid.uuid4().hex}_veo.mp4")
     _log_cost(campaign_id, "ad_scene_video", cost_cents)
     return url, duration

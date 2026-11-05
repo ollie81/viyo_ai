@@ -17,6 +17,7 @@ from studio_store import LocalFiles, PgStore
 def studio_schema(migrated):
     conn = connect()
     conn.execute((ROOT / "creator_studio_schema.sql").read_text())
+    conn.execute((ROOT / "creator_studio_sound.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated
@@ -436,3 +437,81 @@ def test_admin_can_grant_by_username(env):
     missing = client.post("/api/v1/studio/admin/credits/grant", headers={"X-Admin-Key": "admin-secret"},
                           json={"user": "@nobody_here", "credits": 1})
     assert missing.status_code == 404
+
+
+
+def _tone(path, seconds=6, freq=220):
+    import subprocess
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"sine=f={freq}:d={seconds}", path], check=True)
+
+
+def test_music_upload_needs_rights_and_a_real_audio_file(env, tmp_path):
+    client, db = env[0], env[1]
+    u = make_user(db)
+    pid = new_project(client, u)
+    mp3 = tmp_path / "song.mp3"
+    _tone(str(mp3))
+    r = client.post(f"/api/v1/studio/projects/{pid}/music", headers=H(u), files={"file": ("song.mp3", mp3.read_bytes())})
+    assert r.status_code == 400 and "rights" in r.json()["detail"]
+    junk = client.post(f"/api/v1/studio/projects/{pid}/music", headers=H(u), data={"rights_confirmed": "true"},
+                       files={"file": ("x.mp3", b"not audio at all")})
+    assert junk.status_code == 400
+    ok = client.post(f"/api/v1/studio/projects/{pid}/music", headers=H(u), data={"rights_confirmed": "true"},
+                     files={"file": ("song.mp3", mp3.read_bytes())})
+    assert ok.status_code == 200 and ok.json()["music_name"] == "song.mp3"
+    proj = client.get(f"/api/v1/studio/projects/{pid}", headers=H(u)).json()["project"]
+    assert proj["has_music"] and proj["music_volume"] == 0.25
+    other = make_user(db)
+    assert client.post(f"/api/v1/studio/projects/{pid}/music", headers=H(other), data={"rights_confirmed": "true"},
+                       files={"file": ("song.mp3", mp3.read_bytes())}).status_code == 404
+    client.delete(f"/api/v1/studio/projects/{pid}/music", headers=H(u))
+    assert client.get(f"/api/v1/studio/projects/{pid}", headers=H(u)).json()["project"]["has_music"] is False
+
+
+def test_render_mixes_music_and_effects(env, tmp_path):
+    import subprocess
+    client, db, store, files, ai, gen, ren = env
+    u = make_user(db)
+    grant(client, u, 500)
+    pid = new_project(client, u)
+    mp3 = tmp_path / "song.mp3"
+    _tone(str(mp3), 10)
+    client.post(f"/api/v1/studio/projects/{pid}/music", headers=H(u), data={"rights_confirmed": "true"},
+                files={"file": ("song.mp3", mp3.read_bytes())})
+    client.patch(f"/api/v1/studio/projects/{pid}", headers=H(u), json={"music_volume": 0.5})
+    s = client.post(f"/api/v1/studio/projects/{pid}/scenes", headers=H(u),
+                    json={"visual": "x", "duration_seconds": 3, "sfx": ["rain", "whoosh"]}).json()
+    assert s["sfx"] == ["rain", "whoosh"]
+    assert client.patch(f"/api/v1/studio/scenes/{s['id']}", headers=H(u), json={"sfx": ["laser"]}).status_code == 400
+    start(client, u, pid, "image", [s["id"]])
+    run(gen)
+    start(client, u, pid, "render")
+    run(ren)
+    path = db.execute("select path from public.studio_renders").fetchone()[0]
+    local = tmp_path / "out.mp4"
+    local.write_bytes(files.get(path))
+    r = subprocess.run(["ffmpeg", "-i", str(local), "-af", "bandpass=f=220:w=30,volumedetect", "-vn", "-f", "null", "-"],
+                       capture_output=True, text=True).stderr
+    mean = float([l for l in r.splitlines() if "mean_volume" in l][0].split(":")[1].split()[0])
+    assert mean > -50, f"the music is in the film (got {mean} dB at the music's pitch)"
+
+
+def test_high_quality_images_cost_more_and_ask_for_2k(env):
+    client, db, store, files, ai, gen, ren = env
+    u = make_user(db)
+    grant(client, u, 500)
+    pid = new_project(client, u)
+    s = client.post(f"/api/v1/studio/projects/{pid}/scenes", headers=H(u), json={"visual": "x"}).json()
+    std = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u), json={"kind": "image"}).json()["total_credits"]
+    client.patch(f"/api/v1/studio/projects/{pid}", headers=H(u), json={"image_quality": "high"})
+    high = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u), json={"kind": "image"}).json()["total_credits"]
+    assert high > std
+    start(client, u, pid, "image", [s["id"]])
+    run(gen)
+    assert ai.last_image_size == "2K"
+
+
+def test_sound_effects_are_listed():
+    import studio_sfx
+    ids = {e["id"] for e in studio_sfx.labels()}
+    assert {"rain", "whoosh", "heartbeat", "impact"} <= ids

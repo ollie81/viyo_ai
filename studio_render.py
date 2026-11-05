@@ -31,6 +31,7 @@ class SceneInput:
     audio: Optional[str] = None
     audio_seconds: Optional[float] = None
     lines: tuple = ()
+    sfx: tuple = ()          # studio_sfx effect ids
 
 
 class RenderError(Exception):
@@ -103,35 +104,55 @@ def render_scene(s: SceneInput, w: int, h: int, out: str, tmp: str, idx: int, ca
     cmd = ["ffmpeg", "-y", "-v", "error"]
     if s.video:
         cmd += ["-i", s.video]
-        v = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},"
+        v = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},fps={FPS},"
              f"tpad=stop_mode=clone:stop_duration={d},trim=duration={d},setsar=1,format=yuv420p{caps}[v]")
     elif s.image:
         cmd += ["-loop", "1", "-framerate", str(FPS), "-t", str(d), "-i", s.image]
         # Slow push-in: scale up a little over the scene and keep it centred.
         bw, bh = int(w * 1.25) // 2 * 2, int(h * 1.25) // 2 * 2
         frames = max(1, int(d * FPS))
-        v = (f"[0:v]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},"
+        v = (f"[0:v]scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=lanczos,crop={bw}:{bh},"
              f"zoompan=z='1+0.10*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={FPS},"
              f"setsar=1,format=yuv420p{caps}[v]")
     else:
         raise RenderError("a scene has no image or video")
-    audio_idx = 1
+    # Audio: the voices (levelled), the AI video's own sound underneath
+    # them (or at full level when nobody speaks), and any effects.
+    import studio_sfx
+    parts, n = [], 1
     if s.audio:
         cmd += ["-i", s.audio]
-        a = f"[{audio_idx}:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={d},loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[a]"
-    elif s.video and probe(s.video)["has_audio"]:
-        a = f"[0:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={d},loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[a]"
-    else:
+        parts.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[voice]")
+        n += 1
+    if s.video and probe(s.video)["has_audio"]:
+        level = 0.3 if s.audio else 1.0
+        parts.append(f"[0:a]aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=-20:TP=-2,aresample=48000,volume={level}[vid]")
+    for k, effect in enumerate(s.sfx):
+        if effect not in studio_sfx.EFFECTS:
+            continue
+        if studio_sfx.loops(effect):
+            cmd += ["-stream_loop", "-1"]
+        cmd += ["-i", studio_sfx.path_for(effect)]
+        parts.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=duration={d}[fx{k}]")
+        n += 1
+    labels = [p[p.rindex("["):] for p in parts]
+    if not labels:
         cmd += ["-f", "lavfi", "-t", str(d), "-i", "anullsrc=r=48000:cl=stereo"]
-        a = f"[{audio_idx}:a]atrim=duration={d}[a]"
+        a = f"[{n}:a]atrim=duration={d}[a]"
+    else:
+        mix = (f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0,"
+               if len(labels) > 1 else f"{labels[0]}anull,")
+        a = ";".join(parts) + f";{mix}apad,atrim=duration={d},alimiter=limit=0.89:level=false[a]"
     cmd += ["-filter_complex", f"{v};{a}", "-map", "[v]", "-map", "[a]", "-t", str(d),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", "4M", "-bufsize", "8M",
-            "-pix_fmt", "yuv420p", "-r", str(FPS), "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", out]
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-maxrate", "8M", "-bufsize", "16M",
+            "-profile:v", "high", "-pix_fmt", "yuv420p", "-r", str(FPS),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", out]
     _run(cmd, f"scene {idx + 1}")
     return d
 
 
-def render_film(scenes: list[SceneInput], aspect_ratio: str, out: str, tmp: str, captions: bool = True) -> dict:
+def render_film(scenes: list[SceneInput], aspect_ratio: str, out: str, tmp: str, captions: bool = True,
+                music: Optional[str] = None, music_volume: float = 0.25) -> dict:
     if not scenes:
         raise RenderError("no scenes to render")
     w, h = canvas(aspect_ratio)
@@ -144,8 +165,11 @@ def render_film(scenes: list[SceneInput], aspect_ratio: str, out: str, tmp: str,
     with open(listing, "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
+    joined = os.path.join(tmp, "joined.mp4") if music else out
     _run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy",
-          "-movflags", "+faststart", out], "joining scenes")
+          "-movflags", "+faststart", joined], "joining scenes")
+    if music:
+        add_music(joined, music, out, music_volume)
     info = probe(out)
     sha = hashlib.sha256()
     with open(out, "rb") as f:
@@ -153,6 +177,24 @@ def render_film(scenes: list[SceneInput], aspect_ratio: str, out: str, tmp: str,
             sha.update(chunk)
     return {"duration": round(info["duration"], 2), "width": info["width"], "height": info["height"],
             "bytes": os.path.getsize(out), "sha256": sha.hexdigest()}
+
+
+def add_music(video: str, music: str, out: str, volume: float = 0.25) -> None:
+    """Background music under the whole film, looped to length, faded in and
+    out, and pushed down automatically whenever someone speaks (ducking).
+    The picture is copied, not re-encoded."""
+    dur = probe(video)["duration"]
+    vol = min(max(volume, 0.02), 1.0)
+    fade_out = max(0.0, dur - 2.5)
+    graph = (f"[1:a]aresample=48000,aformat=channel_layouts=stereo,volume={vol:.3f},"
+             f"afade=t=in:d=1.5,afade=t=out:st={fade_out:.2f}:d=2.5,atrim=duration={dur:.2f}[m];"
+             f"[0:a]asplit=2[dia][key];"
+             f"[m][key]sidechaincompress=threshold=0.03:ratio=10:attack=15:release=450:makeup=1[duck];"
+             f"[dia][duck]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.89:level=false[a]")
+    _run(["ffmpeg", "-y", "-v", "error", "-i", video, "-stream_loop", "-1", "-i", music,
+          "-filter_complex", graph, "-map", "0:v", "-map", "[a]", "-c:v", "copy",
+          "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-t", f"{dur:.2f}", out],
+         "adding music")
 
 
 def join_audio(wavs: list[str], out: str, gap: float = 0.25) -> float:

@@ -181,7 +181,7 @@ class StudioWorker:
         prompt = (f"Character reference portrait for a {project['genre'] or 'drama'} production. {ch['name']}: "
                   f"{ch['description']}. Waist-up, facing the camera, face fully visible, neutral studio background, "
                   f"soft even light. Style: {project['visual_style'] or 'cinematic, realistic'}. No text.")
-        data, mime, cost = self.ai.image(prompt, [], "9:16")
+        data, mime, cost = self.ai.image(prompt, [], "9:16", _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "portrait", ext, data, mime, character_id=ch["id"])
         self.store.update("studio_characters", {"id": ch["id"]}, {"reference_path": path})
@@ -201,7 +201,7 @@ class StudioWorker:
         notes = " ".join(f"{c['name']}: {c['description']}." for c in in_scene)
         prompt = ai_mod.image_prompt(scene["visual"] or scene["heading"], project["visual_style"],
                                      project["aspect_ratio"], notes)
-        data, mime, cost = self.ai.image(prompt, refs[:4], project["aspect_ratio"])
+        data, mime, cost = self.ai.image(prompt, refs[:4], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
         self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
@@ -280,9 +280,15 @@ class StudioWorker:
                     video=fetch(s["video_path"], f"vid{n}.mp4") if use_video else None,
                     audio=fetch(s.get("audio_path"), f"aud{n}.m4a"),
                     audio_seconds=float(s["audio_seconds"]) if s.get("audio_seconds") else None,
-                    lines=tuple(d["text"] for d in s["dialogue"] if d.get("text"))))
+                    lines=tuple(d["text"] for d in s["dialogue"] if d.get("text")),
+                    sfx=tuple(x for x in (s.get("sfx") or []) if isinstance(x, str))))
+            music = None
+            if project.get("music_path"):
+                music = os.path.join(tmp, "music.m4a")
+                self.files.get_to(project["music_path"], music)
             out = os.path.join(tmp, "film.mp4")
-            info = render.render_film(inputs, project["aspect_ratio"], out, tmp, captions=bool(project.get("captions", True)))
+            info = render.render_film(inputs, project["aspect_ratio"], out, tmp, captions=bool(project.get("captions", True)),
+                                      music=music, music_volume=float(project.get("music_volume") or 0.25))
             prev = self.store.select("studio_renders", {"project_id": project["id"]}, order="version", desc=True, limit=1)
             version = (prev[0]["version"] + 1) if prev else 1
             path, bunny_id = None, None
@@ -312,6 +318,10 @@ class StudioWorker:
         if not scene or scene["project_id"] != project["id"]:
             raise JobFailed("not_found", "That scene no longer exists.")
         return scene
+
+
+def _size(project: dict) -> str:
+    return "2K" if project.get("image_quality") == "high" else "1K"
 
 
 def characters_in_scene(scene: dict, cast: list[dict]) -> list[dict]:

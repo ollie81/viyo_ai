@@ -295,6 +295,8 @@ create table if not exists public.studio_renders (
 alter table public.studio_renders add column if not exists bunny_video_id text;
 alter table public.studio_renders alter column path drop not null;
 
+-- Music, effects and image quality: see creator_studio_sound.sql (run it after this file).
+
 -- ================================================================ jobs
 
 create table if not exists public.studio_jobs (

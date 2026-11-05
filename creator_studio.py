@@ -22,10 +22,11 @@ import uuid
 from collections import defaultdict, deque
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 import studio_ai
+import studio_sfx
 import studio_pricing as pricing
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
@@ -166,6 +167,8 @@ class ProjectPatch(BaseModel):
     captions: Optional[bool] = None
     script: Optional[str] = Field(None, max_length=60000)
     aspect_ratio: Optional[Literal["9:16", "16:9"]] = None
+    music_volume: Optional[float] = Field(None, ge=0, le=1)
+    image_quality: Optional[Literal["standard", "high"]] = None
 
 
 class CharacterIn(BaseModel):
@@ -192,6 +195,7 @@ class SceneIn(BaseModel):
     duration_seconds: float = Field(5, ge=2, le=20)
     mode: Literal["still", "video"] = "still"
     position: Optional[int] = None
+    sfx: list[str] = Field(default_factory=list, max_length=4)
 
 
 class ScenePatch(BaseModel):
@@ -200,6 +204,14 @@ class ScenePatch(BaseModel):
     dialogue: Optional[list[Line]] = Field(None, max_length=12)
     duration_seconds: Optional[float] = Field(None, ge=2, le=20)
     mode: Optional[Literal["still", "video"]] = None
+    sfx: Optional[list[str]] = Field(None, max_length=4)
+
+
+def _clean_sfx(items: list[str]) -> list[str]:
+    bad = [x for x in items if x not in studio_sfx.EFFECTS]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown sound effect: {bad[0]}")
+    return list(dict.fromkeys(items))
 
 
 class OrderIn(BaseModel):
@@ -242,7 +254,7 @@ def _scene_out(s: dict, urls: dict) -> dict:
             "audio_url": urls.get(s.get("audio_path") or ""),
             "audio_seconds": float(s["audio_seconds"]) if s.get("audio_seconds") else None,
             "has_image": bool(s.get("image_path")), "has_video": bool(s.get("video_path")),
-            "has_audio": bool(s.get("audio_path"))}
+            "has_audio": bool(s.get("audio_path")), "sfx": s.get("sfx") or []}
 
 
 def _job_out(j: dict) -> dict:
@@ -260,8 +272,11 @@ def _render_out(r: dict) -> dict:
 
 def _project_out(p: dict) -> dict:
     keys = ("id", "title", "logline", "kind", "aspect_ratio", "genre", "visual_style", "language", "target_seconds",
-            "captions", "script", "created_at", "updated_at")
-    return {k: p.get(k) for k in keys}
+            "captions", "script", "created_at", "updated_at", "music_name")
+    out = {k: p.get(k) for k in keys}
+    out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
+               image_quality=p.get("image_quality") or "standard")
+    return out
 
 
 # ---------------------------------------------------------------- account
@@ -274,6 +289,7 @@ async def me(user_id: str = Depends(creator)):
         "usd_per_credit": pricing.USD_PER_CREDIT,
         "packs": [{**p, "price_usd": pricing.pack_price(p["credits"], LS_PCT, LS_FIXED)} for p in CREDIT_PACKS],
         "checkout_available": False,
+        "sound_effects": studio_sfx.labels(),
         "price_checked": pricing.PRICE_CHECKED,
     }
 
@@ -408,7 +424,8 @@ async def add_scene(project_id: str, body: SceneIn, user_id: str = Depends(creat
     row = st.insert("studio_scenes", [{"project_id": p["id"], "owner_id": user_id, "position": pos,
                                        "heading": body.heading, "visual": body.visual,
                                        "dialogue": [l.model_dump() for l in body.dialogue],
-                                       "duration_seconds": body.duration_seconds, "mode": body.mode}])[0]
+                                       "duration_seconds": body.duration_seconds, "mode": body.mode,
+                                       "sfx": _clean_sfx(body.sfx)}])[0]
     _touch(p["id"])
     return _scene_out(row, {})
 
@@ -417,6 +434,8 @@ async def add_scene(project_id: str, body: SceneIn, user_id: str = Depends(creat
 async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(creator)):
     s = _owned("studio_scenes", scene_id, user_id)
     fields = body.model_dump(exclude_none=True)
+    if "sfx" in fields:
+        fields["sfx"] = _clean_sfx(fields["sfx"])
     if "dialogue" in fields:
         fields["dialogue"] = [l.model_dump() for l in body.dialogue]
         # New lines need a new voice track; the old file stays in the asset history.
@@ -479,12 +498,13 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict]) -> tuple[pricing.
     if kind == "breakdown":
         return pricing.estimate_breakdown(len(p["script"]), p["target_seconds"]), \
             (None if p["script"].strip() else "Write or paste a script first.")
+    size = "2K" if p.get("image_quality") == "high" else "1K"
     if kind == "portrait":
-        return pricing.image_cost(1, 400), (None if target["description"].strip() else "Describe this character first.")
+        return pricing.image_cost(1, 400, size), (None if target["description"].strip() else "Describe this character first.")
     if kind == "image":
         from studio_worker import characters_in_scene
         refs = sum(1 for c in characters_in_scene(target, cast) if c.get("reference_path"))
-        return pricing.image_cost(1, 400 + 1300 * min(refs, 4)), \
+        return pricing.image_cost(1, 400 + 1300 * min(refs, 4), size), \
             (None if (target["visual"] or target["heading"]).strip() else "Describe what this scene shows first.")
     if kind == "voice":
         text = " ".join(d.get("text", "") for d in target.get("dialogue") or [])
@@ -569,6 +589,64 @@ async def cancel_job(job_id: str, user_id: str = Depends(creator)):
             raise HTTPException(status_code=409, detail="This has already started, so it can't be stopped.")
         raise HTTPException(status_code=404, detail="Not found.")
     return {"ok": True, "balance": _balance(user_id)}
+
+
+# ---------------------------------------------------------------- music
+
+MUSIC_MAX_BYTES = 25 * 1024 * 1024
+MUSIC_MAX_SECONDS = 15 * 60
+
+
+@router.post("/projects/{project_id}/music")
+async def upload_music(project_id: str, file: UploadFile = File(...), rights_confirmed: bool = Form(False),
+                       user_id: str = Depends(creator)):
+    """The creator's own background track. Stored privately, re-encoded to
+    AAC (which also drops file metadata), used under the whole film."""
+    p = _project(project_id, user_id)
+    if not rights_confirmed:
+        raise HTTPException(status_code=400, detail="Confirm you have the rights to use this music.")
+    _rate_limit(user_id)
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "upload")
+        size = 0
+        with open(src, "wb") as f:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > MUSIC_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="Music files can be up to 25 MB.")
+                f.write(chunk)
+        try:
+            import studio_render
+            info = studio_render.probe(src)
+        except Exception:
+            raise HTTPException(status_code=400, detail="That doesn't look like an audio file. Try MP3, M4A or WAV.")
+        if info["duration"] <= 1 or info["duration"] > MUSIC_MAX_SECONDS:
+            raise HTTPException(status_code=400, detail="Music must be between 1 second and 15 minutes long.")
+        out = os.path.join(tmp, "music.m4a")
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-map_metadata", "-1", "-ac", "2",
+                            "-ar", "48000", "-c:a", "aac", "-b:a", "192k", out], capture_output=True)
+        if r.returncode != 0:
+            raise HTTPException(status_code=400, detail="That doesn't look like an audio file. Try MP3, M4A or WAV.")
+        from studio_store import new_path
+        path = new_path(user_id, p["id"], "music", "m4a")
+        get_files().put_file(path, out, "audio/mp4")
+        get_store().insert("studio_assets", [{"owner_id": user_id, "project_id": p["id"], "kind": "music", "path": path,
+                                              "bytes": os.path.getsize(out), "duration_seconds": round(info["duration"], 2)}])
+    name = os.path.basename(file.filename or "music")[:80]
+    get_store().update("studio_projects", {"id": p["id"]}, {"music_path": path, "music_name": name})
+    _touch(p["id"])
+    return {"ok": True, "music_name": name, "duration_seconds": round(info["duration"], 1)}
+
+
+@router.delete("/projects/{project_id}/music")
+async def remove_music(project_id: str, user_id: str = Depends(creator)):
+    """Stops using the track. The file stays in the project's history."""
+    p = _project(project_id, user_id)
+    get_store().update("studio_projects", {"id": p["id"]}, {"music_path": None, "music_name": None})
+    _touch(p["id"])
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- renders
