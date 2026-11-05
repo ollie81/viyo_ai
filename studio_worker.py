@@ -38,8 +38,9 @@ class JobFailed(Exception):
 
 class StudioWorker:
     def __init__(self, store: Store, files: Files, ai, lane: str, heartbeat_seconds: int = 20,
-                 stale_seconds: int = 180):
+                 stale_seconds: int = 180, bunny_upload=None):
         self.store, self.files, self.ai, self.lane = store, files, ai, lane
+        self.bunny_upload = bunny_upload  # (local_path, title) -> Bunny video id
         self.heartbeat_seconds, self.stale_seconds = heartbeat_seconds, stale_seconds
         self._stop = threading.Event()
 
@@ -284,17 +285,27 @@ class StudioWorker:
             info = render.render_film(inputs, project["aspect_ratio"], out, tmp, captions=bool(project.get("captions", True)))
             prev = self.store.select("studio_renders", {"project_id": project["id"]}, order="version", desc=True, limit=1)
             version = (prev[0]["version"] + 1) if prev else 1
-            path = f"{job['owner_id']}/{project['id']}/render/v{version:03d}.mp4"
-            self.files.put_file(path, out, "video/mp4")
+            path, bunny_id = None, None
+            if self.bunny_upload is not None:
+                # Films go to Bunny Stream: no file-size limit, built for video.
+                try:
+                    bunny_id = self.bunny_upload(out, f"{project['title']} v{version}")
+                except Exception as e:
+                    raise JobFailed("storage_busy", "Couldn't save the film. Trying again.", retry=True) from e
+            else:
+                path = f"{job['owner_id']}/{project['id']}/render/v{version:03d}.mp4"
+                self.files.put_file(path, out, "video/mp4")
         self.store.insert("studio_assets", [{"owner_id": job["owner_id"], "project_id": project["id"], "job_id": job["id"],
-                                             "kind": "render", "path": path, "bytes": info["bytes"],
+                                             "kind": "render", "path": path or f"bunny:{bunny_id}", "bytes": info["bytes"],
                                              "duration_seconds": info["duration"], "width": info["width"], "height": info["height"]}])
         self.store.insert("studio_renders", [{"project_id": project["id"], "owner_id": job["owner_id"], "job_id": job["id"],
-                                              "version": version, "path": path, "aspect_ratio": project["aspect_ratio"],
+                                              "version": version, "path": path, "bunny_video_id": bunny_id,
+                                              "aspect_ratio": project["aspect_ratio"],
                                               "width": info["width"], "height": info["height"],
                                               "duration_seconds": info["duration"], "bytes": info["bytes"],
                                               "sha256": info["sha256"]}])
-        return {"path": path, "version": version, **info}, pricing.render_cost(info["duration"], info["bytes"])
+        return {"path": path, "bunny_video_id": bunny_id, "version": version, **info}, \
+            pricing.render_cost(info["duration"], info["bytes"])
 
     def _scene(self, job, project):
         scene = self.store.one("studio_scenes", {"id": job["scene_id"]})
@@ -318,9 +329,10 @@ def pick_voice(gender: str, used: set) -> str:
     return pool[len(used) % len(pool)]
 
 
-def start_background(store: Store, files: Files, ai) -> list[StudioWorker]:
+def start_background(store: Store, files: Files, ai, bunny_upload=None) -> list[StudioWorker]:
     """Starts one thread per lane. Called from the worker service."""
-    workers = [StudioWorker(store, files, ai, "generation"), StudioWorker(store, files, ai, "render")]
+    workers = [StudioWorker(store, files, ai, "generation"),
+               StudioWorker(store, files, ai, "render", bunny_upload=bunny_upload)]
     for w in workers:
         threading.Thread(target=w.run_forever, name=f"studio-{w.lane}", daemon=True).start()
     return workers
@@ -346,6 +358,9 @@ def start_production() -> list[StudioWorker]:
     from studio_store import SupabaseFiles, SupabaseStore
     from supabase import create_client
     admin = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-    workers = start_background(SupabaseStore(admin), SupabaseFiles(admin), LazyGoogleAI())
+    import bunny_stream
+    upload = bunny_stream.upload_file if bunny_stream._configured() else None
+    workers = start_background(SupabaseStore(admin), SupabaseFiles(admin), LazyGoogleAI(), bunny_upload=upload)
+    print(f"[INFO] Studio films are saved to {'Bunny Stream' if upload else 'Supabase Storage'}")
     print("[INFO] Creator Studio worker started (generation + render lanes)")
     return workers

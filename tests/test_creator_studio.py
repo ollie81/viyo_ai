@@ -369,3 +369,57 @@ def test_pricing_formula():
     import datetime
     assert p.prices(datetime.date(2027, 1, 2))["text_input_per_m"] == 1.50
     assert p.prices(datetime.date(2026, 11, 5))["text_input_per_m"] == 0.75
+
+
+def test_films_are_saved_to_bunny_when_it_is_set_up(env, monkeypatch, tmp_path):
+    import bunny_stream
+    client, db, store, files, ai, gen, ren = env
+    uploaded = {}
+
+    def fake_upload(local_path, title):
+        uploaded["bytes"] = open(local_path, "rb").read()
+        uploaded["title"] = title
+        return "bunny-vid-1"
+
+    ren.bunny_upload = fake_upload
+    status = {"status": 3, "availableResolutions": "720p,1080p"}
+    monkeypatch.setattr(cs, "bunny_info", lambda vid: dict(status))
+    monkeypatch.setattr(bunny_stream, "BUNNY_STREAM_PULL_ZONE", "vz-test.b-cdn.net")
+    u = make_user(db)
+    grant(client, u, 500)
+    pid = new_project(client, u, aspect_ratio="16:9")
+    s = client.post(f"/api/v1/studio/projects/{pid}/scenes", headers=H(u), json={"visual": "x", "duration_seconds": 2}).json()
+    start(client, u, pid, "image", [s["id"]])
+    run(gen)
+    start(client, u, pid, "render")
+    run(ren)
+    row = db.execute("select path, bunny_video_id from public.studio_renders").fetchone()
+    assert row == (None, "bunny-vid-1"), "the master goes to Bunny, not Supabase"
+    assert uploaded["bytes"][4:8] == b"ftyp" and uploaded["title"] == "Night Shift v1"
+    rid = client.get(f"/api/v1/studio/projects/{pid}", headers=H(u)).json()["renders"][0]["id"]
+    r = client.post(f"/api/v1/studio/renders/{rid}/download", headers=H(u))
+    assert r.status_code == 409 and "still being prepared" in r.json()["detail"]
+    status["status"] = 4
+    body = client.post(f"/api/v1/studio/renders/{rid}/download", headers=H(u)).json()
+    assert body["url"] == "https://vz-test.b-cdn.net/bunny-vid-1/play_1080p.mp4"
+
+
+def test_a_bunny_upload_failure_retries_then_refunds(env):
+    client, db, store, files, ai, gen, ren = env
+
+    def broken(local_path, title):
+        raise RuntimeError("bunny 500")
+
+    ren.bunny_upload = broken
+    u = make_user(db)
+    grant(client, u, 500)
+    pid = new_project(client, u)
+    s = client.post(f"/api/v1/studio/projects/{pid}/scenes", headers=H(u), json={"visual": "x", "duration_seconds": 2}).json()
+    start(client, u, pid, "image", [s["id"]])
+    run(gen)
+    before = balance(client, u)["available"]
+    start(client, u, pid, "render")
+    assert run(ren) == 2, "tried twice"
+    job = client.get(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u)).json()["jobs"][0]
+    assert job["status"] == "failed"
+    assert balance(client, u)["available"] == before

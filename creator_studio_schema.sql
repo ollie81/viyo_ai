@@ -280,7 +280,8 @@ create table if not exists public.studio_renders (
   owner_id uuid not null references auth.users(id) on delete cascade,
   job_id uuid,
   version int not null,
-  path text not null,
+  path text,                    -- Supabase copy (only when Bunny isn't set up)
+  bunny_video_id text,          -- the master lives in Bunny Stream: no file-size limit
   aspect_ratio text not null,
   width int, height int,
   duration_seconds numeric(8,2),
@@ -289,6 +290,10 @@ create table if not exists public.studio_renders (
   created_at timestamptz not null default now(),
   unique (project_id, version)
 );
+
+-- Older copies of this file created path as required and had no Bunny column.
+alter table public.studio_renders add column if not exists bunny_video_id text;
+alter table public.studio_renders alter column path drop not null;
 
 -- ================================================================ jobs
 

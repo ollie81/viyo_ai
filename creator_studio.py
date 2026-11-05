@@ -579,11 +579,28 @@ async def download_render(render_id: str, user_id: str = Depends(creator)):
     p = get_store().one("studio_projects", {"id": r["project_id"]}) or {}
     slug = re.sub(r"[^a-z0-9]+", "-", (p.get("title") or "viyo-film").lower()).strip("-")[:50] or "viyo-film"
     name = f"{slug}-v{r['version']}.mp4"
+    if r.get("bunny_video_id"):
+        import bunny_stream
+        try:
+            info = bunny_info(r["bunny_video_id"])
+        except bunny_stream.BunnyError:
+            raise HTTPException(status_code=502, detail="Video storage didn't answer. Try again in a minute.")
+        if bunny_stream.is_failed(info):
+            raise HTTPException(status_code=409, detail="This render failed to process. Render it again.")
+        if not bunny_stream.is_finished(info):
+            raise HTTPException(status_code=409, detail="Your film is still being prepared. Try again in a minute or two.")
+        return {"url": bunny_stream.source_download_url(r["bunny_video_id"], info), "file_name": name,
+                "expires_at": None, "width": r.get("width"), "height": r.get("height")}
     url = get_files().sign([r["path"]], SIGN_SECONDS, download_name=name).get(r["path"])
     if not url:
         raise HTTPException(status_code=502, detail="Couldn't prepare the download. Try again.")
     return {"url": url, "file_name": name, "expires_at": int(time.time()) + SIGN_SECONDS,
             "width": r.get("width"), "height": r.get("height")}
+
+
+def bunny_info(video_id: str) -> dict:
+    import bunny_stream
+    return bunny_stream.get_video_info(video_id)
 
 
 # ---------------------------------------------------------------- admin

@@ -238,6 +238,28 @@ def source_download_url(video_id: str, info: dict) -> str:
     return _playback_url(video_id, _pick_resolution(info.get("availableResolutions") or ""))
 
 
+def upload_file(local_path: str, title: str) -> str:
+    """Server-side upload of a file on disk (streamed, no size limit on our
+    side). Returns the new Bunny video id. Raises BunnyError."""
+    if not _configured():
+        raise BunnyError("Bunny Stream is not configured")
+    try:
+        r = requests.post(f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos",
+                          json={"title": (title or "Untitled")[:200]},
+                          headers={"AccessKey": BUNNY_STREAM_API_KEY, "Content-Type": "application/json"}, timeout=20)
+        r.raise_for_status()
+        video_id = r.json().get("guid")
+        if not video_id:
+            raise BunnyError("Bunny did not return a video id")
+        with open(local_path, "rb") as f:
+            up = requests.put(f"{_BUNNY_API_BASE}/library/{BUNNY_STREAM_LIBRARY_ID}/videos/{video_id}",
+                              data=f, headers={"AccessKey": BUNNY_STREAM_API_KEY}, timeout=1800)
+        up.raise_for_status()
+    except requests.RequestException as e:
+        raise BunnyError(str(e))
+    return video_id
+
+
 def delete_video(video_id: str) -> bool:
     """True if the video is gone afterwards (including 'was already gone')."""
     if not _configured():
