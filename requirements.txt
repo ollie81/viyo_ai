@@ -53,3 +53,4 @@ Pillow==12.3.0
 # voice-embedding model on CPU. No paid API.
 onnxruntime==1.31.1
 numpy>=1.26
+faster-whisper==1.2.1

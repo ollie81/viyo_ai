@@ -162,3 +162,66 @@ def openai_chunk_transcriber(client, model: str = WHISPER_MODEL) -> ChunkTranscr
         return result.model_dump() if hasattr(result, "model_dump") else dict(result)
 
     return run
+
+
+# ---------------------------------------------------------------- local (faster-whisper)
+#
+# whisper-1 is switched off by OpenAI on 26 Feb 2027, and its replacements
+# don't return word timestamps, which the captions depend on. This runs the
+# open Whisper model on the worker itself instead (faster-whisper, int8 on
+# CPU): same word timestamps, ~99 languages, and no per-minute API cost.
+# Turned on with REPURPOSE_TRANSCRIBER=local on the worker.
+
+LOCAL_MODEL_DEFAULT = "small"
+_local_models: dict = {}
+
+
+def local_model_name() -> str:
+    return os.environ.get("REPURPOSE_LOCAL_WHISPER_MODEL", LOCAL_MODEL_DEFAULT)
+
+
+def transcript_cache_key(local: bool) -> str:
+    """Transcripts are cached per engine, so switching never mixes them."""
+    return f"faster-whisper-{local_model_name()}" if local else WHISPER_MODEL
+
+
+def _load_local_model(name: str):
+    model = _local_models.get(name)
+    if model is None:
+        from faster_whisper import WhisperModel
+        threads = int(os.environ.get("REPURPOSE_LOCAL_WHISPER_THREADS", "0")) or (os.cpu_count() or 2)
+        model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=threads)
+        _local_models[name] = model
+    return model
+
+
+def local_chunk_transcriber(model_name: Optional[str] = None) -> ChunkTranscriber:
+    """Same output shape as whisper-1 verbose_json: text, segments, words, language."""
+    from repurpose_jobs import PermanentJobError, TransientJobError
+
+    def run(chunk_path: str, prompt: Optional[str]) -> dict:
+        name = model_name or local_model_name()
+        try:
+            model = _load_local_model(name)
+        except Exception as e:
+            raise TransientJobError("transcription_unavailable", "Transcription is temporarily unavailable.",
+                                    f"local whisper model {name} failed to load: {e}")
+        try:
+            segments, info = model.transcribe(
+                chunk_path, word_timestamps=True, vad_filter=True, beam_size=1,
+                initial_prompt=prompt or None, condition_on_previous_text=False)
+            segs, words, texts = [], [], []
+            for seg in segments:
+                text = (seg.text or "").strip()
+                if text:
+                    texts.append(text)
+                segs.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text or ""})
+                for w in seg.words or []:
+                    words.append({"word": w.word, "start": float(w.start), "end": float(w.end)})
+        except Exception as e:
+            raise PermanentJobError("transcription_rejected",
+                                    "We couldn't transcribe this video's audio. Try a different file.",
+                                    f"local whisper failed: {e}")
+        return {"text": " ".join(texts), "segments": segs, "words": words, "language": info.language}
+
+    return run

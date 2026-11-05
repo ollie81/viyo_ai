@@ -207,7 +207,7 @@ def build_production_worker() -> Worker:
     from coins import FEATURE_COSTS
     from repurpose_cleanup import run_maintenance
     from repurpose_storage import RoutingStorage, SupabaseStorage
-    from transcription import openai_chunk_transcriber
+    from transcription import local_chunk_transcriber, openai_chunk_transcriber, transcript_cache_key
     import clip_selection
     import creator_insights
 
@@ -218,9 +218,14 @@ def build_production_worker() -> Worker:
     store = JobStore(supabase_rpc(r.supabase_admin), config)
     storage = RoutingStorage(SupabaseStorage(r.supabase_admin, r.SUPABASE_URL))
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=300, max_retries=2)
+    use_local_whisper = os.environ.get("REPURPOSE_TRANSCRIBER", "openai").strip().lower() == "local"
+    print(f"[INFO] transcription: {'local ' + transcript_cache_key(True) if use_local_whisper else 'OpenAI whisper-1'}")
     deps = PipelineDeps(
         storage=storage,
-        transcribe_chunk=openai_chunk_transcriber(client),
+        # REPURPOSE_TRANSCRIBER=local runs speech-to-text on this worker
+        # (faster-whisper); anything else keeps OpenAI's whisper-1.
+        transcribe_chunk=(local_chunk_transcriber() if use_local_whisper else openai_chunk_transcriber(client)),
+        transcription_model=transcript_cache_key(use_local_whisper),
         llm=r.selection_llm(client),
         max_input_bytes=r.MAX_INPUT_SIZE_BYTES,
         max_input_seconds=r.MAX_INPUT_DURATION_SECONDS,

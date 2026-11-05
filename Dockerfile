@@ -23,6 +23,10 @@ COPY . .
 # Voice-embedding model for speaker identification (26 MB). Best effort: if the
 # download fails the feature turns itself off and jobs still run.
 RUN python -c "import speakers; speakers.ensure_model()" || true
+# Speech-to-text model for REPURPOSE_TRANSCRIBER=local (faster-whisper
+# "small", ~480 MB), baked in so the worker never downloads it at run
+# time. Best effort: if it fails the worker downloads it on first use.
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')" || true
 
 # $PORT is injected by Railway at runtime â€” never hardcode a port number here.
 # The same image runs two Railway services: the API (default) and the

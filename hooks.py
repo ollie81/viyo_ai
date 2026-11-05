@@ -33,6 +33,7 @@ For EACH clip below, write {n} different hook options. Rules for every option:
 - at most {max_words} words;
 - use ONLY facts, claims and numbers the speaker actually says in that clip's transcript; you may
   rephrase, tease or quote, but never add anything new and never put words in their mouth;
+- write it in the SAME LANGUAGE the speaker uses in that clip (a French clip gets a French hook);
 - don't just repeat the clip's first sentence;
 - specific beats generic ("Fresh breath changes everything" beats "Kissing tips").
 
