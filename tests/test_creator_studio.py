@@ -368,7 +368,7 @@ def test_pricing_formula():
     assert p.pack_price(500, 0.065, 0.50) == round((5.0 + 0.5) / 0.935, 2)
     assert p.image_cost().provider_cost_usd == pytest.approx(0.067)
     v = p.video_cost(8.0)
-    assert v.provider_cost_usd == pytest.approx(8 * 5792 * 17.5 / 1e6)
+    assert v.provider_cost_usd == pytest.approx(8 * 5792 * 12.0 / 1e6)   # Omni 1.2 Flash
     import datetime
     assert p.prices(datetime.date(2027, 1, 2))["text_input_per_m"] == 1.50
     assert p.prices(datetime.date(2026, 11, 5))["text_input_per_m"] == 0.75
