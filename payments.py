@@ -176,6 +176,7 @@ async def stripe_webhook(request: Request):
             int(coins),
             "coin_purchase",
             f"Purchased {label} — Stripe {intent['id']}",
+            external_ref=f"stripe:{intent['id']}",
         )
     except HTTPException:
         raise

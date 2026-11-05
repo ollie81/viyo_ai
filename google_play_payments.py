@@ -150,5 +150,6 @@ async def verify_google_play_purchase(
         package["coins"],
         "coin_purchase",
         f"Purchased {package['label']} — Google Play {req.purchase_token}",
+        external_ref=f"google_play:{req.purchase_token}",
     )
     return GooglePlayVerifyResponse(coins=package["coins"])

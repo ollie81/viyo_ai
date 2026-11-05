@@ -95,7 +95,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client
 
-from coins import spend_on_feature
+from coins import spend_on_feature, refund_feature
 
 # No-ops cleanly when SENTRY_DSN is unset (sentry_sdk's own documented
 # behavior for an empty/missing dsn) — every unhandled exception in any
@@ -622,7 +622,7 @@ async def improve_caption(
     user_id: str = Depends(get_current_user_id_no_guest),
 ):
     _check_rate_limit(user_id)
-    spend_on_feature(supabase_admin, user_id, "improve_caption")
+    charged = spend_on_feature(supabase_admin, user_id, "improve_caption")
 
     prompt = (
         "Improve this social media caption to be more engaging, keep the "
@@ -640,6 +640,7 @@ async def improve_caption(
         )
         improved = (completion.choices[0].message.content or "").strip().strip('"')
     except Exception:
+        refund_feature(supabase_admin, user_id, "improve_caption", charged)
         raise HTTPException(status_code=502, detail="AI service unavailable")
 
     return ImproveCaptionResponse(improved_caption=improved or req.caption)
@@ -764,7 +765,7 @@ async def analyze_hook(
     not the full /analyze-post Coach review.
     """
     _check_rate_limit(user_id)
-    spend_on_feature(supabase_admin, user_id, "hook_check")
+    charged = spend_on_feature(supabase_admin, user_id, "hook_check")
 
     niche_context = f" Their content niche is '{req.niche}'." if req.niche else ""
     has_image = bool(req.image_url)
@@ -808,10 +809,12 @@ async def analyze_hook(
         )
         text = (completion.choices[0].message.content or "").strip()
     except Exception:
+        refund_feature(supabase_admin, user_id, "hook_check", charged)
         raise HTTPException(status_code=502, detail="AI service unavailable")
 
     parsed = _parse_hook_response(text)
     if parsed is None:
+        refund_feature(supabase_admin, user_id, "hook_check", charged)
         raise HTTPException(status_code=502, detail="AI returned an unexpected format")
 
     return AnalyzeHookResponse(**parsed)

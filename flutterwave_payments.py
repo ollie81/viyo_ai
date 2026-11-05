@@ -200,6 +200,7 @@ async def flutterwave_webhook(request: Request, verif_hash: str = Header(None, a
             int(coins),
             "coin_purchase",
             f"Purchased {package['label']} — Flutterwave {tx_ref}",
+            external_ref=f"flutterwave:{tx_ref}",
         )
     except HTTPException:
         raise

@@ -437,7 +437,7 @@ async def caption_variants(
     user_id: str = Depends(_get_current_user_id_no_guest),
 ):
     _check_caption_variants_rate_limit(user_id)
-    spend_on_feature(supabase_admin, user_id, "caption_variants")
+    charged = spend_on_feature(supabase_admin, user_id, "caption_variants")
 
     top_captions = _get_top_performing_captions(user_id)
     personalized = bool(top_captions)
@@ -475,10 +475,12 @@ async def caption_variants(
         )
         raw = (completion.choices[0].message.content or "").strip()
     except Exception:
+        refund_feature(supabase_admin, user_id, "caption_variants", charged)
         raise HTTPException(status_code=502, detail="AI service unavailable")
 
     variants = _parse_variant_list(raw)
     if not variants:
+        refund_feature(supabase_admin, user_id, "caption_variants", charged)
         raise HTTPException(status_code=502, detail="AI returned an unexpected format")
 
     return CaptionVariantsResponse(variants=variants, personalized=personalized)
@@ -693,7 +695,7 @@ async def post_insight(
     if post.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="You can only see insights for your own posts.")
 
-    spend_on_feature(supabase_admin, user_id, "post_insight")
+    charged = spend_on_feature(supabase_admin, user_id, "post_insight")
 
     engagement = (post.get("like_count") or 0) + (post.get("comment_count") or 0)
     caption = (post.get("caption") or "").strip()
@@ -755,6 +757,8 @@ async def post_insight(
         )
         explanation = (completion.choices[0].message.content or "").strip()
     except Exception:
+        # The AI part failed: show the plain numbers and give the coins back.
+        refund_feature(supabase_admin, user_id, "post_insight", charged)
         explanation = (
             f"This post got {engagement} likes and comments combined"
             + (f", vs. your usual average of {baseline_avg}." if baseline_avg is not None else ".")

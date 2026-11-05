@@ -210,6 +210,7 @@ async def lemonsqueezy_webhook(request: Request, x_signature: str = Header(None)
             int(coins),
             "coin_purchase",
             f"Purchased {label} — Lemon Squeezy order {order_id}",
+            external_ref=f"lemonsqueezy:{order_id}",
         )
     except HTTPException:
         raise

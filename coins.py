@@ -118,6 +118,31 @@ def _log_spend(admin, user_id: str, feature: str, cost: int) -> None:
         print(f"[WARN] Could not log coin spend for {feature}: {e}")
 
 
+class _NotMigrated(Exception):
+    pass
+
+
+def _apply(admin, user_id: str, amount: int, type_: str, description: str,
+           external_ref: Optional[str] = None) -> dict:
+    """One locked database step (viyo_coin_apply in coin_ledger_fix.sql):
+    checks, changes the balance and writes the history row together.
+    Raises _NotMigrated if that function isn't installed yet."""
+    try:
+        res = admin.rpc("viyo_coin_apply", {
+            "p_user_id": user_id, "p_amount": amount, "p_type": type_,
+            "p_description": description, "p_external_ref": external_ref,
+        }).execute()
+    except Exception as e:
+        text = str(e)
+        if "viyo_coin_apply" in text and ("PGRST202" in text or "Could not find" in text or "does not exist" in text):
+            raise _NotMigrated()
+        raise HTTPException(status_code=500, detail=f"Could not update coin balance: {e}")
+    data = res.data
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return data or {}
+
+
 def spend_on_feature(admin, user_id: str, feature: str) -> int:
     """
     Call before running the OpenAI call for a gated feature — raises
@@ -149,6 +174,21 @@ def spend_on_feature(admin, user_id: str, feature: str) -> int:
         return 0
 
     cost = FEATURE_COSTS[feature]["cost"]
+    try:
+        r = _apply(admin, user_id, -cost, feature, f"Used {FEATURE_COSTS[feature]['label']}")
+    except _NotMigrated:
+        return _legacy_spend(admin, user_id, feature, cost)
+    if not r.get("ok"):
+        if r.get("error") == "insufficient_coins":
+            raise HTTPException(status_code=402, detail={
+                "error": "insufficient_coins", "feature": feature,
+                "balance": r.get("balance", 0), "needed": cost})
+        raise HTTPException(status_code=500, detail=f"Could not spend coins: {r.get('error')}")
+    return cost
+
+
+def _legacy_spend(admin, user_id: str, feature: str, cost: int) -> int:
+    """Pre-migration path (compare-and-swap + separate history row)."""
 
     try:
         profile = (
@@ -220,7 +260,8 @@ def refund_feature(admin, user_id: str, feature: str, charged: int) -> None:
         print(f"[WARN] Could not refund {charged} coins for {feature}: {e}")
 
 
-def credit_coins(admin, user_id: str, amount: int, type_: str, description: str) -> None:
+def credit_coins(admin, user_id: str, amount: int, type_: str, description: str,
+                 external_ref: Optional[str] = None) -> bool:
     """
     Adds coins to a balance — the mirror image of spend_on_feature's
     compare-and-swap deduction, used when coins are created rather than
@@ -234,6 +275,19 @@ def credit_coins(admin, user_id: str, amount: int, type_: str, description: str)
     """
     if admin is None:
         raise HTTPException(status_code=503, detail="Coin service is not configured.")
+
+    # Returns True if coins were added, False if this external_ref (a
+    # payment id) was already credited.
+    try:
+        r = _apply(admin, user_id, amount, type_, description, external_ref)
+    except _NotMigrated:
+        r = None
+    if r is not None:
+        if r.get("ok"):
+            return True
+        if r.get("error") == "duplicate":
+            return False
+        raise HTTPException(status_code=500, detail=f"Could not credit coins: {r.get('error')}")
 
     try:
         profile = (
@@ -271,6 +325,7 @@ def credit_coins(admin, user_id: str, amount: int, type_: str, description: str)
         }).execute()
     except Exception as e:
         print(f"[WARN] Could not log coin credit for {user_id}: {e}")
+    return True
 
 
 def debit_coins(admin, user_id: str, amount: int, type_: str, description: str) -> None:
@@ -285,6 +340,18 @@ def debit_coins(admin, user_id: str, amount: int, type_: str, description: str) 
     """
     if admin is None:
         raise HTTPException(status_code=503, detail="Coin service is not configured.")
+
+    try:
+        r = _apply(admin, user_id, -amount, type_, description)
+    except _NotMigrated:
+        r = None
+    if r is not None:
+        if r.get("ok"):
+            return
+        if r.get("error") == "insufficient_coins":
+            raise HTTPException(status_code=402, detail={
+                "error": "insufficient_coins", "balance": r.get("balance", 0), "needed": amount})
+        raise HTTPException(status_code=500, detail=f"Could not debit coins: {r.get('error')}")
 
     try:
         profile = (

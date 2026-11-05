@@ -169,6 +169,7 @@ async def paystack_webhook(request: Request, x_paystack_signature: str = Header(
             int(coins),
             "coin_purchase",
             f"Purchased {label} — Paystack {reference}",
+            external_ref=f"paystack:{reference}",
         )
     except HTTPException:
         raise
