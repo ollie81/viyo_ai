@@ -423,3 +423,16 @@ def test_a_bunny_upload_failure_retries_then_refunds(env):
     job = client.get(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u)).json()["jobs"][0]
     assert job["status"] == "failed"
     assert balance(client, u)["available"] == before
+
+
+def test_admin_can_grant_by_username(env):
+    client, db = env[0], env[1]
+    u = make_user(db)
+    db.execute("update public.profiles set username='maya_films' where id=%s", (u,))
+    r = client.post("/api/v1/studio/admin/credits/grant", headers={"X-Admin-Key": "admin-secret"},
+                    json={"user": "@maya_films", "credits": 250, "kind": "grant", "expires_days": 90})
+    assert r.status_code == 200 and r.json()["user_id"] == str(u)
+    assert balance(client, u)["promotional"] == 250
+    missing = client.post("/api/v1/studio/admin/credits/grant", headers={"X-Admin-Key": "admin-secret"},
+                          json={"user": "@nobody_here", "credits": 1})
+    assert missing.status_code == 404
