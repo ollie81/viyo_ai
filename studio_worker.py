@@ -18,6 +18,7 @@ import traceback
 from typing import Optional
 
 import studio_ai as ai_mod
+import studio_casting as casting
 import studio_pricing as pricing
 import studio_render as render
 from studio_store import Files, Store, new_path
@@ -117,6 +118,13 @@ class StudioWorker:
             raise JobFailed("unknown_job", "Unknown job type.")
         return fn(job, project)
 
+    def _rollback(self) -> None:
+        if hasattr(self.store, "conn"):
+            try:
+                self.store.conn.rollback()
+            except Exception:
+                pass
+
     def _optional_update(self, table, filters, fields) -> None:
         """For columns added by creator_studio_voices.sql: if that hasn't been
         run yet, the recording still counts; only the extra detail is lost."""
@@ -162,8 +170,9 @@ class StudioWorker:
             raise JobFailed("empty", "The AI couldn't find any scenes in this script.", absorbed=cost)
 
         existing = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
-        used = {c["voice"] for c in existing.values() if c.get("voice")}
         earlier = self.series_cast(project)
+        used = {c["voice"] for c in list(existing.values()) + list(earlier.values()) if c.get("voice")}
+        catalog = self.catalog()
         new_chars, describe = [], []
         for i, c in enumerate(chars[:20]):
             name = (c.get("name") or "").strip()[:60]
@@ -177,25 +186,31 @@ class StudioWorker:
                     describe.append({"id": row["id"], "description": c["description"][:1200]})
                 continue
             prev = earlier.get(name.lower())
-            if prev and prev.get("voice") in ai_mod.VOICE_NAMES:
-                # The same person in an earlier episode of this series: same
-                # voice, delivery note, look and identity.
-                used.add(prev["voice"])
-                new_chars.append({"name": name, "description": prev.get("description") or (c.get("description") or "")[:1200],
-                                  "voice": prev["voice"], "voice_style": prev.get("voice_style") or "",
-                                  "voice_language": prev.get("voice_language") or brief["language"],
-                                  "reference_path": prev.get("reference_path"),
-                                  "identity_id": prev.get("identity_id") or prev["id"], "position": i})
+            if prev and prev.get("voice"):
+                # The same person earlier in this series: the same voice
+                # identity, profile, look and identity id. Never re-cast.
+                new_chars.append(dict(series_copy(prev), position=i,
+                                      description=prev.get("description") or (c.get("description") or "")[:1200]))
                 continue
-            voice = pick_voice(c.get("gender", ""), used)   # assigned once, here, and kept
-            used.add(voice)
-            new_chars.append({"name": name, "description": (c.get("description") or "")[:1200],
-                              "voice": voice, "voice_language": brief["language"], "position": i})
+            desc = (c.get("description") or "")[:1200]
+            profile = casting.build_profile(name, c, desc, brief["language"])
+            seed = casting.identity_seed(project["owner_id"], project.get("series_id") or project["id"], name)
+            d = casting.cast(profile, catalog, used, seed, desc)
+            if d.voice:
+                used.add(d.voice)
+            print(f"[INFO] studio cast {project['id']} {name!r}: {profile.age_category}/{profile.age_confidence} "
+                  f"{profile.gender} -> {d.status} {d.voice or '-'}")
+            new_chars.append({"name": name, "description": desc, "voice": d.voice, "voice_provider": d.provider,
+                              "voice_style": d.voice_style, "voice_language": d.language, "position": i,
+                              **profile_fields(profile), "voice_category": d.voice_category,
+                              "voice_description": d.voice_description, "voice_status": d.status,
+                              "voice_assignment_version": 1 if d.voice else 0})
 
         incoming = []
         for s in scenes[:80]:
             dialogue = [{"character": (d.get("character") or "")[:60], "text": (d.get("text") or "")[:600],
-                         **({"emotion": d["emotion"].strip()[:40]} if (d.get("emotion") or "").strip() else {})}
+                         **({"emotion": d["emotion"].strip()[:40]} if (d.get("emotion") or "").strip() else {}),
+                         **({"delivery": d["delivery"].strip()[:80]} if (d.get("delivery") or "").strip() else {})}
                         for d in (s.get("dialogue") or []) if (d.get("text") or "").strip()][:12]
             incoming.append({"heading": (s.get("heading") or "")[:200], "visual": (s.get("visual") or "")[:2000],
                              "dialogue": dialogue,
@@ -219,6 +234,58 @@ class StudioWorker:
         return {"characters": len(chars), "scenes": len(incoming), "kept": len(plan["keep"]),
                 "added": len(plan["insert"]), "set_aside": len(plan["archive"]),
                 "kept_pictures": plan["kept_pictures"], "kept_voice": plan["kept_voice"]}, cost
+
+    def catalog(self) -> list:
+        return load_catalog(self.store)
+
+    def ensure_voice(self, ch: dict, project: dict, cast_rows: list[dict]) -> str:
+        """The character's saved voice, or, if it has never had one (made
+        before casting existed, or waiting for a child voice), a voice cast
+        now and saved. Raises JobFailed if no suitable voice exists."""
+        voice = (ch.get("voice") or "").strip()
+        catalog = self.catalog()
+        if voice:
+            if not any(v.voice_id == voice and v.status == "available" for v in catalog):
+                print(f"[WARN] studio: character {ch['id']} has unknown or unavailable voice {voice!r}")
+                raise JobFailed("invalid_voice",
+                                f"{ch['name']}'s voice (\"{voice}\") isn't available. Choose a new voice for "
+                                f"{ch['name']} in the cast, then try again. Your credits were returned.")
+            return voice
+        profile = profile_from_row(ch, project)
+        taken = {c.get("voice") for c in cast_rows if c.get("voice")} | set(self.series_voices(project))
+        seed = casting.identity_seed(project["owner_id"], project.get("series_id") or project["id"], ch["name"])
+        d = casting.cast(profile, catalog, taken, seed, ch.get("description") or "")
+        fields = {**profile_fields(profile), "voice_category": d.voice_category, "voice_status": d.status,
+                  "voice_language": d.language}
+        if not d.voice:
+            self._optional_update("studio_characters", {"id": ch["id"]}, fields)
+            print(f"[WARN] studio: no voice for {ch['id']} ({profile.age_category}, {profile.language}): {d.reason}")
+            code = "unsupported_language" if d.status == "unsupported_language" else "needs_voice"
+            who = casting.AGE_LABEL.get(profile.age_category, "")
+            msg = (f"{ch['name']}'s lines can't be voiced in {profile.language} yet: the voice model doesn't support it."
+                   if code == "unsupported_language" else
+                   f"{ch['name']} is a {who}, and Viyo doesn't have a suitable {who} voice yet. Viyo won't use an adult "
+                   f"voice instead. Their lines can be voiced once one is added. Your credits were returned.")
+            raise JobFailed(code, msg)
+        fields.update(voice=d.voice, voice_provider=d.provider, voice_description=d.voice_description,
+                      voice_assignment_version=int(ch.get("voice_assignment_version") or 0) + 1)
+        if not (ch.get("voice_style") or "").strip():
+            fields["voice_style"] = d.voice_style
+        self.store.update("studio_characters", {"id": ch["id"]}, {"voice": d.voice})
+        self._optional_update("studio_characters", {"id": ch["id"]}, {k: v for k, v in fields.items() if k != "voice"})
+        try:
+            self.store.insert("studio_voice_changes", [{"character_id": ch["id"], "project_id": ch["project_id"],
+                                                       "owner_id": ch["owner_id"], "old_voice": "", "new_voice": d.voice,
+                                                       "reason": "auto_cast"}])
+        except Exception as e:
+            self._rollback()
+            print(f"[WARN] studio: cast history not saved for {ch['id']}: {str(e)[:120]}")
+        ch.update(fields)
+        print(f"[INFO] studio: cast {ch['id']} {ch['name']!r} -> {d.voice} ({d.status})")
+        return d.voice
+
+    def series_voices(self, project) -> list[str]:
+        return [c.get("voice") for c in self.series_cast(project).values() if c.get("voice")]
 
     def series_cast(self, project) -> dict:
         """Characters from the other episodes of this project's series, by
@@ -280,7 +347,7 @@ class StudioWorker:
         for line in lines:
             speaker = speaker_name(line.get("character") or "")
             if not speaker or is_narrator(speaker):
-                voices.append((NARRATOR_VOICE, None, _style("", line.get("emotion"))))
+                voices.append((NARRATOR_VOICE, None, _style("", line.get("emotion"), line.get("delivery"))))
                 continue
             ch = cast.get(speaker.lower())
             if ch is None:
@@ -288,20 +355,8 @@ class StudioWorker:
                 raise JobFailed("unknown_character",
                                 f"\"{speaker}\" speaks in this scene but isn't in your cast. Add them to the cast "
                                 "or change the line. Your credits were returned.")
-            voice = (ch.get("voice") or "").strip()
-            if not voice:
-                # Never had a voice (made before voices were assigned):
-                # give it one now and save it, so it stays the same from here on.
-                voice = pick_voice("", {c.get("voice") for c in cast.values() if c.get("voice")})
-                self.store.update("studio_characters", {"id": ch["id"]}, {"voice": voice})
-                ch["voice"] = voice
-                print(f"[INFO] studio voice job {job['id']}: gave character {ch['id']} its first voice {voice}")
-            elif voice not in ai_mod.VOICE_NAMES:
-                print(f"[WARN] studio voice job {job['id']}: character {ch['id']} has unknown voice {voice!r}")
-                raise JobFailed("invalid_voice",
-                                f"{ch['name']}'s voice (\"{voice}\") isn't available. Choose a new voice for "
-                                f"{ch['name']} in the cast, then try again. Your credits were returned.")
-            voices.append((voice, ch, _style(ch.get("voice_style") or "", line.get("emotion"))))
+            voice = self.ensure_voice(ch, project, list(cast.values()))
+            voices.append((voice, ch, _style(ch.get("voice_style") or "", line.get("emotion"), line.get("delivery"))))
         total = pricing.voice_cost(0)
         seconds_total = 0.0
         with tempfile.TemporaryDirectory() as tmp:
@@ -339,8 +394,15 @@ class StudioWorker:
                 frame = None
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         notes = " ".join(f"{c['name']}: {c['description']}." for c in characters_in_scene(scene, cast))
+        has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
+        # Dialogue comes only from each character's saved voice (TTS). The
+        # video model can't take that audio (Omni 1.2 has no audio input), so
+        # it must not speak: otherwise a second, different voice appears.
+        speech = ("No dialogue and no speech: nobody talks on camera; their lines are added separately. "
+                  "Characters listen, react and gesture naturally, mouths mostly closed. "
+                  if has_lines else "No dialogue. ")
         prompt = (f"{scene['visual'] or scene['heading']}. {notes} Style: {project['visual_style'] or 'cinematic'}. "
-                  "Natural, subtle motion. No text, captions or watermarks. Do not add music.")
+                  f"Natural, subtle motion. {speech}No text, captions or watermarks. Do not add music.")
         seconds = pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
         data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
@@ -373,6 +435,7 @@ class StudioWorker:
                     audio=fetch(s.get("audio_path"), f"aud{n}.m4a"),
                     audio_seconds=float(s["audio_seconds"]) if s.get("audio_seconds") else None,
                     lines=tuple(d["text"] for d in s["dialogue"] if d.get("text")),
+                    video_audio=not any((d.get("text") or "").strip() for d in s["dialogue"]),
                     sfx=tuple(x for x in (s.get("sfx") or []) if isinstance(x, str))))
             music = None
             if project.get("music_path"):
@@ -432,10 +495,16 @@ def speaker_name(raw: str) -> str:
     return re.sub(r"\s*\((?:v\.?\s*o\.?|o\.?\s*s\.?|o\.?\s*c\.?|cont'?d|contd)\)\s*", " ", raw, flags=re.I).strip()
 
 
-def _style(voice_style: str, emotion) -> str:
-    """The delivery note for one line: the character's fixed note plus this
-    line's emotion. Google advises keeping it short for a steadier voice."""
-    parts = [x.strip() for x in (voice_style or "", emotion or "") if x and x.strip()]
+def _style(voice_style: str, emotion, delivery=None) -> str:
+    """The performance for one line: the character's fixed short note plus
+    this line's emotion and delivery. This only changes how the line is
+    said; the speaker is the saved voice id. Google advises keeping it
+    short for a steadier voice."""
+    parts = []
+    for x in (voice_style or "", emotion or "", delivery or ""):
+        x = x.strip()
+        if x and x.lower() not in [p.lower() for p in parts]:
+            parts.append(x)
     return ", ".join(parts)[:120]
 
 
@@ -504,6 +573,49 @@ def plan_breakdown(current: list[dict], incoming: list[dict]) -> dict:
     archive = [s["id"] for s in pool if s["id"] not in {k["id"] for k in keep}]
     return {"keep": keep, "insert": insert, "archive": archive,
             "kept_pictures": kept_pictures, "kept_voice": kept_voice}
+
+
+PROFILE_KEYS = ("age_category", "age_years", "age_confidence", "gender_presentation", "personality")
+SERIES_KEYS = ("name", "voice", "voice_provider", "voice_style", "voice_language", "reference_path", "age_category",
+               "age_years", "age_confidence", "gender_presentation", "personality", "voice_category",
+               "voice_description", "voice_status", "voice_assignment_version")
+
+
+def profile_fields(p: "casting.Profile") -> dict:
+    return {"age_category": p.age_category, "age_years": p.age_years, "age_confidence": p.age_confidence,
+            "gender_presentation": p.gender, "personality": p.personality}
+
+
+def profile_from_row(ch: dict, project: dict) -> "casting.Profile":
+    """The saved profile, or one worked out from the description for
+    characters made before casting existed or added by hand."""
+    if ch.get("age_category"):
+        return casting.Profile(name=ch["name"], age_category=ch["age_category"], age_years=ch.get("age_years"),
+                               age_confidence=ch.get("age_confidence") or "medium",
+                               gender=ch.get("gender_presentation") or casting.infer_gender(ch.get("description") or ""),
+                               personality=ch.get("personality") or "",
+                               language=project.get("language") or "English")
+    return casting.build_profile(ch["name"], None, ch.get("description") or "", project.get("language") or "English")
+
+
+def series_copy(prev: dict) -> dict:
+    """A character carried into another episode: same identity and voice."""
+    out = {k: prev.get(k) for k in SERIES_KEYS if k in prev}
+    out["identity_id"] = prev.get("identity_id") or prev["id"]
+    return out
+
+
+def load_catalog(store) -> list:
+    try:
+        rows = store.select("studio_voice_catalog", {})
+    except Exception:
+        if hasattr(store, "conn"):
+            try:
+                store.conn.rollback()
+            except Exception:
+                pass
+        rows = []
+    return casting.catalog_from_rows(rows) if rows else casting.builtin_catalog()
 
 
 def pick_voice(gender: str, used: set) -> str:

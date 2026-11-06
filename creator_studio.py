@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from pydantic import BaseModel, Field
 
 import studio_ai
+import studio_casting
 import studio_sfx
 import studio_pricing as pricing
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
@@ -196,7 +197,8 @@ class CharacterPatch(BaseModel):
 class Line(BaseModel):
     character: str = Field("", max_length=60)
     text: str = Field(..., max_length=600)
-    emotion: str = Field("", max_length=40)   # how this one line is delivered, e.g. "whispering"
+    emotion: str = Field("", max_length=40)   # the feeling of this line, e.g. "sad"
+    delivery: str = Field("", max_length=80)  # optional performance note, e.g. "soft, hesitant"
 
 
 class SceneIn(BaseModel):
@@ -262,7 +264,33 @@ def _character_out(c: dict, urls: dict) -> dict:
             "voice_provider": c.get("voice_provider") or "google", "voice_style": c.get("voice_style") or "",
             "voice_language": c.get("voice_language"), "voice_locked": bool(c.get("voice_locked_at")),
             "voice_changed_at": c.get("voice_changed_at"), "identity_id": c.get("identity_id") or c["id"],
+            "age_category": c.get("age_category"), "age_years": c.get("age_years"),
+            "age_confidence": c.get("age_confidence"), "age_label": studio_casting.AGE_LABEL.get(c.get("age_category") or ""),
+            "gender_presentation": c.get("gender_presentation"), "voice_category": c.get("voice_category"),
+            "voice_description": c.get("voice_description") or "", "voice_status": c.get("voice_status") or
+            ("cast" if c.get("voice") else "needs_voice"),
             "portrait_url": urls.get(c.get("reference_path") or ""), "position": c.get("position", 0)}
+
+
+def _catalog() -> list:
+    from studio_worker import load_catalog
+    return load_catalog(get_store())
+
+
+def _available_voice(voice: str) -> bool:
+    return any(v.voice_id == voice and v.status == "available" for v in _catalog())
+
+
+def _identity_group(c: dict) -> list[dict]:
+    """Every copy of this person across the series (same owner)."""
+    root = c.get("identity_id") or c["id"]
+    st = get_store()
+    rows = {r["id"]: r for r in st.select("studio_characters", {"identity_id": root}) if r["owner_id"] == c["owner_id"]}
+    first = st.one("studio_characters", {"id": root})
+    if first and first["owner_id"] == c["owner_id"]:
+        rows[first["id"]] = first
+    rows[c["id"]] = c
+    return list(rows.values())
 
 
 def _outdated_voices(s: dict, cast: Optional[dict]) -> list[str]:
@@ -338,8 +366,107 @@ async def voices(user_id: str = Depends(creator)):
     samples = _voice_samples()
     urls = _sign([s["path"] for s in samples.values()])
     return {"provider": "google", "voices": [
-        {"name": n, "gender": g, "style": s, "sample_url": urls.get((samples.get(n) or {}).get("path") or "")}
-        for n, g, s in studio_ai.VOICES]}
+        {"name": v.voice_id, "gender": v.gender, "style": v.descriptor, "ages": v.age_categories,
+         "sample_url": urls.get((samples.get(v.voice_id) or {}).get("path") or "")}
+        for v in _catalog() if v.status == "available"]}
+
+
+# ---------------------------------------------------------------- admin voice gallery
+
+class CatalogPatch(BaseModel):
+    age_categories: Optional[list[str]] = Field(None, max_length=8)
+    languages: Optional[list[str]] = Field(None, max_length=200)
+    status: Optional[Literal["available", "unavailable"]] = None
+    gender: Optional[Literal["female", "male", "unspecified"]] = None
+    notes: Optional[str] = Field(None, max_length=1000)
+    checked_by: str = Field("admin", max_length=60)
+
+
+class CatalogIn(CatalogPatch):
+    provider: Literal["google"] = "google"
+    voice_id: str = Field(..., min_length=1, max_length=80)
+    descriptor: str = Field("", max_length=40)
+
+
+def _clean_catalog(fields: dict) -> dict:
+    if "age_categories" in fields:
+        bad = [a for a in fields["age_categories"] if a not in studio_casting.AGE_CATEGORIES]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Unknown age group: {', '.join(bad)}.")
+        fields["age_categories"] = sorted(set(fields["age_categories"]), key=studio_casting.AGE_CATEGORIES.index)
+    if "languages" in fields:
+        langs = []
+        for lang in fields["languages"]:
+            if lang == "all":
+                langs.append("all")
+                continue
+            ok, name = studio_casting.language_supported("google", lang)
+            if not ok:
+                raise HTTPException(status_code=400, detail=f"The voice model doesn't support {lang}.")
+            langs.append(name)
+        fields["languages"] = langs or ["all"]
+    return fields
+
+
+@router.get("/admin/voices", dependencies=[Depends(_require_admin)])
+async def admin_voices():
+    """Internal voice gallery: every catalog voice, what has been verified
+    about it, its sample and how many characters use it."""
+    st = get_store()
+    try:
+        rows = st.select("studio_voice_catalog", {})
+    except Exception:
+        raise HTTPException(status_code=503, detail="Run creator_studio_casting.sql first.")
+    samples = _voice_samples()
+    urls = _sign([s["path"] for s in samples.values()])
+    uses: dict = {}
+    for c in st.select("studio_characters", {}):
+        if c.get("voice"):
+            uses[c["voice"]] = uses.get(c["voice"], 0) + 1
+    waiting = [c for c in st.select("studio_characters", {}) if not c.get("voice") and c.get("voice_status") == "needs_voice"]
+    return {"age_groups": studio_casting.AGE_CATEGORIES, "voices": [
+        {**{k: r.get(k) for k in ("provider", "voice_id", "gender", "descriptor", "age_categories", "languages",
+                                   "status", "verified_by", "verified_at", "notes")},
+         "sample_url": urls.get((samples.get(r["voice_id"]) or {}).get("path") or ""),
+         "characters": uses.get(r["voice_id"], 0)}
+        for r in sorted(rows, key=lambda r: (r["provider"], r["voice_id"]))],
+        "characters_waiting": [{"name": c["name"], "age_category": c.get("age_category"),
+                                "language": c.get("voice_language")} for c in waiting[:100]],
+        "waiting_count": len(waiting)}
+
+
+@router.patch("/admin/voices/{provider}/{voice_id}", dependencies=[Depends(_require_admin)])
+async def admin_update_voice(provider: str, voice_id: str, body: CatalogPatch):
+    """Record what an admin verified by listening, or take a voice out of
+    casting. Characters already using it keep it (never silently changed)."""
+    st = get_store()
+    row = st.one("studio_voice_catalog", {"provider": provider, "voice_id": voice_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="No such voice.")
+    fields = _clean_catalog(body.model_dump(exclude_none=True, exclude={"checked_by"}))
+    if "age_categories" in fields:
+        fields.update(verified_by=body.checked_by, verified_at=_now_iso())
+    fields["updated_at"] = _now_iso()
+    row = st.update("studio_voice_catalog", {"provider": provider, "voice_id": voice_id}, fields)[0]
+    in_use = sum(1 for c in st.select("studio_characters", {"voice": voice_id}))
+    return {"voice": row, "characters_using": in_use,
+            "note": ("Characters already using this voice keep it." if fields.get("status") == "unavailable" and in_use
+                     else None)}
+
+
+@router.post("/admin/voices", dependencies=[Depends(_require_admin)])
+async def admin_add_voice(body: CatalogIn):
+    """Add another voice id from the provider (for example from Google's
+    extended voice library) after listening to it."""
+    fields = _clean_catalog(body.model_dump(exclude_none=True, exclude={"checked_by"}))
+    fields.setdefault("age_categories", [])
+    fields.setdefault("languages", ["all"])
+    if fields["age_categories"]:
+        fields.update(verified_by=body.checked_by, verified_at=_now_iso())
+    st = get_store()
+    if st.one("studio_voice_catalog", {"provider": body.provider, "voice_id": body.voice_id}):
+        raise HTTPException(status_code=409, detail="That voice is already in the catalog.")
+    return {"voice": st.insert("studio_voice_catalog", [fields])[0]}
 
 
 class SamplesIn(BaseModel):
@@ -352,8 +479,8 @@ async def admin_voice_samples(body: SamplesIn):
     """Makes the missing voice samples with the real voice model. Costs real
     money (about $0.0007 per voice), so it only runs with confirm_spend."""
     have = _voice_samples()
-    todo = [v for v in (body.voices or [n for n, _, _ in studio_ai.VOICES])
-            if v in studio_ai.VOICE_NAMES and v not in have]
+    known = [v.voice_id for v in _catalog() if v.provider == "google"]
+    todo = [v for v in (body.voices or known) if v in known and v not in have]
     est = pricing.voice_cost(len(todo) * 6.0)
     if not body.confirm_spend:
         return {"would_make": todo, "estimated_cost_usd": round(est.provider_cost_usd, 4), "made": []}
@@ -445,8 +572,9 @@ async def next_episode(project_id: str, user_id: str = Depends(creator)):
         copy = {"project_id": new["id"], "owner_id": user_id, "name": c["name"], "description": c.get("description") or "",
                 "voice": c.get("voice") or "", "reference_path": c.get("reference_path"),
                 "rights_confirmed": bool(c.get("rights_confirmed")), "position": c.get("position") or 0}
-        for k in ("voice_provider", "voice_style", "voice_language"):
-            if k in c:
+        from studio_worker import SERIES_KEYS
+        for k in SERIES_KEYS:
+            if k in c and k not in copy:
                 copy[k] = c.get(k)
         if "identity_id" in c:
             copy["identity_id"] = c.get("identity_id") or c["id"]
@@ -496,21 +624,34 @@ async def archive_project(project_id: str, user_id: str = Depends(creator)):
 @router.post("/projects/{project_id}/characters")
 async def add_character(project_id: str, body: CharacterIn, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
-    voice = body.voice if body.voice in studio_ai.VOICE_NAMES else ""
-    if not voice:   # every character gets its one voice when it's created
-        from studio_worker import pick_voice
-        voice = pick_voice("", {c.get("voice") for c in get_store().select("studio_characters", {"project_id": p["id"]})})
+    st = get_store()
+    from studio_worker import profile_fields
+    cast_rows = st.select("studio_characters", {"project_id": p["id"]})
+    profile = studio_casting.build_profile(body.name.strip(), None, body.description, p.get("language") or "English")
     fields = {"project_id": p["id"], "owner_id": user_id, "name": body.name.strip(),
-              "description": body.description, "voice": voice, "position": 999}
-    if body.voice_style.strip() or p.get("language"):
-        fields.update(voice_style=body.voice_style.strip(), voice_language=p.get("language"))
+              "description": body.description, "position": 999}
+    extra = {**profile_fields(profile), "voice_style": body.voice_style.strip(), "voice_language": p.get("language")}
+    if body.voice and _available_voice(body.voice):
+        fields["voice"] = body.voice
+        extra.update(voice_status="manual", voice_assignment_version=1,
+                     voice_category=studio_casting.voice_category(profile))
+    else:
+        # Cast automatically, the same way the scene list does.
+        seed = studio_casting.identity_seed(user_id, p.get("series_id") or p["id"], body.name)
+        d = studio_casting.cast(profile, _catalog(), {c.get("voice") for c in cast_rows if c.get("voice")}, seed,
+                                body.description)
+        fields["voice"] = d.voice
+        extra.update(voice_status=d.status, voice_category=d.voice_category, voice_description=d.voice_description,
+                     voice_language=d.language, voice_assignment_version=1 if d.voice else 0)
+        if not extra["voice_style"]:
+            extra["voice_style"] = d.voice_style
     try:
-        row = get_store().insert("studio_characters", [fields])[0]
+        row = st.insert("studio_characters", [{**fields, **extra}])[0]
     except Exception:
-        # creator_studio_voices.sql not run yet: the voice still saves.
-        for k in ("voice_style", "voice_language"):
-            fields.pop(k, None)
-        row = get_store().insert("studio_characters", [fields])[0]
+        # creator_studio_casting.sql not run yet: the voice still saves.
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        row = st.insert("studio_characters", [fields])[0]
     _touch(p["id"])
     return _character_out(row, {})
 
@@ -521,7 +662,7 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
     st = get_store()
     before = {"voice": c.get("voice") or "", "voice_style": c.get("voice_style") or ""}
     fields = body.model_dump(exclude_none=True, exclude={"confirm_voice_change"})
-    if "voice" in fields and fields["voice"] not in studio_ai.VOICE_NAMES:
+    if "voice" in fields and not _available_voice(fields["voice"]):
         raise HTTPException(status_code=400, detail="Unknown voice.")
     if "voice_style" in fields:
         fields["voice_style"] = fields["voice_style"].strip()
@@ -530,9 +671,12 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
     for k in [k for k in ("voice", "voice_style") if k in fields and not changes_voice]:
         fields.pop(k)
     recorded: list[dict] = []
+    group = _identity_group(c) if changes_voice else [c]
     if changes_voice:
-        recorded = [s for s in st.select("studio_scenes", {"project_id": c["project_id"]})
-                    if s.get("audio_path") and c["id"] in (s.get("audio_voices") or {})]
+        ids = {g["id"] for g in group}
+        for pid in {g["project_id"] for g in group}:
+            recorded += [s for s in st.select("studio_scenes", {"project_id": pid})
+                         if s.get("audio_path") and ids & set((s.get("audio_voices") or {}).keys())]
         if recorded and not body.confirm_voice_change:
             n = len(recorded)
             raise HTTPException(status_code=409, detail={
@@ -541,15 +685,30 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
                             f"keep the old voice until you record them again. New and re-recorded lines will use "
                             f"the new voice, and so will episodes you make from this one.")})
         fields["voice_changed_at"] = _now_iso()
+        fields["voice_status"] = "manual"
+        fields["voice_assignment_version"] = int(c.get("voice_assignment_version") or 0) + 1
     if fields:
         try:
             c = st.update("studio_characters", {"id": c["id"]}, fields)[0]
         except Exception:
-            for k in ("voice_style", "voice_changed_at"):
+            if hasattr(st, "conn"):
+                st.conn.rollback()
+            for k in ("voice_style", "voice_changed_at", "voice_status", "voice_assignment_version"):
                 fields.pop(k, None)
             if not fields:
                 raise HTTPException(status_code=503, detail="Voice settings are being updated on Viyo. Try again later.")
             c = st.update("studio_characters", {"id": c["id"]}, fields)[0]
+    if changes_voice:
+        # The voice belongs to the person, not the episode: every copy of
+        # this character in the series changes with it.
+        same = {k: c.get(k) for k in ("voice", "voice_style", "voice_changed_at", "voice_status",
+                                      "voice_assignment_version") if k in c}
+        for g in group:
+            if g["id"] != c["id"]:
+                try:
+                    st.update("studio_characters", {"id": g["id"]}, same)
+                except Exception as e:
+                    print(f"[WARN] studio: series voice sync failed for {g['id']}: {str(e)[:120]}")
     out = _character_out(c, _sign([c.get("reference_path")]))
     if changes_voice:
         try:
@@ -557,10 +716,18 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
                 "character_id": c["id"], "project_id": c["project_id"], "owner_id": user_id,
                 "old_voice": before["voice"], "new_voice": c.get("voice") or "",
                 "old_style": before["voice_style"], "new_style": c.get("voice_style") or "",
-                "scenes_affected": len(recorded)}])
+                "scenes_affected": len(recorded), "reason": "creator"}])
         except Exception as e:
+            if hasattr(st, "conn"):
+                st.conn.rollback()
             print(f"[WARN] studio voice history not saved for {c['id']}: {str(e)[:160]}")
-        out["rerecord_scene_ids"] = [s["id"] for s in recorded]
+        out["rerecord_scene_ids"] = [s["id"] for s in recorded if s["project_id"] == c["project_id"]]
+        out["other_episodes_affected"] = len({s["project_id"] for s in recorded if s["project_id"] != c["project_id"]})
+        cat = c.get("age_category")
+        voice = next((v for v in _catalog() if v.voice_id == c.get("voice")), None)
+        if cat in studio_casting.STRICT and voice is not None and cat not in voice.age_categories:
+            out["age_warning"] = (f"{c['name']} is a {studio_casting.AGE_LABEL[cat]}, and {voice.voice_id} hasn't been "
+                                  "checked as suitable for that age.")
     return out
 
 
@@ -602,7 +769,8 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
         fields["dialogue"] = [l.model_dump() for l in body.dialogue]
         # New lines need a new voice track; the old file stays in the asset history.
         def key(lines):
-            return [((l.get("character") or ""), (l.get("text") or ""), (l.get("emotion") or "")) for l in lines or []]
+            return [((l.get("character") or ""), (l.get("text") or ""), (l.get("emotion") or ""), (l.get("delivery") or ""))
+                    for l in lines or []]
         if key(fields["dialogue"]) != key(s.get("dialogue")):
             fields.update(audio_path=None, audio_seconds=None)
     if fields:
@@ -698,8 +866,21 @@ def _voice_problem(scene: dict, cast: list[dict]) -> Optional[str]:
         ch = by_name.get(speaker.lower())
         if ch is None:
             return f"\"{speaker}\" speaks in this scene but isn't in your cast."
-        if ch.get("voice") and ch["voice"] not in studio_ai.VOICE_NAMES:
-            return f"{ch['name']}'s voice isn't available. Choose a new voice for {ch['name']}."
+        if ch.get("voice"):
+            if not _available_voice(ch["voice"]):
+                return f"{ch['name']}'s voice isn't available. Choose a new voice for {ch['name']}."
+            continue
+        # No voice yet: would casting find one now? (Nothing is saved here.)
+        from studio_worker import profile_from_row
+        proj = get_store().one("studio_projects", {"id": ch["project_id"]}) or {}
+        prof = profile_from_row(ch, proj)
+        d = studio_casting.cast(prof, _catalog(), set(), "check", ch.get("description") or "")
+        if d.status == "unsupported_language":
+            return f"{ch['name']}'s lines can't be voiced in {prof.language} yet: the voice model doesn't support it."
+        if not d.voice:
+            who = studio_casting.AGE_LABEL.get(prof.age_category, "")
+            return (f"{ch['name']} is a {who}, and Viyo doesn't have a suitable {who} voice yet. "
+                    "Viyo won't use an adult voice instead.")
     return None
 
 

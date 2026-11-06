@@ -275,7 +275,7 @@ def test_an_unknown_saved_voice_stops_the_job_and_refunds(env, capsys):
     assert not [c for c in ai.calls if c[0] == "voice"], "never voiced with a different voice"
     assert balance(client, u) == {"available": 300, "purchased": 0, "promotional": 300, "held": 0}
     assert db.execute("select audio_path from public.studio_scenes where id = %s", (s["id"],)).fetchone()[0] is None
-    assert "unknown voice 'OldRetiredVoice'" in capsys.readouterr().out
+    assert "unavailable voice 'OldRetiredVoice'" in capsys.readouterr().out
     # ...and the API refuses before holding anything next time.
     r = start(client, u, pid, "voice", [s["id"]])
     assert r.status_code == 400 and "Choose a new voice" in r.json()["detail"]["message"]

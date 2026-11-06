@@ -90,14 +90,25 @@ BREAKDOWN_SCHEMA = {
             "name": {"type": "string"},
             "description": {"type": "string", "description": "Visual description: age range, build, hair, face, clothing. No real people."},
             "gender": {"type": "string", "enum": ["female", "male", "other"]},
-        }, "required": ["name", "description", "gender"]}},
+            "age_category": {"type": "string", "enum": ["infant", "young_child", "older_child", "young_teen", "older_teen",
+                                                        "young_adult", "middle_aged", "elderly", "unknown"],
+                             "description": "From the story: infant 0-1, young_child 2-7, older_child 8-11, young_teen 12-14, "
+                                            "older_teen 15-17, young_adult 18-34, middle_aged 35-59, elderly 60+. "
+                                            "'unknown' if the story gives no clue. Never decide from the name alone."},
+            "age_years": {"type": "integer", "description": "Only if the story states the age. Otherwise omit."},
+            "age_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "personality": {"type": "string", "description": "A few words on personality and how they speak."},
+            "role": {"type": "string", "enum": ["lead", "supporting", "minor"]},
+        }, "required": ["name", "description", "gender", "age_category", "age_confidence"]}},
         "scenes": {"type": "array", "items": {"type": "object", "properties": {
             "heading": {"type": "string"},
             "visual": {"type": "string", "description": "One-shot image prompt: who is in frame, what they do, setting, lighting, camera framing."},
             "dialogue": {"type": "array", "items": {"type": "object", "properties": {
                 "character": {"type": "string"}, "text": {"type": "string"},
-                "emotion": {"type": "string", "description": "How this one line is delivered, 1-4 English words "
-                            "(e.g. 'angry', 'whispering', 'holding back tears'). Empty if plain."}},
+                "emotion": {"type": "string", "description": "The feeling of this one line in 1-3 English words "
+                            "(e.g. 'angry', 'sad', 'frightened'). Empty if plain."},
+                "delivery": {"type": "string", "description": "Optional short performance note in English "
+                             "(e.g. 'soft, hesitant'). Empty if not needed."}},
                 "required": ["character", "text"]}},
             "duration_seconds": {"type": "number"},
         }, "required": ["heading", "visual", "dialogue", "duration_seconds"]}},
@@ -115,7 +126,9 @@ For each scene give: the heading, ONE visual prompt describing a single strong s
 the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over),
 and a duration in seconds (2-12; long enough for its lines).
 Describe every character visually so they can be drawn the same way every time.
-For a line whose delivery matters, give a short emotion (1-4 English words); leave it empty otherwise.
+For every character give their age group from what the story says (stated age, school year, relationships,
+how others speak to them). If the story doesn't make it clear, say 'unknown' with low confidence rather than guessing.
+For a line whose delivery matters, give a short emotion and, if useful, a short delivery note; leave them empty otherwise.
 
 Language rules:
 - Dialogue: copy every spoken line in {lang}, word for word as the screenplay has it. Never translate dialogue into English or any other language.
@@ -364,6 +377,7 @@ class FakeStudioAI:
 
     def video(self, prompt, first_frame, aspect_ratio, seconds=8):
         self.calls.append(("video", aspect_ratio, seconds))
+        self.last_video_prompt = prompt
         self.last_video_model = pricing.VIDEO_MODEL
         self._maybe_fail("video")
         size = "720x1280" if aspect_ratio == "9:16" else "1280x720"

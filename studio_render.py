@@ -32,6 +32,10 @@ class SceneInput:
     audio_seconds: Optional[float] = None
     lines: tuple = ()
     sfx: tuple = ()          # studio_sfx effect ids
+    # The AI video's own sound is used only in scenes without dialogue. When
+    # characters speak, their saved voices are the only dialogue audio, so a
+    # second (different) voice from the video model can never be heard.
+    video_audio: bool = True
 
 
 class RenderError(Exception):
@@ -116,15 +120,15 @@ def render_scene(s: SceneInput, w: int, h: int, out: str, tmp: str, idx: int, ca
              f"setsar=1,format=yuv420p{caps}[v]")
     else:
         raise RenderError("a scene has no image or video")
-    # Audio: the voices (levelled), the AI video's own sound underneath
-    # them (or at full level when nobody speaks), and any effects.
+    # Audio: the voices (levelled), the AI video's own sound only when nobody
+    # speaks in the scene, and any effects.
     import studio_sfx
     parts, n = [], 1
     if s.audio:
         cmd += ["-i", s.audio]
         parts.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[voice]")
         n += 1
-    if s.video and probe(s.video)["has_audio"]:
+    if s.video and s.video_audio and probe(s.video)["has_audio"]:
         level = 0.3 if s.audio else 1.0
         parts.append(f"[0:a]aresample=48000,aformat=channel_layouts=stereo,loudnorm=I=-20:TP=-2,aresample=48000,volume={level}[vid]")
     for k, effect in enumerate(s.sfx):
