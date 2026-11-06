@@ -21,6 +21,7 @@ def studio_schema(migrated):
     conn.execute((ROOT / "creator_studio_breakdown.sql").read_text())
     conn.execute((ROOT / "creator_studio_voices.sql").read_text())
     conn.execute((ROOT / "creator_studio_casting.sql").read_text())
+    conn.execute((ROOT / "creator_studio_video_drama.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated
@@ -65,8 +66,11 @@ def grant(client, user, credits, kind="grant", ref=None):
 
 
 def new_project(client, user, **over):
+    # Most tests exercise the pictures-and-saved-voices way; talking-video
+    # productions are tested in test_video_drama.py.
     body = {"title": "Night Shift", "logline": "A nurse discovers her patient is her missing brother.",
-            "kind": "episode", "aspect_ratio": "9:16", "genre": "Drama", "target_seconds": 60, "accept_terms": True}
+            "kind": "episode", "aspect_ratio": "9:16", "genre": "Drama", "target_seconds": 60, "accept_terms": True,
+            "production_style": "pictures"}
     body.update(over)
     r = client.post("/api/v1/studio/projects", headers=H(user), json=body)
     assert r.status_code == 200, r.text

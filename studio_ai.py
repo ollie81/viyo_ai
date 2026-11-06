@@ -61,7 +61,8 @@ class StudioAI(Protocol):
     def breakdown(self, brief: dict, script: str) -> tuple[dict, pricing.Cost]: ...
     def image(self, prompt: str, references: list[bytes], aspect_ratio: str, size: str = "1K") -> tuple[bytes, str, pricing.Cost]: ...
     def voice(self, text: str, voice: str, style: str = "") -> tuple[bytes, float, pricing.Cost]: ...
-    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8) -> tuple[bytes, pricing.Cost]: ...
+    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8,
+              references: Optional[list] = None) -> tuple[bytes, pricing.Cost]: ...
 
 
 # ---------------------------------------------------------------- prompts
@@ -271,14 +272,23 @@ class GoogleStudioAI:
         wav, seconds = as_wav(raw, getattr(out, "mime_type", "") or "")
         return wav, seconds, pricing.voice_cost(seconds)
 
-    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8):
+    def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8,
+              references: Optional[list] = None):
         """Gemini Omni 1.2 Flash (Interactions API), request shape from
         Google's Omni docs (5 Nov 2026). Not yet verified with a live call:
         it costs real money, so it's tested only with fakes until the
         approved test run."""
         seconds = pricing.video_seconds_for(seconds)
         inp: list = []
-        if first_frame:
+        if references:
+            # Several images: Omni treats them as references. Google's docs say
+            # to describe each image's role in plain words (max 6).
+            roles = []
+            for i, (label, data) in enumerate(references[:6], start=1):
+                inp.append({"type": "image", "data": base64.b64encode(data).decode(), "mime_type": "image/png"})
+                roles.append(f"Image {i}: {label}.")
+            prompt = " ".join(roles) + "\n\n" + prompt
+        elif first_frame:
             inp.append({"type": "image", "data": base64.b64encode(first_frame).decode(), "mime_type": "image/png"})
         inp.append({"type": "text", "text": prompt})
         try:
@@ -375,10 +385,11 @@ class FakeStudioAI:
         pcm = b"\x00\x00" * int(rate * seconds)
         return _pcm_to_wav(pcm, rate), seconds, pricing.voice_cost(seconds)
 
-    def video(self, prompt, first_frame, aspect_ratio, seconds=8):
+    def video(self, prompt, first_frame, aspect_ratio, seconds=8, references=None):
         self.calls.append(("video", aspect_ratio, seconds))
         self.last_video_prompt = prompt
         self.last_video_model = pricing.VIDEO_MODEL
+        self.last_video_refs = [label for label, _data in (references or [])]
         self._maybe_fail("video")
         size = "720x1280" if aspect_ratio == "9:16" else "1280x720"
         with tempfile.TemporaryDirectory() as d:

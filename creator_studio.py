@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 import studio_ai
 import studio_casting
+import studio_lipsync
 import studio_sfx
 import studio_pricing as pricing
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
@@ -161,6 +162,9 @@ class ProjectIn(BaseModel):
     target_seconds: int = Field(90, ge=15, le=600)
     captions: bool = True
     accept_terms: bool = False
+    # 'video': every scene is a moving clip where the characters talk (the
+    # default); 'pictures': still images with saved voices (cheaper).
+    production_style: Literal["video", "pictures"] = "video"
 
 
 class ProjectPatch(BaseModel):
@@ -175,6 +179,7 @@ class ProjectPatch(BaseModel):
     aspect_ratio: Optional[Literal["9:16", "16:9"]] = None
     music_volume: Optional[float] = Field(None, ge=0, le=1)
     image_quality: Optional[Literal["standard", "high"]] = None
+    production_style: Optional[Literal["video", "pictures"]] = None
 
 
 class CharacterIn(BaseModel):
@@ -206,9 +211,10 @@ class SceneIn(BaseModel):
     visual: str = Field("", max_length=2000)
     dialogue: list[Line] = Field(default_factory=list, max_length=12)
     duration_seconds: float = Field(5, ge=2, le=20)
-    mode: Literal["still", "video"] = "still"
+    mode: Optional[Literal["still", "video"]] = None   # default: the production's style
     position: Optional[int] = None
     sfx: list[str] = Field(default_factory=list, max_length=4)
+    speech: Optional[Literal["video_model", "saved_voice", "lipsync"]] = None
 
 
 class ScenePatch(BaseModel):
@@ -218,6 +224,7 @@ class ScenePatch(BaseModel):
     duration_seconds: Optional[float] = Field(None, ge=2, le=20)
     mode: Optional[Literal["still", "video"]] = None
     sfx: Optional[list[str]] = Field(None, max_length=4)
+    speech: Optional[Literal["video_model", "saved_voice", "lipsync"]] = None
 
 
 def _clean_sfx(items: list[str]) -> list[str]:
@@ -232,7 +239,7 @@ class OrderIn(BaseModel):
 
 
 class JobRequest(BaseModel):
-    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render"]
+    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     request_id: str = Field(..., min_length=8, max_length=80)
     # A new scene list for a project that already has scenes must be
@@ -242,7 +249,7 @@ class JobRequest(BaseModel):
 
 
 class EstimateRequest(BaseModel):
-    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render"]
+    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
@@ -301,7 +308,7 @@ def _outdated_voices(s: dict, cast: Optional[dict]) -> list[str]:
             if cid in cast and (cast[cid].get("voice") or "") != v]
 
 
-def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None) -> dict:
+def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Optional[dict] = None) -> dict:
     return {"id": s["id"], "position": s["position"], "heading": s["heading"], "visual": s["visual"],
             "dialogue": s.get("dialogue") or [], "duration_seconds": float(s["duration_seconds"]), "mode": s["mode"],
             "image_url": urls.get(s.get("image_path") or ""), "video_url": urls.get(s.get("video_path") or ""),
@@ -309,7 +316,14 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None) -> dict:
             "audio_seconds": float(s["audio_seconds"]) if s.get("audio_seconds") else None,
             "has_image": bool(s.get("image_path")), "has_video": bool(s.get("video_path")),
             "has_audio": bool(s.get("audio_path")), "sfx": s.get("sfx") or [],
-            "voice_outdated": _outdated_voices(s, cast)}
+            "voice_outdated": _outdated_voices(s, cast),
+            "speech": _speech(s, project), "speech_setting": s.get("speech"),
+            "lipsync_url": urls.get(s.get("lipsync_path") or ""), "has_lipsync": bool(s.get("lipsync_path"))}
+
+
+def _speech(s: dict, project: Optional[dict]) -> str:
+    from studio_worker import scene_speech
+    return scene_speech(s, project or {})
 
 
 def _job_out(j: dict) -> dict:
@@ -330,7 +344,8 @@ def _project_out(p: dict) -> dict:
             "captions", "script", "created_at", "updated_at", "music_name", "series_id")
     out = {k: p.get(k) for k in keys}
     out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
-               image_quality=p.get("image_quality") or "standard")
+               image_quality=p.get("image_quality") or "standard",
+               production_style=p.get("production_style") or "pictures")
     return out
 
 
@@ -345,6 +360,7 @@ async def me(user_id: str = Depends(creator)):
         "packs": [{**p, "price_usd": pricing.pack_price(p["credits"], LS_PCT, LS_FIXED)} for p in CREDIT_PACKS],
         "checkout_available": False,
         "sound_effects": studio_sfx.labels(),
+        "lipsync_available": studio_lipsync.enabled(),
         "price_checked": pricing.PRICE_CHECKED,
     }
 
@@ -543,7 +559,15 @@ async def create_project(body: ProjectIn, user_id: str = Depends(creator)):
     _rate_limit(user_id)
     row = body.model_dump(exclude={"accept_terms"})
     row.update(owner_id=user_id, title=row["title"].strip())
-    created = get_store().insert("studio_projects", [row])[0]
+    st = get_store()
+    try:
+        created = st.insert("studio_projects", [row])[0]
+    except Exception:
+        # creator_studio_video_drama.sql not run yet: make a pictures production.
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        row.pop("production_style", None)
+        created = st.insert("studio_projects", [row])[0]
     return _project_out(created)
 
 
@@ -562,6 +586,8 @@ async def next_episode(project_id: str, user_id: str = Depends(creator)):
     base = re.sub(r"\s*[·-]\s*Episode \d+$", "", src["title"]).strip() or src["title"]
     row = {k: src.get(k) for k in ("kind", "aspect_ratio", "genre", "visual_style", "language", "target_seconds",
                                    "captions")}
+    if src.get("production_style"):
+        row["production_style"] = src["production_style"]
     row.update(owner_id=user_id, series_id=series, title=f"{base} · Episode {n}"[:120], logline="")
     if src.get("image_quality"):
         row["image_quality"] = src["image_quality"]
@@ -595,7 +621,7 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     urls = _sign([c.get("reference_path") for c in chars] +
                  [s.get(k) for s in scenes for k in ("image_path", "video_path", "audio_path")])
     return {"project": _project_out(p), "characters": [_character_out(c, urls) for c in chars],
-            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}) for s in scenes],
+            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p) for s in scenes],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
 
@@ -753,16 +779,19 @@ async def add_scene(project_id: str, body: SceneIn, user_id: str = Depends(creat
     row = st.insert("studio_scenes", [{"project_id": p["id"], "owner_id": user_id, "position": pos,
                                        "heading": body.heading, "visual": body.visual,
                                        "dialogue": [l.model_dump() for l in body.dialogue],
-                                       "duration_seconds": body.duration_seconds, "mode": body.mode,
-                                       "sfx": _clean_sfx(body.sfx)}])[0]
+                                       "duration_seconds": body.duration_seconds,
+                                       "mode": body.mode or ("video" if p.get("production_style") == "video" else "still"),
+                                       "sfx": _clean_sfx(body.sfx), **({"speech": body.speech} if body.speech else {})}])[0]
     _touch(p["id"])
-    return _scene_out(row, {})
+    return _scene_out(row, {}, None, p)
 
 
 @router.patch("/scenes/{scene_id}")
 async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(creator)):
     s = _owned("studio_scenes", scene_id, user_id)
     fields = body.model_dump(exclude_none=True)
+    if fields.get("speech") == "lipsync" and not studio_lipsync.enabled():
+        raise HTTPException(status_code=400, detail="Lip sync isn't switched on yet.")
     if "sfx" in fields:
         fields["sfx"] = _clean_sfx(fields["sfx"])
     if "dialogue" in fields:
@@ -773,6 +802,8 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
                     for l in lines or []]
         if key(fields["dialogue"]) != key(s.get("dialogue")):
             fields.update(audio_path=None, audio_seconds=None)
+            if "lipsync_path" in s:
+                fields["lipsync_path"] = None
     if fields:
         s = get_store().update("studio_scenes", {"id": s["id"]}, fields)[0]
         _touch(s["project_id"])
@@ -839,16 +870,50 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict]) -> tuple[pricing.
         return pricing.image_cost(1, 400 + 1300 * min(refs, 4), size), \
             (None if (target["visual"] or target["heading"]).strip() else "Describe what this scene shows first.")
     if kind == "voice":
+        from studio_worker import scene_speech
         text = " ".join(d.get("text", "") for d in target.get("dialogue") or [])
+        if text.strip() and scene_speech(target, p) == "video_model":
+            return pricing.estimate_voice(text), "The characters speak this scene's lines in the video."
         return pricing.estimate_voice(text), (_voice_problem(target, cast) if text.strip() else "This scene has no lines.")
     if kind == "video":
+        from studio_worker import speech_clip_seconds, talks_in_video
+        if talks_in_video(dict(target, mode="video"), p):
+            secs = speech_clip_seconds(target)
+            if secs is None:
+                return pricing.estimate_video(15), ("This scene has too much dialogue for one video clip "
+                                                    "(15 seconds at most). Split it into two scenes.")
+            return pricing.estimate_video(secs), None
         return pricing.estimate_video(target.get("duration_seconds") or 8.0), None
+    if kind == "lipsync":
+        from studio_worker import needs_lipsync, speech_seconds
+        lines = [d for d in target.get("dialogue") or [] if (d.get("text") or "").strip()]
+        secs = float(target.get("audio_seconds") or 0) + 0.5 if target.get("audio_seconds") else speech_seconds(lines)
+        cost = studio_lipsync.estimate_lipsync(max(secs, float(target.get("duration_seconds") or 0)))
+        if not studio_lipsync.enabled():
+            return cost, "Lip sync isn't switched on yet."
+        if not needs_lipsync(target, p):
+            return cost, "This scene doesn't use lip sync."
+        if not target.get("audio_path"):
+            return cost, "Record this scene's voices first."
+        if not (target.get("image_path") or (target.get("mode") == "video" and target.get("video_path"))):
+            return cost, "Make this scene's video or picture first."
+        return cost, None
     if kind == "render":
         scenes = get_store().select("studio_scenes", {"project_id": p["id"]})
         secs = sum(max(float(s["duration_seconds"]), float(s.get("audio_seconds") or 0) + 0.5) for s in scenes)
         missing = next((s["position"] + 1 for s in sorted(scenes, key=lambda s: s["position"])
                         if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))), None)
         reason = "Add scenes first." if not scenes else (f"Scene {missing} has no picture yet." if missing else None)
+        from studio_worker import talks_in_video
+        unspoken = next((s["position"] + 1 for s in sorted(scenes, key=lambda s: s["position"])
+                         if talks_in_video(s, p) and not s.get("video_path")), None)
+        if reason is None and unspoken:
+            reason = f"Scene {unspoken}'s talking video isn't made yet."
+        from studio_worker import needs_lipsync
+        unsynced = next((s["position"] + 1 for s in sorted(scenes, key=lambda s: s["position"])
+                         if needs_lipsync(s, p) and not s.get("lipsync_path")), None)
+        if reason is None and unsynced:
+            reason = f"Scene {unsynced}'s lip sync isn't made yet."
         return pricing.render_cost(secs), reason
     raise HTTPException(status_code=400, detail="Unknown job type.")
 
@@ -930,7 +995,7 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
         r = st.rpc("studio_create_job", {
             "p_owner": user_id, "p_project": p["id"], "p_kind": body.kind, "p_lane": LANE.get(body.kind, "generation"),
             "p_key": key, "p_credits": item["credits"], "p_input": {},
-            "p_scene": item["target_id"] if body.kind in ("image", "voice", "video") else None,
+            "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync") else None,
             "p_character": item["target_id"] if body.kind == "portrait" else None, "p_max_open": 30})
         if r and r.get("ok"):
             created.append(r["job_id"])

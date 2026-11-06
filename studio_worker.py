@@ -39,8 +39,9 @@ class JobFailed(Exception):
 
 class StudioWorker:
     def __init__(self, store: Store, files: Files, ai, lane: str, heartbeat_seconds: int = 20,
-                 stale_seconds: int = 180, bunny_upload=None):
+                 stale_seconds: int = 180, bunny_upload=None, lipsync=None):
         self.store, self.files, self.ai, self.lane = store, files, ai, lane
+        self.lipsync = lipsync  # studio_lipsync.SyncLipSync when switched on
         self.bunny_upload = bunny_upload  # (local_path, title) -> Bunny video id
         self.heartbeat_seconds, self.stale_seconds = heartbeat_seconds, stale_seconds
         self._stop = threading.Event()
@@ -216,7 +217,7 @@ class StudioWorker:
                              "dialogue": dialogue,
                              "duration_seconds": min(12, max(2, float(s.get("duration_seconds") or 5)))})
         current = self.store.select("studio_scenes", {"project_id": project["id"]})
-        plan = plan_breakdown(current, incoming)
+        plan = plan_breakdown(current, incoming, "video" if project.get("production_style") == "video" else "still")
         try:
             r = self.store.rpc("studio_apply_breakdown", {
                 "p_project": project["id"], "p_owner": project["owner_id"], "p_job": job["id"],
@@ -336,6 +337,9 @@ class StudioWorker:
 
     def do_voice(self, job, project):
         scene = self._scene(job, project)
+        if scene_speech(scene, project) == "video_model":
+            raise JobFailed("spoken_in_video", "The characters speak this scene's lines inside the video, so no separate "
+                                               "voice recording is needed. Your credits were returned.")
         lines = [d for d in scene["dialogue"] if (d.get("text") or "").strip()]
         if not lines:
             raise JobFailed("no_dialogue", "This scene has no lines to voice.")
@@ -378,6 +382,8 @@ class StudioWorker:
                                                                  "updated_at": _now()})
         used = {("narrator" if ch is None else ch["id"]): v for v, ch, _s in voices}
         self._optional_update("studio_scenes", {"id": scene["id"]}, {"audio_voices": used})
+        if scene.get("lipsync_path"):   # new words: the old lip sync no longer matches (its file is kept)
+            self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
         for _v, ch, _s in voices:
             if ch is not None and not ch.get("voice_locked_at") and "voice_locked_at" in ch:
                 ch["voice_locked_at"] = _now()
@@ -393,22 +399,93 @@ class StudioWorker:
             except Exception:
                 frame = None
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
-        notes = " ".join(f"{c['name']}: {c['description']}." for c in characters_in_scene(scene, cast))
-        has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
-        # Dialogue comes only from each character's saved voice (TTS). The
-        # video model can't take that audio (Omni 1.2 has no audio input), so
-        # it must not speak: otherwise a second, different voice appears.
-        speech = ("No dialogue and no speech: nobody talks on camera; their lines are added separately. "
-                  "Characters listen, react and gesture naturally, mouths mostly closed. "
-                  if has_lines else "No dialogue. ")
-        prompt = (f"{scene['visual'] or scene['heading']}. {notes} Style: {project['visual_style'] or 'cinematic'}. "
-                  f"Natural, subtle motion. {speech}No text, captions or watermarks. Do not add music.")
-        seconds = pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
-        data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
+        in_scene = characters_in_scene(scene, cast)
+        notes = " ".join(f"{c['name']}: {c['description']}." for c in in_scene)
+        lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
+        style = f"Style: {project['visual_style'] or 'cinematic'}. "
+        references = None
+        if lines and scene_speech(scene, project) == "video_model":
+            # The characters talk inside the clip. Omni takes no audio, so
+            # each character gets their saved voice description, word for
+            # word every time, plus their portrait so the face stays the same.
+            seconds = speech_clip_seconds(scene)
+            if seconds is None:
+                raise JobFailed("too_long", "This scene has too much dialogue for one video clip (15 seconds at most). "
+                                            "Split it into two scenes. Your credits were returned.")
+            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
+                      f"{talking_direction(lines, cast, project)} "
+                      "No subtitles, captions, text or watermarks. Do not add music.")
+            references = self._references(scene, in_scene, frame)
+        else:
+            has_lines = bool(lines)
+            # Saved voices speak this scene: the video model must not talk,
+            # or a second, different voice appears (its sound isn't used).
+            speech = ("No dialogue and no speech: nobody talks on camera; their lines are added separately. "
+                      "Characters listen, react and gesture naturally, mouths mostly closed. "
+                      if has_lines else "No dialogue. ")
+            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
+                      f"Natural, subtle motion. {speech}No text, captions or watermarks. Do not add music.")
+            seconds = pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
+            if has_lines and scene_speech(scene, project) == "lipsync":
+                need = max(float(scene.get("duration_seconds") or 5), float(scene.get("audio_seconds") or 0) + 0.5,
+                           speech_seconds(lines) if not scene.get("audio_seconds") else 0)
+                if need > MAX_CLIP:
+                    raise JobFailed("too_long", "This scene has too much dialogue for one video clip (15 seconds at "
+                                                "most). Split it into two scenes. Your credits were returned.")
+                seconds = pricing.video_seconds_for(need)
+        data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
+            else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
                           duration_seconds=cost.units.get("video_seconds"))
         self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
+        if scene.get("lipsync_path"):   # a new clip needs new lip sync (the old file is kept)
+            self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
         return {"path": path}, cost
+
+    def _references(self, scene, in_scene, frame) -> list:
+        """Labelled images for Omni: the scene picture (setting and framing)
+        and up to 2 speaking characters' portraits (Google: 3 per character,
+        2 characters, 6 images at most)."""
+        refs = []
+        if frame:
+            refs.append(("the scene: its setting, lighting and framing (not a character)", frame))
+        speakers = [speaker_name(d.get("character") or "").lower() for d in scene.get("dialogue") or []]
+        ordered = sorted(in_scene, key=lambda c: (c["name"].lower() not in speakers, c.get("position") or 0))
+        for c in ordered[:2]:
+            if c.get("reference_path"):
+                try:
+                    refs.append((f"{c['name']} (keep this exact face, hair and clothes)", self.files.get(c["reference_path"])))
+                except Exception:
+                    pass
+        return refs
+
+    def do_lipsync(self, job, project):
+        """The scene's clip (or picture) with the mouth moving to the
+        characters' saved voices. The original clip and voice are kept."""
+        scene = self._scene(job, project)
+        if self.lipsync is None:
+            raise JobFailed("not_ready", "Lip sync isn't switched on yet. Your credits were returned.")
+        if scene_speech(scene, project) != "lipsync":
+            raise JobFailed("not_lipsync", "This scene doesn't use lip sync. Your credits were returned.")
+        if not scene.get("audio_path"):
+            raise JobFailed("no_voice", "Record this scene's voices first. Your credits were returned.")
+        media = scene.get("video_path") if scene.get("mode") == "video" and scene.get("video_path") else scene.get("image_path")
+        if not media:
+            raise JobFailed("no_picture", "Make this scene's video or picture first. Your credits were returned.")
+        kind = "video" if media == scene.get("video_path") else "image"
+        urls = self.files.sign([media, scene["audio_path"]], 3600)
+
+        def started(gid):
+            # Saved with the job, so a restarted worker carries on with this
+            # sync.so job instead of paying for a second one.
+            self.store.rpc("studio_heartbeat", {"p_job_id": job["id"], "p_lease": job["lease"], "p_provider_job_id": gid})
+
+        data, cost, gid = self.lipsync.run(kind, urls[media], urls[scene["audio_path"]],
+                                           resume_id=job.get("provider_job_id"), on_started=started)
+        path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
+                          duration_seconds=cost.units.get("seconds"))
+        self.store.update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": path, "updated_at": _now()})
+        return {"path": path, "sync_id": gid}, cost
 
     def do_render(self, job, project):
         scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
@@ -417,6 +494,14 @@ class StudioWorker:
         missing = [s["position"] + 1 for s in scenes if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))]
         if missing:
             raise JobFailed("not_ready", f"Scene {missing[0]} has no picture yet. Generate it first.")
+        unspoken = [s["position"] + 1 for s in scenes if talks_in_video(s, project) and not s.get("video_path")]
+        unsynced = [s["position"] + 1 for s in scenes if needs_lipsync(s, project) and not s.get("lipsync_path")]
+        if unsynced:
+            raise JobFailed("not_ready", f"Scene {unsynced[0]}'s lip sync isn't made yet. Make it first, so the "
+                                         "lips match the voices.")
+        if unspoken:
+            raise JobFailed("not_ready", f"Scene {unspoken[0]}'s talking video isn't made yet. Make it first, so its "
+                                         "dialogue isn't missing from the film.")
         with tempfile.TemporaryDirectory() as tmp:
             inputs = []
             for s in scenes:
@@ -427,15 +512,17 @@ class StudioWorker:
                     self.files.get_to(path, local)
                     return local
                 n = s["position"]
-                use_video = s["mode"] == "video" and s.get("video_path")
+                synced = s.get("lipsync_path") if needs_lipsync(s, project) else None
+                use_video = synced or (s["mode"] == "video" and s.get("video_path"))
+                spoken_in_clip = bool(synced) or (bool(use_video) and talks_in_video(s, project))
                 inputs.append(render.SceneInput(
                     duration=float(s["duration_seconds"]),
                     image=None if use_video else fetch(s["image_path"], f"img{n}"),
-                    video=fetch(s["video_path"], f"vid{n}.mp4") if use_video else None,
-                    audio=fetch(s.get("audio_path"), f"aud{n}.m4a"),
+                    video=fetch(synced or s["video_path"], f"vid{n}.mp4") if use_video else None,
+                    audio=None if spoken_in_clip else fetch(s.get("audio_path"), f"aud{n}.m4a"),
                     audio_seconds=float(s["audio_seconds"]) if s.get("audio_seconds") else None,
                     lines=tuple(d["text"] for d in s["dialogue"] if d.get("text")),
-                    video_audio=not any((d.get("text") or "").strip() for d in s["dialogue"]),
+                    video_audio=spoken_in_clip or not any((d.get("text") or "").strip() for d in s["dialogue"]),
                     sfx=tuple(x for x in (s.get("sfx") or []) if isinstance(x, str))))
             music = None
             if project.get("music_path"):
@@ -525,7 +612,7 @@ def _has_work(s: dict) -> bool:
     return bool(s.get("image_path") or s.get("video_path") or s.get("audio_path"))
 
 
-def plan_breakdown(current: list[dict], incoming: list[dict]) -> dict:
+def plan_breakdown(current: list[dict], incoming: list[dict], default_mode: str = "still") -> dict:
     """Matches a new scene list against the scenes a project already has.
 
     - Same place and the same lines: the existing scene is kept as it is,
@@ -559,7 +646,7 @@ def plan_breakdown(current: list[dict], incoming: list[dict]) -> dict:
             kept_pictures += bool(old.get("image_path") or old.get("video_path"))
             kept_voice += bool(old.get("audio_path"))
             continue
-        row = dict(s, position=i, mode="still", image_path=None, video_path=None)
+        row = dict(s, position=i, mode=default_mode, image_path=None, video_path=None)
         for old in pool:                       # pass 2: same place, new lines
             if old["id"] in used or not _norm(s["heading"]) or _norm(old.get("heading")) != _norm(s["heading"]):
                 continue
@@ -573,6 +660,67 @@ def plan_breakdown(current: list[dict], incoming: list[dict]) -> dict:
     archive = [s["id"] for s in pool if s["id"] not in {k["id"] for k in keep}]
     return {"keep": keep, "insert": insert, "archive": archive,
             "kept_pictures": kept_pictures, "kept_voice": kept_voice}
+
+
+# ------------------------------------------------------------ talking video
+
+MAX_CLIP = pricing.VIDEO_MAX_SECONDS
+
+
+def scene_speech(scene: dict, project: dict) -> str:
+    """Who speaks a scene's lines: 'video_model' (the characters talk in the
+    clip) or 'saved_voice' (their permanent voices over the scene)."""
+    if scene.get("speech") in ("video_model", "saved_voice", "lipsync"):
+        return scene["speech"]
+    return "video_model" if project.get("production_style") == "video" and scene.get("mode") == "video" else "saved_voice"
+
+
+def needs_lipsync(scene: dict, project: dict) -> bool:
+    return (scene_speech(scene, project) == "lipsync"
+            and any((d.get("text") or "").strip() for d in scene.get("dialogue") or []))
+
+
+def talks_in_video(scene: dict, project: dict) -> bool:
+    return (scene_speech(scene, project) == "video_model"
+            and any((d.get("text") or "").strip() for d in scene.get("dialogue") or []))
+
+
+def speech_seconds(lines: list) -> float:
+    """A conservative estimate of how long the lines take to say."""
+    words = sum(len((d.get("text") or "").split()) for d in lines)
+    return words / 2.4 + 0.5 * len(lines) + 1.0
+
+
+def speech_clip_seconds(scene: dict):
+    """The clip length for a talking scene, or None if the lines can't fit
+    in one clip."""
+    lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
+    need = max(float(scene.get("duration_seconds") or 5), speech_seconds(lines))
+    if need > MAX_CLIP:
+        return None
+    return pricing.video_seconds_for(need)
+
+
+def talking_direction(lines: list, cast: list, project: dict) -> str:
+    """The dialogue for Omni: who says what, in which voice and how. The
+    voice description is the character's saved one, never rewritten."""
+    by_name = {c["name"].strip().lower(): c for c in cast}
+    lang = project.get("language") or "English"
+    out = [f"The characters speak on camera with natural lip movement, in {lang}, saying exactly these words, in this order:"]
+    for d in lines:
+        who = speaker_name(d.get("character") or "")
+        how = ", ".join(x for x in ((d.get("emotion") or "").strip(), (d.get("delivery") or "").strip()) if x)
+        if not who or is_narrator(who):
+            out.append(f'NARRATOR (off-screen voice-over, nobody on screen speaks it){f" ({how})" if how else ""}: "{d["text"].strip()}"')
+            continue
+        ch = by_name.get(who.lower())
+        voice = ""
+        if ch is not None:
+            voice = (ch.get("voice_description") or "").strip() or \
+                casting.describe_voice(profile_from_row(ch, project), None, lang, ch.get("description") or "")
+        out.append(f'{who.upper()} (voice: {voice.rstrip(".")}{f"; delivery: {how}" if how else ""}): "{d["text"].strip()}"')
+    out.append("Keep each character's voice exactly as described. Nobody else speaks.")
+    return " ".join(out)
 
 
 PROFILE_KEYS = ("age_category", "age_years", "age_confidence", "gender_presentation", "personality")
@@ -629,7 +777,14 @@ def pick_voice(gender: str, used: set) -> str:
 
 def start_background(store: Store, files: Files, ai, bunny_upload=None) -> list[StudioWorker]:
     """Starts one thread per lane. Called from the worker service."""
-    workers = [StudioWorker(store, files, ai, "generation"),
+    lipsync = None
+    try:
+        import studio_lipsync
+        if studio_lipsync.enabled():
+            lipsync = studio_lipsync.SyncLipSync()
+    except Exception as e:
+        print(f"[WARN] studio: lip sync not started: {str(e)[:120]}")
+    workers = [StudioWorker(store, files, ai, "generation", lipsync=lipsync),
                StudioWorker(store, files, ai, "render", bunny_upload=bunny_upload)]
     for w in workers:
         threading.Thread(target=w.run_forever, name=f"studio-{w.lane}", daemon=True).start()
