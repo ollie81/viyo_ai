@@ -116,6 +116,11 @@ def _balance(user_id: str) -> dict:
     return {k: int(b.get(k) or 0) for k in ("available", "purchased", "promotional", "held")}
 
 
+def _now_iso() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
 def _sign(paths: list[Optional[str]]) -> dict[str, str]:
     paths = sorted({p for p in paths if p})
     if not paths:
@@ -175,17 +180,23 @@ class CharacterIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=60)
     description: str = Field("", max_length=1200)
     voice: str = ""
+    voice_style: str = Field("", max_length=80)
 
 
 class CharacterPatch(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=60)
     description: Optional[str] = Field(None, max_length=1200)
     voice: Optional[str] = None
+    voice_style: Optional[str] = Field(None, max_length=80)
+    # Changing the voice of a character whose lines are already recorded
+    # must be confirmed (409 otherwise).
+    confirm_voice_change: bool = False
 
 
 class Line(BaseModel):
     character: str = Field("", max_length=60)
     text: str = Field(..., max_length=600)
+    emotion: str = Field("", max_length=40)   # how this one line is delivered, e.g. "whispering"
 
 
 class SceneIn(BaseModel):
@@ -248,17 +259,29 @@ class GrantIn(BaseModel):
 
 def _character_out(c: dict, urls: dict) -> dict:
     return {"id": c["id"], "name": c["name"], "description": c["description"], "voice": c["voice"],
+            "voice_provider": c.get("voice_provider") or "google", "voice_style": c.get("voice_style") or "",
+            "voice_language": c.get("voice_language"), "voice_locked": bool(c.get("voice_locked_at")),
+            "voice_changed_at": c.get("voice_changed_at"), "identity_id": c.get("identity_id") or c["id"],
             "portrait_url": urls.get(c.get("reference_path") or ""), "position": c.get("position", 0)}
 
 
-def _scene_out(s: dict, urls: dict) -> dict:
+def _outdated_voices(s: dict, cast: Optional[dict]) -> list[str]:
+    """Names of characters whose voice changed after this scene was recorded."""
+    if not cast or not s.get("audio_path"):
+        return []
+    return [cast[cid]["name"] for cid, v in (s.get("audio_voices") or {}).items()
+            if cid in cast and (cast[cid].get("voice") or "") != v]
+
+
+def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None) -> dict:
     return {"id": s["id"], "position": s["position"], "heading": s["heading"], "visual": s["visual"],
             "dialogue": s.get("dialogue") or [], "duration_seconds": float(s["duration_seconds"]), "mode": s["mode"],
             "image_url": urls.get(s.get("image_path") or ""), "video_url": urls.get(s.get("video_path") or ""),
             "audio_url": urls.get(s.get("audio_path") or ""),
             "audio_seconds": float(s["audio_seconds"]) if s.get("audio_seconds") else None,
             "has_image": bool(s.get("image_path")), "has_video": bool(s.get("video_path")),
-            "has_audio": bool(s.get("audio_path")), "sfx": s.get("sfx") or []}
+            "has_audio": bool(s.get("audio_path")), "sfx": s.get("sfx") or [],
+            "voice_outdated": _outdated_voices(s, cast)}
 
 
 def _job_out(j: dict) -> dict:
@@ -276,7 +299,7 @@ def _render_out(r: dict) -> dict:
 
 def _project_out(p: dict) -> dict:
     keys = ("id", "title", "logline", "kind", "aspect_ratio", "genre", "visual_style", "language", "target_seconds",
-            "captions", "script", "created_at", "updated_at", "music_name")
+            "captions", "script", "created_at", "updated_at", "music_name", "series_id")
     out = {k: p.get(k) for k in keys}
     out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
                image_quality=p.get("image_quality") or "standard")
@@ -296,6 +319,55 @@ async def me(user_id: str = Depends(creator)):
         "sound_effects": studio_sfx.labels(),
         "price_checked": pricing.PRICE_CHECKED,
     }
+
+
+VOICE_SAMPLE_TEXT = "Hi. This is how I sound. I can be the voice of one of the characters in your story."
+
+
+def _voice_samples() -> dict[str, dict]:
+    try:
+        return {r["voice"]: r for r in get_store().select("studio_voice_samples", {})}
+    except Exception:
+        return {}   # creator_studio_voices.sql not run yet
+
+
+@router.get("/voices")
+async def voices(user_id: str = Depends(creator)):
+    """The voices a character can have, with a short sample to listen to
+    when an admin has made them."""
+    samples = _voice_samples()
+    urls = _sign([s["path"] for s in samples.values()])
+    return {"provider": "google", "voices": [
+        {"name": n, "gender": g, "style": s, "sample_url": urls.get((samples.get(n) or {}).get("path") or "")}
+        for n, g, s in studio_ai.VOICES]}
+
+
+class SamplesIn(BaseModel):
+    confirm_spend: bool = False
+    voices: list[str] = Field(default_factory=list, max_length=40)
+
+
+@router.post("/admin/voices/samples", dependencies=[Depends(_require_admin)])
+async def admin_voice_samples(body: SamplesIn):
+    """Makes the missing voice samples with the real voice model. Costs real
+    money (about $0.0007 per voice), so it only runs with confirm_spend."""
+    have = _voice_samples()
+    todo = [v for v in (body.voices or [n for n, _, _ in studio_ai.VOICES])
+            if v in studio_ai.VOICE_NAMES and v not in have]
+    est = pricing.voice_cost(len(todo) * 6.0)
+    if not body.confirm_spend:
+        return {"would_make": todo, "estimated_cost_usd": round(est.provider_cost_usd, 4), "made": []}
+    ai, files, st, made, failed = studio_ai.GoogleStudioAI(), get_files(), get_store(), [], []
+    for v in todo:
+        try:
+            wav, secs, _cost = ai.voice(VOICE_SAMPLE_TEXT, v, "")
+            path = f"voice-samples/{v.lower()}-{uuid.uuid4().hex[:8]}.wav"
+            files.put(path, wav, "audio/wav")
+            st.insert("studio_voice_samples", [{"voice": v, "path": path, "seconds": round(secs, 2)}])
+            made.append(v)
+        except Exception as e:
+            failed.append({"voice": v, "error": str(e)[:200]})
+    return {"made": made, "failed": failed}
 
 
 @router.get("/credits")
@@ -348,6 +420,42 @@ async def create_project(body: ProjectIn, user_id: str = Depends(creator)):
     return _project_out(created)
 
 
+@router.post("/projects/{project_id}/next-episode")
+async def next_episode(project_id: str, user_id: str = Depends(creator)):
+    """A new episode in the same series: same settings and the same cast,
+    with each character keeping their voice, delivery note and portrait."""
+    src = _project(project_id, user_id)
+    _rate_limit(user_id)
+    st = get_store()
+    series = src.get("series_id") or src["id"]
+    if not src.get("series_id"):
+        st.update("studio_projects", {"id": src["id"]}, {"series_id": series})
+    episodes = st.select("studio_projects", {"series_id": series, "owner_id": user_id})
+    n = max(2, len(episodes) + 1)   # `episodes` already includes this one
+    base = re.sub(r"\s*[·-]\s*Episode \d+$", "", src["title"]).strip() or src["title"]
+    row = {k: src.get(k) for k in ("kind", "aspect_ratio", "genre", "visual_style", "language", "target_seconds",
+                                   "captions")}
+    row.update(owner_id=user_id, series_id=series, title=f"{base} · Episode {n}"[:120], logline="")
+    if src.get("image_quality"):
+        row["image_quality"] = src["image_quality"]
+    new = st.insert("studio_projects", [row])[0]
+    cast = sorted(st.select("studio_characters", {"project_id": src["id"]}), key=lambda c: c.get("position") or 0)
+    copies = []
+    for c in cast:
+        copy = {"project_id": new["id"], "owner_id": user_id, "name": c["name"], "description": c.get("description") or "",
+                "voice": c.get("voice") or "", "reference_path": c.get("reference_path"),
+                "rights_confirmed": bool(c.get("rights_confirmed")), "position": c.get("position") or 0}
+        for k in ("voice_provider", "voice_style", "voice_language"):
+            if k in c:
+                copy[k] = c.get(k)
+        if "identity_id" in c:
+            copy["identity_id"] = c.get("identity_id") or c["id"]
+        copies.append(copy)
+    if copies:
+        st.insert("studio_characters", copies)
+    return _project_out(new)
+
+
 @router.get("/projects/{project_id}")
 async def get_project(project_id: str, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
@@ -359,7 +467,8 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     urls = _sign([c.get("reference_path") for c in chars] +
                  [s.get(k) for s in scenes for k in ("image_path", "video_path", "audio_path")])
     return {"project": _project_out(p), "characters": [_character_out(c, urls) for c in chars],
-            "scenes": [_scene_out(s, urls) for s in scenes], "renders": [_render_out(r) for r in renders],
+            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}) for s in scenes],
+            "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
 
 
@@ -391,9 +500,17 @@ async def add_character(project_id: str, body: CharacterIn, user_id: str = Depen
     if not voice:   # every character gets its one voice when it's created
         from studio_worker import pick_voice
         voice = pick_voice("", {c.get("voice") for c in get_store().select("studio_characters", {"project_id": p["id"]})})
-    row = get_store().insert("studio_characters", [{"project_id": p["id"], "owner_id": user_id, "name": body.name.strip(),
-                                                    "description": body.description, "voice": voice,
-                                                    "position": 999}])[0]
+    fields = {"project_id": p["id"], "owner_id": user_id, "name": body.name.strip(),
+              "description": body.description, "voice": voice, "position": 999}
+    if body.voice_style.strip() or p.get("language"):
+        fields.update(voice_style=body.voice_style.strip(), voice_language=p.get("language"))
+    try:
+        row = get_store().insert("studio_characters", [fields])[0]
+    except Exception:
+        # creator_studio_voices.sql not run yet: the voice still saves.
+        for k in ("voice_style", "voice_language"):
+            fields.pop(k, None)
+        row = get_store().insert("studio_characters", [fields])[0]
     _touch(p["id"])
     return _character_out(row, {})
 
@@ -401,12 +518,50 @@ async def add_character(project_id: str, body: CharacterIn, user_id: str = Depen
 @router.patch("/characters/{character_id}")
 async def update_character(character_id: str, body: CharacterPatch, user_id: str = Depends(creator)):
     c = _owned("studio_characters", character_id, user_id)
-    fields = body.model_dump(exclude_none=True)
+    st = get_store()
+    before = {"voice": c.get("voice") or "", "voice_style": c.get("voice_style") or ""}
+    fields = body.model_dump(exclude_none=True, exclude={"confirm_voice_change"})
     if "voice" in fields and fields["voice"] not in studio_ai.VOICE_NAMES:
         raise HTTPException(status_code=400, detail="Unknown voice.")
+    if "voice_style" in fields:
+        fields["voice_style"] = fields["voice_style"].strip()
+    changes_voice = ("voice" in fields and fields["voice"] != (c.get("voice") or "")) or \
+                    ("voice_style" in fields and fields["voice_style"] != (c.get("voice_style") or ""))
+    for k in [k for k in ("voice", "voice_style") if k in fields and not changes_voice]:
+        fields.pop(k)
+    recorded: list[dict] = []
+    if changes_voice:
+        recorded = [s for s in st.select("studio_scenes", {"project_id": c["project_id"]})
+                    if s.get("audio_path") and c["id"] in (s.get("audio_voices") or {})]
+        if recorded and not body.confirm_voice_change:
+            n = len(recorded)
+            raise HTTPException(status_code=409, detail={
+                "code": "confirm_voice_change", "scenes": n, "scene_ids": [s["id"] for s in recorded],
+                "message": (f"{c['name']} already speaks in {n} recorded scene{'s' if n != 1 else ''}. Those recordings "
+                            f"keep the old voice until you record them again. New and re-recorded lines will use "
+                            f"the new voice, and so will episodes you make from this one.")})
+        fields["voice_changed_at"] = _now_iso()
     if fields:
-        c = get_store().update("studio_characters", {"id": c["id"]}, fields)[0]
-    return _character_out(c, _sign([c.get("reference_path")]))
+        try:
+            c = st.update("studio_characters", {"id": c["id"]}, fields)[0]
+        except Exception:
+            for k in ("voice_style", "voice_changed_at"):
+                fields.pop(k, None)
+            if not fields:
+                raise HTTPException(status_code=503, detail="Voice settings are being updated on Viyo. Try again later.")
+            c = st.update("studio_characters", {"id": c["id"]}, fields)[0]
+    out = _character_out(c, _sign([c.get("reference_path")]))
+    if changes_voice:
+        try:
+            st.insert("studio_voice_changes", [{
+                "character_id": c["id"], "project_id": c["project_id"], "owner_id": user_id,
+                "old_voice": before["voice"], "new_voice": c.get("voice") or "",
+                "old_style": before["voice_style"], "new_style": c.get("voice_style") or "",
+                "scenes_affected": len(recorded)}])
+        except Exception as e:
+            print(f"[WARN] studio voice history not saved for {c['id']}: {str(e)[:160]}")
+        out["rerecord_scene_ids"] = [s["id"] for s in recorded]
+    return out
 
 
 @router.delete("/characters/{character_id}")
@@ -446,7 +601,9 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
     if "dialogue" in fields:
         fields["dialogue"] = [l.model_dump() for l in body.dialogue]
         # New lines need a new voice track; the old file stays in the asset history.
-        if fields["dialogue"] != s.get("dialogue"):
+        def key(lines):
+            return [((l.get("character") or ""), (l.get("text") or ""), (l.get("emotion") or "")) for l in lines or []]
+        if key(fields["dialogue"]) != key(s.get("dialogue")):
             fields.update(audio_path=None, audio_seconds=None)
     if fields:
         s = get_store().update("studio_scenes", {"id": s["id"]}, fields)[0]

@@ -335,11 +335,11 @@ def test_a_voice_provider_failure_mid_scene_refunds(env):
         {"character": "Maya", "text": "One"}, {"character": "Maya", "text": "Two"}]}).json()
     real, calls = ai.voice, []
 
-    def second_line_fails(text, voice):
+    def second_line_fails(text, voice, style=""):
         calls.append(text)
         if len(calls) == 2:
             raise studio_ai.ProviderError("boom")
-        return real(text, voice)
+        return real(text, voice, style)
 
     ai.voice = second_line_fails
     start(client, u, pid, "voice", [s["id"]])

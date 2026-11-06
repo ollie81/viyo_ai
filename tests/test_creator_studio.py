@@ -19,6 +19,7 @@ def studio_schema(migrated):
     conn.execute((ROOT / "creator_studio_schema.sql").read_text())
     conn.execute((ROOT / "creator_studio_sound.sql").read_text())
     conn.execute((ROOT / "creator_studio_breakdown.sql").read_text())
+    conn.execute((ROOT / "creator_studio_voices.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated

@@ -117,6 +117,19 @@ class StudioWorker:
             raise JobFailed("unknown_job", "Unknown job type.")
         return fn(job, project)
 
+    def _optional_update(self, table, filters, fields) -> None:
+        """For columns added by creator_studio_voices.sql: if that hasn't been
+        run yet, the recording still counts; only the extra detail is lost."""
+        try:
+            self.store.update(table, filters, fields)
+        except Exception as e:
+            print(f"[WARN] studio: couldn't save {list(fields)} on {table} (run creator_studio_voices.sql?): {str(e)[:160]}")
+            if hasattr(self.store, "conn"):
+                try:
+                    self.store.conn.rollback()
+                except Exception:
+                    pass
+
     def _save(self, job, project, kind: str, ext: str, data: bytes, content_type: str, **asset) -> str:
         path = new_path(job["owner_id"], project["id"], kind, ext)
         self.files.put(path, data, content_type)
@@ -150,6 +163,7 @@ class StudioWorker:
 
         existing = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
         used = {c["voice"] for c in existing.values() if c.get("voice")}
+        earlier = self.series_cast(project)
         new_chars, describe = [], []
         for i, c in enumerate(chars[:20]):
             name = (c.get("name") or "").strip()[:60]
@@ -162,14 +176,26 @@ class StudioWorker:
                 if not row.get("description") and c.get("description"):
                     describe.append({"id": row["id"], "description": c["description"][:1200]})
                 continue
+            prev = earlier.get(name.lower())
+            if prev and prev.get("voice") in ai_mod.VOICE_NAMES:
+                # The same person in an earlier episode of this series: same
+                # voice, delivery note, look and identity.
+                used.add(prev["voice"])
+                new_chars.append({"name": name, "description": prev.get("description") or (c.get("description") or "")[:1200],
+                                  "voice": prev["voice"], "voice_style": prev.get("voice_style") or "",
+                                  "voice_language": prev.get("voice_language") or brief["language"],
+                                  "reference_path": prev.get("reference_path"),
+                                  "identity_id": prev.get("identity_id") or prev["id"], "position": i})
+                continue
             voice = pick_voice(c.get("gender", ""), used)   # assigned once, here, and kept
             used.add(voice)
             new_chars.append({"name": name, "description": (c.get("description") or "")[:1200],
-                              "voice": voice, "position": i})
+                              "voice": voice, "voice_language": brief["language"], "position": i})
 
         incoming = []
         for s in scenes[:80]:
-            dialogue = [{"character": (d.get("character") or "")[:60], "text": (d.get("text") or "")[:600]}
+            dialogue = [{"character": (d.get("character") or "")[:60], "text": (d.get("text") or "")[:600],
+                         **({"emotion": d["emotion"].strip()[:40]} if (d.get("emotion") or "").strip() else {})}
                         for d in (s.get("dialogue") or []) if (d.get("text") or "").strip()][:12]
             incoming.append({"heading": (s.get("heading") or "")[:200], "visual": (s.get("visual") or "")[:2000],
                              "dialogue": dialogue,
@@ -193,6 +219,20 @@ class StudioWorker:
         return {"characters": len(chars), "scenes": len(incoming), "kept": len(plan["keep"]),
                 "added": len(plan["insert"]), "set_aside": len(plan["archive"]),
                 "kept_pictures": plan["kept_pictures"], "kept_voice": plan["kept_voice"]}, cost
+
+    def series_cast(self, project) -> dict:
+        """Characters from the other episodes of this project's series, by
+        lower-case name, the most recently edited episode winning."""
+        sid = project.get("series_id")
+        if not sid:
+            return {}
+        episodes = [e for e in self.store.select("studio_projects", {"series_id": sid, "owner_id": project["owner_id"]})
+                    if e["id"] != project["id"]]
+        out: dict = {}
+        for e in sorted(episodes, key=lambda e: e.get("updated_at") or ""):
+            for c in self.store.select("studio_characters", {"project_id": e["id"]}):
+                out[c["name"].strip().lower()] = c
+        return out
 
     def do_portrait(self, job, project):
         ch = self.store.one("studio_characters", {"id": job["character_id"]})
@@ -240,7 +280,7 @@ class StudioWorker:
         for line in lines:
             speaker = speaker_name(line.get("character") or "")
             if not speaker or is_narrator(speaker):
-                voices.append(NARRATOR_VOICE)
+                voices.append((NARRATOR_VOICE, None, _style("", line.get("emotion"))))
                 continue
             ch = cast.get(speaker.lower())
             if ch is None:
@@ -255,18 +295,19 @@ class StudioWorker:
                 voice = pick_voice("", {c.get("voice") for c in cast.values() if c.get("voice")})
                 self.store.update("studio_characters", {"id": ch["id"]}, {"voice": voice})
                 ch["voice"] = voice
+                print(f"[INFO] studio voice job {job['id']}: gave character {ch['id']} its first voice {voice}")
             elif voice not in ai_mod.VOICE_NAMES:
                 print(f"[WARN] studio voice job {job['id']}: character {ch['id']} has unknown voice {voice!r}")
                 raise JobFailed("invalid_voice",
                                 f"{ch['name']}'s voice (\"{voice}\") isn't available. Choose a new voice for "
                                 f"{ch['name']} in the cast, then try again. Your credits were returned.")
-            voices.append(voice)
+            voices.append((voice, ch, _style(ch.get("voice_style") or "", line.get("emotion"))))
         total = pricing.voice_cost(0)
         seconds_total = 0.0
         with tempfile.TemporaryDirectory() as tmp:
             wavs = []
-            for i, (line, voice) in enumerate(zip(lines, voices)):
-                wav, secs, cost = self.ai.voice(line["text"], voice)
+            for i, (line, (voice, _ch, style)) in enumerate(zip(lines, voices)):
+                wav, secs, cost = self.ai.voice(line["text"], voice, style)
                 seconds_total += secs
                 p = os.path.join(tmp, f"l{i}.wav")
                 with open(p, "wb") as f:
@@ -280,6 +321,12 @@ class StudioWorker:
         path = self._save(job, project, "audio", "m4a", data, "audio/mp4", scene_id=scene["id"], duration_seconds=round(dur, 2))
         self.store.update("studio_scenes", {"id": scene["id"]}, {"audio_path": path, "audio_seconds": round(dur, 2),
                                                                  "updated_at": _now()})
+        used = {("narrator" if ch is None else ch["id"]): v for v, ch, _s in voices}
+        self._optional_update("studio_scenes", {"id": scene["id"]}, {"audio_voices": used})
+        for _v, ch, _s in voices:
+            if ch is not None and not ch.get("voice_locked_at") and "voice_locked_at" in ch:
+                ch["voice_locked_at"] = _now()
+                self._optional_update("studio_characters", {"id": ch["id"]}, {"voice_locked_at": ch["voice_locked_at"]})
         return {"path": path, "seconds": round(dur, 2)}, total
 
     def do_video(self, job, project):
@@ -383,6 +430,13 @@ NARRATOR_NAMES = {"narrator", "narration", "voice over", "voiceover", "vo"}
 def speaker_name(raw: str) -> str:
     """'DANIEL (V.O.)' -> 'DANIEL'. Screenplay extensions aren't part of the name."""
     return re.sub(r"\s*\((?:v\.?\s*o\.?|o\.?\s*s\.?|o\.?\s*c\.?|cont'?d|contd)\)\s*", " ", raw, flags=re.I).strip()
+
+
+def _style(voice_style: str, emotion) -> str:
+    """The delivery note for one line: the character's fixed note plus this
+    line's emotion. Google advises keeping it short for a steadier voice."""
+    parts = [x.strip() for x in (voice_style or "", emotion or "") if x and x.strip()]
+    return ", ".join(parts)[:120]
 
 
 def is_narrator(name: str) -> bool:

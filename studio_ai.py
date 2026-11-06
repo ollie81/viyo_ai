@@ -60,7 +60,7 @@ class StudioAI(Protocol):
     def write_script(self, brief: dict) -> tuple[str, pricing.Cost]: ...
     def breakdown(self, brief: dict, script: str) -> tuple[dict, pricing.Cost]: ...
     def image(self, prompt: str, references: list[bytes], aspect_ratio: str, size: str = "1K") -> tuple[bytes, str, pricing.Cost]: ...
-    def voice(self, text: str, voice: str) -> tuple[bytes, float, pricing.Cost]: ...
+    def voice(self, text: str, voice: str, style: str = "") -> tuple[bytes, float, pricing.Cost]: ...
     def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8) -> tuple[bytes, pricing.Cost]: ...
 
 
@@ -95,7 +95,10 @@ BREAKDOWN_SCHEMA = {
             "heading": {"type": "string"},
             "visual": {"type": "string", "description": "One-shot image prompt: who is in frame, what they do, setting, lighting, camera framing."},
             "dialogue": {"type": "array", "items": {"type": "object", "properties": {
-                "character": {"type": "string"}, "text": {"type": "string"}}, "required": ["character", "text"]}},
+                "character": {"type": "string"}, "text": {"type": "string"},
+                "emotion": {"type": "string", "description": "How this one line is delivered, 1-4 English words "
+                            "(e.g. 'angry', 'whispering', 'holding back tears'). Empty if plain."}},
+                "required": ["character", "text"]}},
             "duration_seconds": {"type": "number"},
         }, "required": ["heading", "visual", "dialogue", "duration_seconds"]}},
     },
@@ -112,6 +115,7 @@ For each scene give: the heading, ONE visual prompt describing a single strong s
 the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over),
 and a duration in seconds (2-12; long enough for its lines).
 Describe every character visually so they can be drawn the same way every time.
+For a line whose delivery matters, give a short emotion (1-4 English words); leave it empty otherwise.
 
 Language rules:
 - Dialogue: copy every spoken line in {lang}, word for word as the screenplay has it. Never translate dialogue into English or any other language.
@@ -140,6 +144,19 @@ def _pcm_to_wav(pcm: bytes, rate: int) -> bytes:
         w.setframerate(rate)
         w.writeframes(pcm)
     return buf.getvalue()
+
+
+def as_wav(data: bytes, mime_type: str = "") -> tuple[bytes, float]:
+    """(wav bytes, seconds). Gemini 3.8 TTS returns a complete WAV file;
+    older models returned raw 16-bit PCM. Never wrap a WAV in a second
+    header."""
+    import wave
+    if data[:4] == b"RIFF":
+        with wave.open(io.BytesIO(data)) as w:
+            return data, w.getnframes() / float(w.getframerate() or 24000)
+    m = re.search(r"rate=(\d+)", mime_type or "")
+    rate = int(m.group(1)) if m else 24000
+    return _pcm_to_wav(data, rate), len(data) / 2 / rate
 
 
 def _classify(e: Exception) -> Exception:
@@ -217,26 +234,29 @@ class GoogleStudioAI:
                         pricing.image_cost(1, (u.prompt_token_count or 0) if u else 0, size)
         raise PolicyBlocked("No image came back for this prompt. Try rewording the scene.")
 
-    def voice(self, text: str, voice: str):
-        from google.genai import types
+    def voice(self, text: str, voice: str, style: str = ""):
+        """One line in one prebuilt voice, Gemini 3.8 Flash TTS through the
+        Interactions API (request shape from Google's speech docs, 6 Nov
+        2026). `style` is one short delivery note; the transcript stays
+        verbatim. Not yet verified with a live call."""
+        part: dict = {"type": "text", "text": text}
+        if style.strip():
+            part["annotations"] = [{"type": "speech_metadata", "style": style.strip()[:120]}]
         try:
-            resp = self.client.models.generate_content(
-                model=pricing.TTS_MODEL, contents=text,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)))))
+            inter = self.client.interactions.create(
+                model=pricing.TTS_MODEL,
+                input=[{"type": "user_input", "content": [part]}],
+                response_format={"type": "audio"},
+                generation_config={"speech_config": [{"voice": voice}]})
         except Exception as e:
             raise _classify(e)
-        for cand in resp.candidates or []:
-            for part in (cand.content.parts if cand.content else []) or []:
-                if part.inline_data is not None and part.inline_data.data:
-                    m = re.search(r"rate=(\d+)", part.inline_data.mime_type or "")
-                    rate = int(m.group(1)) if m else 24000
-                    pcm = part.inline_data.data
-                    seconds = len(pcm) / 2 / rate
-                    return _pcm_to_wav(pcm, rate), seconds, pricing.voice_cost(seconds)
-        raise PolicyBlocked("No audio came back for this line.")
+        out = getattr(inter, "output_audio", None)
+        data = getattr(out, "data", None) if out is not None else None
+        if not data:
+            raise PolicyBlocked("No audio came back for this line.")
+        raw = base64.b64decode(data) if isinstance(data, str) else data
+        wav, seconds = as_wav(raw, getattr(out, "mime_type", "") or "")
+        return wav, seconds, pricing.voice_cost(seconds)
 
     def video(self, prompt: str, first_frame: Optional[bytes], aspect_ratio: str, seconds: int = 8):
         """Gemini Omni 1.2 Flash (Interactions API), request shape from
@@ -333,8 +353,9 @@ class FakeStudioAI:
         Image.new("RGB", (w, h), (40, 30, 90)).save(buf, "PNG")
         return buf.getvalue(), "image/png", pricing.image_cost(1, 300, size)
 
-    def voice(self, text, voice):
+    def voice(self, text, voice, style=""):
         self.calls.append(("voice", voice))
+        self.voice_log = getattr(self, "voice_log", []) + [{"text": text, "voice": voice, "style": style}]
         self._maybe_fail("voice")
         seconds = max(0.8, len(text.split()) / 2.4)
         rate = 24000
