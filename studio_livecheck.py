@@ -118,7 +118,9 @@ class LiveCheck:
         ai = self.ai or ai_mod.GoogleStudioAI()
         b = self.brief
 
-        script = self._step("1. Screenplay (Gemini text)", 0.02, lambda: self._script(ai))
+        est = pricing.estimate_script(int(b.get("target_seconds") or 30), len(b.get("title", "")) + len(b.get("logline", "")))
+        script = self._step("1. Story plan + screenplay + script doctor (Gemini text, 3 calls)",
+                            est.provider_cost_usd * 1.6, lambda: self._script(ai))
         if not script:
             return
         plan = self._step("2. Scene list + ages (Gemini text)", 0.02, lambda: self._breakdown(ai, script))
@@ -189,9 +191,20 @@ class LiveCheck:
     # ------------------------------------------------------------ steps
 
     def _script(self, ai):
-        text, cost = ai.write_script(self.brief)
+        develop = getattr(ai, "develop_script", None)
+        if develop is None:
+            text, cost = ai.write_script(self.brief)
+            bible = {}
+        else:
+            text, bible, cost = develop(self.brief, [])
+            self.brief["story_bible"] = bible
+            self._put("story-plan.json", json.dumps(bible, indent=1, ensure_ascii=False).encode(), "application/json")
         self._put("screenplay.txt", text.encode(), "text/plain")
-        return text, cost.provider_cost_usd, {"chars": len(text), "preview": text[:600]}, ["screenplay.txt"]
+        detail = {"chars": len(text), "preview": text[:600], "logline": bible.get("logline"),
+                  "draft_scores": bible.get("scores"), "doctor_fixes": bible.get("fixes"),
+                  "rewrite_used": bible.get("rewrite_used")}
+        files = ["screenplay.txt"] + (["story-plan.json"] if bible else [])
+        return text, cost.provider_cost_usd, detail, files
 
     def _breakdown(self, ai, script):
         data, cost = ai.breakdown(self.brief, script)

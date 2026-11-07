@@ -152,9 +152,31 @@ class StudioWorker:
                                          "language", "visual_style")}
         if not ai_mod.moderate_text(f"{project['title']}\n{project['logline']}"):
             raise JobFailed("content_blocked", "This idea can't be made on Viyo. Please change it.")
-        text, cost = self.ai.write_script(brief)
+        develop = getattr(self.ai, "develop_script", None)
+        if develop is None:
+            text, cost = self.ai.write_script(brief)
+            bible = None
+        else:
+            text, bible, cost = develop(brief, self.earlier_episodes(project))
         self.store.update("studio_projects", {"id": project["id"]}, {"script": text, "updated_at": _now()})
-        return {"chars": len(text)}, cost
+        if bible:
+            self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
+        return {"chars": len(text), "scores": (bible or {}).get("scores"), "rewritten": (bible or {}).get("rewrite_used")}, cost
+
+    def earlier_episodes(self, project) -> list[dict]:
+        """The story bibles of the episodes before this one in its series,
+        oldest first, so the writers' room keeps the story continuous."""
+        sid = project.get("series_id")
+        if not sid:
+            return []
+        eps = [e for e in self.store.select("studio_projects", {"series_id": sid, "owner_id": project["owner_id"]})
+               if e["id"] != project["id"] and (e.get("created_at") or "") <= (project.get("created_at") or "~")]
+        out = []
+        for e in sorted(eps, key=lambda e: e.get("created_at") or ""):
+            sb = e.get("story_bible") or {}
+            if sb:
+                out.append({**sb, "title": e.get("title") or sb.get("title")})
+        return out
 
     def do_breakdown(self, job, project):
         script = project["script"].strip()
@@ -162,7 +184,8 @@ class StudioWorker:
             raise JobFailed("no_script", "Write or paste a script first.")
         if not ai_mod.moderate_text(script):
             raise JobFailed("content_blocked", "This script can't be made on Viyo. Please change it.")
-        brief = {k: project.get(k) for k in ("title", "kind", "aspect_ratio", "visual_style", "target_seconds", "language")}
+        brief = {k: project.get(k) for k in ("title", "kind", "aspect_ratio", "visual_style", "target_seconds", "language",
+                                             "story_bible")}
         brief["language"] = brief.get("language") or "English"
         data, cost = self.ai.breakdown(brief, script)
         chars = data.get("characters") or []

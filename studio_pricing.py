@@ -175,7 +175,13 @@ HOLD_FACTOR = 1.6
 
 
 def estimate_script(target_seconds: int, brief_chars: int) -> Cost:
-    return text_cost(800 + brief_chars // 3, THINKING_BUDGET + 900 + int(target_seconds * 9))
+    """The writers' room makes three calls: story plan, draft, script doctor
+    (which reads the plan and the draft and writes the whole script again)."""
+    script_out = 600 + int(target_seconds * 14)
+    plan_in, plan_out = 1600 + brief_chars // 3, THINKING_BUDGET + 2200
+    draft_in, draft_out = 1200 + plan_out, THINKING_BUDGET + script_out
+    doctor_in, doctor_out = 1300 + plan_out + script_out, THINKING_BUDGET + script_out + 700
+    return text_cost(plan_in + draft_in + doctor_in, plan_out + draft_out + doctor_out)
 
 
 def estimate_breakdown(script_chars: int, target_seconds: int) -> Cost:

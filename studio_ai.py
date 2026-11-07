@@ -118,9 +118,19 @@ BREAKDOWN_SCHEMA = {
 }
 
 
+def _plan_cast(b: dict) -> str:
+    cast = (b.get("story_bible") or {}).get("characters") or []
+    if not cast:
+        return ""
+    lines = ["The story plan's characters (use these ages and looks; the age decides their voice):"]
+    for c in cast[:12]:
+        lines.append(f"- {c.get('name')}: age {c.get('age', '?')}; looks: {c.get('look', '')}; speaks: {c.get('speech', '')}")
+    return "\n".join(lines) + "\n"
+
+
 def breakdown_prompt(b: dict, script: str) -> str:
     lang = b.get("language") or "English"
-    return f"""Break this screenplay into a shot list for an AI-made {b.get('kind')} ({b.get('aspect_ratio')}).
+    return _plan_cast(b) + f"""Break this screenplay into a shot list for an AI-made {b.get('kind')} ({b.get('aspect_ratio')}).
 Visual style: {b.get('visual_style') or 'cinematic, realistic'}.
 The production language is {lang}.
 For each scene give: the heading, ONE visual prompt describing a single strong shot (characters by name, action, setting, lighting, framing),
@@ -214,9 +224,32 @@ class GoogleStudioAI:
         return resp
 
     def write_script(self, brief: dict):
-        resp = self._text(script_prompt(brief))
-        i, o = self._text_usage(resp)
-        return resp.text.strip(), pricing.text_cost(i, o)
+        text, _bible, cost = self.develop_script(brief, [])
+        return text, cost
+
+    def develop_script(self, brief: dict, previous: list):
+        """The writers' room (studio_story): plan -> draft -> script doctor.
+        Returns (screenplay, story bible, cost)."""
+        import studio_story
+
+        def text_fn(prompt):
+            resp = self._text(prompt)
+            i, o = self._text_usage(resp)
+            return (resp.text or ""), i, o
+
+        def json_fn(prompt, schema):
+            resp = self._text(prompt, response_mime_type="application/json", response_json_schema=schema)
+            i, o = self._text_usage(resp)
+            try:
+                return json.loads(resp.text), i, o
+            except (TypeError, ValueError):
+                raise ProviderError("The AI returned an unreadable story plan.")
+
+        try:
+            text, bible, i, o = studio_story.develop(text_fn, json_fn, brief, previous)
+        except ValueError as e:
+            raise ProviderError(f"The story couldn't be written: {e}")
+        return text, bible, pricing.text_cost(i, o)
 
     def breakdown(self, brief: dict, script: str):
         resp = self._text(breakdown_prompt(brief, script), response_mime_type="application/json",
@@ -340,6 +373,21 @@ class FakeStudioAI:
                     raise err.pop(0)
                 return
             raise err
+
+    def develop_script(self, brief, previous):
+        self.last_story_previous = list(previous)
+        text, cost = self.write_script(brief)
+        bible = {"title": brief.get("title"), "logline": brief.get("logline") or "A story.",
+                 "central_conflict": "Maya must face the brother she left behind.", "stakes": "Her family",
+                 "characters": [{"name": "Maya", "age": "late 20s", "role": "lead", "want": "to be forgiven",
+                                 "flaw": "runs from conflict", "speech": "short, guarded", "look": "short black hair, red jacket"},
+                                {"name": "Daniel", "age": "30s", "role": "supporting", "want": "the truth",
+                                 "flaw": "stubborn", "speech": "blunt", "look": "beard, grey hoodie"}],
+                 "beats": [{"purpose": "hook", "what_happens": "Maya returns", "emotional_turn": "calm -> shock", "seconds": 5}],
+                 "ending": "Daniel calls her name.", "scores": {"hook": 6}, "fixes": ["sharper hook"],
+                 "episode_summary": f"Episode about {brief.get('title')}.", "open_threads": ["Why did Maya leave?"],
+                 "rewrite_used": True}
+        return text, bible, cost
 
     def write_script(self, brief):
         self.calls.append(("script", brief.get("title")))

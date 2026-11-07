@@ -371,7 +371,8 @@ def _project_out(p: dict) -> dict:
     out = {k: p.get(k) for k in keys}
     out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
                image_quality=p.get("image_quality") or "standard",
-               production_style=p.get("production_style") or "pictures")
+               production_style=p.get("production_style") or "pictures",
+               story_bible=p.get("story_bible") or None)
     return out
 
 

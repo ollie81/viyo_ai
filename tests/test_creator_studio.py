@@ -26,6 +26,7 @@ def studio_schema(migrated):
     if not os.environ.get("STUDIO_PREMIGRATION"):
         conn.execute((ROOT / "creator_studio_casting.sql").read_text())
         conn.execute((ROOT / "creator_studio_video_drama.sql").read_text())
+        conn.execute((ROOT / "creator_studio_story.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated
