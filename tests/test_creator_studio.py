@@ -1,5 +1,6 @@
 """Creator Studio end to end: API + worker + render against the real SQL
 (local Postgres), local files and a fake AI that costs nothing."""
+import os
 import uuid
 
 import pytest
@@ -20,8 +21,11 @@ def studio_schema(migrated):
     conn.execute((ROOT / "creator_studio_sound.sql").read_text())
     conn.execute((ROOT / "creator_studio_breakdown.sql").read_text())
     conn.execute((ROOT / "creator_studio_voices.sql").read_text())
-    conn.execute((ROOT / "creator_studio_casting.sql").read_text())
-    conn.execute((ROOT / "creator_studio_video_drama.sql").read_text())
+    # STUDIO_PREMIGRATION=1 runs the tests as production is before these two
+    # files are run, to prove the code still works without them.
+    if not os.environ.get("STUDIO_PREMIGRATION"):
+        conn.execute((ROOT / "creator_studio_casting.sql").read_text())
+        conn.execute((ROOT / "creator_studio_video_drama.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated

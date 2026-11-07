@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -279,6 +280,31 @@ def _character_out(c: dict, urls: dict) -> dict:
             "portrait_url": urls.get(c.get("reference_path") or ""), "position": c.get("position", 0)}
 
 
+# Columns added by creator_studio_casting.sql and creator_studio_voices.sql.
+# Writes fall back step by step when a file hasn't been run yet, so the
+# rest of the record still saves.
+CASTING_COLUMNS = ("age_category", "age_years", "age_confidence", "gender_presentation", "personality",
+                   "voice_category", "voice_description", "voice_status", "voice_assignment_version")
+VOICE_COLUMNS = ("voice_style", "voice_language", "voice_changed_at", "voice_provider", "voice_locked_at", "identity_id")
+
+
+def _write_with_fallback(write, fields: dict):
+    """Tries the full write, then without casting columns, then without the
+    stage-1 voice columns too."""
+    st = get_store()
+    attempts = [dict(fields), {k: v for k, v in fields.items() if k not in CASTING_COLUMNS},
+                {k: v for k, v in fields.items() if k not in CASTING_COLUMNS + VOICE_COLUMNS}]
+    last = None
+    for f in attempts:
+        try:
+            return write(f)
+        except Exception as e:
+            last = e
+            if hasattr(st, "conn"):
+                st.conn.rollback()
+    raise last
+
+
 def _catalog() -> list:
     from studio_worker import load_catalog
     return load_catalog(get_store())
@@ -513,6 +539,57 @@ async def admin_voice_samples(body: SamplesIn):
     return {"made": made, "failed": failed}
 
 
+# ---------------------------------------------------------------- live provider test (admin)
+
+class LiveCheckIn(BaseModel):
+    confirm_spend: bool = False
+    cap_usd: float = Field(5.0, gt=0, le=5.0)
+
+
+_live_lock = threading.Lock()
+_live_running: dict = {}
+
+
+@router.post("/admin/live-check", dependencies=[Depends(_require_admin)])
+async def admin_live_check(body: LiveCheckIn):
+    """Runs the first real test of every paid provider (Gemini text, image,
+    voice, Omni video, sync.so) on one tiny production, with a hard cap.
+    No creator data or credits are touched. Returns a results link."""
+    import studio_livecheck
+    if not body.confirm_spend:
+        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.35,
+                "note": "Send confirm_spend to run it. Costs real money on Viyo's Google and sync.so accounts."}
+    with _live_lock:
+        busy = [c for c in _live_running.values() if c.report.get("status") == "running"]
+        if busy:
+            raise HTTPException(status_code=409, detail="A live test is already running.")
+        check = studio_livecheck.start_in_background(get_files(), body.cap_usd)
+        _live_running[check.id] = check
+    return {"id": check.id, "results_path": f"/api/v1/studio/live-check/{check.id}"}
+
+
+@router.get("/live-check/{check_id}")
+async def live_check_report(check_id: str):
+    """Results of a live test. The id is long and random; there is no
+    personal data in it, only test files and costs."""
+    import studio_livecheck
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,40}", check_id or ""):
+        raise HTTPException(status_code=404, detail="Not found.")
+    check = _live_running.get(check_id)
+    report = dict(check.report) if check else studio_livecheck.latest_report(get_files(), check_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Not found.")
+    names = sorted({f for s in report.get("steps", []) for f in (s.get("files") or [])})
+    paths = [f"livecheck/{check_id}/{n}" for n in names]
+    try:
+        signed = get_files().sign(paths, 7 * 24 * 3600) if paths else {}
+    except Exception:
+        signed = {}
+    report["file_urls"] = {n: signed.get(f"livecheck/{check_id}/{n}") for n in names}
+    report["spent_usd"] = round(check.budget.spent, 4) if check else report.get("spent_usd")
+    return report
+
+
 @router.get("/credits")
 async def credits(user_id: str = Depends(creator)):
     rows = get_store().select("studio_credit_ledger", {"user_id": user_id}, order="created_at", desc=True, limit=60)
@@ -671,13 +748,7 @@ async def add_character(project_id: str, body: CharacterIn, user_id: str = Depen
                      voice_language=d.language, voice_assignment_version=1 if d.voice else 0)
         if not extra["voice_style"]:
             extra["voice_style"] = d.voice_style
-    try:
-        row = st.insert("studio_characters", [{**fields, **extra}])[0]
-    except Exception:
-        # creator_studio_casting.sql not run yet: the voice still saves.
-        if hasattr(st, "conn"):
-            st.conn.rollback()
-        row = st.insert("studio_characters", [fields])[0]
+    row = _write_with_fallback(lambda f: st.insert("studio_characters", [f])[0], {**fields, **extra})
     _touch(p["id"])
     return _character_out(row, {})
 
@@ -719,11 +790,9 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
         except Exception:
             if hasattr(st, "conn"):
                 st.conn.rollback()
-            for k in ("voice_style", "voice_changed_at", "voice_status", "voice_assignment_version"):
-                fields.pop(k, None)
-            if not fields:
-                raise HTTPException(status_code=503, detail="Voice settings are being updated on Viyo. Try again later.")
-            c = st.update("studio_characters", {"id": c["id"]}, fields)[0]
+            cid = c["id"]
+            c = _write_with_fallback(lambda f: st.update("studio_characters", {"id": cid}, f)[0] if f
+                                     else st.one("studio_characters", {"id": cid}), fields)
     if changes_voice:
         # The voice belongs to the person, not the episode: every copy of
         # this character in the series changes with it.
@@ -737,16 +806,18 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
                     print(f"[WARN] studio: series voice sync failed for {g['id']}: {str(e)[:120]}")
     out = _character_out(c, _sign([c.get("reference_path")]))
     if changes_voice:
-        try:
-            st.insert("studio_voice_changes", [{
-                "character_id": c["id"], "project_id": c["project_id"], "owner_id": user_id,
+        hist = {"character_id": c["id"], "project_id": c["project_id"], "owner_id": user_id,
                 "old_voice": before["voice"], "new_voice": c.get("voice") or "",
                 "old_style": before["voice_style"], "new_style": c.get("voice_style") or "",
-                "scenes_affected": len(recorded), "reason": "creator"}])
-        except Exception as e:
-            if hasattr(st, "conn"):
-                st.conn.rollback()
-            print(f"[WARN] studio voice history not saved for {c['id']}: {str(e)[:160]}")
+                "scenes_affected": len(recorded), "reason": "creator"}
+        for attempt in (hist, {k: v for k, v in hist.items() if k != "reason"}):   # 'reason' needs the casting SQL
+            try:
+                st.insert("studio_voice_changes", [attempt])
+                break
+            except Exception as e:
+                if hasattr(st, "conn"):
+                    st.conn.rollback()
+                print(f"[WARN] studio voice history not saved for {c['id']}: {str(e)[:160]}")
         out["rerecord_scene_ids"] = [s["id"] for s in recorded if s["project_id"] == c["project_id"]]
         out["other_episodes_affected"] = len({s["project_id"] for s in recorded if s["project_id"] != c["project_id"]})
         cat = c.get("age_category")

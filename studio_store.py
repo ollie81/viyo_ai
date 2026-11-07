@@ -157,6 +157,7 @@ class Files:
         with open(local_path, "wb") as f:
             f.write(self.get(path))
     def sign(self, paths: list[str], seconds: int, download_name: Optional[str] = None) -> dict[str, str]: ...
+    def list(self, prefix: str) -> list[str]: ...   # file names directly under prefix
 
 
 class SupabaseFiles(Files):
@@ -175,6 +176,9 @@ class SupabaseFiles(Files):
 
     def get(self, path):
         return self._b().download(path)
+
+    def list(self, prefix):
+        return [r["name"] for r in (self._b().list(prefix.rstrip("/"), {"limit": 1000}) or []) if r.get("name")]
 
     def sign(self, paths, seconds, download_name=None):
         out = {}
@@ -222,6 +226,10 @@ class LocalFiles(Files):
 
     def exists(self, path):
         return os.path.exists(os.path.join(self.root, path))
+
+    def list(self, prefix):
+        d = os.path.join(self.root, prefix)
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
 
 
 def new_path(owner_id: str, project_id: str, kind: str, ext: str) -> str:
