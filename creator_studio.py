@@ -1136,8 +1136,18 @@ async def estimate(project_id: str, body: EstimateRequest, user_id: str = Depend
 @router.post("/projects/{project_id}/jobs")
 async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
-    _rate_limit(user_id)
     st = get_store()
+    # Assistant-generated story plans must be explicitly approved by their
+    # owner before they can be converted into cast and scenes. Enforce this
+    # here, not only in the client, so direct API calls cannot bypass review.
+    if body.kind == "breakdown":
+        bible = p.get("story_bible") or {}
+        if isinstance(bible, dict) and bible and not (bible.get("_assistant_approval") or {}).get("approved"):
+            raise HTTPException(status_code=409, detail={
+                "code": "story_approval_required",
+                "message": "Review and approve the story before creating cast and scenes."
+            })
+    _rate_limit(user_id)
     if body.kind == "breakdown" and not body.confirm_replace:
         scenes = st.select("studio_scenes", {"project_id": p["id"]})
         if scenes:
