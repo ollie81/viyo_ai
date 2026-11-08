@@ -254,6 +254,17 @@ class EstimateRequest(BaseModel):
     target_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
+class AssistantGenerateIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    # Must match the latest server estimate. This makes price confirmation
+    # explicit before the existing credit-hold/job flow is entered.
+    confirm_credits: int = Field(..., ge=0)
+
+
+class AssistantApproveIn(BaseModel):
+    confirm_story: bool = False
+
+
 class GrantIn(BaseModel):
     user: str = Field(..., description="user id, email or @username")
     credits: int = Field(..., gt=0, le=1_000_000)
@@ -702,6 +713,78 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
             "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p) for s in scenes],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
+
+
+@router.get("/projects/{project_id}/assistant")
+async def creator_assistant_state(project_id: str, user_id: str = Depends(creator)):
+    """Creator-facing assistant context for one owned production.
+
+    The assistant is a project workspace, not a shared admin chat. It returns
+    only this creator's story, script and script-job status.
+    """
+    p = _project(project_id, user_id)
+    st = get_store()
+    jobs = st.select("studio_jobs", {"project_id": p["id"]}, order="created_at", desc=True, limit=60)
+    script_jobs = [j for j in jobs if j.get("kind") == "script"]
+    bible = p.get("story_bible") or {}
+    approval = bible.get("_assistant_approval") or {}
+    estimate = _quote("script", p, [])[0]
+    return {
+        "project": _project_out(p),
+        "story_status": "approved" if approval.get("approved") else ("draft" if bible else "not_started"),
+        "story_approved_at": approval.get("approved_at"),
+        "script_job": _job_out(script_jobs[0]) if script_jobs else None,
+        "script_estimate": estimate,
+        "balance": _balance(user_id),
+    }
+
+
+@router.post("/projects/{project_id}/assistant/generate")
+async def creator_assistant_generate(project_id: str, body: AssistantGenerateIn,
+                                     user_id: str = Depends(creator)):
+    """Start the existing priced story/script workflow from the assistant.
+
+    The caller must first display /estimate and echo its credit total. The
+    existing idempotent job/hold/worker path remains the only way to run AI.
+    """
+    p = _project(project_id, user_id)
+    estimate = _quote("script", p, [])[0]
+    if estimate["blocked"]:
+        raise HTTPException(status_code=400, detail=estimate["blocked"])
+    if body.confirm_credits != estimate["credits"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "price_changed", "message": "The estimate changed. Review the new price before continuing.",
+            "estimate": estimate, "balance": _balance(user_id)})
+    result = await start_jobs(project_id, JobRequest(kind="script", request_id=body.request_id), user_id)
+    return {**result, "estimate": estimate}
+
+
+@router.post("/projects/{project_id}/assistant/approve")
+async def creator_assistant_approve(project_id: str, body: AssistantApproveIn,
+                                    user_id: str = Depends(creator)):
+    """Record the creator's approval of the generated story bible.
+
+    Approval does not generate or replace any paid assets.
+    """
+    p = _project(project_id, user_id)
+    if not body.confirm_story:
+        raise HTTPException(status_code=400, detail="Confirm that you approve this story before continuing.")
+    bible = p.get("story_bible") or {}
+    if not p.get("script") or not bible:
+        raise HTTPException(status_code=409, detail="Generate the story and screenplay before approving it.")
+    import copy
+    updated = copy.deepcopy(bible)
+    updated["_assistant_approval"] = {"approved": True, "approved_at": _now_iso()}
+    try:
+        p = get_store().update("studio_projects", {"id": p["id"]},
+                               {"story_bible": updated, "updated_at": _now_iso()})[0]
+    except Exception as e:
+        if hasattr(get_store(), "conn"):
+            get_store().conn.rollback()
+        print(f"[WARN] Creator Studio story approval could not be saved: {str(e)[:160]}")
+        raise HTTPException(status_code=503, detail="Story approval storage is not ready. Run creator_studio_story.sql.")
+    return {"ok": True, "story_status": "approved", "story_approved_at": updated["_assistant_approval"]["approved_at"],
+            "project": _project_out(p)}
 
 
 @router.patch("/projects/{project_id}")
