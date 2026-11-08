@@ -96,3 +96,14 @@ Frontend gap:
 ## First implementation boundary
 
 The first code change should be the secure, owner-scoped story-development API and its tests. It should not be a direct conversion of the old admin router and should not start with a large UI rewrite. Once the API contract and tests are stable, connect the web client to it.
+
+## Implementation status — 8 November 2026
+
+Phase A has a first backend slice on branch `feat/creator-studio-assistant-api`:
+
+- Added owner-scoped assistant state, generation, and story-approval endpoints under `/api/v1/studio/projects/{project_id}/assistant`.
+- Generation routes into the existing `script` job, pricing estimate, idempotency, credit hold, worker, capture and refund flow. It requires the creator to echo the currently estimated credit amount; a changed estimate returns 409 without creating a job.
+- Approval records an approval timestamp in the project's existing `story_bible`; it does not trigger asset generation.
+- Added tests for owner isolation, guest/signed-out rejection, price mismatch without a credit hold, successful generation, and explicit story approval.
+
+This is an API foundation only. It is not yet a conversational assistant, a web UI, a scene-planning UI, or a deployed feature. The repository tests have not been executed in this editing session; CI/review must verify them before merge. The existing story migration `creator_studio_story.sql` must be applied in the target environment for approval persistence.
