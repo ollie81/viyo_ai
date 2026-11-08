@@ -792,7 +792,15 @@ async def update_project(project_id: str, body: ProjectPatch, user_id: str = Dep
     p = _project(project_id, user_id)
     fields = body.model_dump(exclude_none=True)
     if fields:
+        import copy
         import datetime
+        # Approval applies to the exact idea and screenplay the creator reviewed.
+        # Any edit to either invalidates it so stale approval cannot authorize
+        # production of a changed story.
+        if ("script" in fields or "logline" in fields) and p.get("story_bible"):
+            bible = copy.deepcopy(p["story_bible"])
+            bible.pop("_assistant_approval", None)
+            fields["story_bible"] = bible
         fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         p = get_store().update("studio_projects", {"id": p["id"]}, fields)[0]
     return _project_out(p)
