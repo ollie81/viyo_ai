@@ -21,6 +21,7 @@ import studio_ai as ai_mod
 import studio_casting as casting
 import studio_pricing as pricing
 import studio_render as render
+import studio_music as music_mod
 from studio_store import Files, Store, new_path
 
 NARRATOR_VOICE = "Charon"
@@ -548,9 +549,27 @@ class StudioWorker:
                     video_audio=spoken_in_clip or not any((d.get("text") or "").strip() for d in s["dialogue"]),
                     sfx=tuple(x for x in (s.get("sfx") or []) if isinstance(x, str))))
             music = None
+            music_generated = False
             if project.get("music_path"):
                 music = os.path.join(tmp, "music.m4a")
                 self.files.get_to(project["music_path"], music)
+            else:
+                try:
+                    track = music_mod.generate(project)
+                except music_mod.MusicGenerationError as exc:
+                    raise JobFailed("music_unavailable", str(exc), retry=exc.retry) from exc
+                music = os.path.join(tmp, "viyo-original-score.mp3")
+                with open(music, "wb") as f:
+                    f.write(track)
+                music_generated = True
+                music_path = new_path(job["owner_id"], project["id"], "music", "mp3")
+                self.files.put_file(music_path, music, "audio/mpeg")
+                self.store.insert("studio_assets", [{
+                    "owner_id": job["owner_id"], "project_id": project["id"], "job_id": job["id"],
+                    "kind": "music", "path": music_path, "bytes": len(track)
+                }])
+                self.store.update("studio_projects", {"id": project["id"]},
+                                  {"music_path": music_path, "music_name": "Viyo Original Score"})
             out = os.path.join(tmp, "film.mp4")
             info = render.render_film(inputs, project["aspect_ratio"], out, tmp, captions=bool(project.get("captions", True)),
                                       music=music, music_volume=float(project.get("music_volume") or 0.25))
@@ -576,7 +595,7 @@ class StudioWorker:
                                               "duration_seconds": info["duration"], "bytes": info["bytes"],
                                               "sha256": info["sha256"]}])
         return {"path": path, "bunny_video_id": bunny_id, "version": version, **info}, \
-            pricing.render_cost(info["duration"], info["bytes"])
+            pricing.render_cost(info["duration"], info["bytes"], music_generated=music_generated)
 
     def _scene(self, job, project):
         scene = self.store.one("studio_scenes", {"id": job["scene_id"]})
