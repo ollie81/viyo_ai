@@ -586,3 +586,38 @@ def test_creator_assistant_requires_price_confirmation_then_approves_story(env):
     assert approved.json()["story_status"] == "approved"
     assert client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(u)).json()["story_status"] == "approved"
     assert balance(client, u)["held"] == 0
+
+
+def test_story_approval_is_enforced_by_breakdown_api_and_invalidated_on_edit(env):
+    client, db, store, files, ai, gen, ren = env
+    u = make_user(db)
+    grant(client, u, 2000, kind="purchase")
+    pid = new_project(client, u)
+
+    quote = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u),
+                        json={"kind": "script"}).json()
+    started = client.post(f"/api/v1/studio/projects/{pid}/assistant/generate", headers=H(u),
+                          json={"request_id": "approval-guard-001",
+                                "confirm_credits": quote["total_credits"]})
+    assert started.status_code == 200, started.text
+    assert run(gen) == 1
+
+    # A direct request to the generic jobs endpoint must not bypass review.
+    blocked = start(client, u, pid, "breakdown")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "story_approval_required"
+
+    approved = client.post(f"/api/v1/studio/projects/{pid}/assistant/approve", headers=H(u),
+                           json={"confirm_story": True})
+    assert approved.status_code == 200, approved.text
+    assert start(client, u, pid, "breakdown").status_code == 200
+
+    # Changing the idea after approval clears the approval on the server.
+    edited = client.patch(f"/api/v1/studio/projects/{pid}", headers=H(u),
+                          json={"logline": "A changed story idea"})
+    assert edited.status_code == 200, edited.text
+    state = client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(u)).json()
+    assert state["story_status"] == "draft"
+    blocked_after_edit = start(client, u, pid, "breakdown")
+    assert blocked_after_edit.status_code == 409
+    assert blocked_after_edit.json()["detail"]["code"] == "story_approval_required"
