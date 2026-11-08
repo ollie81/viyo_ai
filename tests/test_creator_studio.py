@@ -528,3 +528,61 @@ def test_sound_effects_are_listed():
     import studio_sfx
     ids = {e["id"] for e in studio_sfx.labels()}
     assert {"rain", "whoosh", "heartbeat", "impact"} <= ids
+
+
+def test_creator_assistant_is_scoped_to_the_project_owner(env):
+    client, db = env[0], env[1]
+    owner, other = make_user(db), make_user(db)
+    pid = new_project(client, owner)
+
+    own = client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(owner))
+    assert own.status_code == 200
+    assert own.json()["story_status"] == "not_started"
+    assert own.json()["project"]["id"] == pid
+
+    assert client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(other)).status_code == 404
+    assert client.post(f"/api/v1/studio/projects/{pid}/assistant/generate", headers=H(other),
+                       json={"request_id": "someone-elses", "confirm_credits": 1}).status_code == 404
+    assert client.get(f"/api/v1/studio/projects/{pid}/assistant").status_code == 401
+    assert client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H("guest")).status_code == 403
+
+
+def test_creator_assistant_requires_price_confirmation_then_approves_story(env):
+    client, db, store, files, ai, gen, ren = env
+    u = make_user(db)
+    grant(client, u, 2000, kind="purchase")
+    pid = new_project(client, u)
+
+    quote = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u),
+                        json={"kind": "script"}).json()
+    credits = quote["total_credits"]
+    before = balance(client, u)["available"]
+
+    mismatch = client.post(f"/api/v1/studio/projects/{pid}/assistant/generate", headers=H(u),
+                           json={"request_id": "story-price-001", "confirm_credits": credits + 1})
+    assert mismatch.status_code == 409
+    assert balance(client, u)["available"] == before
+
+    started = client.post(f"/api/v1/studio/projects/{pid}/assistant/generate", headers=H(u),
+                          json={"request_id": "story-price-001", "confirm_credits": credits})
+    assert started.status_code == 200, started.text
+    assert started.json()["estimate"]["credits"] == credits
+    assert balance(client, u)["held"] == credits
+
+    assert run(gen) == 1
+    state = client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(u)).json()
+    assert state["story_status"] == "draft"
+    assert state["script_job"]["status"] == "succeeded"
+    assert state["project"]["script"]
+    assert state["project"]["story_bible"]
+
+    no_confirmation = client.post(f"/api/v1/studio/projects/{pid}/assistant/approve", headers=H(u),
+                                  json={"confirm_story": False})
+    assert no_confirmation.status_code == 400
+
+    approved = client.post(f"/api/v1/studio/projects/{pid}/assistant/approve", headers=H(u),
+                           json={"confirm_story": True})
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["story_status"] == "approved"
+    assert client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(u)).json()["story_status"] == "approved"
+    assert balance(client, u)["held"] == 0
