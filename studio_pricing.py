@@ -153,14 +153,16 @@ def video_cost(seconds: float, output_tokens: Optional[int] = None, input_tokens
                 storage_cost_usd=storage_cost(seconds * 1_000_000))
 
 
-def render_cost(output_seconds: float, output_bytes: Optional[int] = None) -> Cost:
-    """Our own compute (ffmpeg on the worker) plus storing the master."""
+def render_cost(output_seconds: float, output_bytes: Optional[int] = None, music_generated: bool = False) -> Cost:
+    """FFmpeg compute/storage plus an original Lyria score when one is needed."""
     p = prices()
     cpu_seconds = max(30.0, output_seconds * 3.0)
     size = output_bytes if output_bytes is not None else output_seconds * 1_000_000
-    return Cost("viyo", "ffmpeg", {"cpu_seconds": round(cpu_seconds), "output_seconds": round(output_seconds, 2),
-                                   "bytes": int(size)},
-                0.0, infra_cost_usd=cpu_seconds * p["cpu_per_second"], storage_cost_usd=storage_cost(size))
+    music_cost = 0.08 if music_generated else 0.0  # Google Lyria 3.5: $0.08 per generated song
+    return Cost("viyo+google" if music_generated else "viyo", "ffmpeg+lyria-3.5" if music_generated else "ffmpeg",
+                {"cpu_seconds": round(cpu_seconds), "output_seconds": round(output_seconds, 2),
+                 "bytes": int(size), "generated_music": music_generated},
+                music_cost, infra_cost_usd=cpu_seconds * p["cpu_per_second"], storage_cost_usd=storage_cost(size))
 
 
 def storage_cost(num_bytes: float) -> float:
