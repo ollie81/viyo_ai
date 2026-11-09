@@ -545,6 +545,30 @@ class StudioWorker:
             self.store.insert("studio_outfits", rows)
         return {"suggested": len(rows)}, cost
 
+    def do_cover(self, job, project):
+        """The production's cover: AI poster art of the main characters (made
+        from their reference pictures, so they look like themselves) with the
+        title lettered in, then the real Viyo mark added in a corner."""
+        import viyo_brand
+        cast = sorted(self.store.select("studio_characters", {"project_id": project["id"]}),
+                      key=lambda c: (c.get("position") or 0))
+        bible = {c.get("name", "").lower(): c for c in (project.get("story_bible") or {}).get("characters") or []}
+        cast.sort(key=lambda c: {"lead": 0, "supporting": 1}.get((bible.get(c["name"].lower()) or {}).get("role"), 2))
+        main = cast[:2]
+        labelled = self._reference_files([(c, None) for c in main], "front", COVER_REFS, per_character=2)
+        prompt = viyo_brand.cover_prompt(project, main, [label for label, _d in labelled], ident.identity_text)
+        data, mime, cost = self.ai.image(prompt, [d for _l, d in labelled], "3:4", _size(project))
+        stamped = viyo_brand.stamp(data)
+        path = self._save(job, project, "image", "png", stamped, "image/png")
+        try:
+            self.store.update("studio_projects", {"id": project["id"]}, {"cover_path": path, "updated_at": _now()})
+        except Exception as e:
+            self._rollback()
+            print(f"[ERROR] studio cover {job['id']}: run creator_studio_cover.sql: {str(e)[:160]}")
+            raise JobFailed("not_ready", "Covers are being set up on Viyo. Please try again later. Your credits were returned.",
+                            absorbed=cost)
+        return {"path": path, "references": [label for label, _d in labelled]}, cost
+
     def _cast_for_scene(self, project, scene, cast):
         """[(character, outfit)] in this scene, speakers first, with the
         outfit each one wears (continuity across connected scenes)."""
@@ -843,6 +867,7 @@ class StudioWorker:
 
 
 IMAGE_REFS = 4   # reference pictures sent with a scene picture
+COVER_REFS = 4   # and with a cover
 VIDEO_REFS = 6   # Omni's limit
 
 

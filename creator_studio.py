@@ -37,7 +37,7 @@ from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
 
 SIGN_SECONDS = 3600
-JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits")
+JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits", "cover")
 LANE = {"render": "render"}
 CREDIT_PACKS = [  # credits are worth $0.01 each to Viyo after payment fees
     {"id": "starter", "credits": 500, "label": "500 credits"},
@@ -248,7 +248,7 @@ class OrderIn(BaseModel):
 
 
 class JobRequest(BaseModel):
-    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits"]
+    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     request_id: str = Field(..., min_length=8, max_length=80)
     # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
@@ -261,7 +261,7 @@ class JobRequest(BaseModel):
 
 
 class EstimateRequest(BaseModel):
-    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits"]
+    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
@@ -768,12 +768,14 @@ async def list_projects(user_id: str = Depends(creator)):
     render_count = defaultdict(int)
     for r in renders:
         render_count[r["project_id"]] += 1
-    urls = _sign([v[1] for v in first_image.values()])
+    urls = _sign([v[1] for v in first_image.values()] + [p.get("cover_path") for p in projects])
     return {"balance": _balance(user_id), "projects": [{
         **{k: p[k] for k in ("id", "title", "logline", "kind", "aspect_ratio", "genre", "updated_at")},
         "scene_count": counts[p["id"]][0], "scenes_with_images": counts[p["id"]][1],
         "render_count": render_count[p["id"]],
-        "thumbnail_url": urls.get(first_image.get(p["id"], (0, ""))[1])} for p in projects]}
+        "cover_url": urls.get(p.get("cover_path") or ""),
+        "thumbnail_url": urls.get(p.get("cover_path") or "") or urls.get(first_image.get(p["id"], (0, ""))[1])}
+        for p in projects]}
 
 
 @router.post("/projects")
@@ -863,7 +865,9 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     libraries = {c["id"]: _outfit_library(c, [o for o in outfits if o["character_id"] == c["id"]])
                  for c in chars} if p.get("series_id") else {}
     urls.update(_sign([o.get("reference_path") for lib in libraries.values() for o in lib]))
-    return {"project": _project_out(p),
+    project_out = _project_out(p)
+    project_out["cover_url"] = _sign([p.get("cover_path")]).get(p.get("cover_path") or "") if p.get("cover_path") else None
+    return {"project": project_out,
             "characters": [_character_out(c, urls, [o for o in outfits if o["character_id"] == c["id"]],
                                           libraries.get(c["id"])) for c in chars],
             "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {})) for s in scenes],
@@ -1369,7 +1373,7 @@ async def reorder_scenes(project_id: str, body: OrderIn, user_id: str = Depends(
 
 def _targets(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
     st = get_store()
-    if kind in ("script", "breakdown", "render", "outfits"):
+    if kind in ("script", "breakdown", "render", "outfits", "cover"):
         return [p]
     table = "studio_characters" if kind == "portrait" else "studio_scenes"
     rows = st.select(table, {"project_id": p["id"]})
@@ -1387,6 +1391,11 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
     if kind == "script":
         return pricing.estimate_script(p["target_seconds"], len(p["title"]) + len(p["logline"])), \
             (None if p["logline"].strip() else "Describe your idea first.")
+    if kind == "cover":
+        from studio_worker import COVER_REFS
+        size = "2K" if p.get("image_quality") == "high" else "1K"
+        return pricing.image_cost(1, 600 + pricing.SHEET_REF_TOKENS * COVER_REFS, size), \
+            (None if (p.get("title") or "").strip() else "Give the production a title first.")
     if kind == "outfits":
         n = len(get_store().select("studio_characters", {"project_id": p["id"]}))
         return pricing.estimate_outfit_suggestions(len(p.get("script") or ""), n), \
@@ -1514,7 +1523,7 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
     items = []
     for t in _targets(kind, p, target_ids):
         cost, reason = _price(kind, p, t, cast, opts)
-        items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits") else t["id"],
+        items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover") else t["id"],
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
                       "blocked": reason})
     return items
