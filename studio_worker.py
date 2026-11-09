@@ -562,33 +562,53 @@ class StudioWorker:
         overrides = scene.get("outfit_overrides") or {}
         return [(c, ident.effective_outfit(outfits.get(c["id"]), overrides.get(c["id"]))) for c in in_scene]
 
-    def _reference_files(self, entries, camera, total, per_character=3) -> list:
+    def _reference_files(self, entries, camera, total, per_character=3, expressions=None) -> list:
         """[(label, bytes)] of the best reference views for this camera angle."""
         out = []
         for (c, outfit), n in zip(entries, ident.split_limit(len(entries), total, per_character)):
-            for label, path in ident.references_for(c, camera, outfit, n):
+            for label, path in ident.references_for(c, camera, outfit, n, (expressions or {}).get(c["id"])):
                 try:
                     out.append((label, self.files.get(path)))
                 except Exception:
                     pass
         return out
 
+    @staticmethod
+    def _expressions(scene, entries) -> dict:
+        return {c["id"]: e for c, _o in entries if (e := ident.scene_expression(scene, c["name"]))}
+
+    def _made_with(self, scene, entries, labels) -> None:
+        """Remember which identity version, outfit and reference pictures a
+        scene was made with, so the Studio can flag scenes made before an
+        identity or outfit changed."""
+        record = {c["id"]: {"identity_version": int(c.get("identity_version") or 0),
+                            "locked": bool(c.get("identity_locked_at")),
+                            "outfit_id": (o or {}).get("id"),
+                            "scene_only": bool((o or {}).get("scene_only")),
+                            "anchor": ((c.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")}
+                  for c, o in entries}
+        record["_refs"] = labels[:8]
+        self._optional_update("studio_scenes", {"id": scene["id"]}, {"made_with": record})
+
     def do_image(self, job, project):
         scene = self._scene(job, project)
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
-        labelled = self._reference_files(entries, camera, IMAGE_REFS)
+        expressions = self._expressions(scene, entries)
+        labelled = self._reference_files(entries, camera, IMAGE_REFS, expressions=expressions)
         refs = [data for _label, data in labelled]
         roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
         prompt = ident.scene_prompt(scene["visual"] or scene["heading"], entries, camera, project["visual_style"],
-                                    project["aspect_ratio"], extra=(roles + "\n") if roles else "")
+                                    project["aspect_ratio"], extra=(roles + "\n") if roles else "",
+                                    expressions=expressions)
         prompt += "\nNo text, captions, logos or watermarks in the image."
         data, mime, cost = self.ai.image(prompt, refs[:IMAGE_REFS], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
         self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
-        return {"path": path}, cost
+        self._made_with(scene, entries, [label for label, _d in labelled])
+        return {"path": path, "references": [label for label, _d in labelled]}, cost
 
     def do_voice(self, job, project):
         scene = self._scene(job, project)
@@ -656,7 +676,8 @@ class StudioWorker:
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
-        block = ident.cast_block(entries)
+        expressions = self._expressions(scene, entries)
+        block = ident.cast_block(entries, expressions)
         notes = (f"Characters (permanent identity: never change their face, hair, skin, height or build):\n{block}\n"
                  if block else "")
         lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
@@ -673,7 +694,7 @@ class StudioWorker:
             prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
                       f"{talking_direction(lines, cast, project)} "
                       "No subtitles, captions, text or watermarks. Do not add music.")
-            references = self._references(scene, entries, frame, camera)
+            references = self._references(scene, entries, frame, camera, expressions)
         else:
             has_lines = bool(lines)
             # Saved voices speak this scene: the video model must not talk,
@@ -694,7 +715,7 @@ class StudioWorker:
         if references is None and frame is None and entries:
             # No scene picture to start from: the characters' reference views
             # keep them the same person.
-            references = self._references(scene, entries, None, camera) or None
+            references = self._references(scene, entries, None, camera, expressions) or None
         data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
             else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
@@ -702,9 +723,11 @@ class StudioWorker:
         self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
         if scene.get("lipsync_path"):   # a new clip needs new lip sync (the old file is kept)
             self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
-        return {"path": path}, cost
+        labels = [label for label, _d in references or []] or (["the scene picture"] if frame else [])
+        self._made_with(scene, entries, labels)
+        return {"path": path, "references": labels}, cost
 
-    def _references(self, scene, entries, frame, camera="front") -> list:
+    def _references(self, scene, entries, frame, camera="front", expressions=None) -> list:
         """Labelled images for Omni (6 at most; Google: 3 per character, 2
         characters): the scene picture (setting and framing), then each of
         the first two characters' reference views for this camera angle,
@@ -713,7 +736,7 @@ class StudioWorker:
         if frame:
             refs.append(("the scene: its setting, lighting and framing (not a character)", frame))
         room = VIDEO_REFS - len(refs)
-        refs += self._reference_files(entries[:2], camera, min(room, 3 * len(entries[:2])))
+        refs += self._reference_files(entries[:2], camera, min(room, 3 * len(entries[:2])), expressions=expressions)
         return refs
 
     def do_lipsync(self, job, project):

@@ -57,9 +57,18 @@ IDENTITY_SCHEMA = {
                  "required": [k for k, _ in fields if k not in ("facial_hair", "marks", "distinguishing", "other")]}
            for sec, fields in IDENTITY_FIELDS.items()},
         "default_outfit": {"type": "string", "description": "The clothes and accessories they usually wear in this story."},
+        "guessed": {"type": "array", "items": {"type": "string"},
+                    "description": "Every field you chose yourself because the story does not state or clearly show it, "
+                                   "as 'section.field', e.g. 'face.eyes', 'basic.height_cm'."},
     },
-    "required": ["basic", "face", "body", "default_outfit"],
+    "required": ["basic", "face", "body", "default_outfit", "guessed"],
 }
+
+SOURCES = ("story", "ai_guess", "creator")
+
+
+def field_keys() -> list[str]:
+    return [f"{sec}.{k}" for sec, fields in IDENTITY_FIELDS.items() for k, _ in fields] + ["default_outfit"]
 
 
 def identity_prompt(name: str, description: str, context: str = "") -> str:
@@ -71,7 +80,8 @@ What the story says about them: {description or '(nothing yet: invent a fitting,
 {context}
 Rules:
 - Be concrete and visual (e.g. "almond-shaped dark-brown eyes, set slightly wide", not "nice eyes").
-- Keep everything the story already says. Fill the gaps with choices that suit the character.
+- Keep everything the story already says. Fill the gaps with choices that suit the character, and be honest:
+  list in "guessed" every field the story does not state or clearly show (the creator will check those).
 - Height in centimetres must suit their age and build.
 - Use "none" for things they do not have (e.g. facial hair, scars).
 - Fictional person only: never describe a real or famous person.
@@ -100,22 +110,62 @@ def clean_identity(raw) -> dict:
     outfit = raw.get("default_outfit")
     if isinstance(outfit, str) and outfit.strip():
         out["default_outfit"] = outfit.strip()[:800]
+    # Where each detail came from: the story, an AI guess, or the creator.
+    present = [k for k in field_keys() if _value(out, k) not in (None, "")]
+    given = raw.get("_sources") if isinstance(raw.get("_sources"), dict) else {}
+    guessed = {g for g in (raw.get("guessed") or []) if isinstance(g, str)}
+    sources = {}
+    for k in present:
+        if given.get(k) in SOURCES:
+            sources[k] = given[k]
+        elif "guessed" in raw:
+            sources[k] = "ai_guess" if k in guessed else "story"
+    if sources:
+        out["_sources"] = sources
     return out
 
 
+def _value(identity: dict, key: str):
+    if key == "default_outfit":
+        return identity.get("default_outfit")
+    sec, k = key.split(".", 1)
+    return (identity.get(sec) or {}).get(k)
+
+
+def guessed_fields(identity: Optional[dict]) -> list[str]:
+    """Details the AI chose itself and the creator hasn't checked yet."""
+    return [k for k, s in ((identity or {}).get("_sources") or {}).items() if s == "ai_guess"]
+
+
 def merge_identity(current: dict, patch: dict) -> dict:
-    """The creator's edit on top of the saved identity (empty value = clear)."""
-    merged = {sec: dict((current or {}).get(sec) or {}) for sec in IDENTITY_FIELDS}
+    """The creator's edit on top of the saved identity (empty value = clear).
+    A field the creator changes, or lists in "_confirm" ("all" = every
+    field), counts as checked by the creator."""
+    patch = patch or {}
+    current = current or {}
+    merged = {sec: dict(current.get(sec) or {}) for sec in IDENTITY_FIELDS}
+    sources = dict(current.get("_sources") or {})
     for sec in IDENTITY_FIELDS:
-        for k, v in ((patch or {}).get(sec) or {}).items():
+        for k, v in (patch.get(sec) or {}).items():
+            before = merged[sec].get(k)
             if v in (None, ""):
                 merged[sec].pop(k, None)
+                sources.pop(f"{sec}.{k}", None)
             else:
                 merged[sec][k] = v
-    if "default_outfit" in (patch or {}):
+                if str(v) != str(before):
+                    sources[f"{sec}.{k}"] = "creator"
+    if "default_outfit" in patch:
         merged["default_outfit"] = patch["default_outfit"] or ""
-    elif (current or {}).get("default_outfit"):
+        if (patch["default_outfit"] or "") != (current.get("default_outfit") or ""):
+            sources["default_outfit"] = "creator"
+    elif current.get("default_outfit"):
         merged["default_outfit"] = current["default_outfit"]
+    confirm = patch.get("_confirm") or []
+    for k in (list(sources) if confirm == "all" else confirm if isinstance(confirm, list) else []):
+        if k in sources:
+            sources[k] = "creator"
+    merged["_sources"] = sources
     return clean_identity(merged)
 
 
@@ -167,7 +217,8 @@ _VIEW_SHOT = {
     "left_profile": "Full-body shot in exact left side profile (the camera sees the character's left side), standing straight.",
     "right_profile": "Full-body shot in exact right side profile (the camera sees the character's right side), standing straight.",
     "back_full": "Full-body shot from directly behind, head to feet; the back of the head, hair and clothes clearly visible.",
-    "expressions": "A 2x2 grid of head-and-shoulders close-ups of the same face: happy, angry, sad, afraid. Same lighting in each.",
+    "expressions": ("A 3x2 grid of head-and-shoulders close-ups of the same face. Top row: neutral, happy, sad. "
+                    "Bottom row: angry, frightened, surprised. Same lighting and framing in each; no written labels."),
     "wardrobe": "Full-body front shot that shows the whole outfit and every accessory clearly: fabric, colours, shoes, jewellery.",
 }
 
@@ -239,6 +290,32 @@ def ready_to_lock(views: dict) -> Optional[str]:
     return None
 
 
+# ------------------------------------------------------------ expressions
+
+EXPRESSIONS = ("neutral", "happy", "sad", "angry", "frightened", "surprised")
+_EXPRESSION_WORDS = {
+    "happy": ("happy", "joy", "smil", "laugh", "delight", "excited", "relieved", "tender", "warm", "hopeful"),
+    "sad": ("sad", "cry", "crying", "tears", "grief", "heartbroken", "hurt", "sorrow", "devastated"),
+    "angry": ("angry", "anger", "furious", "rage", "shout", "yell", "bitter", "cold", "hostile"),
+    "frightened": ("afraid", "fear", "frightened", "scared", "terrified", "panic", "nervous", "anxious", "dread"),
+    "surprised": ("surprised", "shock", "stunned", "gasp", "astonished", "disbelief"),
+}
+
+
+def scene_expression(scene: dict, name: str) -> Optional[str]:
+    """How this character's face should look in this scene, from the
+    emotions on their lines, else from the scene text. None = no strong cue."""
+    lines = [d for d in scene.get("dialogue") or [] if (d.get("character") or "").strip().lower().startswith(name.lower())]
+    cues = " ".join(f"{d.get('emotion') or ''} {d.get('delivery') or ''}" for d in lines).lower()
+    for text in (cues, (scene.get("visual") or "").lower()):
+        if not text.strip():
+            continue
+        for expr, words in _EXPRESSION_WORDS.items():
+            if any(re.search(rf"\b{w}", text) for w in words):
+                return expr
+    return None
+
+
 # ------------------------------------------------------------ camera & refs
 
 CAMERAS = ("auto", "close_up", "front", "side", "back", "full_body", "wide")
@@ -274,7 +351,8 @@ _CAMERA_VIEWS = {
 }
 
 
-def references_for(character: dict, camera: str, outfit: Optional[dict], limit: int) -> list[tuple[str, str]]:
+def references_for(character: dict, camera: str, outfit: Optional[dict], limit: int,
+                   expression: Optional[str] = None) -> list[tuple[str, str]]:
     """(label, file path) of the best reference pictures for this shot.
     Approved views first; a sheet-less character falls back to its portrait."""
     if limit <= 0:
@@ -288,7 +366,12 @@ def references_for(character: dict, camera: str, outfit: Optional[dict], limit: 
         if path and path not in {p for _, p in out} and len(out) < limit:
             out.append((label, path))
 
-    usable = [v for v in _CAMERA_VIEWS.get(camera, _CAMERA_VIEWS["front"]) if status.get(v) in ("approved", "draft")]
+    wanted = list(_CAMERA_VIEWS.get(camera, _CAMERA_VIEWS["front"]))
+    if expression and expression != "neutral" and camera != "back":
+        # A strong emotion: the expressions sheet comes right after the main view.
+        wanted = [v for v in wanted if v != "expressions"]
+        wanted.insert(1, "expressions")
+    usable = [v for v in wanted if status.get(v) in ("approved", "draft")]
     usable.sort(key=lambda v: status[v] != "approved")
     if usable:
         add(f"{name}: {VIEW_LABEL[usable[0]].lower()} (keep this exact face, hair, skin and body)", views[usable[0]]["path"])
@@ -299,7 +382,10 @@ def references_for(character: dict, camera: str, outfit: Optional[dict], limit: 
         else:
             add(f"{name} wearing the outfit for this scene (keep these exact clothes)", outfit["reference_path"])
     for v in usable[1:]:
-        add(f"{name}: {VIEW_LABEL[v].lower()} (same person)", views[v]["path"])
+        if v == "expressions" and expression:
+            add(f"{name}: expressions sheet (same face; use the {expression} one)", views[v]["path"])
+        else:
+            add(f"{name}: {VIEW_LABEL[v].lower()} (same person)", views[v]["path"])
     if not out and character.get("reference_path"):
         add(f"{name} (keep this exact face, hair and clothes)", character["reference_path"])
     return out
@@ -429,14 +515,18 @@ def resolve_outfits(scenes: list[dict], outfits: list[dict], cast: list[dict], i
 
 # ------------------------------------------------------------ prompts
 
-def cast_block(entries: list[tuple[dict, Optional[dict]]]) -> str:
-    """Each character's permanent identity, then what they wear in this scene."""
+def cast_block(entries: list[tuple[dict, Optional[dict]]], expressions: Optional[dict] = None) -> str:
+    """Each character's permanent identity, then what they wear and how
+    their face looks in this scene."""
     lines = []
     for c, outfit in entries:
         lines.append("- " + identity_text(c["name"], c.get("identity"), c.get("description") or ""))
         wear = outfit_text(outfit, (c.get("identity") or {}).get("default_outfit") or "")
         if wear:
             lines.append(f"  Wearing in this scene: {wear}.")
+        expr = (expressions or {}).get(c["id"])
+        if expr:
+            lines.append(f"  Expression in this scene: {expr} (the same face, only the expression changes).")
     return "\n".join(lines)
 
 
@@ -448,9 +538,9 @@ _CAMERA_TEXT = {
 
 
 def scene_prompt(action: str, entries: list[tuple[dict, Optional[dict]]], camera: str, style: str,
-                 aspect_ratio: str, extra: str = "") -> str:
+                 aspect_ratio: str, extra: str = "", expressions: Optional[dict] = None) -> str:
     """Permanent identity first and fenced off, so scene text can't change it."""
-    block = cast_block(entries)
+    block = cast_block(entries, expressions)
     frame = "Vertical 9:16 frame." if aspect_ratio == "9:16" else "Wide 16:9 frame."
     who = (f"CHARACTERS (permanent identity: never change their face, hair, skin tone, height, body proportions or "
            f"marks, whatever the scene says; clothes change only as listed):\n{block}\n\n" if block else "")
