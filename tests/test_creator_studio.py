@@ -89,7 +89,19 @@ def run(worker, times=50):
     return n
 
 
-def start(client, user, pid, kind, targets=None, rid=None):
+def approve_story(client, user, pid):
+    """Presses "Approve story" like a creator would, when an AI story is waiting for approval."""
+    p = client.get(f"/api/v1/studio/projects/{pid}", headers=H(user)).json()["project"]
+    bible = p.get("story_bible") or {}
+    if p.get("script") and bible and not (bible.get("_assistant_approval") or {}).get("approved"):
+        r = client.post(f"/api/v1/studio/projects/{pid}/assistant/approve", headers=H(user), json={"confirm_story": True})
+        assert r.status_code == 200, r.text
+
+
+def start(client, user, pid, kind, targets=None, rid=None, approve=True):
+    # Creators approve an AI story before "Break into cast & scenes"; approve=False tests the gate itself.
+    if kind == "breakdown" and approve:
+        approve_story(client, user, pid)
     return client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(user),
                        json={"kind": kind, "target_ids": targets or [], "request_id": rid or uuid.uuid4().hex})
 
@@ -603,7 +615,7 @@ def test_story_approval_is_enforced_by_breakdown_api_and_invalidated_on_edit(env
     assert run(gen) == 1
 
     # A direct request to the generic jobs endpoint must not bypass review.
-    blocked = start(client, u, pid, "breakdown")
+    blocked = start(client, u, pid, "breakdown", approve=False)
     assert blocked.status_code == 409
     assert blocked.json()["detail"]["code"] == "story_approval_required"
 
@@ -618,6 +630,6 @@ def test_story_approval_is_enforced_by_breakdown_api_and_invalidated_on_edit(env
     assert edited.status_code == 200, edited.text
     state = client.get(f"/api/v1/studio/projects/{pid}/assistant", headers=H(u)).json()
     assert state["story_status"] == "draft"
-    blocked_after_edit = start(client, u, pid, "breakdown")
+    blocked_after_edit = start(client, u, pid, "breakdown", approve=False)
     assert blocked_after_edit.status_code == 409
     assert blocked_after_edit.json()["detail"]["code"] == "story_approval_required"

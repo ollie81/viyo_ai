@@ -11,7 +11,7 @@ import studio_ai
 import studio_pricing as pricing
 import studio_worker as sw
 from conftest import make_user
-from test_creator_studio import H, balance, env, grant, new_project, run, start, studio_schema  # noqa: F401
+from test_creator_studio import H, approve_story, balance, env, grant, new_project, run, start, studio_schema  # noqa: F401
 
 
 def detail(client, u, pid):
@@ -137,6 +137,7 @@ def test_rerunning_the_same_breakdown_keeps_every_scene_and_its_work(env):
     pid = produced(client, ai, gen, u)
     before = scene_rows(db, pid)
     assets = db.execute("select count(*) from public.studio_assets").fetchone()[0]
+    approve_story(client, u, pid)
     r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
                     json={"kind": "breakdown", "request_id": uuid.uuid4().hex, "confirm_replace": True})
     assert r.status_code == 200
@@ -167,6 +168,7 @@ def test_changed_and_new_scenes_never_disconnect_paid_assets(env):
             {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running", "duration_seconds": 3,
              "dialogue": [{"character": "Daniel", "text": "Maya! Please wait!"}]},                     # new line
         ]}
+    approve_story(client, u, pid)
     client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
                 json={"kind": "breakdown", "request_id": uuid.uuid4().hex, "confirm_replace": True})
     run(gen)
@@ -193,6 +195,7 @@ def test_existing_characters_keep_their_voice_through_a_new_scene_list(env):
     u = make_user(db)
     pid = produced(client, ai, gen, u)
     db.execute("update public.studio_characters set voice = 'Sulafat' where name = 'Maya'")
+    approve_story(client, u, pid)
     client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
                 json={"kind": "breakdown", "request_id": uuid.uuid4().hex, "confirm_replace": True})
     run(gen)
@@ -205,6 +208,7 @@ def test_a_failed_breakdown_leaves_the_project_as_it_was_and_refunds(env):
     pid = produced(client, ai, gen, u)
     before, bal = scene_rows(db, pid), balance(client, u)
     ai.fail["breakdown"] = studio_ai.ProviderError("boom")
+    approve_story(client, u, pid)
     client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
                 json={"kind": "breakdown", "request_id": uuid.uuid4().hex, "confirm_replace": True})
     run(gen)
