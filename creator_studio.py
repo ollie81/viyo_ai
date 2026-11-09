@@ -1070,6 +1070,8 @@ async def unlock_identity(character_id: str, user_id: str = Depends(creator)):
 async def add_outfit(character_id: str, body: OutfitIn, user_id: str = Depends(creator)):
     c = _owned("studio_characters", character_id, user_id)
     st = get_store()
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Give the outfit a name.")
     existing = [o for o in _outfits(c["project_id"]) if o["character_id"] == c["id"]]
     if len(existing) >= 12:
         raise HTTPException(status_code=400, detail="A character can have up to 12 outfits.")
@@ -1104,6 +1106,8 @@ def _owned_outfit(outfit_id: str, user_id: str) -> dict:
 async def update_outfit(outfit_id: str, body: OutfitPatch, user_id: str = Depends(creator)):
     o = _owned_outfit(outfit_id, user_id)
     fields = {k: v.strip() for k, v in body.model_dump(exclude_none=True).items()}
+    if "name" in fields and not fields["name"]:
+        raise HTTPException(status_code=400, detail="Give the outfit a name.")
     if fields:
         get_store().update("studio_outfits", {"id": o["id"]}, {**fields, "updated_at": _now_iso()})
     return _identity_response(get_store().one("studio_characters", {"id": o["character_id"]}))

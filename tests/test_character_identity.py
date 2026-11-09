@@ -388,3 +388,11 @@ def test_the_next_episode_keeps_the_locked_identity_sheet_and_outfits(env):
     assert c2["id"] != c["id"] and c2["identity_locked"] and c2["identity"] == char(client, u, pid)["identity"]
     assert paths(db, c2["id"]) == paths(db, c["id"])
     assert [o["name"] for o in c2["outfits"]] == ["Main outfit"] and c2["outfits"][0]["has_image"]
+
+
+def test_an_outfit_needs_a_real_name(env):
+    client, db, ai, gen, u, pid = setup(env)
+    c = char(client, u, pid)
+    assert client.post(f"/api/v1/studio/characters/{c['id']}/outfits", headers=H(u), json={"name": "   "}).status_code == 400
+    o = client.post(f"/api/v1/studio/characters/{c['id']}/outfits", headers=H(u), json={"name": "Coat"}).json()["outfits"][0]
+    assert client.patch(f"/api/v1/studio/outfits/{o['id']}", headers=H(u), json={"name": "  "}).status_code == 400
