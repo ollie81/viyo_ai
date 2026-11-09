@@ -882,7 +882,8 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
                                           libraries.get(c["id"])) for c in chars],
             "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {})) for s in scenes],
             "renders": [_render_out(r) for r in renders],
-            "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
+            "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id),
+            "production": _production_out(p)}
 
 
 def _covers(p: dict) -> list:
@@ -1730,6 +1731,149 @@ async def download_render(render_id: str, user_id: str = Depends(creator)):
         raise HTTPException(status_code=502, detail="Couldn't prepare the download. Try again.")
     return {"url": url, "file_name": name, "expires_at": int(time.time()) + SIGN_SECONDS,
             "width": r.get("width"), "height": r.get("height")}
+
+
+# ---------------------------------------------------------------- one-click production
+
+class ProductionQuoteIn(BaseModel):
+    # Make a reference sheet for characters that have none (recommended),
+    # instead of a single portrait.
+    sheets: bool = True
+
+
+class ProductionIn(ProductionQuoteIn):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    # The total the creator saw; refused if the price changed since.
+    confirm_credits: int = Field(..., ge=0)
+
+
+def _production_quote(p: dict, body: ProductionQuoteIn) -> dict:
+    import studio_production
+    q = studio_production.plan(p, {"sheets": body.sheets})
+    q["balance"] = _balance(p["owner_id"])
+    q["note"] = ("Credits for the whole production are reserved when you start. Each step keeps only what it really "
+                 "costs; failed steps are refunded and tried again once; what's left comes back at the end.")
+    return q
+
+
+def _latest_run(p: dict) -> Optional[dict]:
+    try:
+        runs = get_store().select("studio_production_runs", {"project_id": p["id"]}, order="created_at", desc=True, limit=1)
+    except Exception:
+        if hasattr(get_store(), "conn"):
+            get_store().conn.rollback()
+        return None
+    return runs[0] if runs else None
+
+
+def _production_out(p: dict) -> Optional[dict]:
+    import studio_production
+    run = _latest_run(p)
+    try:
+        return studio_production.progress(get_store(), run) if run else None
+    except Exception as e:
+        print(f"[WARN] studio production progress: {str(e)[:160]}")
+        return None
+
+
+def _owned_run(run_id: str, user_id: str) -> dict:
+    try:
+        run = get_store().one("studio_production_runs", {"id": _uuid(run_id)})
+    except HTTPException:
+        raise
+    except Exception:
+        if hasattr(get_store(), "conn"):
+            get_store().conn.rollback()
+        run = None
+    if not run or run["owner_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return run
+
+
+@router.post("/projects/{project_id}/production/quote")
+async def production_quote(project_id: str, body: ProductionQuoteIn, user_id: str = Depends(creator)):
+    """Everything this production still needs to become a finished film, with
+    the total price. Nothing is charged."""
+    return _production_quote(_project(project_id, user_id), body)
+
+
+@router.post("/projects/{project_id}/production")
+async def start_production(project_id: str, body: ProductionIn, user_id: str = Depends(creator)):
+    """Reserves the total and makes everything, in order, in the background."""
+    import studio_production
+    p = _project(project_id, user_id)
+    _rate_limit(user_id)
+    q = _production_quote(p, body)
+    if q["blocked"]:
+        raise HTTPException(status_code=409, detail={"code": "blocked", "message": q["blocked"][0], "blocked": q["blocked"]})
+    if not q["stages"]:
+        raise HTTPException(status_code=409, detail={"code": "nothing_to_do", "message": "Everything is already made."})
+    if q["total_credits"] != body.confirm_credits:
+        raise HTTPException(status_code=409, detail={"code": "price_changed", "message": "The price changed. Check it again.",
+                                                     "total_credits": q["total_credits"]})
+    plan_ = {"stages": [{"stage": s["stage"], "label": s["label"], "credits": s["credits"],
+                         "items": [{"target_id": i["target_id"], "label": i["label"], "credits": i["credits"]}
+                                   for i in s["items"]]} for s in q["stages"]]}
+    try:
+        r = get_store().rpc("studio_run_reserve", {
+            "p_owner": user_id, "p_project": p["id"], "p_credits": q["total_credits"],
+            "p_key": f"{user_id}:{body.request_id}:production", "p_options": {"sheets": body.sheets, "round": 0},
+            "p_plan": plan_})
+    except Exception as e:
+        if hasattr(get_store(), "conn"):
+            get_store().conn.rollback()
+        print(f"[ERROR] studio production reserve: {str(e)[:200]}")
+        raise HTTPException(status_code=503, detail="One-click production isn't ready yet. Run creator_studio_production.sql.")
+    if not r or not r.get("ok"):
+        err = (r or {}).get("error")
+        if err == "insufficient_credits":
+            raise HTTPException(status_code=402, detail={"message": "Not enough credits.", "balance": _balance(user_id),
+                                                         "needed": q["total_credits"]})
+        if err == "already_running":
+            raise HTTPException(status_code=409, detail={"code": "already_running",
+                                                         "message": "A production is already running for this project."})
+        raise HTTPException(status_code=400, detail=err or "failed")
+    run = get_store().one("studio_production_runs", {"id": r["run_id"]})
+    return {"production": studio_production.progress(get_store(), run), "balance": _balance(user_id)}
+
+
+@router.get("/projects/{project_id}/production")
+async def production_status(project_id: str, user_id: str = Depends(creator)):
+    import studio_production
+    run = _latest_run(_project(project_id, user_id))
+    return {"production": studio_production.progress(get_store(), run) if run else None}
+
+
+@router.post("/production/{run_id}/resume")
+async def resume_production(run_id: str, user_id: str = Depends(creator)):
+    """After fixing what it asked for (or adding credits): carry on. Each step
+    that failed gets one more try; nothing already made is redone."""
+    import studio_production
+    run = _owned_run(run_id, user_id)
+    if run["status"] != "needs_attention":
+        raise HTTPException(status_code=409, detail="This production isn't waiting for you.")
+    opts = dict(run.get("options") or {})
+    opts["round"] = int(opts.get("round") or 0) + 1
+    get_store().update("studio_production_runs", {"id": run["id"]},
+                       {"status": "running", "problem": None, "options": opts, "updated_at": _now_iso()})
+    return {"production": studio_production.progress(get_store(), get_store().one("studio_production_runs", {"id": run["id"]}))}
+
+
+@router.post("/production/{run_id}/cancel")
+async def cancel_production(run_id: str, user_id: str = Depends(creator)):
+    """Stops the run: steps not started yet are canceled and refunded, and the
+    rest of the reservation comes back. Anything already made is kept."""
+    import studio_production
+    run = _owned_run(run_id, user_id)
+    if run["status"] in ("done", "canceled"):
+        raise HTTPException(status_code=409, detail="This production has already finished.")
+    st = get_store()
+    for j in studio_production._run_jobs(st, run):
+        if j["status"] == "queued":
+            st.rpc("studio_cancel_job", {"p_owner": user_id, "p_job_id": j["id"]})
+    st.rpc("studio_run_finish", {"p_run": run["id"], "p_status": "canceled", "p_problem": None})
+    return {"production": studio_production.progress(st, st.one("studio_production_runs", {"id": run["id"]})),
+            "balance": _balance(user_id)}
 
 
 # ---------------------------------------------------------------- publish
