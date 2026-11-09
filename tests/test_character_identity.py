@@ -396,3 +396,127 @@ def test_an_outfit_needs_a_real_name(env):
     assert client.post(f"/api/v1/studio/characters/{c['id']}/outfits", headers=H(u), json={"name": "   "}).status_code == 400
     o = client.post(f"/api/v1/studio/characters/{c['id']}/outfits", headers=H(u), json={"name": "Coat"}).json()["outfits"][0]
     assert client.patch(f"/api/v1/studio/outfits/{o['id']}", headers=H(u), json={"name": "  "}).status_code == 400
+
+
+# ------------------------------------------------ flexible outfit system
+
+def add_outfit(client, u, cid, name, **kw):
+    r = client.post(f"/api/v1/studio/characters/{cid}/outfits", headers=H(u), json={"name": name, **kw})
+    assert r.status_code == 200, r.text
+    return next(o for o in r.json()["outfits"] if o["name"] == name)
+
+
+def test_unlimited_outfits_with_independent_parts(env):
+    client, db, ai, gen, u, pid = setup(env)
+    c = char(client, u, pid)
+    for i in range(15):
+        add_outfit(client, u, c["id"], f"Look {i}")
+    work = add_outfit(client, u, c["id"], "Work", parts={"clothing": "blue hospital scrubs", "shoes": "white clogs",
+                                                          "accessories": "ID badge", "makeup": "none, tired eyes"})
+    assert len(char(client, u, pid)["outfits"]) == 16
+    assert work["parts"] == {"clothing": "blue hospital scrubs", "shoes": "white clogs", "accessories": "ID badge",
+                             "makeup": "none, tired eyes"}
+    # Change only the shoes: the other parts stay.
+    r = client.patch(f"/api/v1/studio/outfits/{work['id']}", headers=H(u),
+                     json={"parts": {**work["parts"], "shoes": "black trainers"}})
+    got = next(o for o in r.json()["outfits"] if o["id"] == work["id"])
+    assert got["parts"]["shoes"] == "black trainers" and got["parts"]["clothing"] == "blue hospital scrubs"
+    assert client.post(f"/api/v1/studio/characters/{c['id']}/outfits", headers=H(u),
+                       json={"name": "x", "parts": {"face": "new"}}).json()["outfits"][-1]["parts"] == {}
+
+
+def test_an_outfit_picture_never_remakes_the_face_or_body_and_goes_out_of_date_when_a_part_changes(env):
+    client, db, ai, gen, u, pid = setup(env)
+    c = make_sheet(client, ai, gen, u, pid)
+    sheet_before, ident_before = paths(db, c["id"]), char(client, u, pid)["identity"]
+    work = add_outfit(client, u, c["id"], "Work", parts={"clothing": "blue scrubs", "makeup": "red lipstick"})
+    ai.image_log, ai.calls = [], []
+    jobs(client, u, pid, "portrait", c["id"], outfit_id=work["id"])
+    run(gen)
+    assert len(ai.image_log) == 1 and ai.image_log[0]["refs"] == 1 and ("identity", "Maya") not in ai.calls
+    prompt = ai.image_log[0]["prompt"]
+    assert "clothing: blue scrubs" in prompt and "makeup: red lipstick" in prompt and "only the clothes" in prompt
+    assert paths(db, c["id"]) == sheet_before and char(client, u, pid)["identity"] == ident_before
+    o = next(x for x in char(client, u, pid)["outfits"] if x["id"] == work["id"])
+    assert o["has_image"] and not o["image_outdated"]
+    client.patch(f"/api/v1/studio/outfits/{work['id']}", headers=H(u), json={"parts": {"clothing": "blue scrubs",
+                                                                                        "makeup": "none"}})
+    o = next(x for x in char(client, u, pid)["outfits"] if x["id"] == work["id"])
+    assert o["image_outdated"]
+
+
+def test_a_scene_only_change_does_not_touch_the_outfit_or_the_next_scene(env):
+    scenes = [dict(FACE, heading=f"SCENE {i}") for i in range(3)]
+    client, db, ai, gen, u, pid = setup(env, scenes=scenes, style="pictures")
+    c = make_sheet(client, ai, gen, u, pid)
+    s = detail(client, u, pid)["scenes"]
+    r = client.patch(f"/api/v1/studio/scenes/{s[1]['id']}", headers=H(u),
+                     json={"outfit_overrides": {c["id"]: {"makeup": "smudged mascara", "clothing": ""}}})
+    assert r.status_code == 200 and r.json()["outfit_overrides"] == {c["id"]: {"makeup": "smudged mascara"}}
+    assert client.patch(f"/api/v1/studio/scenes/{s[1]['id']}", headers=H(u),
+                        json={"outfit_overrides": {c["id"]: {"hair": "blonde"}}}).status_code == 400
+    ai.image_log = []
+    start(client, u, pid, "image", [x["id"] for x in s])
+    run(gen)
+    smudged = ["smudged mascara" in x["prompt"] for x in ai.image_log]
+    assert smudged == [False, True, False]
+    assert "for this scene only" in ai.image_log[1]["prompt"] and "red jacket" in ai.image_log[1]["prompt"]
+    main = next(o for o in char(client, u, pid)["outfits"] if o["is_default"])
+    assert "makeup" not in main["parts"]
+
+
+def test_ai_suggests_outfits_and_the_creator_decides(env):
+    scenes = [dict(FACE, heading=f"SCENE {i}") for i in range(3)]
+    client, db, ai, gen, u, pid = setup(env, scenes=scenes, style="pictures")
+    c = make_sheet(client, ai, gen, u, pid)
+    client.patch(f"/api/v1/studio/projects/{pid}", headers=H(u), json={"script": "INT. CHURCH - DAY\n\nMaya marries.\n"})
+    est = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u), json={"kind": "outfits"}).json()
+    assert est["ready_count"] == 1 and 1 <= est["total_credits"] <= 10
+    assert start(client, u, pid, "outfits").status_code == 200
+    run(gen)
+    assert "costume designer" in ai.last_outfit_prompt and "Maya marries." in ai.last_outfit_prompt
+    me = char(client, u, pid)
+    sug = me["outfit_suggestions"]
+    assert [o["name"] for o in sug] == ["Wedding"] and sug[0]["parts"]["shoes"] == "satin heels"
+    assert sug[0]["reason"] == "Her wedding day." and [o["name"] for o in me["outfits"]] == ["Main outfit"]
+    s = detail(client, u, pid)["scenes"]
+    assert sug[0]["suggested_scenes"] == [s[1]["id"]] and s[1]["outfits"] == {}, "nothing applied yet"
+    # A suggestion can't be used or pictured until accepted.
+    assert client.patch(f"/api/v1/studio/scenes/{s[0]['id']}", headers=H(u),
+                        json={"outfits": {c["id"]: sug[0]["id"]}}).status_code == 400
+    r = client.post(f"/api/v1/studio/outfits/{sug[0]['id']}/accept", headers=H(u), json={"use_in_suggested_scenes": True})
+    assert r.status_code == 200 and [o["name"] for o in r.json()["outfits"]] == ["Main outfit", "Wedding"]
+    assert detail(client, u, pid)["scenes"][1]["outfits"] == {c["id"]: sug[0]["id"]}
+    # New suggestions replace old ones, never the accepted outfit; dismissing deletes a suggestion.
+    start(client, u, pid, "outfits")
+    run(gen)
+    me = char(client, u, pid)
+    assert me["outfit_suggestions"] == [] and [o["name"] for o in me["outfits"]] == ["Main outfit", "Wedding"]
+    ai.outfit_result = [{"character": "Maya", "name": "Nightwear", "clothing": "grey pyjamas", "scenes": [3]}]
+    start(client, u, pid, "outfits")
+    run(gen)
+    night = char(client, u, pid)["outfit_suggestions"][0]
+    assert client.delete(f"/api/v1/studio/outfits/{night['id']}", headers=H(u)).status_code == 200
+    assert char(client, u, pid)["outfit_suggestions"] == []
+
+
+def test_outfits_are_reused_in_later_episodes_but_temporary_ones_are_not(env):
+    client, db, ai, gen, u, pid = setup(env)
+    c = make_sheet(client, ai, gen, u, pid)
+    add_outfit(client, u, c["id"], "Hospital", parts={"clothing": "hospital gown"})
+    add_outfit(client, u, c["id"], "Soaked", parts={"clothing": "rain-soaked jacket"}, is_temporary=True)
+    ep2 = client.post(f"/api/v1/studio/projects/{pid}/next-episode", headers=H(u)).json()["id"]
+    split(client, ai, gen, u, ep2, [TALK])
+    c2 = char(client, u, ep2)
+    assert [o["name"] for o in c2["outfits"]] == ["Main outfit", "Hospital"]
+    # An outfit added to episode 1 later shows in episode 2's library and is reused without a new picture.
+    gala = add_outfit(client, u, c["id"], "Gala", parts={"clothing": "black gown"})
+    lib = char(client, u, ep2)["outfit_library"]
+    assert [o["name"] for o in lib] == ["Gala"]
+    ai.calls = []
+    r = client.post(f"/api/v1/studio/characters/{c2['id']}/outfits/import", headers=H(u), json={"outfit_id": gala["id"]})
+    assert r.status_code == 200 and "Gala" in [o["name"] for o in r.json()["outfits"]] and r.json()["outfit_library"] == []
+    assert not [x for x in ai.calls if x[0] == "image"]
+    other = make_user(db)
+    assert client.post(f"/api/v1/studio/characters/{c2['id']}/outfits/import", headers=H(other),
+                       json={"outfit_id": gala["id"]}).status_code == 404

@@ -45,6 +45,30 @@ alter table public.studio_scenes drop constraint if exists studio_scenes_camera_
 alter table public.studio_scenes add constraint studio_scenes_camera_check
   check (camera in ('auto', 'close_up', 'front', 'side', 'back', 'full_body', 'wide'));
 
+-- Flexible outfits. Each part changes on its own; the face and body never do.
+--   parts: {"clothing": "...", "shoes": "...", "accessories": "...", "makeup": "..."}
+--   is_temporary: a short-lived change (e.g. rain-soaked); not offered in later episodes.
+--   status: 'saved', or 'suggested' by the AI from the screenplay (the creator accepts or dismisses it).
+--   suggested_scenes: the scene ids the AI suggested it for. reason: why it fits.
+--   image_signature: which parts the picture was made from (a changed part = picture out of date).
+alter table public.studio_outfits add column if not exists parts jsonb not null default '{}'::jsonb;
+alter table public.studio_outfits add column if not exists is_temporary boolean not null default false;
+alter table public.studio_outfits add column if not exists status text not null default 'saved';
+alter table public.studio_outfits drop constraint if exists studio_outfits_status_check;
+alter table public.studio_outfits add constraint studio_outfits_status_check check (status in ('saved', 'suggested'));
+alter table public.studio_outfits add column if not exists suggested_scenes jsonb not null default '[]'::jsonb;
+alter table public.studio_outfits add column if not exists reason text not null default '';
+alter table public.studio_outfits add column if not exists image_signature text;
+
+-- A change for one scene only, per character and part, on top of the chosen
+-- outfit: {"<character id>": {"makeup": "smudged mascara"}}. Not carried on.
+alter table public.studio_scenes add column if not exists outfit_overrides jsonb not null default '{}'::jsonb;
+
+-- The outfit-suggestion job type.
+alter table public.studio_jobs drop constraint if exists studio_jobs_kind_check;
+alter table public.studio_jobs add constraint studio_jobs_kind_check
+  check (kind in ('script', 'breakdown', 'portrait', 'image', 'voice', 'video', 'render', 'lipsync', 'outfits'));
+
 -- Owners can read their own outfits; every write goes through the backend.
 alter table public.studio_outfits enable row level security;
 drop policy if exists "owner reads" on public.studio_outfits;

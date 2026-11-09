@@ -189,10 +189,11 @@ def view_prompt(view: str, name: str, identity: Optional[dict], description: str
 
 
 def outfit_prompt(name: str, identity: Optional[dict], description: str, style: str, outfit_name: str,
-                  outfit_description: str) -> str:
+                  outfit_description: str, parts: Optional[dict] = None) -> str:
+    wear = outfit_text({"name": outfit_name, "description": outfit_description, "parts": parts or {}}, outfit_name)
     return (f"Outfit reference for {name}: \"{outfit_name}\". Reference image 1 is the approved front view of this "
-            "character. Draw THE SAME PERSON (identical face, hair, skin tone, height, proportions and marks), "
-            f"now wearing: {outfit_description or outfit_name}.\nPERMANENT IDENTITY: "
+            "character. Draw THE SAME PERSON (identical face, hair, skin tone, height, proportions and marks); "
+            f"only the clothes, shoes, accessories and makeup change. Now wearing: {wear}.\nPERMANENT IDENTITY: "
             f"{identity_text(name, identity, description)}\nFull-body front shot, head to feet, the whole outfit "
             "and every accessory visible. Plain light-grey studio background, soft even light, no other people. "
             f"Style: {style or 'cinematic, realistic'}. No text, labels, captions or watermarks.")
@@ -291,8 +292,12 @@ def references_for(character: dict, camera: str, outfit: Optional[dict], limit: 
     usable.sort(key=lambda v: status[v] != "approved")
     if usable:
         add(f"{name}: {VIEW_LABEL[usable[0]].lower()} (keep this exact face, hair, skin and body)", views[usable[0]]["path"])
-    if outfit and outfit.get("reference_path"):
-        add(f"{name} wearing the outfit for this scene (keep these exact clothes)", outfit["reference_path"])
+    sig = (outfit or {}).get("image_signature")
+    if outfit and outfit.get("reference_path") and (not sig or sig == outfit_signature(outfit) or outfit.get("scene_only")):
+        if outfit.get("scene_only"):
+            add(f"{name} in their outfit (keep it, except this scene's changes described in the text)", outfit["reference_path"])
+        else:
+            add(f"{name} wearing the outfit for this scene (keep these exact clothes)", outfit["reference_path"])
     for v in usable[1:]:
         add(f"{name}: {VIEW_LABEL[v].lower()} (same person)", views[v]["path"])
     if not out and character.get("reference_path"):
@@ -310,10 +315,99 @@ def split_limit(n_characters: int, total: int, per_character: int = 3) -> list[i
 
 # ------------------------------------------------------------ outfits
 
+OUTFIT_PARTS = ("clothing", "shoes", "accessories", "makeup")
+PART_LABEL = {"clothing": "Clothing", "shoes": "Shoes", "accessories": "Accessories", "makeup": "Makeup"}
+
+
+def clean_parts(raw) -> dict:
+    """Only the four outfit parts, as short text. Face, hair colour, body
+    and height are identity, never outfit."""
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: re.sub(r"\s+", " ", str(raw[k])).strip()[:300] for k in OUTFIT_PARTS
+            if isinstance(raw.get(k), (str, int, float)) and str(raw[k]).strip()}
+
+
+def effective_outfit(outfit: Optional[dict], override: Optional[dict]) -> Optional[dict]:
+    """The outfit worn in one scene: the chosen outfit with this scene's
+    one-off changes on top, part by part."""
+    override = clean_parts(override)
+    if not outfit and not override:
+        return outfit
+    base = dict(outfit or {"name": "", "description": ""})
+    parts = dict(clean_parts(base.get("parts")))
+    parts.update(override)
+    base["parts"] = parts
+    base["scene_only"] = override
+    return base
+
+
+def outfit_text(outfit: Optional[dict], fallback: str = "") -> str:
+    """What the character wears, part by part."""
+    if not outfit:
+        return fallback
+    parts = clean_parts(outfit.get("parts"))
+    bits = [f"{PART_LABEL[k].lower()}: {parts[k]}" for k in OUTFIT_PARTS if parts.get(k)]
+    if outfit.get("description"):
+        bits.insert(0, outfit["description"])
+    text = "; ".join(bits) or outfit.get("name") or fallback
+    if outfit.get("scene_only"):
+        text += " (for this scene only: " + "; ".join(f"{PART_LABEL[k].lower()} {v}"
+                                                      for k, v in outfit["scene_only"].items()) + ")"
+    return text
+
+
+def outfit_signature(outfit: dict) -> str:
+    """Which parts a picture was made from: if any part changes later, the
+    picture is out of date (the face and body are never re-made for it)."""
+    import hashlib
+    parts = clean_parts(outfit.get("parts"))
+    key = "|".join([outfit.get("description") or ""] + [parts.get(k, "") for k in OUTFIT_PARTS])
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
+OUTFIT_SUGGEST_SCHEMA = {
+    "type": "object",
+    "properties": {"outfits": {"type": "array", "items": {"type": "object", "properties": {
+        "character": {"type": "string", "description": "Exactly as in the character list."},
+        "name": {"type": "string", "description": "Short outfit name, e.g. 'Hospital scrubs', 'Wedding', 'Nightwear'."},
+        "clothing": {"type": "string"}, "shoes": {"type": "string"},
+        "accessories": {"type": "string"}, "makeup": {"type": "string", "description": "Empty if none."},
+        "scenes": {"type": "array", "items": {"type": "integer"}, "description": "Scene numbers (1 = first) it is worn in."},
+        "reason": {"type": "string", "description": "One short sentence: why this outfit fits the story here."},
+    }, "required": ["character", "name", "clothing", "scenes"]}}},
+    "required": ["outfits"],
+}
+
+
+def outfit_suggest_prompt(script: str, cast: list[dict], scenes: list[dict], style: str) -> str:
+    who = "\n".join(f"- {c['name']}: usual clothes: {(c.get('identity') or {}).get('default_outfit') or c.get('description') or '?'}"
+                    for c in cast)
+    shots = "\n".join(f"{i}. {s.get('heading') or ''}: {s.get('visual') or ''}" for i, s in enumerate(scenes, start=1))
+    return f"""You are the costume designer of a film. Suggest the outfits each character needs, based on the story:
+where they are, the time of day, the occasion, what happens to them (rain, a fight, a wedding, a hospital).
+
+CHARACTERS:
+{who}
+
+SCENES:
+{shots or '(no scene list yet)'}
+
+SCREENPLAY:
+{script[:12000]}
+
+Rules:
+- Only suggest a new outfit when the story gives a reason to change clothes. Most scenes keep the same outfit.
+- Describe clothing, shoes, accessories and makeup separately and concretely (colours, fabrics, condition).
+- Never change the character's face, hair colour, skin, body or height: only what they wear.
+- List the scene numbers each outfit is worn in.
+- Visual style: {style or 'cinematic, realistic'}. Write in English."""
+
+
 def resolve_outfits(scenes: list[dict], outfits: list[dict], cast: list[dict], in_scene) -> dict:
     """{scene id: {character id: outfit row or None}}. A scene that names an
     outfit uses it; otherwise the character keeps the outfit they wore in the
     scene before (the same outfit period); otherwise their default outfit."""
+    outfits = [o for o in outfits if (o.get("status") or "saved") == "saved"]
     by_id = {o["id"]: o for o in outfits}
     default = {}
     for o in sorted(outfits, key=lambda o: (not o.get("is_default"), o.get("position") or 0)):
@@ -340,7 +434,7 @@ def cast_block(entries: list[tuple[dict, Optional[dict]]]) -> str:
     lines = []
     for c, outfit in entries:
         lines.append("- " + identity_text(c["name"], c.get("identity"), c.get("description") or ""))
-        wear = (outfit or {}).get("description") or (outfit or {}).get("name") or (c.get("identity") or {}).get("default_outfit")
+        wear = outfit_text(outfit, (c.get("identity") or {}).get("default_outfit") or "")
         if wear:
             lines.append(f"  Wearing in this scene: {wear}.")
     return "\n".join(lines)

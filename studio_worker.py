@@ -88,7 +88,7 @@ class StudioWorker:
         t.start()
         try:
             output, cost = self.handle(job)
-            credits = min(cost.credits, int(job["estimated_credits"])) if job["kind"] not in ("script", "breakdown") \
+            credits = min(cost.credits, int(job["estimated_credits"])) if job["kind"] not in ("script", "breakdown", "outfits") \
                 else cost.credits
             self.store.rpc("studio_complete_job", {"p_job_id": job["id"], "p_lease": job["lease"], "p_output": output,
                                                    "p_credits": credits, "p_usage": cost.usage()})
@@ -280,11 +280,14 @@ class StudioWorker:
                     "identity_locked_at": prev.get("identity_locked_at"),
                     "identity_version": prev.get("identity_version") or 0})
                 for o in self.store.select("studio_outfits", {"character_id": prev["id"]}):
+                    if o.get("is_temporary") or (o.get("status") or "saved") != "saved":
+                        continue
                     self.store.insert("studio_outfits", [{
                         "project_id": project["id"], "owner_id": project["owner_id"], "character_id": row["id"],
                         "name": o["name"], "description": o.get("description") or "",
                         "reference_path": o.get("reference_path"), "is_default": o.get("is_default", False),
-                        "position": o.get("position") or 0}])
+                        "position": o.get("position") or 0, "parts": o.get("parts") or {},
+                        "image_signature": o.get("image_signature")}])
         except Exception as e:
             self._rollback()
             print(f"[WARN] studio: identities not carried into episode {project['id']}: {str(e)[:160]}")
@@ -478,12 +481,14 @@ class StudioWorker:
             rows = self.store.select("studio_outfits", {"character_id": ch["id"]})
             default = next((o for o in rows if o.get("is_default")), None)
             if default:
-                self.store.update("studio_outfits", {"id": default["id"]}, {"reference_path": path, "updated_at": _now()})
+                self.store.update("studio_outfits", {"id": default["id"]}, {
+                    "reference_path": path, "image_signature": ident.outfit_signature(default), "updated_at": _now()})
             else:
+                row = {"name": "Main outfit", "description": (identity.get("default_outfit") or "")[:800], "parts": {}}
                 self.store.insert("studio_outfits", [{
-                    "project_id": project["id"], "owner_id": job["owner_id"], "character_id": ch["id"],
-                    "name": "Main outfit", "description": (identity.get("default_outfit") or "")[:800],
-                    "reference_path": path, "is_default": True, "position": 0}])
+                    "project_id": project["id"], "owner_id": job["owner_id"], "character_id": ch["id"], **row,
+                    "reference_path": path, "image_signature": ident.outfit_signature(row), "is_default": True,
+                    "position": 0}])
         except Exception as e:
             self._rollback()
             print(f"[WARN] studio: default outfit not saved (run creator_studio_identity.sql?): {str(e)[:160]}")
@@ -492,17 +497,53 @@ class StudioWorker:
         outfit = self.store.one("studio_outfits", {"id": outfit_id})
         if not outfit or outfit["character_id"] != ch["id"]:
             raise JobFailed("not_found", "That outfit no longer exists.")
+        if (outfit.get("status") or "saved") != "saved":
+            raise JobFailed("not_saved", "Accept this suggested outfit before making its picture. Your credits were returned.")
         anchor_path = ((ch.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")
         if not anchor_path:
             raise JobFailed("needs_front", "Make the character's front view first: outfits are made from it. "
                                            "Your credits were returned.")
         prompt = ident.outfit_prompt(ch["name"], ch.get("identity"), ch.get("description") or "",
-                                     project.get("visual_style") or "", outfit["name"], outfit.get("description") or "")
+                                     project.get("visual_style") or "", outfit["name"], outfit.get("description") or "",
+                                     outfit.get("parts"))
+        # Only the clothes change: the approved front view is the reference,
+        # and the identity and reference sheet are never re-made for an outfit.
         data, mime, cost = self.ai.image(prompt, [self.files.get(anchor_path)], "9:16", _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "portrait", ext, data, mime, character_id=ch["id"])
-        self.store.update("studio_outfits", {"id": outfit["id"]}, {"reference_path": path, "updated_at": _now()})
+        self.store.update("studio_outfits", {"id": outfit["id"]}, {
+            "reference_path": path, "image_signature": ident.outfit_signature(outfit), "updated_at": _now()})
         return {"path": path, "outfit_id": outfit["id"]}, cost
+
+    def do_outfits(self, job, project):
+        """The AI costume designer suggests outfits from the screenplay. They
+        are saved as suggestions only: the creator accepts or dismisses each."""
+        cast = sorted(self.store.select("studio_characters", {"project_id": project["id"]}),
+                      key=lambda c: c.get("position") or 0)
+        if not cast:
+            raise JobFailed("no_cast", "Add characters first. Your credits were returned.")
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
+        prompt = ident.outfit_suggest_prompt(project.get("script") or "", cast, scenes, project.get("visual_style") or "")
+        items, cost = self.ai.suggest_outfits(prompt)
+        by_name = {c["name"].strip().lower(): c for c in cast}
+        existing = self.store.select("studio_outfits", {"project_id": project["id"]})
+        for o in existing:
+            if o.get("status") == "suggested":       # a new set of suggestions replaces the old one
+                self.store.delete("studio_outfits", {"id": o["id"]})
+        saved_names = {(o["character_id"], o["name"].strip().lower()) for o in existing if o.get("status") != "suggested"}
+        rows = []
+        for i, s in enumerate(items[:40]):
+            c = by_name.get((s.get("character") or "").strip().lower())
+            name = (s.get("name") or "").strip()[:60]
+            if not c or not name or (c["id"], name.lower()) in saved_names:
+                continue
+            scene_ids = [scenes[n - 1]["id"] for n in (s.get("scenes") or []) if isinstance(n, int) and 1 <= n <= len(scenes)]
+            rows.append({"project_id": project["id"], "owner_id": job["owner_id"], "character_id": c["id"], "name": name,
+                         "description": "", "parts": ident.clean_parts(s), "status": "suggested",
+                         "suggested_scenes": scene_ids, "reason": (s.get("reason") or "")[:300], "position": 100 + i})
+        if rows:
+            self.store.insert("studio_outfits", rows)
+        return {"suggested": len(rows)}, cost
 
     def _cast_for_scene(self, project, scene, cast):
         """[(character, outfit)] in this scene, speakers first, with the
@@ -518,7 +559,8 @@ class StudioWorker:
                 outfits = ident.resolve_outfits(scenes, rows, cast, characters_in_scene).get(scene["id"], {})
         except Exception:
             self._rollback()     # creator_studio_identity.sql not run yet: no outfits
-        return [(c, outfits.get(c["id"])) for c in in_scene]
+        overrides = scene.get("outfit_overrides") or {}
+        return [(c, ident.effective_outfit(outfits.get(c["id"]), overrides.get(c["id"]))) for c in in_scene]
 
     def _reference_files(self, entries, camera, total, per_character=3) -> list:
         """[(label, bytes)] of the best reference views for this camera angle."""

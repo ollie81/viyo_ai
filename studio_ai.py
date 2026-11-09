@@ -275,6 +275,18 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
+    def suggest_outfits(self, prompt: str):
+        """Costume suggestions from the screenplay (studio_identity)."""
+        import studio_identity
+        resp = self._text(prompt, response_mime_type="application/json",
+                          response_json_schema=studio_identity.OUTFIT_SUGGEST_SCHEMA)
+        try:
+            data = json.loads(resp.text)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned unreadable outfit suggestions.")
+        i, o = self._text_usage(resp)
+        return data.get("outfits") or [], pricing.text_cost(i, o)
+
     def breakdown(self, brief: dict, script: str):
         resp = self._text(breakdown_prompt(brief, script), response_mime_type="application/json",
                           response_json_schema=BREAKDOWN_SCHEMA)
@@ -438,6 +450,16 @@ class FakeStudioAI:
                 {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running down a wet street",
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
+
+    def suggest_outfits(self, prompt):
+        self.calls.append(("outfits",))
+        self.last_outfit_prompt = prompt
+        self._maybe_fail("outfits")
+        return getattr(self, "outfit_result", None) or [
+            {"character": "Maya", "name": "Wedding", "clothing": "long ivory wedding dress", "shoes": "satin heels",
+             "accessories": "pearl earrings", "makeup": "soft bridal makeup", "scenes": [2], "reason": "Her wedding day."},
+            {"character": "Nobody", "name": "Ghost", "clothing": "sheet", "scenes": [1]},
+        ], pricing.text_cost(1500, 700)
 
     def identity(self, name, description, context=""):
         self.calls.append(("identity", name))

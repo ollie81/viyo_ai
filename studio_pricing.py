@@ -232,6 +232,10 @@ IDENTITY_TOKENS = (900, THINKING_BUDGET + 700)   # the identity profile: one sho
 SHEET_REF_TOKENS = 1300                          # one reference picture sent with each view
 
 
+def estimate_outfit_suggestions(script_chars: int, characters: int) -> Cost:
+    return text_cost(1200 + min(script_chars, 12000) // 3, THINKING_BUDGET + 300 + characters * 350)
+
+
 def estimate_identity() -> Cost:
     return text_cost(*IDENTITY_TOKENS)
 
@@ -248,6 +252,6 @@ def estimate_sheet(views: int, size: str = "1K", needs_identity: bool = False) -
 def hold_credits(kind: str, cost: Cost) -> int:
     """Credits to hold for a job: text jobs vary, so a margin is held and
     the unused part returned; fixed-price items hold exactly the price."""
-    if kind in ("script", "breakdown"):
+    if kind in ("script", "breakdown", "outfits"):
         return credits_for(cost.total_usd * HOLD_FACTOR)
     return cost.credits
