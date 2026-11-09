@@ -91,11 +91,13 @@ class StudioWorker:
             self.store.rpc("studio_complete_job", {"p_job_id": job["id"], "p_lease": job["lease"], "p_output": output,
                                                    "p_credits": credits, "p_usage": cost.usage()})
         except JobFailed as e:
+            print(f"[INFO] studio job {job['id']} ({job['kind']}) failed: {e.code}: {e.message}")
             self._fail(job, e.code, e.message, e.retry, e.absorbed)
         except ai_mod.ProviderBusy as e:
             self._fail(job, "provider_busy", "The AI service is busy. Trying again shortly.", True)
             print(f"[WARN] studio job {job['id']} busy: {e}")
         except ai_mod.PolicyBlocked as e:
+            print(f"[INFO] studio job {job['id']} ({job['kind']}) blocked by the AI: {e}")
             self._fail(job, "content_blocked", str(e) or "The AI refused this content. Try rewording it.", False)
         except Exception as e:
             traceback.print_exc()

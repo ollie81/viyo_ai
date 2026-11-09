@@ -89,7 +89,11 @@ What makes short drama unforgettable:
 - Plant something early that pays off later. The twist must feel surprising and, looking back, inevitable.
 - Show emotion in actions and images, not in words.
 - End on a strong image or line. An episode ends on a question the viewer can't leave unanswered.
-- Avoid cliches: no waking from a dream, no evil twin, no "it was all a misunderstanding"."""
+- Avoid cliches: no waking from a dream, no evil twin, no "it was all a misunderstanding".
+
+Mature themes are welcome when the story needs them: violence, crime, death, betrayal, adult romance and desire.
+Keep sex scenes between adults implied (a kiss, then cut away), never explicit. Characters under 18 are never
+in romantic or sexual situations. No real-world how-to for weapons or crimes."""
 
 
 def _format(b: dict) -> str:

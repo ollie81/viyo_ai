@@ -29,6 +29,17 @@ import studio_pricing as pricing
 
 THINKING_BUDGET = pricing.THINKING_BUDGET
 
+
+def drama_safety():
+    """Google's filters set for adult fiction: violence, crime, dark themes and
+    adult romance go through; only high-severity content is blocked. Google's
+    own policy still refuses explicit sexual content and sexual content
+    involving minors whatever these settings say."""
+    from google.genai import types
+    return [types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH) for c in (
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT)]
+
 VOICES = [  # Gemini TTS prebuilt voices
     ("Zephyr", "female", "Bright"), ("Puck", "male", "Upbeat"), ("Charon", "male", "Informative"),
     ("Kore", "female", "Firm"), ("Fenrir", "male", "Excitable"), ("Leda", "female", "Youthful"),
@@ -216,7 +227,8 @@ class GoogleStudioAI:
             resp = self.client.models.generate_content(
                 model=pricing.TEXT_MODEL, contents=prompt,
                 config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET), **cfg))
+                    thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+                    safety_settings=drama_safety(), **cfg))
         except Exception as e:
             raise _classify(e)
         if not (resp.text or "").strip():
@@ -269,6 +281,7 @@ class GoogleStudioAI:
             resp = self.client.models.generate_content(
                 model=pricing.IMAGE_MODEL, contents=parts,
                 config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"],
+                                                   safety_settings=drama_safety(),
                                                    image_config=types.ImageConfig(aspect_ratio=aspect_ratio,
                                                                                   image_size=size)))
         except Exception as e:
@@ -449,9 +462,22 @@ class FakeStudioAI:
         return data, pricing.video_cost(3.0, 3 * 5792, 1000)
 
 
+# Viyo makes adult fiction: violence, crime, death, dark themes and adult
+# romance are allowed. Only these are refused (OpenAI moderation categories).
+BLOCKED_ALWAYS = ("sexual_minors", "self_harm_instructions")
+BLOCKED_IF_CERTAIN = {"illicit_violent": 0.9}   # real how-to for weapons or violent crime
+
+
+def story_allowed(result) -> bool:
+    cats, scores = result.categories, result.category_scores
+    if any(getattr(cats, c, False) for c in BLOCKED_ALWAYS):
+        return False
+    return not any((getattr(scores, c, 0) or 0) >= limit for c, limit in BLOCKED_IF_CERTAIN.items())
+
+
 def moderate_text(text: str) -> bool:
-    """True if the text is acceptable. OpenAI's moderation endpoint is free;
-    without a key (local runs) everything passes."""
+    """True if the text is acceptable for a Viyo drama (see BLOCKED_ALWAYS).
+    OpenAI's moderation endpoint is free; without a key (local runs) everything passes."""
     key = os.environ.get("OPENAI_API_KEY", "")
     if not key or key.startswith("test") or key == "x" or not text.strip():
         return True
@@ -459,7 +485,7 @@ def moderate_text(text: str) -> bool:
         from openai import OpenAI
         r = OpenAI(api_key=key, timeout=20, max_retries=1).moderations.create(
             model="omni-moderation-latest", input=text[:20000])
-        return not r.results[0].flagged
+        return story_allowed(r.results[0])
     except Exception as e:
         print(f"[WARN] moderation unavailable, allowing: {e}")
         return True
