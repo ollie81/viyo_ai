@@ -28,6 +28,7 @@ def studio_schema(migrated):
         conn.execute((ROOT / "creator_studio_video_drama.sql").read_text())
         conn.execute((ROOT / "creator_studio_story.sql").read_text())
         conn.execute((ROOT / "creator_studio_identity.sql").read_text())
+        conn.execute((ROOT / "creator_studio_consistency.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated

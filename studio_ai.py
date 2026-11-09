@@ -471,7 +471,8 @@ class FakeStudioAI:
             "face": {"face_shape": "oval", "eyes": "almond, dark brown, slightly wide-set", "nose": "straight, narrow",
                      "hair": "short black hair, straight", "marks": "small scar above the left eyebrow"},
             "body": {"proportions": "long legs", "shoulders": "narrow", "physique": "lean"},
-            "default_outfit": "red jacket, black jeans, white sneakers"}), pricing.text_cost(900, 600)
+            "default_outfit": "red jacket, black jeans, white sneakers",
+            "guessed": ["basic.height_cm", "face.eyes", "body.shoulders"]}), pricing.text_cost(900, 600)
 
     def image(self, prompt, references, aspect_ratio, size="1K"):
         self.calls.append(("image", aspect_ratio, len(references)))

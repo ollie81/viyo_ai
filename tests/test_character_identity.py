@@ -132,7 +132,7 @@ def test_every_view_is_made_from_the_front_view(env):
     assert "first, defining picture" in prompts[0]
     assert all("Draw THE SAME PERSON" in x for x in prompts[1:])
     assert all("small scar above the left eyebrow" in x for x in prompts[:5])
-    assert "left side profile" in prompts[2] and "directly behind" in prompts[4] and "2x2 grid" in prompts[5]
+    assert "left side profile" in prompts[2] and "directly behind" in prompts[4] and "3x2 grid" in prompts[5] and "frightened, surprised" in prompts[5]
     raw = paths(db, c["id"])
     anchor = raw["front_full"]["path"]
     assert all(raw[v]["anchor"] == anchor for v in ALL) and all(raw[v]["status"] == "draft" for v in ALL)
@@ -520,3 +520,105 @@ def test_outfits_are_reused_in_later_episodes_but_temporary_ones_are_not(env):
     other = make_user(db)
     assert client.post(f"/api/v1/studio/characters/{c2['id']}/outfits/import", headers=H(other),
                        json={"outfit_id": gala["id"]}).status_code == 404
+
+
+# ------------------------------------------- honesty, expressions, staleness
+
+def test_ai_guesses_are_marked_and_the_creator_confirms_or_corrects_them(env):
+    client, db, ai, gen, u, pid = setup(env)
+    c = make_sheet(client, ai, gen, u, pid)
+    assert sorted(c["guessed_fields"]) == ["basic.height_cm", "body.shoulders", "face.eyes"]
+    assert c["identity"]["_sources"]["basic.age"] == "story"
+    # Correct one guess, confirm another; the third stays a guess.
+    r = client.patch(f"/api/v1/studio/characters/{c['id']}/identity", headers=H(u),
+                     json={"identity": {"face": {"eyes": "hazel, round"}, "_confirm": ["basic.height_cm"]}})
+    assert r.status_code == 200
+    assert r.json()["guessed_fields"] == ["body.shoulders"]
+    src = r.json()["identity"]["_sources"]
+    assert src["face.eyes"] == src["basic.height_cm"] == "creator" and r.json()["identity"]["face"]["eyes"] == "hazel, round"
+    r = client.patch(f"/api/v1/studio/characters/{c['id']}/identity", headers=H(u), json={"identity": {"_confirm": "all"}})
+    assert r.json()["guessed_fields"] == []
+
+
+def test_a_scene_gives_each_character_their_expression(env):
+    scared = {"heading": "INT. FLAT - NIGHT", "visual": "Close-up of Maya at the door", "duration_seconds": 4,
+              "dialogue": [{"character": "Maya", "text": "Who's there?", "emotion": "terrified"}]}
+    client, db, ai, gen, u, pid = setup(env, scenes=(scared,), style="pictures")
+    make_sheet(client, ai, gen, u, pid)
+    ai.image_log = []
+    start(client, u, pid, "image")
+    run(gen)
+    prompt = ai.image_log[0]["prompt"]
+    assert "Expression in this scene: frightened" in prompt and "use the frightened one" in prompt
+    assert ident.scene_expression({"visual": "Daniel laughs", "dialogue": []}, "Daniel") == "happy"
+    assert ident.scene_expression({"visual": "A street", "dialogue": []}, "Daniel") is None
+
+
+def test_scenes_made_before_an_identity_or_outfit_change_are_flagged(env):
+    scenes = [dict(FACE, heading=f"SCENE {i}") for i in range(2)]
+    client, db, ai, gen, u, pid = setup(env, scenes=scenes, style="pictures")
+    s = detail(client, u, pid)["scenes"]
+    start(client, u, pid, "image", [s[0]["id"]])        # made before Maya has a sheet
+    run(gen)
+    c = make_sheet(client, ai, gen, u, pid)
+    s = detail(client, u, pid)["scenes"]
+    assert s[0]["consistency"] == ["Made before Maya's reference sheet. Redo to match Maya's identity."]
+    start(client, u, pid, "image", [x["id"] for x in s])
+    run(gen)
+    s = detail(client, u, pid)["scenes"]
+    assert s[0]["consistency"] == [] and s[1]["consistency"] == []
+    assert any(r.startswith("Maya: face close-up") for r in s[0]["made_with_references"]), "the references really sent"
+    # An outfit change for scene 2 flags only scene 2; the identity stays.
+    gala = add_outfit(client, u, c["id"], "Gala", parts={"clothing": "black gown"})
+    client.patch(f"/api/v1/studio/scenes/{s[1]['id']}", headers=H(u), json={"outfits": {c["id"]: gala["id"]}})
+    s = detail(client, u, pid)["scenes"]
+    assert s[0]["consistency"] == [] and "outfit" in s[1]["consistency"][0]
+    # An identity edit flags both.
+    client.patch(f"/api/v1/studio/characters/{c['id']}/identity", headers=H(u), json={"identity": {"basic": {"height_cm": 175}}})
+    s = detail(client, u, pid)["scenes"]
+    assert all("identity changed" in x["consistency"][0] for x in s)
+
+
+def test_the_whole_workflow_keeps_maya_the_same_person(env):
+    """Create -> sheet -> approve -> outfits -> scenes -> episode 2 -> outfit
+    change leaves the identity alone -> a failure is refunded."""
+    scenes = [dict(FACE, heading="SCENE 1"), dict(BEHIND, heading="SCENE 2"), dict(FACE, heading="SCENE 3")]
+    client, db, ai, gen, u, pid = setup(env, scenes=scenes, style="pictures")
+    c = make_sheet(client, ai, gen, u, pid)
+    assert all(v["status"] == "draft" for v in c["reference_views"])
+    c = client.post(f"/api/v1/studio/characters/{c['id']}/identity/lock", headers=H(u)).json()
+    locked_identity, locked_sheet = c["identity"], paths(db, c["id"])
+    work = add_outfit(client, u, c["id"], "Work", parts={"clothing": "navy scrubs", "shoes": "white clogs"})
+    night = add_outfit(client, u, c["id"], "Nightwear", parts={"clothing": "grey pyjamas", "makeup": "none"})
+    for o in (work, night):
+        jobs(client, u, pid, "portrait", c["id"], outfit_id=o["id"])
+    run(gen)
+    s = detail(client, u, pid)["scenes"]
+    client.patch(f"/api/v1/studio/scenes/{s[0]['id']}", headers=H(u), json={"outfits": {c["id"]: work["id"]}})
+    client.patch(f"/api/v1/studio/scenes/{s[2]['id']}", headers=H(u), json={"outfits": {c["id"]: night["id"]}})
+    ai.image_log = []
+    start(client, u, pid, "image", [x["id"] for x in s])
+    run(gen)
+    prompts = [x["prompt"] for x in ai.image_log]
+    # Same permanent identity in every scene; the outfit follows the scene.
+    assert all("small scar above the left eyebrow" in x and "height 168 cm" in x for x in prompts)
+    assert ["navy scrubs" in x for x in prompts] == [True, True, False]
+    assert ["grey pyjamas" in x for x in prompts] == [False, False, True]
+    assert "Reference image 1: Maya: back, full body" in prompts[1]
+    assert char(client, u, pid)["identity"] == locked_identity and paths(db, c["id"]) == locked_sheet
+    # Episode 2: the same locked person, the same outfits, and the scenes use them.
+    ep2 = client.post(f"/api/v1/studio/projects/{pid}/next-episode", headers=H(u)).json()["id"]
+    split(client, ai, gen, u, ep2, [dict(FACE)])
+    c2 = char(client, u, ep2)
+    assert c2["identity_locked"] and c2["identity"] == locked_identity
+    assert {o["name"] for o in c2["outfits"]} >= {"Main outfit", "Work", "Nightwear"}
+    ai.image_log = []
+    start(client, u, ep2, "image")
+    run(gen)
+    assert "small scar above the left eyebrow" in ai.image_log[0]["prompt"] and ai.image_log[0]["refs"] >= 2
+    # A failed scene costs nothing.
+    before = balance(client, u)
+    ai.fail["image"] = studio_ai.ProviderError("boom")
+    start(client, u, ep2, "image")
+    run(gen)
+    assert balance(client, u) == before

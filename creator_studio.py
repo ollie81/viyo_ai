@@ -338,6 +338,7 @@ def _identity_out(c: dict, urls: dict, outfits: Optional[list] = None, library: 
     status = ident.sheet_status(views)
     return {
         "identity": c.get("identity") or {}, "identity_locked": bool(c.get("identity_locked_at")),
+        "guessed_fields": ident.guessed_fields(c.get("identity")),
         "identity_locked_at": c.get("identity_locked_at"), "identity_version": int(c.get("identity_version") or 0),
         "reference_views": [{"view": v, "label": ident.VIEW_LABEL[v], "status": status[v],
                              "url": urls.get((views.get(v) or {}).get("path") or "")} for v in ident.VIEWS],
@@ -451,7 +452,30 @@ def _outdated_voices(s: dict, cast: Optional[dict]) -> list[str]:
             if cid in cast and (cast[cid].get("voice") or "") != v]
 
 
-def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Optional[dict] = None) -> dict:
+def _consistency(s: dict, cast: Optional[dict], resolved: Optional[dict]) -> list[str]:
+    """Characters whose identity or outfit changed after this scene's picture
+    or video was made (redo the scene to match). Scenes made before a
+    character had a reference sheet are flagged too."""
+    if not cast or not (s.get("image_path") or s.get("video_path")) or "made_with" not in s:
+        return []
+    from studio_worker import characters_in_scene
+    made = s.get("made_with") or {}
+    out = []
+    for c in characters_in_scene(s, list(cast.values())):
+        if not ident.sheet_status(c.get("reference_views") or {}).get(ident.ANCHOR) in ("draft", "approved"):
+            continue
+        m = made.get(c["id"])
+        if not m or not m.get("anchor"):
+            out.append(f"Made before {c['name']}'s reference sheet. Redo to match {c['name']}'s identity.")
+        elif int(m.get("identity_version") or 0) != int(c.get("identity_version") or 0):
+            out.append(f"{c['name']}'s identity changed after this was made. Redo to match.")
+        elif resolved is not None and m.get("outfit_id") != ((resolved.get(c["id"]) or {}).get("id")):
+            out.append(f"{c['name']}'s outfit for this scene changed after it was made. Redo to match.")
+    return out
+
+
+def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Optional[dict] = None,
+               resolved: Optional[dict] = None) -> dict:
     return {"id": s["id"], "position": s["position"], "heading": s["heading"], "visual": s["visual"],
             "dialogue": s.get("dialogue") or [], "duration_seconds": float(s["duration_seconds"]), "mode": s["mode"],
             "image_url": urls.get(s.get("image_path") or ""), "video_url": urls.get(s.get("video_path") or ""),
@@ -464,7 +488,9 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "lipsync_url": urls.get(s.get("lipsync_path") or ""), "has_lipsync": bool(s.get("lipsync_path")),
             "outfits": s.get("outfits") or {}, "outfit_overrides": s.get("outfit_overrides") or {},
             "camera": s.get("camera") or "auto",
-            "camera_used": ident.scene_camera(s)}
+            "camera_used": ident.scene_camera(s),
+            "made_with_references": (s.get("made_with") or {}).get("_refs") or [],
+            "consistency": _consistency(s, cast, resolved)}
 
 
 def _speech(s: dict, project: Optional[dict]) -> str:
@@ -832,13 +858,15 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     outfits = _outfits(p["id"])
     urls = _sign([x for c in chars for x in _identity_paths(c)] + [o.get("reference_path") for o in outfits] +
                  [s.get(k) for s in scenes for k in ("image_path", "video_path", "audio_path")])
+    from studio_worker import characters_in_scene
+    resolved = ident.resolve_outfits(scenes, outfits, chars, characters_in_scene)
     libraries = {c["id"]: _outfit_library(c, [o for o in outfits if o["character_id"] == c["id"]])
                  for c in chars} if p.get("series_id") else {}
     urls.update(_sign([o.get("reference_path") for lib in libraries.values() for o in lib]))
     return {"project": _project_out(p),
             "characters": [_character_out(c, urls, [o for o in outfits if o["character_id"] == c["id"]],
                                           libraries.get(c["id"])) for c in chars],
-            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p) for s in scenes],
+            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {})) for s in scenes],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
 
