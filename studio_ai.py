@@ -263,6 +263,18 @@ class GoogleStudioAI:
             raise ProviderError(f"The story couldn't be written: {e}")
         return text, bible, pricing.text_cost(i, o)
 
+    def identity(self, name: str, description: str, context: str = ""):
+        """The character's permanent identity profile (studio_identity)."""
+        import studio_identity
+        resp = self._text(studio_identity.identity_prompt(name, description, context),
+                          response_mime_type="application/json", response_json_schema=studio_identity.IDENTITY_SCHEMA)
+        try:
+            data = json.loads(resp.text)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned an unreadable character profile.")
+        i, o = self._text_usage(resp)
+        return studio_identity.clean_identity(data), pricing.text_cost(i, o)
+
     def breakdown(self, brief: dict, script: str):
         resp = self._text(breakdown_prompt(brief, script), response_mime_type="application/json",
                           response_json_schema=BREAKDOWN_SCHEMA)
@@ -427,8 +439,21 @@ class FakeStudioAI:
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
 
+    def identity(self, name, description, context=""):
+        self.calls.append(("identity", name))
+        self._maybe_fail("identity")
+        import studio_identity
+        return studio_identity.clean_identity({
+            "basic": {"age": "late 20s", "height_cm": 168, "build": "slim", "skin_tone": "warm medium brown",
+                      "posture": "upright, guarded"},
+            "face": {"face_shape": "oval", "eyes": "almond, dark brown, slightly wide-set", "nose": "straight, narrow",
+                     "hair": "short black hair, straight", "marks": "small scar above the left eyebrow"},
+            "body": {"proportions": "long legs", "shoulders": "narrow", "physique": "lean"},
+            "default_outfit": "red jacket, black jeans, white sneakers"}), pricing.text_cost(900, 600)
+
     def image(self, prompt, references, aspect_ratio, size="1K"):
         self.calls.append(("image", aspect_ratio, len(references)))
+        self.image_log = getattr(self, "image_log", []) + [{"prompt": prompt, "refs": len(references)}]
         self.last_image_size = size
         self._maybe_fail("image")
         from PIL import Image

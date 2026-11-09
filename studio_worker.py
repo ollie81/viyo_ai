@@ -9,6 +9,7 @@ or fail (return everything; retry only when the provider was busy).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -19,6 +20,7 @@ from typing import Optional
 
 import studio_ai as ai_mod
 import studio_casting as casting
+import studio_identity as ident
 import studio_pricing as pricing
 import studio_render as render
 from studio_store import Files, Store, new_path
@@ -257,9 +259,35 @@ class StudioWorker:
             raise
         if not r or not r.get("ok"):
             raise JobFailed("not_found", "This production no longer exists.", absorbed=cost)
+        self._carry_identities(project, earlier, [c["name"] for c in new_chars])
         return {"characters": len(chars), "scenes": len(incoming), "kept": len(plan["keep"]),
                 "added": len(plan["insert"]), "set_aside": len(plan["archive"]),
                 "kept_pictures": plan["kept_pictures"], "kept_voice": plan["kept_voice"]}, cost
+
+    def _carry_identities(self, project, earlier: dict, names: list[str]) -> None:
+        """A character coming back in a later episode keeps their approved
+        identity, reference sheet and outfits."""
+        if not earlier:
+            return
+        try:
+            rows = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
+            for name in names:
+                prev, row = earlier.get(name.strip().lower()), rows.get(name.strip().lower())
+                if not prev or not row or not (prev.get("identity") or prev.get("reference_views")):
+                    continue
+                self.store.update("studio_characters", {"id": row["id"]}, {
+                    "identity": prev.get("identity") or {}, "reference_views": prev.get("reference_views") or {},
+                    "identity_locked_at": prev.get("identity_locked_at"),
+                    "identity_version": prev.get("identity_version") or 0})
+                for o in self.store.select("studio_outfits", {"character_id": prev["id"]}):
+                    self.store.insert("studio_outfits", [{
+                        "project_id": project["id"], "owner_id": project["owner_id"], "character_id": row["id"],
+                        "name": o["name"], "description": o.get("description") or "",
+                        "reference_path": o.get("reference_path"), "is_default": o.get("is_default", False),
+                        "position": o.get("position") or 0}])
+        except Exception as e:
+            self._rollback()
+            print(f"[WARN] studio: identities not carried into episode {project['id']}: {str(e)[:160]}")
 
     def catalog(self) -> list:
         return load_catalog(self.store)
@@ -331,6 +359,13 @@ class StudioWorker:
         ch = self.store.one("studio_characters", {"id": job["character_id"]})
         if not ch or ch["project_id"] != project["id"]:
             raise JobFailed("not_found", "That character no longer exists.")
+        inp = job.get("input") or {}
+        if isinstance(inp, str):
+            inp = json.loads(inp or "{}")
+        if inp.get("outfit_id"):
+            return self._outfit_picture(job, project, ch, inp["outfit_id"])
+        if inp.get("views"):
+            return self._sheet(job, project, ch, inp["views"])
         prompt = (f"Character reference portrait for a {project['genre'] or 'drama'} production. {ch['name']}: "
                   f"{ch['description']}. Waist-up, facing the camera, face fully visible, neutral studio background, "
                   f"soft even light. Style: {project['visual_style'] or 'cinematic, realistic'}. No text.")
@@ -340,21 +375,174 @@ class StudioWorker:
         self.store.update("studio_characters", {"id": ch["id"]}, {"reference_path": path})
         return {"path": path}, cost
 
+    # ------------------------------------------------ character consistency
+
+    def _identity_for(self, ch, project):
+        """The saved identity, or a new one from the AI (one short text call)."""
+        if ident.has_identity(ch.get("identity")):
+            return ch["identity"], None
+        make = getattr(self.ai, "identity", None)
+        if make is None:
+            return ident.fallback_identity(ch.get("description") or "", casting.AGE_LABEL.get(ch.get("age_category") or "")), None
+        bible = {c.get("name", "").lower(): c for c in (project.get("story_bible") or {}).get("characters") or []}
+        plan = bible.get(ch["name"].lower()) or {}
+        context = ""
+        if plan:
+            context = f"From the story plan: age {plan.get('age', '?')}; looks: {plan.get('look', '')}; role: {plan.get('role', '')}."
+        if ch.get("age_category"):
+            context += f" Age group: {casting.AGE_LABEL.get(ch['age_category'], ch['age_category'])}."
+        identity, cost = make(ch["name"], ch.get("description") or "", context.strip())
+        if not ident.has_identity(identity):
+            identity = ident.fallback_identity(ch.get("description") or "")
+        return identity, cost
+
+    def _sheet(self, job, project, ch, requested):
+        """The reference sheet, the front view first. Every other view is made
+        FROM the front view, so all of them show the same person. Each view is
+        saved as soon as it is made; a later failure keeps the finished views
+        and charges only for them. Approved views that weren't asked for are
+        never touched."""
+        if ch.get("identity_locked_at"):
+            raise JobFailed("locked", "This character's identity is locked. Unlock it to change the reference "
+                                      "sheet. Your credits were returned.")
+        order = ident.view_order(requested)
+        if not order:
+            raise JobFailed("bad_views", "Choose which views to make.")
+        views = dict(ch.get("reference_views") or {})
+        anchor_path = (views.get(ident.ANCHOR) or {}).get("path")
+        if ident.ANCHOR not in order and not anchor_path:
+            raise JobFailed("needs_front", "Make the front view first: every other view is made from it. "
+                                           "Your credits were returned.")
+        costs = []
+        identity, c0 = self._identity_for(ch, project)
+        if c0 is not None:
+            costs.append(c0)
+            self._optional_update("studio_characters", {"id": ch["id"]}, {"identity": identity})
+        ch = dict(ch, identity=identity)
+        size, style = _size(project), project.get("visual_style") or ""
+        anchor = self.files.get(anchor_path) if anchor_path and ident.ANCHOR not in order else None
+        face = None
+        made, failed = [], []
+        version = int(ch.get("identity_version") or 0)
+        for view in order:
+            try:
+                if view == ident.ANCHOR:
+                    refs, seed = [], None
+                    if ch.get("reference_path") and not anchor_path:
+                        # A portrait the creator already has: keep that face.
+                        try:
+                            seed = self.files.get(ch["reference_path"])
+                        except Exception:
+                            seed = None
+                    prompt = ident.view_prompt(view, ch["name"], identity, ch.get("description") or "", style,
+                                               from_anchor=False)
+                    if seed:
+                        refs = [seed]
+                        prompt = ("Reference image 1 is this character's existing portrait: keep exactly that face, "
+                                  "hair and skin tone.\n" + prompt)
+                else:
+                    refs = [anchor]
+                    if view == "expressions" and face:
+                        refs.append(face)
+                    prompt = ident.view_prompt(view, ch["name"], identity, ch.get("description") or "", style)
+                data, mime, cost = self.ai.image(prompt, refs, "9:16", size)
+                ext = "png" if "png" in mime else "jpg"
+                path = self._save(job, project, "portrait", ext, data, mime, character_id=ch["id"])
+                if view == ident.ANCHOR:
+                    anchor, anchor_path = data, path
+                if view == "face_closeup":
+                    face = data
+                version += 1
+                views[view] = {"path": path, "status": "draft", "anchor": anchor_path, "at": _now()}
+                self._optional_update("studio_characters", {"id": ch["id"]},
+                                      {"reference_views": views, "identity_version": version})
+                # The face picture is what every older step already uses.
+                if view == "face_closeup" or (view == ident.ANCHOR and not ch.get("reference_path")):
+                    self.store.update("studio_characters", {"id": ch["id"]}, {"reference_path": path})
+                    ch["reference_path"] = path
+                if view == "wardrobe":
+                    self._default_outfit(job, project, ch, identity, path)
+                made.append(view)
+                costs.append(cost)
+            except JobFailed:
+                raise
+            except Exception as e:
+                if not made:
+                    raise
+                print(f"[WARN] studio sheet {job['id']} {ch['name']!r} {view}: {str(e)[:160]}")
+                failed.append(view)
+        return {"views": made, "failed": failed}, pricing.combine(costs)
+
+    def _default_outfit(self, job, project, ch, identity, path):
+        try:
+            rows = self.store.select("studio_outfits", {"character_id": ch["id"]})
+            default = next((o for o in rows if o.get("is_default")), None)
+            if default:
+                self.store.update("studio_outfits", {"id": default["id"]}, {"reference_path": path, "updated_at": _now()})
+            else:
+                self.store.insert("studio_outfits", [{
+                    "project_id": project["id"], "owner_id": job["owner_id"], "character_id": ch["id"],
+                    "name": "Main outfit", "description": (identity.get("default_outfit") or "")[:800],
+                    "reference_path": path, "is_default": True, "position": 0}])
+        except Exception as e:
+            self._rollback()
+            print(f"[WARN] studio: default outfit not saved (run creator_studio_identity.sql?): {str(e)[:160]}")
+
+    def _outfit_picture(self, job, project, ch, outfit_id):
+        outfit = self.store.one("studio_outfits", {"id": outfit_id})
+        if not outfit or outfit["character_id"] != ch["id"]:
+            raise JobFailed("not_found", "That outfit no longer exists.")
+        anchor_path = ((ch.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")
+        if not anchor_path:
+            raise JobFailed("needs_front", "Make the character's front view first: outfits are made from it. "
+                                           "Your credits were returned.")
+        prompt = ident.outfit_prompt(ch["name"], ch.get("identity"), ch.get("description") or "",
+                                     project.get("visual_style") or "", outfit["name"], outfit.get("description") or "")
+        data, mime, cost = self.ai.image(prompt, [self.files.get(anchor_path)], "9:16", _size(project))
+        ext = "png" if "png" in mime else "jpg"
+        path = self._save(job, project, "portrait", ext, data, mime, character_id=ch["id"])
+        self.store.update("studio_outfits", {"id": outfit["id"]}, {"reference_path": path, "updated_at": _now()})
+        return {"path": path, "outfit_id": outfit["id"]}, cost
+
+    def _cast_for_scene(self, project, scene, cast):
+        """[(character, outfit)] in this scene, speakers first, with the
+        outfit each one wears (continuity across connected scenes)."""
+        in_scene = characters_in_scene(scene, cast)
+        speakers = [speaker_name(d.get("character") or "").lower() for d in scene.get("dialogue") or []]
+        in_scene.sort(key=lambda c: (c["name"].lower() not in speakers, c.get("position") or 0))
+        outfits = {}
+        try:
+            rows = self.store.select("studio_outfits", {"project_id": project["id"]})
+            if rows:
+                scenes = self.store.select("studio_scenes", {"project_id": project["id"]})
+                outfits = ident.resolve_outfits(scenes, rows, cast, characters_in_scene).get(scene["id"], {})
+        except Exception:
+            self._rollback()     # creator_studio_identity.sql not run yet: no outfits
+        return [(c, outfits.get(c["id"])) for c in in_scene]
+
+    def _reference_files(self, entries, camera, total, per_character=3) -> list:
+        """[(label, bytes)] of the best reference views for this camera angle."""
+        out = []
+        for (c, outfit), n in zip(entries, ident.split_limit(len(entries), total, per_character)):
+            for label, path in ident.references_for(c, camera, outfit, n):
+                try:
+                    out.append((label, self.files.get(path)))
+                except Exception:
+                    pass
+        return out
+
     def do_image(self, job, project):
         scene = self._scene(job, project)
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
-        in_scene = characters_in_scene(scene, cast)
-        refs = []
-        for c in in_scene:
-            if c.get("reference_path"):
-                try:
-                    refs.append(self.files.get(c["reference_path"]))
-                except Exception:
-                    pass
-        notes = " ".join(f"{c['name']}: {c['description']}." for c in in_scene)
-        prompt = ai_mod.image_prompt(scene["visual"] or scene["heading"], project["visual_style"],
-                                     project["aspect_ratio"], notes)
-        data, mime, cost = self.ai.image(prompt, refs[:4], project["aspect_ratio"], _size(project))
+        entries = self._cast_for_scene(project, scene, cast)
+        camera = ident.scene_camera(scene)
+        labelled = self._reference_files(entries, camera, IMAGE_REFS)
+        refs = [data for _label, data in labelled]
+        roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
+        prompt = ident.scene_prompt(scene["visual"] or scene["heading"], entries, camera, project["visual_style"],
+                                    project["aspect_ratio"], extra=(roles + "\n") if roles else "")
+        prompt += "\nNo text, captions, logos or watermarks in the image."
+        data, mime, cost = self.ai.image(prompt, refs[:IMAGE_REFS], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
         self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
@@ -424,8 +612,11 @@ class StudioWorker:
             except Exception:
                 frame = None
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
-        in_scene = characters_in_scene(scene, cast)
-        notes = " ".join(f"{c['name']}: {c['description']}." for c in in_scene)
+        entries = self._cast_for_scene(project, scene, cast)
+        camera = ident.scene_camera(scene)
+        block = ident.cast_block(entries)
+        notes = (f"Characters (permanent identity: never change their face, hair, skin, height or build):\n{block}\n"
+                 if block else "")
         lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
         style = f"Style: {project['visual_style'] or 'cinematic'}. "
         references = None
@@ -440,7 +631,7 @@ class StudioWorker:
             prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
                       f"{talking_direction(lines, cast, project)} "
                       "No subtitles, captions, text or watermarks. Do not add music.")
-            references = self._references(scene, in_scene, frame)
+            references = self._references(scene, entries, frame, camera)
         else:
             has_lines = bool(lines)
             # Saved voices speak this scene: the video model must not talk,
@@ -458,6 +649,10 @@ class StudioWorker:
                     raise JobFailed("too_long", "This scene has too much dialogue for one video clip (15 seconds at "
                                                 "most). Split it into two scenes. Your credits were returned.")
                 seconds = pricing.video_seconds_for(need)
+        if references is None and frame is None and entries:
+            # No scene picture to start from: the characters' reference views
+            # keep them the same person.
+            references = self._references(scene, entries, None, camera) or None
         data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
             else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
@@ -467,21 +662,16 @@ class StudioWorker:
             self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
         return {"path": path}, cost
 
-    def _references(self, scene, in_scene, frame) -> list:
-        """Labelled images for Omni: the scene picture (setting and framing)
-        and up to 2 speaking characters' portraits (Google: 3 per character,
-        2 characters, 6 images at most)."""
+    def _references(self, scene, entries, frame, camera="front") -> list:
+        """Labelled images for Omni (6 at most; Google: 3 per character, 2
+        characters): the scene picture (setting and framing), then each of
+        the first two characters' reference views for this camera angle,
+        speakers first, and their outfit for this scene."""
         refs = []
         if frame:
             refs.append(("the scene: its setting, lighting and framing (not a character)", frame))
-        speakers = [speaker_name(d.get("character") or "").lower() for d in scene.get("dialogue") or []]
-        ordered = sorted(in_scene, key=lambda c: (c["name"].lower() not in speakers, c.get("position") or 0))
-        for c in ordered[:2]:
-            if c.get("reference_path"):
-                try:
-                    refs.append((f"{c['name']} (keep this exact face, hair and clothes)", self.files.get(c["reference_path"])))
-                except Exception:
-                    pass
+        room = VIDEO_REFS - len(refs)
+        refs += self._reference_files(entries[:2], camera, min(room, 3 * len(entries[:2])))
         return refs
 
     def do_lipsync(self, job, project):
@@ -585,6 +775,10 @@ class StudioWorker:
         if not scene or scene["project_id"] != project["id"]:
             raise JobFailed("not_found", "That scene no longer exists.")
         return scene
+
+
+IMAGE_REFS = 4   # reference pictures sent with a scene picture
+VIDEO_REFS = 6   # Omni's limit
 
 
 def _size(project: dict) -> str:

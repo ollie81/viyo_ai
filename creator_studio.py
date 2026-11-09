@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 import studio_ai
 import studio_casting
+import studio_identity as ident
 import studio_lipsync
 import studio_sfx
 import studio_pricing as pricing
@@ -226,6 +227,10 @@ class ScenePatch(BaseModel):
     mode: Optional[Literal["still", "video"]] = None
     sfx: Optional[list[str]] = Field(None, max_length=4)
     speech: Optional[Literal["video_model", "saved_voice", "lipsync"]] = None
+    # Which outfit each character wears here ({character id: outfit id};
+    # empty = keep the outfit from the scene before), and the camera framing.
+    outfits: Optional[dict[str, str]] = None
+    camera: Optional[Literal["auto", "close_up", "front", "side", "back", "full_body", "wide"]] = None
 
 
 def _clean_sfx(items: list[str]) -> list[str]:
@@ -243,6 +248,9 @@ class JobRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     request_id: str = Field(..., min_length=8, max_length=80)
+    # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
+    views: list[str] = Field(default_factory=list, max_length=7)
+    outfit_id: Optional[str] = None
     # A new scene list for a project that already has scenes must be
     # confirmed: unchanged scenes keep their work, changed ones are set
     # aside (never deleted).
@@ -252,6 +260,23 @@ class JobRequest(BaseModel):
 class EstimateRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
+    views: list[str] = Field(default_factory=list, max_length=7)
+    outfit_id: Optional[str] = None
+
+
+class IdentityPatch(BaseModel):
+    # {"basic": {...}, "face": {...}, "body": {...}, "default_outfit": "..."}; empty value clears a field.
+    identity: dict
+
+
+class OutfitIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60)
+    description: str = Field("", max_length=800)
+
+
+class OutfitPatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=60)
+    description: Optional[str] = Field(None, max_length=800)
 
 
 class AssistantGenerateIn(BaseModel):
@@ -278,7 +303,7 @@ class GrantIn(BaseModel):
 
 # ---------------------------------------------------------------- serialisers
 
-def _character_out(c: dict, urls: dict) -> dict:
+def _character_out(c: dict, urls: dict, outfits: Optional[list] = None) -> dict:
     return {"id": c["id"], "name": c["name"], "description": c["description"], "voice": c["voice"],
             "voice_provider": c.get("voice_provider") or "google", "voice_style": c.get("voice_style") or "",
             "voice_language": c.get("voice_language"), "voice_locked": bool(c.get("voice_locked_at")),
@@ -288,7 +313,43 @@ def _character_out(c: dict, urls: dict) -> dict:
             "gender_presentation": c.get("gender_presentation"), "voice_category": c.get("voice_category"),
             "voice_description": c.get("voice_description") or "", "voice_status": c.get("voice_status") or
             ("cast" if c.get("voice") else "needs_voice"),
-            "portrait_url": urls.get(c.get("reference_path") or ""), "position": c.get("position", 0)}
+            "portrait_url": urls.get(c.get("reference_path") or ""), "position": c.get("position", 0),
+            **_identity_out(c, urls, outfits)}
+
+
+def _identity_out(c: dict, urls: dict, outfits: Optional[list] = None) -> dict:
+    views = c.get("reference_views") or {}
+    status = ident.sheet_status(views)
+    return {
+        "identity": c.get("identity") or {}, "identity_locked": bool(c.get("identity_locked_at")),
+        "identity_locked_at": c.get("identity_locked_at"), "identity_version": int(c.get("identity_version") or 0),
+        "reference_views": [{"view": v, "label": ident.VIEW_LABEL[v], "status": status[v],
+                             "url": urls.get((views.get(v) or {}).get("path") or "")} for v in ident.VIEWS],
+        "lock_problem": ident.ready_to_lock(views),
+        "outfits": [_outfit_out(o, urls) for o in sorted(outfits or [], key=lambda o: (not o.get("is_default"),
+                                                                                       o.get("position") or 0))],
+    }
+
+
+def _outfit_out(o: dict, urls: dict) -> dict:
+    return {"id": o["id"], "character_id": o["character_id"], "name": o["name"], "description": o.get("description") or "",
+            "is_default": bool(o.get("is_default")), "image_url": urls.get(o.get("reference_path") or ""),
+            "has_image": bool(o.get("reference_path"))}
+
+
+def _identity_paths(c: dict) -> list:
+    return [c.get("reference_path")] + [(e or {}).get("path") for e in (c.get("reference_views") or {}).values()]
+
+
+def _outfits(project_id: str) -> list:
+    """Outfit rows (none before creator_studio_identity.sql is run)."""
+    st = get_store()
+    try:
+        return st.select("studio_outfits", {"project_id": project_id})
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        return []
 
 
 # Columns added by creator_studio_casting.sql and creator_studio_voices.sql.
@@ -355,7 +416,9 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "has_audio": bool(s.get("audio_path")), "sfx": s.get("sfx") or [],
             "voice_outdated": _outdated_voices(s, cast),
             "speech": _speech(s, project), "speech_setting": s.get("speech"),
-            "lipsync_url": urls.get(s.get("lipsync_path") or ""), "has_lipsync": bool(s.get("lipsync_path"))}
+            "lipsync_url": urls.get(s.get("lipsync_path") or ""), "has_lipsync": bool(s.get("lipsync_path")),
+            "outfits": s.get("outfits") or {}, "camera": s.get("camera") or "auto",
+            "camera_used": ident.scene_camera(s)}
 
 
 def _speech(s: dict, project: Optional[dict]) -> str:
@@ -693,9 +756,20 @@ async def next_episode(project_id: str, user_id: str = Depends(creator)):
                 copy[k] = c.get(k)
         if "identity_id" in c:
             copy["identity_id"] = c.get("identity_id") or c["id"]
+        # The approved look comes along: identity, reference sheet, lock.
+        for k in ("identity", "reference_views", "identity_locked_at", "identity_version"):
+            if k in c:
+                copy[k] = c.get(k)
         copies.append(copy)
     if copies:
-        st.insert("studio_characters", copies)
+        made = {r["name"]: r["id"] for r in st.insert("studio_characters", copies)}
+        old = {c["id"]: c["name"] for c in cast}
+        outfits = [{"project_id": new["id"], "owner_id": user_id, "character_id": made[old[o["character_id"]]],
+                    "name": o["name"], "description": o.get("description") or "", "reference_path": o.get("reference_path"),
+                    "is_default": bool(o.get("is_default")), "position": o.get("position") or 0}
+                   for o in _outfits(src["id"]) if old.get(o["character_id"]) in made]
+        if outfits:
+            st.insert("studio_outfits", outfits)
     return _project_out(new)
 
 
@@ -707,9 +781,11 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
     renders = st.select("studio_renders", {"project_id": p["id"]}, order="version", desc=True, limit=20)
     jobs = st.select("studio_jobs", {"project_id": p["id"]}, order="created_at", desc=True, limit=60)
-    urls = _sign([c.get("reference_path") for c in chars] +
+    outfits = _outfits(p["id"])
+    urls = _sign([x for c in chars for x in _identity_paths(c)] + [o.get("reference_path") for o in outfits] +
                  [s.get(k) for s in scenes for k in ("image_path", "video_path", "audio_path")])
-    return {"project": _project_out(p), "characters": [_character_out(c, urls) for c in chars],
+    return {"project": _project_out(p),
+            "characters": [_character_out(c, urls, [o for o in outfits if o["character_id"] == c["id"]]) for c in chars],
             "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p) for s in scenes],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
@@ -896,7 +972,8 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
                     st.update("studio_characters", {"id": g["id"]}, same)
                 except Exception as e:
                     print(f"[WARN] studio: series voice sync failed for {g['id']}: {str(e)[:120]}")
-    out = _character_out(c, _sign([c.get("reference_path")]))
+    outfits = [o for o in _outfits(c["project_id"]) if o["character_id"] == c["id"]]
+    out = _character_out(c, _sign(_identity_paths(c) + [o.get("reference_path") for o in outfits]), outfits)
     if changes_voice:
         hist = {"character_id": c["id"], "project_id": c["project_id"], "owner_id": user_id,
                 "old_voice": before["voice"], "new_voice": c.get("voice") or "",
@@ -918,6 +995,147 @@ async def update_character(character_id: str, body: CharacterPatch, user_id: str
             out["age_warning"] = (f"{c['name']} is a {studio_casting.AGE_LABEL[cat]}, and {voice.voice_id} hasn't been "
                                   "checked as suitable for that age.")
     return out
+
+
+# ------------------------------------------------- character consistency
+
+def _save_identity_fields(c: dict, fields: dict) -> dict:
+    st = get_store()
+    try:
+        return st.update("studio_characters", {"id": c["id"]}, fields)[0]
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        raise HTTPException(status_code=503, detail="Character identities aren't ready yet. Run creator_studio_identity.sql.")
+
+
+def _identity_response(c: dict) -> dict:
+    outfits = [o for o in _outfits(c["project_id"]) if o["character_id"] == c["id"]]
+    return _character_out(c, _sign(_identity_paths(c) + [o.get("reference_path") for o in outfits]), outfits)
+
+
+def _unlocked(c: dict) -> None:
+    if c.get("identity_locked_at"):
+        raise HTTPException(status_code=409, detail={"code": "identity_locked",
+                                                     "message": f"{c['name']}'s identity is locked. Unlock it to change it."})
+
+
+@router.patch("/characters/{character_id}/identity")
+async def update_identity(character_id: str, body: IdentityPatch, user_id: str = Depends(creator)):
+    """The creator edits the permanent identity (only while it is unlocked)."""
+    c = _owned("studio_characters", character_id, user_id)
+    _unlocked(c)
+    identity = ident.merge_identity(c.get("identity") or {}, body.identity)
+    c = _save_identity_fields(c, {"identity": identity, "identity_version": int(c.get("identity_version") or 0) + 1})
+    _touch(c["project_id"])
+    return _identity_response(c)
+
+
+@router.post("/characters/{character_id}/views/{view}/approve")
+async def approve_view(character_id: str, view: str, user_id: str = Depends(creator)):
+    c = _owned("studio_characters", character_id, user_id)
+    if view not in ident.VIEWS:
+        raise HTTPException(status_code=404, detail="Unknown view.")
+    _unlocked(c)
+    views = dict(c.get("reference_views") or {})
+    if not (views.get(view) or {}).get("path"):
+        raise HTTPException(status_code=409, detail="Make this view first.")
+    views[view] = dict(views[view], status="approved")
+    return _identity_response(_save_identity_fields(c, {"reference_views": views}))
+
+
+@router.post("/characters/{character_id}/identity/lock")
+async def lock_identity(character_id: str, user_id: str = Depends(creator)):
+    """Approve every finished view and lock the identity: from now on every
+    scene uses exactly this person, and nothing changes it until unlocked."""
+    c = _owned("studio_characters", character_id, user_id)
+    views = dict(c.get("reference_views") or {})
+    problem = ident.ready_to_lock(views)
+    if problem:
+        raise HTTPException(status_code=409, detail={"code": "not_ready", "message": problem})
+    for v, e in views.items():
+        if (e or {}).get("path"):
+            views[v] = dict(e, status="approved")
+    c = _save_identity_fields(c, {"reference_views": views, "identity_locked_at": _now_iso()})
+    return _identity_response(c)
+
+
+@router.post("/characters/{character_id}/identity/unlock")
+async def unlock_identity(character_id: str, user_id: str = Depends(creator)):
+    c = _owned("studio_characters", character_id, user_id)
+    return _identity_response(_save_identity_fields(c, {"identity_locked_at": None}))
+
+
+@router.post("/characters/{character_id}/outfits")
+async def add_outfit(character_id: str, body: OutfitIn, user_id: str = Depends(creator)):
+    c = _owned("studio_characters", character_id, user_id)
+    st = get_store()
+    existing = [o for o in _outfits(c["project_id"]) if o["character_id"] == c["id"]]
+    if len(existing) >= 12:
+        raise HTTPException(status_code=400, detail="A character can have up to 12 outfits.")
+    try:
+        st.insert("studio_outfits", [{"project_id": c["project_id"], "owner_id": user_id, "character_id": c["id"],
+                                      "name": body.name.strip(), "description": body.description.strip(),
+                                      "is_default": not existing, "position": len(existing)}])
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        raise HTTPException(status_code=503, detail="Outfits aren't ready yet. Run creator_studio_identity.sql.")
+    _touch(c["project_id"])
+    return _identity_response(c)
+
+
+def _owned_outfit(outfit_id: str, user_id: str) -> dict:
+    st = get_store()
+    try:
+        o = st.one("studio_outfits", {"id": _uuid(outfit_id)})
+    except HTTPException:
+        raise
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        o = None
+    if not o or o["owner_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return o
+
+
+@router.patch("/outfits/{outfit_id}")
+async def update_outfit(outfit_id: str, body: OutfitPatch, user_id: str = Depends(creator)):
+    o = _owned_outfit(outfit_id, user_id)
+    fields = {k: v.strip() for k, v in body.model_dump(exclude_none=True).items()}
+    if fields:
+        get_store().update("studio_outfits", {"id": o["id"]}, {**fields, "updated_at": _now_iso()})
+    return _identity_response(get_store().one("studio_characters", {"id": o["character_id"]}))
+
+
+@router.delete("/outfits/{outfit_id}")
+async def delete_outfit(outfit_id: str, user_id: str = Depends(creator)):
+    o = _owned_outfit(outfit_id, user_id)
+    if o.get("is_default"):
+        raise HTTPException(status_code=409, detail="The main outfit can't be removed. Edit it instead.")
+    st = get_store()
+    st.delete("studio_outfits", {"id": o["id"]})
+    # Scenes that chose it fall back to the outfit from the scene before.
+    for s in st.select("studio_scenes", {"project_id": o["project_id"]}):
+        choice = dict(s.get("outfits") or {})
+        if choice.get(o["character_id"]) == o["id"]:
+            choice.pop(o["character_id"])
+            st.update("studio_scenes", {"id": s["id"]}, {"outfits": choice})
+    return _identity_response(st.one("studio_characters", {"id": o["character_id"]}))
+
+
+def _clean_outfit_choice(scene: dict, choice: dict) -> dict:
+    outfits = {o["id"]: o for o in _outfits(scene["project_id"])}
+    clean = {}
+    for cid, oid in (choice or {}).items():
+        if not oid:
+            continue
+        o = outfits.get(oid)
+        if not o or o["character_id"] != cid:
+            raise HTTPException(status_code=400, detail="That outfit doesn't belong to that character.")
+        clean[cid] = oid
+    return clean
 
 
 @router.delete("/characters/{character_id}")
@@ -957,6 +1175,8 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
         raise HTTPException(status_code=400, detail="Lip sync isn't switched on yet.")
     if "sfx" in fields:
         fields["sfx"] = _clean_sfx(fields["sfx"])
+    if "outfits" in fields:
+        fields["outfits"] = _clean_outfit_choice(s, fields["outfits"])
     if "dialogue" in fields:
         fields["dialogue"] = [l.model_dump() for l in body.dialogue]
         # New lines need a new voice track; the old file stays in the asset history.
@@ -1016,7 +1236,8 @@ def _targets(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
     return sorted(rows, key=lambda r: r.get("position") or 0)
 
 
-def _price(kind: str, p: dict, target: dict, cast: list[dict]) -> tuple[pricing.Cost, Optional[str]]:
+def _price(kind: str, p: dict, target: dict, cast: list[dict],
+           opts: Optional[dict] = None) -> tuple[pricing.Cost, Optional[str]]:
     """(cost, reason it can't be made yet)."""
     if kind == "script":
         return pricing.estimate_script(p["target_seconds"], len(p["title"]) + len(p["logline"])), \
@@ -1025,6 +1246,23 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict]) -> tuple[pricing.
         return pricing.estimate_breakdown(len(p["script"]), p["target_seconds"]), \
             (None if p["script"].strip() else "Write or paste a script first.")
     size = "2K" if p.get("image_quality") == "high" else "1K"
+    if kind == "portrait" and (opts or {}).get("outfit_id"):
+        views = target.get("reference_views") or {}
+        if target.get("id") != (opts or {}).get("outfit_character"):
+            return pricing.image_cost(1, 400, size), "That outfit belongs to another character."
+        return pricing.image_cost(1, 400 + pricing.SHEET_REF_TOKENS, size), \
+            (None if (views.get(ident.ANCHOR) or {}).get("path") else "Make the front view first.")
+    if kind == "portrait" and (opts or {}).get("views"):
+        order = ident.view_order(opts["views"])
+        if not order:
+            return pricing.image_cost(1, 400, size), "Choose which views to make."
+        cost = pricing.estimate_sheet(len(order), size, not ident.has_identity(target.get("identity")))
+        if target.get("identity_locked_at"):
+            return cost, f"{target['name']}'s identity is locked. Unlock it first."
+        has_front = ((target.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")
+        if ident.ANCHOR not in order and not has_front:
+            return cost, "Make the front view first: every other view is made from it."
+        return cost, None
     if kind == "portrait":
         return pricing.image_cost(1, 400, size), (None if target["description"].strip() else "Describe this character first.")
     if kind == "image":
@@ -1112,11 +1350,21 @@ def _voice_problem(scene: dict, cast: list[dict]) -> Optional[str]:
     return None
 
 
-def _quote(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
+def _portrait_opts(views: list[str], outfit_id: Optional[str], user_id: str) -> dict:
+    if outfit_id:
+        o = _owned_outfit(outfit_id, user_id)
+        return {"outfit_id": o["id"], "outfit_character": o["character_id"]}
+    bad = [v for v in views if v not in ident.VIEWS]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown view: {bad[0]}.")
+    return {"views": ident.view_order(views)} if views else {}
+
+
+def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = None) -> list[dict]:
     cast = get_store().select("studio_characters", {"project_id": p["id"]}) if kind in ("image", "voice") else []
     items = []
     for t in _targets(kind, p, target_ids):
-        cost, reason = _price(kind, p, t, cast)
+        cost, reason = _price(kind, p, t, cast, opts)
         items.append({"target_id": None if kind in ("script", "breakdown", "render") else t["id"],
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
                       "blocked": reason})
@@ -1126,7 +1374,8 @@ def _quote(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
 @router.post("/projects/{project_id}/estimate")
 async def estimate(project_id: str, body: EstimateRequest, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
-    items = _quote(body.kind, p, body.target_ids)
+    opts = _portrait_opts(body.views, body.outfit_id, user_id) if body.kind == "portrait" else None
+    items = _quote(body.kind, p, body.target_ids, opts)
     ready = [i for i in items if not i["blocked"]]
     return {"kind": body.kind, "items": items, "total_credits": sum(i["credits"] for i in ready),
             "ready_count": len(ready), "balance": _balance(user_id),
@@ -1160,14 +1409,16 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
                             "hasn't changed, with its pictures and voice. Scenes that change are replaced, and the "
                             "old versions are saved, not deleted.")})
     created, problems = [], []
-    for item in _quote(body.kind, p, body.target_ids):
+    opts = _portrait_opts(body.views, body.outfit_id, user_id) if body.kind == "portrait" else None
+    job_input = {k: v for k, v in (opts or {}).items() if k in ("views", "outfit_id")}
+    for item in _quote(body.kind, p, body.target_ids, opts):
         if item["blocked"]:
             problems.append({"target_id": item["target_id"], "error": item["blocked"]})
             continue
         key = f"{user_id}:{body.request_id}:{body.kind}:{item['target_id'] or p['id']}"
         r = st.rpc("studio_create_job", {
             "p_owner": user_id, "p_project": p["id"], "p_kind": body.kind, "p_lane": LANE.get(body.kind, "generation"),
-            "p_key": key, "p_credits": item["credits"], "p_input": {},
+            "p_key": key, "p_credits": item["credits"], "p_input": job_input,
             "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync") else None,
             "p_character": item["target_id"] if body.kind == "portrait" else None, "p_max_open": 30})
         if r and r.get("ok"):
