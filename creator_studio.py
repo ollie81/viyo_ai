@@ -254,6 +254,8 @@ class JobRequest(BaseModel):
     # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
+    # Cover jobs only: the creator's idea for the poster (optional).
+    cover_note: Optional[str] = Field(None, max_length=300)
     # A new scene list for a project that already has scenes must be
     # confirmed: unchanged scenes keep their work, changed ones are set
     # aside (never deleted).
@@ -265,6 +267,8 @@ class EstimateRequest(BaseModel):
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
+    # Cover jobs only: the creator's idea for the poster (optional).
+    cover_note: Optional[str] = Field(None, max_length=300)
 
 
 class IdentityPatch(BaseModel):
@@ -508,7 +512,8 @@ def _job_out(j: dict) -> dict:
 def _render_out(r: dict) -> dict:
     return {"id": r["id"], "version": r["version"], "aspect_ratio": r["aspect_ratio"], "width": r.get("width"),
             "height": r.get("height"), "duration_seconds": float(r.get("duration_seconds") or 0),
-            "bytes": r.get("bytes"), "created_at": r.get("created_at")}
+            "bytes": r.get("bytes"), "created_at": r.get("created_at"),
+            "post_id": r.get("post_id"), "published_at": r.get("published_at")}
 
 
 def _project_out(p: dict) -> dict:
@@ -866,13 +871,40 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
                  for c in chars} if p.get("series_id") else {}
     urls.update(_sign([o.get("reference_path") for lib in libraries.values() for o in lib]))
     project_out = _project_out(p)
-    project_out["cover_url"] = _sign([p.get("cover_path")]).get(p.get("cover_path") or "") if p.get("cover_path") else None
+    covers = _covers(p)
+    curls = _sign([c["path"] for c in covers])
+    project_out["cover_url"] = curls.get(p.get("cover_path") or "") or (
+        _sign([p.get("cover_path")]).get(p.get("cover_path") or "") if p.get("cover_path") else None)
+    project_out["covers"] = [{"id": c["id"], "url": curls.get(c["path"]), "is_main": c["path"] == p.get("cover_path"),
+                              "created_at": c.get("created_at")} for c in covers]
     return {"project": project_out,
             "characters": [_character_out(c, urls, [o for o in outfits if o["character_id"] == c["id"]],
                                           libraries.get(c["id"])) for c in chars],
             "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {})) for s in scenes],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id)}
+
+
+def _covers(p: dict) -> list:
+    """Every cover made for this production, newest first (all are kept)."""
+    rows = get_store().select("studio_assets", {"project_id": p["id"], "kind": "image"})
+    return sorted([r for r in rows if not r.get("scene_id") and r["owner_id"] == p["owner_id"]],
+                  key=lambda r: r.get("created_at") or "", reverse=True)
+
+
+class CoverPick(BaseModel):
+    cover_id: str
+
+
+@router.post("/projects/{project_id}/cover")
+async def choose_cover(project_id: str, body: CoverPick, user_id: str = Depends(creator)):
+    """Make one of this production's covers the main one."""
+    p = _project(project_id, user_id)
+    cover = next((c for c in _covers(p) if c["id"] == _uuid(body.cover_id)), None)
+    if not cover:
+        raise HTTPException(status_code=404, detail="Not found.")
+    get_store().update("studio_projects", {"id": p["id"]}, {"cover_path": cover["path"], "updated_at": _now_iso()})
+    return {"ok": True, "cover_id": cover["id"]}
 
 
 @router.get("/projects/{project_id}/assistant")
@@ -1394,7 +1426,8 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
     if kind == "cover":
         from studio_worker import COVER_REFS
         size = "2K" if p.get("image_quality") == "high" else "1K"
-        return pricing.image_cost(1, 600 + pricing.SHEET_REF_TOKENS * COVER_REFS, size), \
+        return pricing.combine([pricing.text_cost(1800, pricing.THINKING_BUDGET + 400),
+                                pricing.image_cost(1, 900 + pricing.SHEET_REF_TOKENS * COVER_REFS, size)]), \
             (None if (p.get("title") or "").strip() else "Give the production a title first.")
     if kind == "outfits":
         n = len(get_store().select("studio_characters", {"project_id": p["id"]}))
@@ -1569,6 +1602,8 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
     created, problems = [], []
     opts = _portrait_opts(body.views, body.outfit_id, user_id) if body.kind == "portrait" else None
     job_input = {k: v for k, v in (opts or {}).items() if k in ("views", "outfit_id")}
+    if body.kind == "cover" and (body.cover_note or "").strip():
+        job_input = {"note": body.cover_note.strip()}
     for item in _quote(body.kind, p, body.target_ids, opts):
         if item["blocked"]:
             problems.append({"target_id": item["target_id"], "error": item["blocked"]})
@@ -1695,6 +1730,111 @@ async def download_render(render_id: str, user_id: str = Depends(creator)):
         raise HTTPException(status_code=502, detail="Couldn't prepare the download. Try again.")
     return {"url": url, "file_name": name, "expires_at": int(time.time()) + SIGN_SECONDS,
             "width": r.get("width"), "height": r.get("height")}
+
+
+# ---------------------------------------------------------------- publish
+
+_publisher = None
+
+
+def get_publisher():
+    global _publisher
+    if _publisher is None:
+        import studio_publish
+        _publisher = studio_publish.Publisher()
+    return _publisher
+
+
+class PublishIn(BaseModel):
+    # 0 = free to watch. Otherwise the coin price per episode (the usual
+    # first-episodes-free rule of Viyo Dramas applies to paid series).
+    coin_price: int = Field(0, ge=0, le=500)
+    caption: str = Field("", max_length=500)
+    confirm: bool = False
+
+
+def _viyo_series_for(p: dict) -> Optional[str]:
+    """This production's Viyo drama: its own, or one an earlier episode of the
+    same Studio series was published into."""
+    if p.get("viyo_series_id"):
+        return p["viyo_series_id"]
+    if p.get("series_id"):
+        for e in get_store().select("studio_projects", {"series_id": p["series_id"], "owner_id": p["owner_id"]}):
+            if e.get("viyo_series_id"):
+                return e["viyo_series_id"]
+    return None
+
+
+@router.post("/renders/{render_id}/publish")
+async def publish_render(render_id: str, body: PublishIn, user_id: str = Depends(creator)):
+    """Posts a finished film to Viyo under the creator's account: an episode
+    of their Viyo drama (made on first publish), live at once, on the
+    drama's page and in the feed. The main cover is the drama's poster."""
+    import studio_publish
+    r = _owned("studio_renders", render_id, user_id)
+    if "post_id" not in r:
+        raise HTTPException(status_code=503, detail="Publishing isn't ready yet. Run creator_studio_publish.sql.")
+    if r.get("post_id"):
+        raise HTTPException(status_code=409, detail="This version is already published.")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Confirm that you want to publish this to Viyo.")
+    p = _project(r["project_id"], user_id)
+    pub = get_publisher()
+    files = get_files()
+    # The video: already in Bunny, or uploaded there now.
+    video_id = r.get("bunny_video_id")
+    if not video_id:
+        if not r.get("path"):
+            raise HTTPException(status_code=409, detail="This render has no video file. Render it again.")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "film.mp4")
+            with open(local, "wb") as f:
+                f.write(files.get(r["path"]))
+            try:
+                video_id = pub.bunny_upload(local, p["title"] or "Viyo")
+            except Exception as e:
+                print(f"[ERROR] studio publish {render_id}: video upload failed: {str(e)[:200]}")
+                raise HTTPException(status_code=502, detail="The video couldn't be uploaded. Try again in a minute.")
+    # The main cover becomes a public poster.
+    cover_url = None
+    if p.get("cover_path"):
+        try:
+            cover_url = pub.public_image(files.get(p["cover_path"]), "image/png", user_id)
+        except Exception as e:
+            print(f"[WARN] studio publish {render_id}: cover not published: {str(e)[:160]}")
+    series_id = _viyo_series_for(p)
+    series = pub.series(series_id) if series_id else None
+    if series and series.get("user_id") != user_id:
+        series = None
+    if series is None:
+        series = pub.create_series({
+            "user_id": user_id, "title": (p["title"] or "Untitled")[:120], "description": (p.get("logline") or "")[:2000],
+            "cover_image_url": cover_url, "genre": p.get("genre") or "Drama",
+            "coin_price_per_episode": body.coin_price or 30,
+            "content_type": studio_publish.content_type_for(p.get("kind")),
+            "orientation": studio_publish.orientation_for(p.get("aspect_ratio")),
+        })
+    elif cover_url:
+        pub.update_series(series["id"], {"cover_image_url": cover_url})
+    if body.coin_price and series.get("coin_price_per_episode") != body.coin_price:
+        pub.update_series(series["id"], {"coin_price_per_episode": body.coin_price})
+    episode = pub.last_episode(series["id"]) + 1
+    row = {"user_id": user_id, "post_type": "video",
+           "caption": body.caption.strip() or f"{series['title']} - Episode {episode}",
+           "media_url": pub.bunny_playback(video_id), "thumbnail_url": cover_url,
+           "duration_seconds": int(float(r.get("duration_seconds") or 0)) or None, "is_private": False,
+           "series_id": series["id"], "episode_number": episode,
+           "video_provider": "bunny", "bunny_video_id": video_id, "video_status": "processing"}
+    if body.coin_price == 0:
+        row["is_free"] = True
+    post = pub.insert_post(row)
+    st = get_store()
+    st.update("studio_renders", {"id": r["id"]}, {"post_id": post["id"], "published_at": _now_iso()})
+    st.update("studio_projects", {"id": p["id"]}, {"viyo_series_id": series["id"], "updated_at": _now_iso()})
+    pub.after_post(post, user_id, series["id"], episode)
+    return {"post_id": post["id"], "series_id": series["id"], "episode_number": episode, "cover_url": cover_url,
+            "free": body.coin_price == 0}
 
 
 def bunny_info(video_id: str) -> dict:

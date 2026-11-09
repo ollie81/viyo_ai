@@ -546,28 +546,54 @@ class StudioWorker:
         return {"suggested": len(rows)}, cost
 
     def do_cover(self, job, project):
-        """The production's cover: AI poster art of the main characters (made
-        from their reference pictures, so they look like themselves) with the
-        title lettered in, then the real Viyo mark added in a corner."""
+        """A cover: an art-director step reads the story and decides what the
+        poster shows (any number of characters, or none); the poster is then
+        painted to that plan, the chosen characters drawn from their reference
+        pictures, with the title lettered in. The real Viyo mark is added in a
+        corner afterwards. Every cover is kept; the first becomes the main one."""
         import viyo_brand
+        inp = job.get("input") or {}
+        if isinstance(inp, str):
+            inp = json.loads(inp or "{}")
+        note = (inp.get("note") or "").strip()[:300]
         cast = sorted(self.store.select("studio_characters", {"project_id": project["id"]}),
                       key=lambda c: (c.get("position") or 0))
         bible = {c.get("name", "").lower(): c for c in (project.get("story_bible") or {}).get("characters") or []}
         cast.sort(key=lambda c: {"lead": 0, "supporting": 1}.get((bible.get(c["name"].lower()) or {}).get("role"), 2))
-        main = cast[:2]
-        labelled = self._reference_files([(c, None) for c in main], "front", COVER_REFS, per_character=2)
-        prompt = viyo_brand.cover_prompt(project, main, [label for label, _d in labelled], ident.identity_text)
+        costs, concept = [], {}
+        make = getattr(self.ai, "cover_concept", None)
+        if make is not None:
+            try:
+                concept, c0 = make(viyo_brand.concept_prompt(project, cast, note))
+                costs.append(c0)
+            except Exception as e:
+                print(f"[WARN] studio cover {job['id']}: no concept, using the leads: {str(e)[:120]}")
+        by_name = {c["name"].strip().lower(): c for c in cast}
+        if concept:
+            chosen = [by_name[n.strip().lower()] for n in concept.get("characters") or [] if n.strip().lower() in by_name]
+        else:
+            chosen = cast[:2]
+        chosen = list(dict.fromkeys(c["id"] for c in chosen))
+        chosen = [next(c for c in cast if c["id"] == i) for i in chosen][:6]
+        per = 2 if len(chosen) <= 2 else 1
+        labelled = self._reference_files([(c, None) for c in chosen[:COVER_REFS]], "front", COVER_REFS, per_character=per)
+        prompt = viyo_brand.cover_prompt(project, chosen, [label for label, _d in labelled], ident.identity_text,
+                                         concept, note)
         data, mime, cost = self.ai.image(prompt, [d for _l, d in labelled], "3:4", _size(project))
+        costs.append(cost)
+        total = pricing.combine(costs)
         stamped = viyo_brand.stamp(data)
         path = self._save(job, project, "image", "png", stamped, "image/png")
-        try:
-            self.store.update("studio_projects", {"id": project["id"]}, {"cover_path": path, "updated_at": _now()})
-        except Exception as e:
-            self._rollback()
-            print(f"[ERROR] studio cover {job['id']}: run creator_studio_cover.sql: {str(e)[:160]}")
-            raise JobFailed("not_ready", "Covers are being set up on Viyo. Please try again later. Your credits were returned.",
-                            absorbed=cost)
-        return {"path": path, "references": [label for label, _d in labelled]}, cost
+        if not project.get("cover_path"):
+            try:
+                self.store.update("studio_projects", {"id": project["id"]}, {"cover_path": path, "updated_at": _now()})
+            except Exception as e:
+                self._rollback()
+                print(f"[ERROR] studio cover {job['id']}: run creator_studio_cover.sql: {str(e)[:160]}")
+                raise JobFailed("not_ready", "Covers are being set up on Viyo. Please try again later. "
+                                             "Your credits were returned.", absorbed=total)
+        return {"path": path, "concept": concept, "characters": [c["name"] for c in chosen],
+                "references": [label for label, _d in labelled]}, total
 
     def _cast_for_scene(self, project, scene, cast):
         """[(character, outfit)] in this scene, speakers first, with the

@@ -275,6 +275,18 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
+    def cover_concept(self, prompt: str):
+        """The art director's poster concept (viyo_brand)."""
+        import viyo_brand
+        resp = self._text(prompt, response_mime_type="application/json",
+                          response_json_schema=viyo_brand.COVER_CONCEPT_SCHEMA)
+        try:
+            data = json.loads(resp.text)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned an unreadable poster concept.")
+        i, o = self._text_usage(resp)
+        return data, pricing.text_cost(i, o)
+
     def suggest_outfits(self, prompt: str):
         """Costume suggestions from the screenplay (studio_identity)."""
         import studio_identity
@@ -450,6 +462,15 @@ class FakeStudioAI:
                 {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running down a wet street",
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
+
+    def cover_concept(self, prompt):
+        self.calls.append(("cover_concept",))
+        self.last_concept_prompt = prompt
+        self._maybe_fail("cover_concept")
+        return getattr(self, "concept_result", None) or {
+            "focus": "characters", "characters": ["Maya", "Daniel"], "composition": "Maya in front, Daniel behind her",
+            "setting": "a rooftop at night in the rain", "colour_and_light": "neon blue and red",
+            "title_style": "sharp silver letters"}, pricing.text_cost(1200, 300)
 
     def suggest_outfits(self, prompt):
         self.calls.append(("outfits",))
