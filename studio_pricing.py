@@ -213,6 +213,38 @@ def estimate_video(seconds: float = 8.0) -> Cost:
     return video_cost(video_seconds_for(seconds), input_tokens=1800)
 
 
+def combine(costs: list[Cost]) -> Cost:
+    """Several provider calls in one job (e.g. a character's reference sheet)."""
+    costs = [c for c in costs if c is not None]
+    if not costs:
+        return Cost("google", IMAGE_MODEL)
+    units: dict = {"calls": len(costs)}
+    for c in costs:
+        for k, v in (c.units or {}).items():
+            if isinstance(v, (int, float)):
+                units[k] = units.get(k, 0) + v
+    return Cost(costs[0].provider, "+".join(sorted({c.model for c in costs})), units,
+                sum(c.provider_cost_usd for c in costs), sum(c.infra_cost_usd for c in costs),
+                sum(c.storage_cost_usd for c in costs))
+
+
+IDENTITY_TOKENS = (900, THINKING_BUDGET + 700)   # the identity profile: one short JSON text call
+SHEET_REF_TOKENS = 1300                          # one reference picture sent with each view
+
+
+def estimate_identity() -> Cost:
+    return text_cost(*IDENTITY_TOKENS)
+
+
+def estimate_sheet(views: int, size: str = "1K", needs_identity: bool = False) -> Cost:
+    """A character's reference views: the front view has no reference, every
+    other view is made from it (one reference picture each)."""
+    parts = [image_cost(1, 400 + SHEET_REF_TOKENS, size) for _ in range(views)]
+    if needs_identity:
+        parts.append(estimate_identity())
+    return combine(parts)
+
+
 def hold_credits(kind: str, cost: Cost) -> int:
     """Credits to hold for a job: text jobs vary, so a margin is held and
     the unused part returned; fixed-price items hold exactly the price."""
