@@ -1028,9 +1028,29 @@ def _size(project: dict) -> str:
 
 
 def characters_in_scene(scene: dict, cast: list[dict]) -> list[dict]:
-    text = " ".join([scene.get("visual") or "", scene.get("heading") or ""] +
-                    [d.get("character") or "" for d in scene.get("dialogue") or []]).lower()
-    return [c for c in cast if c.get("name") and re.search(rf"\b{re.escape(c['name'].lower())}\b", text)]
+    """Who is in the scene: their full name anywhere, or their first name in
+    what we see or among the speakers ("Maya" is Maya Lin). Last names alone
+    don't count, so "VANCE MANOR" doesn't put Julian Vance in every scene."""
+    speakers = " ".join(speaker_name(d.get("character") or "") for d in scene.get("dialogue") or []).lower()
+    visual = (scene.get("visual") or "").lower()
+    text = " ".join([visual, (scene.get("heading") or "").lower(), speakers])
+    firsts = {}
+    for c in cast:
+        first = (c.get("name") or "").strip().split(" ")[0].lower()
+        firsts[first] = firsts.get(first, 0) + 1
+    out = []
+    for c in cast:
+        name = (c.get("name") or "").strip().lower()
+        if not name:
+            continue
+        first = name.split(" ")[0]
+        found = re.search(rf"\b{re.escape(name)}\b", text)
+        # A first name counts only when it's long enough and no one else shares it.
+        if not found and " " in name and len(first) >= 3 and firsts.get(first) == 1:
+            found = re.search(rf"\b{re.escape(first)}\b", visual + " " + speakers)
+        if found:
+            out.append(c)
+    return out
 
 
 # ------------------------------------------------------------ breakdown plan

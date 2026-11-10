@@ -148,6 +148,10 @@ For each scene give: the heading, ONE visual prompt describing a single strong s
 the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over),
 and a duration in seconds (2-12; long enough for its lines).
 Describe every character visually so they can be drawn the same way every time.
+When characters share a moment in the same place (talking face to face, arguing, fighting, hugging, a kiss), show
+them TOGETHER in one shot (a two-shot or over-the-shoulder shot), naming each one and where they stand. Don't turn
+every line into a separate single close-up; mix two-shots, group shots and close-ups like a real film. A character
+who is only heard (on the phone, off-screen) is written as "heard, not in frame".
 For every character give their age group from what the story says (stated age, school year, relationships,
 how others speak to them). If the story doesn't make it clear, say 'unknown' with low confidence rather than guessing.
 For a line whose delivery matters, give a short emotion and, if useful, a short delivery note; leave them empty otherwise.
