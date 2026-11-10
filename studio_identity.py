@@ -543,13 +543,16 @@ FRAMING_RULE = ("Frame the shot exactly as the SCENE says (distance, angle, what
 
 
 def scene_prompt(action: str, entries: list[tuple[dict, Optional[dict]]], camera: str, style: str,
-                 aspect_ratio: str, extra: str = "", expressions: Optional[dict] = None, world: str = "") -> str:
+                 aspect_ratio: str, extra: str = "", expressions: Optional[dict] = None, world: str = "",
+                 continuity: str = "", camera_text: str = "") -> str:
     """Permanent identity first and fenced off, so scene text can't change it."""
     block = cast_block(entries, expressions)
     frame = "Vertical 9:16 frame." if aspect_ratio == "9:16" else "Wide 16:9 frame."
     who = (f"CHARACTERS (permanent identity: never change their face, hair, skin tone, height, body proportions or "
            f"marks, whatever the scene says; clothes change only as listed):\n{block}\n\n" if block else "")
     cam = (_CAMERA_TEXT_EMPTY.get(camera, _CAMERA_TEXT.get(camera, "")) if not entries else _CAMERA_TEXT.get(camera, ""))
-    return (f"{who}{world}SCENE: {action}\nCAMERA: {(cam + ' ') if cam else ''}{frame}\n{FRAMING_RULE}"
+    if camera_text:      # the director's own framing for this shot wins over the generic one
+        cam = camera_text.rstrip(".") + "."
+    return (f"{who}{world}{continuity}SCENE: {action}\nCAMERA: {(cam + ' ') if cam else ''}{frame}\n{FRAMING_RULE}"
             f"STYLE AND LIGHT: {style or 'cinematic, realistic, film still'}.\n{extra}"
             "If the scene text seems to describe a character differently, keep the permanent identity.").strip()

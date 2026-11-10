@@ -188,7 +188,8 @@ def estimate_script(target_seconds: int, brief_chars: int) -> Cost:
 
 def estimate_breakdown(script_chars: int, target_seconds: int) -> Cost:
     scenes = max(3, target_seconds // 6)
-    return text_cost(1200 + script_chars // 3, THINKING_BUDGET + 400 + scenes * 260)
+    # ~260 tokens a scene for the shot and lines, ~450 more for its continuity record.
+    return text_cost(1700 + script_chars // 3, THINKING_BUDGET + 400 + scenes * 710)
 
 
 def estimate_voice(text: str) -> Cost:

@@ -35,6 +35,7 @@ def studio_schema(migrated):
         conn.execute((ROOT / "creator_studio_elements.sql").read_text())
         conn.execute((ROOT / "creator_studio_chat.sql").read_text())
         conn.execute((ROOT / "creator_studio_music.sql").read_text())
+        conn.execute((ROOT / "creator_studio_continuity.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated

@@ -33,6 +33,7 @@ import studio_lipsync
 import studio_sfx
 import studio_pricing as pricing
 import studio_music as music_mod
+import studio_continuity as continuity
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
@@ -242,6 +243,9 @@ class ScenePatch(BaseModel):
     location_id: Optional[str] = None
     props: Optional[list[str]] = Field(None, max_length=20)
     props_auto: bool = False
+    # Edits to the scene's continuity record (e.g. start_state, end_state,
+    # transition); merged into what is saved.
+    continuity: Optional[dict] = None
 
 
 def _clean_sfx(items: list[str]) -> list[str]:
@@ -532,6 +536,7 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "camera_used": ident.scene_camera(s),
             "made_with_references": (s.get("made_with") or {}).get("_refs") or [],
             "location_id": s.get("location_id"), "props": s.get("props"),
+            "continuity": s.get("continuity") or {},
             **_scene_world(s, elements),
             "consistency": _consistency(s, cast, resolved)}
 
@@ -931,7 +936,36 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
             "elements": [_element_out(e, eurls) for e in elements],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id),
-            "production": _production_out(p)}
+            "production": _production_out(p),
+            "continuity_issues": _continuity_issues(scenes, chars, outfits, resolved, elements)}
+
+
+def _continuity_issues(scenes, chars, outfits, resolved, elements) -> list:
+    """The free scene-by-scene continuity review (no AI call)."""
+    import studio_elements as world
+    return continuity.review(
+        scenes,
+        {sid: {cid: (o or {}).get("id") for cid, o in row.items()} for sid, row in resolved.items()},
+        {o["id"]: o["name"] for o in outfits}, {c["id"]: c["name"] for c in chars},
+        {sc["id"]: (world.scene_location(sc, elements) or {}).get("id") for sc in scenes})
+
+
+def _project_continuity(p: dict) -> list:
+    st = get_store()
+    chars = st.select("studio_characters", {"project_id": p["id"]})
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    outfits = _outfits(p["id"])
+    from studio_worker import characters_in_scene
+    return _continuity_issues(scenes, chars, outfits, ident.resolve_outfits(scenes, outfits, chars, characters_in_scene),
+                              _elements(p["id"]))
+
+
+@router.get("/projects/{project_id}/continuity")
+async def project_continuity(project_id: str, user_id: str = Depends(creator)):
+    """Compares consecutive scenes: outfits, place, time, objects in hand,
+    people leaving and coming back, feelings, and pictures made from an
+    older version of the scene before."""
+    return {"issues": _project_continuity(_project(project_id, user_id))}
 
 
 def _covers(p: dict) -> list:
@@ -1411,6 +1445,8 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
     if "outfit_overrides" in fields:
         fields["outfit_overrides"] = _clean_outfit_overrides(s, fields["outfit_overrides"])
     fields.pop("props_auto", None)
+    if body.continuity is not None:
+        fields["continuity"] = continuity.merge(s.get("continuity"), body.continuity)
     if body.location_id is not None or body.props is not None or body.props_auto:
         own = {e["id"]: e for e in _elements(s["project_id"])}
         if body.location_id is not None:
@@ -1867,13 +1903,37 @@ def _messages(conv: dict, limit: int = 60) -> list:
     return rows[-limit:]
 
 
-def _chat_context(p: dict) -> str:
+def _chat_context(p: dict, message: str = "") -> str:
     import studio_chat
+    from studio_worker import characters_in_scene
     st = get_store()
     cast = sorted(st.select("studio_characters", {"project_id": p["id"]}), key=lambda c: c.get("position") or 0)
     scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
     jobs = st.select("studio_jobs", {"project_id": p["id"]}, order="created_at", desc=True, limit=20)
-    return studio_chat.project_context(p, cast, _outfits(p["id"]), _elements(p["id"]), scenes, _production_out(p), jobs)
+    outfits, elements = _outfits(p["id"]), _elements(p["id"])
+    resolved = ident.resolve_outfits(scenes, outfits, cast, characters_in_scene)
+    names = {c["id"]: c["name"] for c in cast}
+    wearing = {sid: {names.get(cid, "?"): (o or {}).get("name") for cid, o in row.items() if o}
+               for sid, row in resolved.items()}
+    issues = _continuity_issues(scenes, cast, outfits, resolved, elements)
+    return studio_chat.project_context(p, cast, outfits, elements, scenes, _production_out(p), jobs,
+                                       wearing=wearing, issues=issues, focus=studio_chat.scenes_named(message))
+
+
+def _proposal_targets(p: dict, props: list) -> list:
+    """Paid suggestions for one scene carry that scene's id, so only it is remade."""
+    scenes = sorted(get_store().select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    for prop in props:
+        if prop.get("type") in ("remake_picture", "remake_video"):
+            try:
+                n = int((prop.get("data") or {}).get("scene"))
+            except (TypeError, ValueError):
+                n = 0
+            if 1 <= n <= len(scenes):
+                prop["targets"] = [scenes[n - 1]["id"]]
+            else:
+                prop["status"], prop["error"] = "failed", "That scene number doesn't exist."
+    return props
 
 
 @router.get("/projects/{project_id}/assistant/chat")
@@ -1943,7 +2003,7 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
                                  {"summary": summary[:4000], "summarized_count": summarized + len(fold)})[0]
         recent = earlier[max(int(conv.get("summarized_count") or 0), len(earlier) - studio_chat.RECENT):]
         memory = conv.get("memory") or {}
-        prompt = studio_chat.build_prompt(_chat_context(p), conv.get("summary") or "", memory.get("decisions") or [],
+        prompt = studio_chat.build_prompt(_chat_context(p, body.message), conv.get("summary") or "", memory.get("decisions") or [],
                                           recent, body.message.strip())
         data, c2 = _ai_call(lambda: get_ai().chat(prompt))
         costs.append(c2)
@@ -1951,7 +2011,7 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         credits = min(CHAT_HOLD, max(1, cost.credits))
         reply = st.insert("studio_messages", [{
             "conversation_id": conv["id"], "project_id": p["id"], "owner_id": user_id, "role": "assistant",
-            "content": str(data.get("reply") or "").strip()[:20000], "proposals": studio_chat.clean_proposals(data.get("proposals")),
+            "content": str(data.get("reply") or "").strip()[:20000], "proposals": _proposal_targets(p, studio_chat.clean_proposals(data.get("proposals"))),
             "credits": credits, "client_key": key + ":reply"}])[0]
         new_decisions = [str(d).strip()[:300] for d in data.get("decisions") or [] if str(d).strip()]
         st.update("studio_conversations", {"id": conv["id"]}, {
@@ -2059,6 +2119,9 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
             patch = {k: d[k] for k in ("heading", "visual") if d.get(k)}
             if d.get("dialogue") is not None:
                 patch["dialogue"] = lines
+            states = {k: d[k] for k in ("start_state", "end_state", "transition") if d.get(k)}
+            if states:
+                patch["continuity"] = states
             if not patch:
                 raise HTTPException(status_code=409, detail="This suggestion has nothing to change.")
             await update_scene(s["id"], ScenePatch(**patch), user_id)
