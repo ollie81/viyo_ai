@@ -36,16 +36,18 @@ ACTIONS = {
     "add_outfit": "free",        # data: character, name, clothing, shoes, accessories, makeup
     "add_place": "free",         # data: name, description
     "add_object": "free",        # data: name, description, owner
-    "rewrite_scene": "free",     # data: scene (number), heading, visual, dialogue [{character, text, emotion}]
+    "rewrite_scene": "free",     # data: scene (number), heading, visual, dialogue, start_state, end_state, transition
     "set_scene_outfit": "free",  # data: scene, character, outfit
     "develop_story": "paid",     # the writers' room writes the full screenplay (job kind "script")
     "break_into_scenes": "paid", # job kind "breakdown"
     "find_places_objects": "paid",  # job kind "elements"
     "make_cover": "paid",        # job kind "cover"
     "make_film": "paid",         # one-click production
+    "remake_picture": "paid",    # data: scene (number): a new picture for that one scene (job kind "image")
+    "remake_video": "paid",      # data: scene (number): a new video for that one scene (job kind "video")
 }
 PAID_JOB = {"develop_story": "script", "break_into_scenes": "breakdown", "find_places_objects": "elements",
-            "make_cover": "cover", "make_film": "production"}
+            "make_cover": "cover", "make_film": "production", "remake_picture": "image", "remake_video": "video"}
 
 _STR = {"type": "string"}
 CHAT_SCHEMA = {
@@ -62,6 +64,9 @@ CHAT_SCHEMA = {
                 "target_seconds": {"type": "integer"}, "script": _STR, "name": _STR, "description": _STR,
                 "character": _STR, "owner": _STR, "clothing": _STR, "shoes": _STR, "accessories": _STR, "makeup": _STR,
                 "outfit": _STR, "scene": {"type": "integer"}, "heading": _STR, "visual": _STR,
+                "start_state": _STR, "end_state": _STR,
+                "transition": {"type": "string", "enum": ["continuous", "same_place_cut", "new_place", "time_jump",
+                                                          "flashback"]},
                 "dialogue": {"type": "array", "items": {"type": "object", "properties": {
                     "character": _STR, "text": _STR, "emotion": _STR}}},
             }},
@@ -102,6 +107,17 @@ Truth rules (very important):
 - Ideas in the conversation summary or earlier messages are only ideas unless they appear in PROJECT facts or
   DECISIONS.
 
+Continuity supervisor:
+- The PROJECT facts list each scene's continuity record (start, end, positions, what people hold and wear, feelings,
+  how it follows the scene before), what each character wears in it, and a CONTINUITY CHECK of problems found
+  between consecutive scenes.
+- When asked why scenes don't match, or to make one continue from another: name the scenes, say exactly what changed
+  (outfit, place, object, time, position, feeling), why it breaks the story, and propose the fix (rewrite_scene with
+  start_state / end_state, set_scene_outfit), then remake_picture or remake_video for the scene that must change.
+- Tell intended changes (the script means them) from accidental ones.
+- A picture or video only changes when it is made again. Never say a visual problem is fixed until a new picture or
+  video has been made and the creator has looked at it. Pictures can't be guaranteed identical: say it gets closer.
+
 Proposals (0 to 3, only when a concrete change would help now):
 - update_story: title / logline / genre / kind (short, episode, series, film) / target_seconds / visual_style / language.
 - write_screenplay: data.script = the complete screenplay text (only when the creator asked you to write or rewrite it
@@ -109,7 +125,10 @@ Proposals (0 to 3, only when a concrete change would help now):
 - add_character / update_character: data.name or data.character + data.description (age, look, personality).
 - add_outfit: data.character, data.name, data.clothing, data.shoes, data.accessories, data.makeup.
 - add_place / add_object: data.name, data.description (exact look), data.owner for objects.
-- rewrite_scene: data.scene (number from the scene list), data.heading, data.visual, data.dialogue.
+- rewrite_scene: data.scene (number from the scene list), data.heading, data.visual, data.dialogue, and for
+  continuity data.start_state / data.end_state / data.transition.
+- remake_picture / remake_video: data.scene. A new picture or video for that one scene only (paid). Suggest it after a
+  free fix (rewrite_scene, set_scene_outfit) so the scene is made again with the correction.
 - set_scene_outfit: data.scene, data.character, data.outfit (an existing outfit name).
 - develop_story, break_into_scenes, find_places_objects, make_cover, make_film: paid steps, data may be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -120,8 +139,46 @@ def _short(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+DETAIL_ALL = 12   # up to this many scenes, every scene is shown in full
+
+
+def scenes_named(message: str) -> set[int]:
+    """Scene numbers the creator mentions ("scene 2", "scenes 3 and 4")."""
+    out = set()
+    for m in re.finditer(r"scenes?\s+((?:\d+\s*(?:,|and|&|-|to)?\s*)+)", (message or "").lower()):
+        out.update(int(x) for x in re.findall(r"\d+", m.group(1)))
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+    for m in re.finditer(r"scene\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b", (message or "").lower()):
+        out.add(words[m.group(1)])
+    return out
+
+
+def _scene_detail(c: dict, wearing: dict) -> list[str]:
+    out = []
+    if c.get("transition"):
+        out.append(f"   From the scene before: {c['transition'].replace('_', ' ')}"
+                   f"{' (' + c['transition_note'] + ')' if c.get('transition_note') else ''}")
+    for k, label in (("start_state", "Starts"), ("action", "Action"), ("end_state", "Ends"),
+                     ("camera", "Camera"), ("time_of_day", "Time"), ("lighting", "Light")):
+        if c.get(k):
+            out.append(f"   {label}: {_short(c[k], 300)}")
+    for x in c.get("characters") or []:
+        bits = [x.get("position") or "", "holding " + ", ".join(x["holding"]) if x.get("holding") else "",
+                "ends holding " + ", ".join(x["holding_at_end"]) if x.get("holding_at_end") else "",
+                f"feels {x.get('emotion_start')}→{x.get('emotion_end')}" if x.get("emotion_start") else "",
+                "only heard" if not x.get("in_frame", True) else "", "enters" if x.get("enters") else "",
+                "leaves" if x.get("leaves") else ""]
+        out.append(f"   {x['name']}: " + "; ".join(b for b in bits if b))
+    if c.get("intentional_changes"):
+        out.append("   Intended changes: " + "; ".join(c["intentional_changes"]))
+    if wearing:
+        out.append("   Wearing: " + "; ".join(f"{k} – {v}" for k, v in wearing.items()))
+    return out
+
+
 def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: list[dict], scenes: list[dict],
-                    production: Optional[dict], jobs: list[dict]) -> str:
+                    production: Optional[dict], jobs: list[dict], wearing: Optional[dict] = None,
+                    issues: Optional[list] = None, focus: Optional[set] = None) -> str:
     """What the assistant knows as fact: only what is saved."""
     import studio_identity as ident
     lines = [f"Title: {p.get('title') or '(none)'}",
@@ -151,11 +208,19 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
         lines.append("Objects: " + ("; ".join(e["name"] for e in elements if e["kind"] == "prop") or "(none)"))
     if scenes:
         lines.append(f"Scenes ({len(scenes)}):")
+        near = {n + d for n in (focus or set()) for d in (-1, 0, 1)}
         for i, s in enumerate(scenes[:60], start=1):
             who = sorted({(d.get("character") or "").strip() for d in s.get("dialogue") or [] if d.get("character")})
             made = "video" if s.get("video_path") else "picture" if s.get("image_path") else "not made"
-            lines.append(f"{i}. {s.get('heading') or ''}: {_short(s.get('visual') or '', 140)}"
+            full = len(scenes) <= DETAIL_ALL or i in near
+            lines.append(f"{i}. {s.get('heading') or ''}: {_short(s.get('visual') or '', 600 if full else 140)}"
                          f"{' Speakers: ' + ', '.join(who) if who else ''} [{made}]")
+            if full:
+                lines += _scene_detail(s.get("continuity") or {}, (wearing or {}).get(s["id"]) or {})
+        if issues is not None:
+            lines.append("CONTINUITY CHECK (consecutive scenes): " + ("no problems found" if not issues else ""))
+            for x in issues[:20]:
+                lines.append(f"- Scene {x['previous']}→{x['scene']} [{x['kind']}]: {x['message']} Fix: {x['fix']}")
     else:
         lines.append("Scenes: (not broken into scenes yet)")
     if production:

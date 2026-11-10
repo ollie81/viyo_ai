@@ -25,6 +25,7 @@ import studio_identity as ident
 import studio_pricing as pricing
 import studio_render as render
 import studio_music as music_mod
+import studio_continuity as continuity
 import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
@@ -251,6 +252,7 @@ class StudioWorker:
             incoming.append({"heading": (s.get("heading") or "")[:200], "visual": (s.get("visual") or "")[:2000],
                              "dialogue": dialogue,
                              "duration_seconds": min(12, max(2, float(s.get("duration_seconds") or 5)))})
+        records = [continuity.clean(s.get("continuity")) for s in scenes[:80]]
         current = self.store.select("studio_scenes", {"project_id": project["id"]})
         plan = plan_breakdown(current, incoming, "video" if project.get("production_style") == "video" else "still")
         try:
@@ -268,6 +270,12 @@ class StudioWorker:
         if not r or not r.get("ok"):
             raise JobFailed("not_found", "This production no longer exists.", absorbed=cost)
         self._carry_identities(project, earlier, [c["name"] for c in new_chars])
+        # The continuity record of every scene, kept or new: the story around
+        # each scene may have changed even when its own words didn't.
+        for row in self.store.select("studio_scenes", {"project_id": project["id"]}):
+            pos = row.get("position")
+            if isinstance(pos, int) and 0 <= pos < len(records) and records[pos]:
+                self._optional_update("studio_scenes", {"id": row["id"]}, {"continuity": records[pos]})
         return {"characters": len(chars), "scenes": len(incoming), "kept": len(plan["keep"]),
                 "added": len(plan["insert"]), "set_aside": len(plan["archive"]),
                 "kept_pictures": plan["kept_pictures"], "kept_voice": plan["kept_voice"]}, cost
@@ -567,6 +575,31 @@ class StudioWorker:
         elements = self._elements(project)
         return world_mod.scene_location(scene, elements), world_mod.scene_props(scene, elements)
 
+    def _previous_shot(self, project, scene, location):
+        """(label, bytes) of the scene just before this one, if it has a picture
+        and happens in the same place; otherwise None."""
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
+        before = [r for r in scenes if r["position"] < scene["position"]]
+        if not before or not before[-1].get("image_path"):
+            return None
+        prev = before[-1]
+        if continuity.of(scene).get("transition"):
+            # The continuity record decides: a time jump or a new place doesn't copy the last shot.
+            if not continuity.carries_look(prev, scene):
+                return None
+        else:
+            same_place = (location is not None and (self._world(project, prev)[0] or {}).get("id") == location.get("id")) \
+                or ((prev.get("heading") or "").strip().lower() == (scene.get("heading") or "").strip().lower() != "")
+            if not same_place:
+                return None
+        try:
+            data = self.files.get(prev["image_path"])
+        except Exception:
+            return None
+        self._last_previous_shot = prev["image_path"]
+        return ("the previous shot, same place and moment (match its light, weather, time of day, colours, and the "
+                "characters' clothes and state such as wet hair or dirt; NOT its framing, pose or who is in it)", data)
+
     def _world_files(self, location, props, limit) -> list:
         out = []
         for label, path in world_mod.reference_labels(location, props, limit):
@@ -722,7 +755,12 @@ class StudioWorker:
     def _expressions(scene, entries) -> dict:
         return {c["id"]: e for c, _o in entries if (e := ident.scene_expression(scene, c["name"]))}
 
-    def _made_with(self, scene, entries, labels) -> None:
+    def _scene_before(self, project, scene):
+        rows = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
+        before = [r for r in rows if r["position"] < scene["position"]]
+        return before[-1] if before else None
+
+    def _made_with(self, scene, entries, labels, previous=None) -> None:
         """Remember which identity version, outfit and reference pictures a
         scene was made with, so the Studio can flag scenes made before an
         identity or outfit changed."""
@@ -733,6 +771,8 @@ class StudioWorker:
                             "anchor": ((c.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")}
                   for c, o in entries}
         record["_refs"] = labels[:8]
+        if previous:
+            record["_previous_shot"] = previous   # lets the review spot pictures made from an older scene
         self._optional_update("studio_scenes", {"id": scene["id"]}, {"made_with": record})
 
     def do_image(self, job, project):
@@ -742,21 +782,32 @@ class StudioWorker:
         camera = ident.scene_camera(scene)
         expressions = self._expressions(scene, entries)
         location, props = self._world(project, scene)
-        n_world = len(world_mod.reference_labels(location, props, IMAGE_REFS))
+        # The shot just before, when it's the same place: it carries the light,
+        # weather and the characters' state over, so the scenes look connected.
+        # It already shows the place, so the place's own picture isn't needed.
+        self._last_previous_shot = None
+        prev = self._previous_shot(project, scene, location)
+        before = self._scene_before(project, scene)
+        world_loc = None if prev else location
+        n_world = len(world_mod.reference_labels(world_loc, props, IMAGE_REFS)) + (1 if prev else 0)
         world_take = min(n_world, 2 if entries else IMAGE_REFS)
         labelled = self._reference_files(entries, camera, IMAGE_REFS - world_take, expressions=expressions)
-        labelled += self._world_files(location, props, IMAGE_REFS - len(labelled))
+        if prev:
+            labelled.append(prev)
+        labelled += self._world_files(world_loc, props, IMAGE_REFS - len(labelled))
         refs = [data for _label, data in labelled]
         roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
         prompt = ident.scene_prompt(scene["visual"] or scene["heading"], entries, camera, project["visual_style"],
                                     project["aspect_ratio"], extra=(roles + "\n") if roles else "",
-                                    expressions=expressions, world=world_mod.world_block(location, props))
+                                    expressions=expressions, world=world_mod.world_block(location, props),
+                                    continuity=continuity.image_block(before, scene),
+                                    camera_text=continuity.of(scene).get("camera", "") if scene.get("camera") in (None, "", "auto") else "")
         prompt += "\nNo text, captions, logos or watermarks in the image."
         data, mime, cost = self.ai.image(prompt, refs[:IMAGE_REFS], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
         self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
-        self._made_with(scene, entries, [label for label, _d in labelled])
+        self._made_with(scene, entries, [label for label, _d in labelled], previous=self._last_previous_shot)
         return {"path": path, "references": [label for label, _d in labelled]}, cost
 
     def do_voice(self, job, project):
@@ -832,6 +883,9 @@ class StudioWorker:
                  if block else "") + world_mod.world_block(location, props)
         lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
         style = f"Style: {project['visual_style'] or 'cinematic'}. "
+        # Beginning, during and end of the clip, the camera, and what must not change.
+        direction = continuity.video_block(self._scene_before(project, scene), scene)
+        direction = (direction + " ") if direction else ""
         references = None
         if lines and scene_speech(scene, project) == "video_model":
             # The characters talk inside the clip. Omni takes no audio, so
@@ -841,7 +895,7 @@ class StudioWorker:
             if seconds is None:
                 raise JobFailed("too_long", "This scene has too much dialogue for one video clip (15 seconds at most). "
                                             "Split it into two scenes. Your credits were returned.")
-            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
+            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}{direction}"
                       f"{talking_direction(lines, cast, project)} "
                       "No subtitles, captions, text or watermarks. Do not add music.")
             references = self._references(scene, entries, frame, camera, expressions, (location, props))
@@ -852,8 +906,9 @@ class StudioWorker:
             speech = ("No dialogue and no speech: nobody talks on camera; their lines are added separately. "
                       "Characters listen, react and gesture naturally, mouths mostly closed. "
                       if has_lines else "No dialogue. ")
-            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
-                      f"Natural, subtle motion. {speech}No text, captions or watermarks. Do not add music.")
+            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}{direction}"
+                      f"{'' if direction else 'Natural, subtle motion. '}{speech}No text, captions or watermarks. "
+                      "Do not add music.")
             seconds = pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
             if has_lines and scene_speech(scene, project) == "lipsync":
                 need = max(float(scene.get("duration_seconds") or 5), float(scene.get("audio_seconds") or 0) + 0.5,
@@ -1055,9 +1110,34 @@ def _size(project: dict) -> str:
 
 
 def characters_in_scene(scene: dict, cast: list[dict]) -> list[dict]:
-    text = " ".join([scene.get("visual") or "", scene.get("heading") or ""] +
-                    [d.get("character") or "" for d in scene.get("dialogue") or []]).lower()
-    return [c for c in cast if c.get("name") and re.search(rf"\b{re.escape(c['name'].lower())}\b", text)]
+    """Who is in the scene: their full name anywhere, or their first name in
+    what we see or among the speakers ("Maya" is Maya Lin). Last names alone
+    don't count, so "VANCE MANOR" doesn't put Julian Vance in every scene."""
+    named = continuity.in_frame_names(scene)
+    if named is not None:
+        # The continuity record says who is in frame (a voice on the phone isn't).
+        speakers, visual = "", " / ".join(named).lower()
+    else:
+        speakers = " ".join(speaker_name(d.get("character") or "") for d in scene.get("dialogue") or []).lower()
+        visual = (scene.get("visual") or "").lower()
+    text = " ".join([visual, "" if named is not None else (scene.get("heading") or "").lower(), speakers])
+    firsts = {}
+    for c in cast:
+        first = (c.get("name") or "").strip().split(" ")[0].lower()
+        firsts[first] = firsts.get(first, 0) + 1
+    out = []
+    for c in cast:
+        name = (c.get("name") or "").strip().lower()
+        if not name:
+            continue
+        first = name.split(" ")[0]
+        found = re.search(rf"\b{re.escape(name)}\b", text)
+        # A first name counts only when it's long enough and no one else shares it.
+        if not found and " " in name and len(first) >= 3 and firsts.get(first) == 1:
+            found = re.search(rf"\b{re.escape(first)}\b", visual + " " + speakers)
+        if found:
+            out.append(c)
+    return out
 
 
 # ------------------------------------------------------------ breakdown plan
