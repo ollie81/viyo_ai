@@ -1575,7 +1575,7 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
                          if needs_lipsync(s, p) and not s.get("lipsync_path")), None)
         if reason is None and unsynced:
             reason = f"Scene {unsynced}'s lip sync isn't made yet."
-        return pricing.render_cost(secs), reason
+        return pricing.render_cost(secs, music_generated=not bool(p.get("music_path"))), reason
     raise HTTPException(status_code=400, detail="Unknown job type.")
 
 
