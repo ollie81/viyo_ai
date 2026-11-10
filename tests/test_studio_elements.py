@@ -69,7 +69,7 @@ def test_each_place_and_object_gets_a_picture_used_in_every_scene(env):
     roof, flat, roof2 = (x["prompt"] for x in ai.image_log)
     for prompt in (roof, roof2):
         assert "LOCATION (the same place every time" in prompt and "rusty railing" in prompt
-        assert "the location, Rooftop (keep this exact place)" in prompt
+        assert "the location, Rooftop (how the place looks" in prompt
     assert "OBJECTS (exactly the same in every scene" in roof and "gold clasp" in roof
     assert "the object Maya's black leather bag" in flat and "LOCATION" not in flat
     assert [x["refs"] for x in ai.image_log] == [2, 1, 1], "place + object; object; place"
@@ -130,3 +130,21 @@ def test_matching_rules():
     assert world.scene_location(s, [roof, bag]) is roof and world.scene_props(s, [roof, bag]) == [bag]
     assert world.scene_props(dict(s, props=[]), [roof, bag]) == []
     assert world.scene_location({"heading": "EXT. PARK", "visual": ""}, [roof]) is None
+
+
+def test_framing_comes_from_the_scene_not_the_place_picture():
+    import studio_identity as ident
+    loc = {"name": "Vance mansion", "description": "Gothic gates", "reference_path": "x.png", "details": {}}
+    assert "only the part of it this shot would see" in world.world_block(loc, [])
+    assert "not like this picture" in world.reference_labels(loc, [], 4)[0][0]
+    empty = ident.scene_prompt("Extreme close-up of a phone in a puddle", [], "front", "", "9:16")
+    assert "characters" not in empty.split("SCENE:")[1].split("STYLE")[0].replace("people the SCENE", "")
+    assert "Frame the shot exactly as the SCENE says" in empty
+
+
+def test_object_pictures_and_descriptions_leave_out_the_scene():
+    phone = {"kind": "prop", "name": "Maya's smartphone", "details": {},
+             "description": "Cracked black phone, underwater in a mud puddle, showing INCOMING CALL: JULIAN"}
+    p = world.picture_prompt(phone, "", "9:16")
+    assert "plain neutral background" in p and "ignore any situation" in p and "switched off" in p
+    assert "Never what happens to it in a scene" in world.extract_prompt("x", [], [], "")

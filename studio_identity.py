@@ -535,6 +535,11 @@ _CAMERA_TEXT = {
     "side": "Side-on shot: characters seen in profile.", "back": "Shot from behind the characters.",
     "full_body": "Full-body shot, head to feet.", "wide": "Wide shot.",
 }
+# Scenes with nobody in them: never mention characters, or the model adds a person.
+_CAMERA_TEXT_EMPTY = {"front": "", "side": "", "back": "", "full_body": ""}
+FRAMING_RULE = ("Frame the shot exactly as the SCENE says (distance, angle, what fills the frame). Reference pictures "
+                "only show what people, places and things look like, never how to frame this shot. Show only the "
+                "people the SCENE puts in it.\n")
 
 
 def scene_prompt(action: str, entries: list[tuple[dict, Optional[dict]]], camera: str, style: str,
@@ -544,6 +549,7 @@ def scene_prompt(action: str, entries: list[tuple[dict, Optional[dict]]], camera
     frame = "Vertical 9:16 frame." if aspect_ratio == "9:16" else "Wide 16:9 frame."
     who = (f"CHARACTERS (permanent identity: never change their face, hair, skin tone, height, body proportions or "
            f"marks, whatever the scene says; clothes change only as listed):\n{block}\n\n" if block else "")
-    return (f"{who}{world}SCENE: {action}\nCAMERA: {_CAMERA_TEXT.get(camera, '')} {frame}\n"
+    cam = (_CAMERA_TEXT_EMPTY.get(camera, _CAMERA_TEXT.get(camera, "")) if not entries else _CAMERA_TEXT.get(camera, ""))
+    return (f"{who}{world}SCENE: {action}\nCAMERA: {(cam + ' ') if cam else ''}{frame}\n{FRAMING_RULE}"
             f"STYLE AND LIGHT: {style or 'cinematic, realistic, film still'}.\n{extra}"
             "If the scene text seems to describe a character differently, keep the permanent identity.").strip()
