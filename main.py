@@ -236,6 +236,44 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
+class _ErrorsAsJson:
+    """Turns an unexpected error into a plain 500 reply *inside* the CORS
+    layer, so the browser can read it. Without this the 500 is produced
+    outside CORS, has no CORS headers, and the web app can only say
+    "Couldn't reach Viyo" instead of showing that the server had a problem."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def send_wrapper(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as exc:
+            if started:
+                raise
+            import traceback as _tb
+            import uuid as _uuid
+            ref = _uuid.uuid4().hex[:8]
+            print(f"[ERROR] {scope.get('method')} {scope.get('path')} ref={ref}: {type(exc).__name__}: {str(exc)[:300]}")
+            _tb.print_exc()
+            sentry_sdk.capture_exception(exc)
+            from fastapi.responses import JSONResponse as _J
+            await _J(status_code=500, content={
+                "error": "Internal server error",
+                "detail": f"Viyo had a problem with this request. Please try again. (ref {ref})"})(scope, receive, send)
+
+
+app.add_middleware(_ErrorsAsJson)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,  # set via ALLOWED_ORIGINS env var — no wildcard
