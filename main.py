@@ -274,7 +274,10 @@ app.add_middleware(
     # no wildcard-but-still-safe option with allow_origins this specific
     # (an origin regex, not "*"), since CORSMiddleware only lets you
     # wildcard allow_methods alongside a wildcard allow_origins.
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    # PATCH: every Studio edit (project, character, look, outfit, scene,
+    # place/object) uses it; without it the browser's preflight got a 400
+    # and the app showed "Couldn't reach Viyo".
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
