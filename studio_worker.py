@@ -26,6 +26,7 @@ import studio_pricing as pricing
 import studio_render as render
 import studio_music as music_mod
 import studio_continuity as continuity
+import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
 NARRATOR_VOICE = "Charon"
@@ -920,16 +921,42 @@ class StudioWorker:
             # No scene picture to start from: the characters' reference views
             # keep them the same person.
             references = self._references(scene, entries, None, camera, expressions, (location, props)) or None
-        data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
-            else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
+        talking = bool(lines) and scene_speech(scene, project) == "video_model"
+        backup_used = None
+        try:
+            data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
+                else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
+        except ai_mod.PolicyBlocked as refused:
+            data, cost, backup_used = self._video_backup(job, project, prompt, frame, seconds, talking,
+                                                         audio=talking or not lines, refused=refused)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
                           duration_seconds=cost.units.get("video_seconds"))
         self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
         if scene.get("lipsync_path"):   # a new clip needs new lip sync (the old file is kept)
             self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
         labels = [label for label, _d in references or []] or (["the scene picture"] if frame else [])
+        if backup_used:
+            labels = ["the scene picture"]
         self._made_with(scene, entries, labels)
-        return {"path": path, "references": labels}, cost
+        return {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}, cost
+
+    def _video_backup(self, job, project, prompt, frame, seconds, talking, audio, refused):
+        """Google refused the video: try the backup models (fal.ai) from the
+        scene picture. Raises the original refusal when none can make it."""
+        names = fal_mod.models()
+        if not names or not frame:
+            raise refused
+        lang = project.get("language") or "English"
+        for name in names:
+            if not fal_mod.usable(name, talking, lang):
+                continue
+            try:
+                data, cost = fal_mod.generate(name, prompt, frame, project["aspect_ratio"], seconds, audio)
+                print(f"[INFO] studio job {job['id']}: Google refused the video; made with backup {name}")
+                return data, cost, name
+            except fal_mod.BackupFailed as e:
+                print(f"[INFO] studio job {job['id']}: backup {name} failed: {e}")
+        raise ai_mod.PolicyBlocked(str(refused) + " The backup video models couldn't make it either.")
 
     def _references(self, scene, entries, frame, camera="front", expressions=None, world=(None, [])) -> list:
         """Labelled images for Omni (6 at most; Google: 3 per character, 2
