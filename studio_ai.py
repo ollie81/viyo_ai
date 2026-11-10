@@ -222,12 +222,26 @@ def as_wav(data: bytes, mime_type: str = "") -> tuple[bytes, float]:
     return _pcm_to_wav(data, rate), len(data) / 2 / rate
 
 
+def blocked_message(text: str) -> str:
+    """Google's refusal in plain words, with what the creator can change."""
+    text = text.lower()
+    if "real people" in text or "likeness" in text or "real person" in text:
+        return ("Google thought this shows a real person. This happens when a character has the same name as a famous "
+                "person, or a reference picture looks like a real photo of someone. Try a different name for the "
+                "character in Cast, then make the video again.")
+    if "filtered" in text or "prohibited use" in text:
+        return ("Google's safety check blocked the finished video. Usually it's very graphic violence or injuries shown "
+                "up close (blood, wounds, someone tied up or gagged). Try showing it less graphically, for example "
+                "the fear on a face instead of the injury.")
+    return "Google's safety check refused this scene. Try rewording what we see."
+
+
 def _classify(e: Exception) -> Exception:
     text = str(e).lower()
     if any(k in text for k in ("429", "resource_exhausted", "quota", "503", "unavailable", "overloaded", "timeout", "deadline")):
         return ProviderBusy(str(e)[:300])
-    if any(k in text for k in ("safety", "blocked", "prohibited", "policy")):
-        return PolicyBlocked(str(e)[:300])
+    if any(k in text for k in ("safety", "blocked", "prohibited", "policy", "filtered", "likeness")):
+        return PolicyBlocked(blocked_message(text))
     if any(k in text for k in ("404", "not_found", "not found", "is not supported", "invalid_argument")):
         return ProviderError("The AI model rejected the request (" + str(e)[:200] + "). Your credits were returned.")
     return ProviderError(str(e)[:300])
