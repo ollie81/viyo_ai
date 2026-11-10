@@ -566,6 +566,25 @@ class StudioWorker:
         elements = self._elements(project)
         return world_mod.scene_location(scene, elements), world_mod.scene_props(scene, elements)
 
+    def _previous_shot(self, project, scene, location):
+        """(label, bytes) of the scene just before this one, if it has a picture
+        and happens in the same place; otherwise None."""
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
+        before = [r for r in scenes if r["position"] < scene["position"]]
+        if not before or not before[-1].get("image_path"):
+            return None
+        prev = before[-1]
+        same_place = (location is not None and (self._world(project, prev)[0] or {}).get("id") == location.get("id")) or \
+            ((prev.get("heading") or "").strip().lower() == (scene.get("heading") or "").strip().lower() != "")
+        if not same_place:
+            return None
+        try:
+            data = self.files.get(prev["image_path"])
+        except Exception:
+            return None
+        return ("the previous shot, same place and moment (match its light, weather, time of day, colours, and the "
+                "characters' clothes and state such as wet hair or dirt; NOT its framing, pose or who is in it)", data)
+
     def _world_files(self, location, props, limit) -> list:
         out = []
         for label, path in world_mod.reference_labels(location, props, limit):
@@ -741,10 +760,17 @@ class StudioWorker:
         camera = ident.scene_camera(scene)
         expressions = self._expressions(scene, entries)
         location, props = self._world(project, scene)
-        n_world = len(world_mod.reference_labels(location, props, IMAGE_REFS))
+        # The shot just before, when it's the same place: it carries the light,
+        # weather and the characters' state over, so the scenes look connected.
+        # It already shows the place, so the place's own picture isn't needed.
+        prev = self._previous_shot(project, scene, location)
+        world_loc = None if prev else location
+        n_world = len(world_mod.reference_labels(world_loc, props, IMAGE_REFS)) + (1 if prev else 0)
         world_take = min(n_world, 2 if entries else IMAGE_REFS)
         labelled = self._reference_files(entries, camera, IMAGE_REFS - world_take, expressions=expressions)
-        labelled += self._world_files(location, props, IMAGE_REFS - len(labelled))
+        if prev:
+            labelled.append(prev)
+        labelled += self._world_files(world_loc, props, IMAGE_REFS - len(labelled))
         refs = [data for _label, data in labelled]
         roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
         prompt = ident.scene_prompt(scene["visual"] or scene["heading"], entries, camera, project["visual_style"],
