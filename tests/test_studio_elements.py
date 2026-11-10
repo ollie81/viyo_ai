@@ -62,6 +62,7 @@ def test_each_place_and_object_gets_a_picture_used_in_every_scene(env):
     prompts = [x["prompt"] for x in ai.image_log]
     assert any("Establishing shot of the empty set" in x for x in prompts) and any("Prop reference photo" in x for x in prompts)
     assert all(e["has_image"] for e in detail(client, u, pid)["elements"])
+    assert detail(client, u, pid)["project"]["covers"] == [], "place and object pictures are not covers"
     ai.image_log = []
     start(client, u, pid, "image", [s["id"] for s in d["scenes"]])
     run(gen)

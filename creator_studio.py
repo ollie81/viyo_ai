@@ -933,8 +933,11 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
 
 def _covers(p: dict) -> list:
     """Every cover made for this production, newest first (all are kept)."""
-    rows = get_store().select("studio_assets", {"project_id": p["id"], "kind": "image"})
-    return sorted([r for r in rows if not r.get("scene_id") and r["owner_id"] == p["owner_id"]],
+    st = get_store()
+    cover_jobs = {j["id"] for j in st.select("studio_jobs", {"project_id": p["id"], "kind": "cover"})}
+    rows = st.select("studio_assets", {"project_id": p["id"], "kind": "image"})
+    return sorted([r for r in rows if not r.get("scene_id") and r["owner_id"] == p["owner_id"]
+                   and r.get("job_id") in cover_jobs],
                   key=lambda r: r.get("created_at") or "", reverse=True)
 
 
