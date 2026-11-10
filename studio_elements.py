@@ -50,6 +50,11 @@ def extract_prompt(script: str, scenes: list[dict], cast: list[dict], style: str
    use, give or fight over (a bag, a phone, keys, a letter, a weapon, a ring, a car). Describe the exact look so it
    is drawn the same every time. Skip ordinary background items.
 
+Describe each object as it IS, on its own: shape, size, colour, material, permanent marks (a crack, a scratch, a
+sticker). Never what happens to it in a scene: not where it lies (a puddle, a table, a pocket), not water, mud,
+blood or weather on it, not what its screen shows, not who is calling. Describe each location as the empty set,
+with no events or people in it.
+
 For each, list the scene numbers it appears in. Only what the screenplay contains; no brand names or logos.
 Visual style: {style or 'cinematic, realistic'}. Characters: {who}.
 
@@ -76,6 +81,8 @@ def picture_prompt(element: dict, style: str, aspect_ratio: str) -> str:
     owner = f" (belongs to {d['owner']})" if d.get("owner") else ""
     return (f"Prop reference photo for a film: {element['name']}{owner}. {element.get('description') or ''}.\n"
             "The object alone, centred, fully visible, on a plain neutral background, soft studio light, sharp detail. "
+            "Show only the object itself: ignore any situation in the description (where it lies, water, mud, rain, "
+            "what is happening). Any screen is dark and switched off. "
             f"Style: {style or 'cinematic, realistic'}. No people, no text, no logos or brand names.")
 
 
@@ -122,7 +129,8 @@ def world_block(location: Optional[dict], props: list[dict]) -> str:
     if location:
         d = location.get("details") or {}
         extra = "; ".join(x for x in (d.get("time_of_day"), d.get("mood")) if x)
-        lines.append(f"LOCATION (the same place every time it appears, keep its layout, furniture and colours): "
+        lines.append(f"LOCATION (the same place every time it appears: keep its look, materials and colours, but show only "
+                     f"the part of it this shot would see; in a close-up it may be only a small background detail): "
                      f"{location['name']}. {location.get('description') or ''}{(' (' + extra + ')') if extra else ''}")
     if props:
         lines.append("OBJECTS (exactly the same in every scene: same colour, material and shape):\n" +
@@ -134,7 +142,8 @@ def reference_labels(location: Optional[dict], props: list[dict], limit: int) ->
     """(label, path) of the place's and objects' pictures, the place first."""
     out = []
     if location and location.get("reference_path") and len(out) < limit:
-        out.append((f"the location, {location['name']} (keep this exact place)", location["reference_path"]))
+        out.append((f"the location, {location['name']} (how the place looks; frame the shot as the SCENE says, "
+                    f"not like this picture)", location["reference_path"]))
     for p in props:
         if p.get("reference_path") and len(out) < limit:
             out.append((f"the object {p['name']} (keep it exactly like this)", p["reference_path"]))
