@@ -68,6 +68,10 @@ class StudioWorker:
     def run_once(self) -> bool:
         job = self.store.rpc("studio_claim_job", {"p_lane": self.lane, "p_stale_seconds": self.stale_seconds})
         if not job:
+            if self.lane == "generation":
+                # Nothing queued: move one-click productions to their next step.
+                import studio_production
+                return studio_production.advance_all(self.store)
             return False
         self.run_job(job)
         return True
