@@ -148,3 +148,25 @@ def test_object_pictures_and_descriptions_leave_out_the_scene():
     p = world.picture_prompt(phone, "", "9:16")
     assert "plain neutral background" in p and "ignore any situation" in p and "switched off" in p
     assert "Never what happens to it in a scene" in world.extract_prompt("x", [], [], "")
+
+
+def test_the_next_shot_in_the_same_place_carries_the_look_over(env):
+    client, db, ai, gen, ren, u, pid = setup(env, scenes=(ROOF, ROOF2, FLAT))
+    d = find(client, ai, gen, u, pid)
+    start(client, u, pid, "element", [e["id"] for e in d["elements"]])
+    run(gen)
+    roof, roof2, flat = d["scenes"]
+    for s in (roof, roof2, flat):
+        ai.image_log = []
+        start(client, u, pid, "image", [s["id"]])
+        run(gen)
+        if s is roof:
+            first = ai.image_log[-1]["prompt"]
+        elif s is roof2:
+            second = ai.image_log[-1]["prompt"]
+        else:
+            third = ai.image_log[-1]["prompt"]
+    assert "the previous shot" not in first, "nothing comes before the first scene"
+    assert "the previous shot, same place and moment" in second
+    assert "the location, Rooftop" not in second, "the previous shot already shows the place"
+    assert "the previous shot" not in third, "a different place doesn't copy the rooftop"
