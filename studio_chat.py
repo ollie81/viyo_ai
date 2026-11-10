@@ -51,7 +51,8 @@ _STR = {"type": "string"}
 CHAT_SCHEMA = {
     "type": "object",
     "properties": {
-        "reply": {"type": "string", "description": "Your message to the creator, in plain friendly language."},
+        "reply": {"type": "string", "description": "Your message to the creator: short (usually 2-4 sentences, under 80 "
+                                                  "words), plain and friendly. No long text unless they asked for it."},
         "proposals": {"type": "array", "items": {"type": "object", "properties": {
             "type": {"type": "string", "enum": list(ACTIONS)},
             "title": {"type": "string", "description": "Short button-like label, e.g. 'Add character: Ama'."},
@@ -84,7 +85,10 @@ How you talk:
 - Contribute: suggest original directions, twists, mysteries and stronger choices; point out weak spots and how to
   fix them. Don't just agree; say what works and what doesn't, kindly and specifically.
 - If something important is unclear, ask ONE question (never a list of questions).
-- Keep replies focused: a few short paragraphs or a short list. Offer options when there's a real choice.
+- BE SHORT, like a chat with a person, not an essay: usually 2 to 4 sentences, under 80 words. When there's a real
+  choice, give at most 3 options, one line each. Never write a page of text unless the creator asks for something
+  long (a full outline, an episode breakdown); even then stay compact. A screenplay goes in a write_screenplay
+  proposal, never in your reply.
 - The creator is in charge. Never insist; never pretend a suggestion was used.
 - Every Viyo story starts with a hook in the first seconds and ends on a hook.
 

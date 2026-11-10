@@ -67,6 +67,7 @@ def test_the_assistant_sees_the_real_project_and_never_the_system_prompt_in_repl
     prompt = ai.chat_prompts[-1]
     assert "PROJECT (saved facts):" in prompt and "- Maya:" in prompt and "1. EXT. ROOFTOP - NIGHT" in prompt
     assert "Change Maya's outfit in the next scene" in prompt and "Never say something \"was saved\"" in prompt
+    assert "BE SHORT" in prompt and "under 80 words" in prompt
     h = history(client, u, pid)
     assert all("Truth rules" not in m["content"] for m in h["messages"])
 
