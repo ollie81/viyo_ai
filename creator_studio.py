@@ -37,7 +37,8 @@ from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
 
 SIGN_SECONDS = 3600
-JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits", "cover")
+JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits", "cover", "elements",
+             "element")
 LANE = {"render": "render"}
 CREDIT_PACKS = [  # credits are worth $0.01 each to Viyo after payment fees
     {"id": "starter", "credits": 500, "label": "500 credits"},
@@ -234,6 +235,11 @@ class ScenePatch(BaseModel):
     # part: {character id: {"clothing"|"shoes"|"accessories"|"makeup": "..."}}.
     outfit_overrides: Optional[dict[str, dict[str, str]]] = None
     camera: Optional[Literal["auto", "close_up", "front", "side", "back", "full_body", "wide"]] = None
+    # The scene's place ("" = work it out from the heading) and objects
+    # (props_auto = work them out from the text).
+    location_id: Optional[str] = None
+    props: Optional[list[str]] = Field(None, max_length=20)
+    props_auto: bool = False
 
 
 def _clean_sfx(items: list[str]) -> list[str]:
@@ -248,7 +254,8 @@ class OrderIn(BaseModel):
 
 
 class JobRequest(BaseModel):
-    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover"]
+    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
+                  "elements", "element"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     request_id: str = Field(..., min_length=8, max_length=80)
     # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
@@ -263,7 +270,8 @@ class JobRequest(BaseModel):
 
 
 class EstimateRequest(BaseModel):
-    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover"]
+    kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
+                  "elements", "element"]
     target_ids: list[str] = Field(default_factory=list, max_length=100)
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
@@ -478,8 +486,35 @@ def _consistency(s: dict, cast: Optional[dict], resolved: Optional[dict]) -> lis
     return out
 
 
+def _scene_world(s: dict, elements: Optional[list]) -> dict:
+    import studio_elements
+    if not elements:
+        return {"location_used": None, "props_used": []}
+    loc = studio_elements.scene_location(s, elements)
+    return {"location_used": {"id": loc["id"], "name": loc["name"]} if loc else None,
+            "props_used": [{"id": e["id"], "name": e["name"]} for e in studio_elements.scene_props(s, elements)]}
+
+
+def _elements(project_id: str) -> list:
+    """Places and objects (none before creator_studio_elements.sql is run)."""
+    st = get_store()
+    try:
+        return sorted(st.select("studio_elements", {"project_id": project_id}),
+                      key=lambda e: (e["kind"] != "location", e.get("position") or 0))
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        return []
+
+
+def _element_out(e: dict, urls: dict) -> dict:
+    return {"id": e["id"], "kind": e["kind"], "name": e["name"], "description": e.get("description") or "",
+            "details": e.get("details") or {}, "status": e.get("status") or "draft",
+            "image_url": urls.get(e.get("reference_path") or ""), "has_image": bool(e.get("reference_path"))}
+
+
 def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Optional[dict] = None,
-               resolved: Optional[dict] = None) -> dict:
+               resolved: Optional[dict] = None, elements: Optional[list] = None) -> dict:
     return {"id": s["id"], "position": s["position"], "heading": s["heading"], "visual": s["visual"],
             "dialogue": s.get("dialogue") or [], "duration_seconds": float(s["duration_seconds"]), "mode": s["mode"],
             "image_url": urls.get(s.get("image_path") or ""), "video_url": urls.get(s.get("video_path") or ""),
@@ -494,6 +529,8 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "camera": s.get("camera") or "auto",
             "camera_used": ident.scene_camera(s),
             "made_with_references": (s.get("made_with") or {}).get("_refs") or [],
+            "location_id": s.get("location_id"), "props": s.get("props"),
+            **_scene_world(s, elements),
             "consistency": _consistency(s, cast, resolved)}
 
 
@@ -851,6 +888,10 @@ async def next_episode(project_id: str, user_id: str = Depends(creator)):
                    and (o.get("status") or "saved") == "saved" and not o.get("is_temporary")]
         if outfits:
             st.insert("studio_outfits", outfits)
+    for e in _elements(src["id"]):
+        st.insert("studio_elements", [{k: e.get(k) for k in ("kind", "name", "description", "details", "reference_path",
+                                                             "status", "position")} |
+                                      {"project_id": new["id"], "owner_id": user_id}])
     return _project_out(new)
 
 
@@ -867,6 +908,8 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
                  [s.get(k) for s in scenes for k in ("image_path", "video_path", "audio_path")])
     from studio_worker import characters_in_scene
     resolved = ident.resolve_outfits(scenes, outfits, chars, characters_in_scene)
+    elements = _elements(p["id"])
+    eurls = _sign([e.get("reference_path") for e in elements])
     libraries = {c["id"]: _outfit_library(c, [o for o in outfits if o["character_id"] == c["id"]])
                  for c in chars} if p.get("series_id") else {}
     urls.update(_sign([o.get("reference_path") for lib in libraries.values() for o in lib]))
@@ -880,7 +923,9 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     return {"project": project_out,
             "characters": [_character_out(c, urls, [o for o in outfits if o["character_id"] == c["id"]],
                                           libraries.get(c["id"])) for c in chars],
-            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {})) for s in scenes],
+            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {}), elements)
+                       for s in scenes],
+            "elements": [_element_out(e, eurls) for e in elements],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id),
             "production": _production_out(p)}
@@ -888,8 +933,11 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
 
 def _covers(p: dict) -> list:
     """Every cover made for this production, newest first (all are kept)."""
-    rows = get_store().select("studio_assets", {"project_id": p["id"], "kind": "image"})
-    return sorted([r for r in rows if not r.get("scene_id") and r["owner_id"] == p["owner_id"]],
+    st = get_store()
+    cover_jobs = {j["id"] for j in st.select("studio_jobs", {"project_id": p["id"], "kind": "cover"})}
+    rows = st.select("studio_assets", {"project_id": p["id"], "kind": "image"})
+    return sorted([r for r in rows if not r.get("scene_id") and r["owner_id"] == p["owner_id"]
+                   and r.get("job_id") in cover_jobs],
                   key=lambda r: r.get("created_at") or "", reverse=True)
 
 
@@ -1359,6 +1407,19 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
         fields["outfits"] = _clean_outfit_choice(s, fields["outfits"])
     if "outfit_overrides" in fields:
         fields["outfit_overrides"] = _clean_outfit_overrides(s, fields["outfit_overrides"])
+    fields.pop("props_auto", None)
+    if body.location_id is not None or body.props is not None or body.props_auto:
+        own = {e["id"]: e for e in _elements(s["project_id"])}
+        if body.location_id is not None:
+            if body.location_id and (own.get(body.location_id) or {}).get("kind") != "location":
+                raise HTTPException(status_code=400, detail="That place isn't in this production.")
+            fields["location_id"] = body.location_id or None
+        if body.props_auto:
+            fields["props"] = None
+        elif body.props is not None:
+            if any((own.get(x) or {}).get("kind") != "prop" for x in body.props):
+                raise HTTPException(status_code=400, detail="That object isn't in this production.")
+            fields["props"] = list(dict.fromkeys(body.props))
     if "dialogue" in fields:
         fields["dialogue"] = [l.model_dump() for l in body.dialogue]
         # New lines need a new voice track; the old file stays in the asset history.
@@ -1406,9 +1467,9 @@ async def reorder_scenes(project_id: str, body: OrderIn, user_id: str = Depends(
 
 def _targets(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
     st = get_store()
-    if kind in ("script", "breakdown", "render", "outfits", "cover"):
+    if kind in ("script", "breakdown", "render", "outfits", "cover", "elements"):
         return [p]
-    table = "studio_characters" if kind == "portrait" else "studio_scenes"
+    table = {"portrait": "studio_characters", "element": "studio_elements"}.get(kind, "studio_scenes")
     rows = st.select(table, {"project_id": p["id"]})
     if target_ids:
         wanted = {_uuid(t) for t in target_ids}
@@ -1424,6 +1485,13 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
     if kind == "script":
         return pricing.estimate_script(p["target_seconds"], len(p["title"]) + len(p["logline"])), \
             (None if p["logline"].strip() else "Describe your idea first.")
+    if kind == "elements":
+        n = len(get_store().select("studio_scenes", {"project_id": p["id"]}))
+        return pricing.text_cost(1500 + min(len(p.get("script") or ""), 14000) // 3, pricing.THINKING_BUDGET + 400 + n * 60), \
+            (None if (p.get("script") or "").strip() or n else "Write the script first.")
+    if kind == "element":
+        size = "2K" if p.get("image_quality") == "high" else "1K"
+        return pricing.image_cost(1, 400, size), (None if (target.get("name") or "").strip() else "Name it first.")
     if kind == "cover":
         from studio_worker import COVER_REFS
         size = "2K" if p.get("image_quality") == "high" else "1K"
@@ -1557,7 +1625,7 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
     items = []
     for t in _targets(kind, p, target_ids):
         cost, reason = _price(kind, p, t, cast, opts)
-        items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover") else t["id"],
+        items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover", "elements") else t["id"],
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
                       "blocked": reason})
     return items
@@ -1612,7 +1680,8 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
         key = f"{user_id}:{body.request_id}:{body.kind}:{item['target_id'] or p['id']}"
         r = st.rpc("studio_create_job", {
             "p_owner": user_id, "p_project": p["id"], "p_kind": body.kind, "p_lane": LANE.get(body.kind, "generation"),
-            "p_key": key, "p_credits": item["credits"], "p_input": job_input,
+            "p_key": key, "p_credits": item["credits"],
+            "p_input": {"element_id": item["target_id"]} if body.kind == "element" else job_input,
             "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync") else None,
             "p_character": item["target_id"] if body.kind == "portrait" else None, "p_max_open": 30})
         if r and r.get("ok"):
@@ -1731,6 +1800,94 @@ async def download_render(render_id: str, user_id: str = Depends(creator)):
         raise HTTPException(status_code=502, detail="Couldn't prepare the download. Try again.")
     return {"url": url, "file_name": name, "expires_at": int(time.time()) + SIGN_SECONDS,
             "width": r.get("width"), "height": r.get("height")}
+
+
+# ---------------------------------------------------------------- places and objects
+
+class ElementIn(BaseModel):
+    kind: Literal["location", "prop"]
+    name: str = Field(..., min_length=1, max_length=80)
+    description: str = Field("", max_length=800)
+    details: dict[str, str] = Field(default_factory=dict)
+
+
+class ElementPatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=80)
+    description: Optional[str] = Field(None, max_length=800)
+    details: Optional[dict[str, str]] = None
+    status: Optional[Literal["draft", "approved"]] = None
+
+
+def _clean_details(d: dict) -> dict:
+    return {k: str(v).strip()[:120] for k, v in (d or {}).items()
+            if k in ("time_of_day", "mood", "owner") and str(v).strip()}
+
+
+def _owned_element(element_id: str, user_id: str) -> dict:
+    st = get_store()
+    try:
+        e = st.one("studio_elements", {"id": _uuid(element_id)})
+    except HTTPException:
+        raise
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        e = None
+    if not e or e["owner_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return e
+
+
+@router.post("/projects/{project_id}/elements")
+async def add_element(project_id: str, body: ElementIn, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Give it a name.")
+    st = get_store()
+    try:
+        e = st.insert("studio_elements", [{"project_id": p["id"], "owner_id": user_id, "kind": body.kind,
+                                           "name": body.name.strip(), "description": body.description.strip(),
+                                           "details": _clean_details(body.details), "position": len(_elements(p["id"]))}])[0]
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        raise HTTPException(status_code=503, detail="Places and objects aren't ready yet. Run creator_studio_elements.sql.")
+    _touch(p["id"])
+    return _element_out(e, {})
+
+
+@router.patch("/elements/{element_id}")
+async def update_element(element_id: str, body: ElementPatch, user_id: str = Depends(creator)):
+    e = _owned_element(element_id, user_id)
+    raw = body.model_dump(exclude_none=True)
+    fields = {k: v.strip() for k, v in raw.items() if isinstance(v, str) and k != "status"}
+    if "name" in fields and not fields["name"]:
+        raise HTTPException(status_code=400, detail="Give it a name.")
+    if "details" in raw:
+        fields["details"] = _clean_details(raw["details"])
+    if "status" in raw:
+        if raw["status"] == "approved" and not e.get("reference_path"):
+            raise HTTPException(status_code=409, detail="Make its picture first.")
+        fields["status"] = raw["status"]
+    if fields:
+        e = get_store().update("studio_elements", {"id": e["id"]}, {**fields, "updated_at": _now_iso()})[0]
+    return _element_out(e, _sign([e.get("reference_path")]))
+
+
+@router.delete("/elements/{element_id}")
+async def delete_element(element_id: str, user_id: str = Depends(creator)):
+    e = _owned_element(element_id, user_id)
+    st = get_store()
+    for s in st.select("studio_scenes", {"project_id": e["project_id"]}):
+        fields = {}
+        if s.get("location_id") == e["id"]:
+            fields["location_id"] = None
+        if isinstance(s.get("props"), list) and e["id"] in s["props"]:
+            fields["props"] = [x for x in s["props"] if x != e["id"]]
+        if fields:
+            st.update("studio_scenes", {"id": s["id"]}, fields)
+    st.delete("studio_elements", {"id": e["id"]})
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- one-click production

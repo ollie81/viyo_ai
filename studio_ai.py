@@ -275,6 +275,18 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
+    def extract_elements(self, prompt: str):
+        """Recurring places and objects in the script (studio_elements)."""
+        import studio_elements
+        resp = self._text(prompt, response_mime_type="application/json",
+                          response_json_schema=studio_elements.ELEMENTS_SCHEMA)
+        try:
+            data = json.loads(resp.text)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned an unreadable list of places and objects.")
+        i, o = self._text_usage(resp)
+        return data, pricing.text_cost(i, o)
+
     def cover_concept(self, prompt: str):
         """The art director's poster concept (viyo_brand)."""
         import viyo_brand
@@ -462,6 +474,17 @@ class FakeStudioAI:
                 {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running down a wet street",
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
+
+    def extract_elements(self, prompt):
+        self.calls.append(("elements",))
+        self.last_elements_prompt = prompt
+        self._maybe_fail("elements")
+        return getattr(self, "elements_result", None) or {
+            "locations": [{"name": "Rooftop", "description": "flat concrete roof, rusty railing, city lights below",
+                           "time_of_day": "night", "mood": "tense", "scenes": [1]}],
+            "props": [{"name": "Maya's black leather bag", "description": "small black leather shoulder bag, gold clasp",
+                       "owner": "Maya", "scenes": [1]}],
+        }, pricing.text_cost(1600, 500)
 
     def cover_concept(self, prompt):
         self.calls.append(("cover_concept",))

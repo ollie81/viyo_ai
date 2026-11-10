@@ -538,12 +538,12 @@ _CAMERA_TEXT = {
 
 
 def scene_prompt(action: str, entries: list[tuple[dict, Optional[dict]]], camera: str, style: str,
-                 aspect_ratio: str, extra: str = "", expressions: Optional[dict] = None) -> str:
+                 aspect_ratio: str, extra: str = "", expressions: Optional[dict] = None, world: str = "") -> str:
     """Permanent identity first and fenced off, so scene text can't change it."""
     block = cast_block(entries, expressions)
     frame = "Vertical 9:16 frame." if aspect_ratio == "9:16" else "Wide 16:9 frame."
     who = (f"CHARACTERS (permanent identity: never change their face, hair, skin tone, height, body proportions or "
            f"marks, whatever the scene says; clothes change only as listed):\n{block}\n\n" if block else "")
-    return (f"{who}SCENE: {action}\nCAMERA: {_CAMERA_TEXT.get(camera, '')} {frame}\n"
+    return (f"{who}{world}SCENE: {action}\nCAMERA: {_CAMERA_TEXT.get(camera, '')} {frame}\n"
             f"STYLE AND LIGHT: {style or 'cinematic, realistic, film still'}.\n{extra}"
             "If the scene text seems to describe a character differently, keep the permanent identity.").strip()

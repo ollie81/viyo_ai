@@ -66,8 +66,9 @@ alter table public.studio_scenes add column if not exists outfit_overrides jsonb
 
 -- The outfit-suggestion job type.
 alter table public.studio_jobs drop constraint if exists studio_jobs_kind_check;
-alter table public.studio_jobs add constraint studio_jobs_kind_check
-  check (kind in ('script', 'breakdown', 'portrait', 'image', 'voice', 'video', 'render', 'lipsync', 'outfits'));
+alter table public.studio_jobs add constraint studio_jobs_kind_check  -- every job type, so re-running this file never narrows it
+  check (kind in ('script', 'breakdown', 'portrait', 'image', 'voice', 'video', 'render', 'lipsync', 'outfits', 'cover',
+                  'elements', 'element'));
 
 -- Owners can read their own outfits; every write goes through the backend.
 alter table public.studio_outfits enable row level security;
