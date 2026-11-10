@@ -1802,6 +1802,326 @@ async def download_render(render_id: str, user_id: str = Depends(creator)):
             "width": r.get("width"), "height": r.get("height")}
 
 
+# ---------------------------------------------------------------- assistant chat
+
+CHAT_HOLD = 6          # credits held while the assistant answers; only the real cost is kept
+_ai = None
+
+
+def get_ai():
+    global _ai
+    if _ai is None:
+        _ai = studio_ai.GoogleStudioAI()
+    return _ai
+
+
+class ChatIn(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+    request_id: str = Field(..., min_length=8, max_length=80)
+    conversation_id: Optional[str] = None
+
+
+class ProposalStatus(BaseModel):
+    # For paid steps the app started itself (after the price check), or to dismiss.
+    status: Literal["started", "dismissed"]
+
+
+def _chat_tables_ready() -> bool:
+    st = get_store()
+    try:
+        st.select("studio_conversations", {"id": "00000000-0000-0000-0000-000000000000"})
+        return True
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        return False
+
+
+def _message_out(m: dict) -> dict:
+    return {"id": m["id"], "role": m["role"], "content": m["content"], "proposals": m.get("proposals") or [],
+            "credits": int(m.get("credits") or 0), "created_at": m.get("created_at")}
+
+
+def _conversation_for(p: dict, user_id: str, conversation_id: Optional[str], create: bool) -> Optional[dict]:
+    st = get_store()
+    if conversation_id:
+        c = st.one("studio_conversations", {"id": _uuid(conversation_id)})
+        if not c or c["owner_id"] != user_id or c["project_id"] != p["id"]:
+            raise HTTPException(status_code=404, detail="Not found.")
+        return c
+    rows = st.select("studio_conversations", {"project_id": p["id"]}, order="updated_at", desc=True, limit=1)
+    rows = [r for r in rows if r["owner_id"] == user_id]
+    if rows:
+        return rows[0]
+    if not create:
+        return None
+    return st.insert("studio_conversations", [{"project_id": p["id"], "owner_id": user_id,
+                                               "title": (p.get("title") or "")[:120]}])[0]
+
+
+def _messages(conv: dict, limit: int = 60) -> list:
+    rows = get_store().select("studio_messages", {"conversation_id": conv["id"]}, order="created_at")
+    return rows[-limit:]
+
+
+def _chat_context(p: dict) -> str:
+    import studio_chat
+    st = get_store()
+    cast = sorted(st.select("studio_characters", {"project_id": p["id"]}), key=lambda c: c.get("position") or 0)
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    jobs = st.select("studio_jobs", {"project_id": p["id"]}, order="created_at", desc=True, limit=20)
+    return studio_chat.project_context(p, cast, _outfits(p["id"]), _elements(p["id"]), scenes, _production_out(p), jobs)
+
+
+@router.get("/projects/{project_id}/assistant/chat")
+async def chat_history(project_id: str, conversation_id: Optional[str] = None, user_id: str = Depends(creator)):
+    """The creator's conversation about this production (the latest, or one by id)."""
+    import studio_chat
+    p = _project(project_id, user_id)
+    if not _chat_tables_ready():
+        raise HTTPException(status_code=503, detail="The assistant chat isn't ready yet. Run creator_studio_chat.sql.")
+    conv = _conversation_for(p, user_id, conversation_id, create=False)
+    convs = [c for c in get_store().select("studio_conversations", {"project_id": p["id"]}, order="updated_at", desc=True,
+                                           limit=20) if c["owner_id"] == user_id]
+    return {"conversation": {"id": conv["id"], "title": conv.get("title") or ""} if conv else None,
+            "conversations": [{"id": c["id"], "title": c.get("title") or "", "updated_at": c.get("updated_at")} for c in convs],
+            "messages": [_message_out(m) for m in _messages(conv)] if conv else [],
+            "suggestions": studio_chat.SUGGESTIONS,
+            "price_note": f"Each message costs about 1-2 credits (at most {CHAT_HOLD}); you're never charged for a failed answer.",
+            "balance": _balance(user_id)}
+
+
+@router.post("/projects/{project_id}/assistant/chat/new")
+async def chat_new(project_id: str, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    c = get_store().insert("studio_conversations", [{"project_id": p["id"], "owner_id": user_id,
+                                                     "title": f"{(p.get('title') or '')[:100]} (new chat)"}])[0]
+    return {"conversation": {"id": c["id"], "title": c["title"]}, "messages": []}
+
+
+@router.post("/projects/{project_id}/assistant/chat")
+async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creator)):
+    """Sends the creator's message and returns the assistant's reply. The same
+    request_id never sends or charges twice; a failed answer is not charged."""
+    import studio_chat
+    p = _project(project_id, user_id)
+    if not _chat_tables_ready():
+        raise HTTPException(status_code=503, detail="The assistant chat isn't ready yet. Run creator_studio_chat.sql.")
+    st = get_store()
+    key = f"{user_id}:{body.request_id}"
+    done = st.one("studio_messages", {"client_key": key + ":reply"})
+    if done:
+        mine = st.one("studio_messages", {"client_key": key})
+        return {"message": _message_out(mine) if mine else None, "reply": _message_out(done), "balance": _balance(user_id),
+                "conversation_id": done["conversation_id"]}
+    _rate_limit(user_id)
+    conv = _conversation_for(p, user_id, body.conversation_id, create=True)
+    mine = st.one("studio_messages", {"client_key": key})
+    if mine and mine["conversation_id"] != conv["id"]:
+        raise HTTPException(status_code=409, detail="That message belongs to another chat.")
+    hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": CHAT_HOLD})
+    if not hold or not hold.get("ok"):
+        raise HTTPException(status_code=402, detail={"message": "Not enough credits for the assistant.", "balance": _balance(user_id)})
+    try:
+        if not mine:
+            mine = st.insert("studio_messages", [{"conversation_id": conv["id"], "project_id": p["id"], "owner_id": user_id,
+                                                  "role": "user", "content": body.message.strip(), "client_key": key}])[0]
+        rows = _messages(conv, 400)
+        earlier = [m for m in rows if m["id"] != mine["id"]]
+        costs = []
+        # Fold older messages into the running summary instead of resending them.
+        summarized = int(conv.get("summarized_count") or 0)
+        if len(earlier) - summarized > SUMMARY_WINDOW():
+            fold = earlier[summarized:len(earlier) - studio_chat.RECENT]
+            if fold:
+                summary, c1 = _ai_call(lambda: get_ai().summarize(studio_chat.summary_prompt(conv.get("summary") or "", fold)))
+                costs.append(c1)
+                conv = st.update("studio_conversations", {"id": conv["id"]},
+                                 {"summary": summary[:4000], "summarized_count": summarized + len(fold)})[0]
+        recent = earlier[max(int(conv.get("summarized_count") or 0), len(earlier) - studio_chat.RECENT):]
+        memory = conv.get("memory") or {}
+        prompt = studio_chat.build_prompt(_chat_context(p), conv.get("summary") or "", memory.get("decisions") or [],
+                                          recent, body.message.strip())
+        data, c2 = _ai_call(lambda: get_ai().chat(prompt))
+        costs.append(c2)
+        cost = pricing.combine(costs)
+        credits = min(CHAT_HOLD, max(1, cost.credits))
+        reply = st.insert("studio_messages", [{
+            "conversation_id": conv["id"], "project_id": p["id"], "owner_id": user_id, "role": "assistant",
+            "content": str(data.get("reply") or "").strip()[:20000], "proposals": studio_chat.clean_proposals(data.get("proposals")),
+            "credits": credits, "client_key": key + ":reply"}])[0]
+        new_decisions = [str(d).strip()[:300] for d in data.get("decisions") or [] if str(d).strip()]
+        st.update("studio_conversations", {"id": conv["id"]}, {
+            "memory": {**memory, "decisions": ((memory.get("decisions") or []) + new_decisions)[-60:]},
+            "updated_at": _now_iso()})
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": credits})
+    except HTTPException:
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
+        raise
+    except Exception as e:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
+        print(f"[WARN] studio chat {p['id']}: {str(e)[:200]}")
+        raise HTTPException(status_code=502, detail={"code": "assistant_failed", "message":
+                            "The assistant couldn't answer just now. Try again; you weren't charged."})
+    return {"message": _message_out(mine), "reply": _message_out(reply), "conversation_id": conv["id"],
+            "balance": _balance(user_id)}
+
+
+def SUMMARY_WINDOW() -> int:
+    import studio_chat
+    return studio_chat.SUMMARIZE_AFTER
+
+
+def _ai_call(fn):
+    """One retry when the provider is busy."""
+    try:
+        return fn()
+    except studio_ai.ProviderBusy:
+        import time as _t
+        _t.sleep(1.5)
+        return fn()
+
+
+def _owned_message(message_id: str, user_id: str) -> dict:
+    m = get_store().one("studio_messages", {"id": _uuid(message_id)})
+    if not m or m["owner_id"] != user_id or m["role"] != "assistant":
+        raise HTTPException(status_code=404, detail="Not found.")
+    return m
+
+
+def _find_by_name(rows: list, name: str, what: str) -> dict:
+    n = (name or "").strip().lower()
+    hit = next((r for r in rows if r["name"].strip().lower() == n), None) or \
+        next((r for r in rows if n and n in r["name"].strip().lower()), None)
+    if not hit:
+        raise HTTPException(status_code=409, detail=f"There's no {what} called \"{name}\" in this production.")
+    return hit
+
+
+def _scene_by_number(p: dict, n) -> dict:
+    scenes = sorted(get_store().select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    try:
+        return scenes[int(n) - 1]
+    except (TypeError, ValueError, IndexError):
+        raise HTTPException(status_code=409, detail=f"There's no scene {n} in this production.")
+
+
+async def _apply(p: dict, prop: dict, user_id: str) -> str:
+    """Runs a free proposal through the Studio's own endpoints. Returns what
+    was done, in plain words."""
+    from pydantic import ValidationError
+    d = prop.get("data") or {}
+    kind = prop["type"]
+    st = get_store()
+    try:
+        if kind == "update_story":
+            fields = {k: d[k] for k in ("title", "logline", "genre", "visual_style", "language", "target_seconds") if d.get(k)}
+            if d.get("kind") in ("short", "episode", "series", "film"):
+                st.update("studio_projects", {"id": p["id"]}, {"kind": d["kind"]})
+            elif not fields:
+                raise HTTPException(status_code=409, detail="This suggestion has nothing to change.")
+            if fields:
+                await update_project(p["id"], ProjectPatch(**fields), user_id)
+            return "Story details updated."
+        if kind == "write_screenplay":
+            if not (d.get("script") or "").strip():
+                raise HTTPException(status_code=409, detail="This suggestion has no screenplay text.")
+            await update_project(p["id"], ProjectPatch(script=d["script"]), user_id)
+            return "Screenplay saved."
+        if kind == "add_character":
+            out = await add_character(p["id"], CharacterIn(name=d.get("name") or "", description=d.get("description") or ""), user_id)
+            return f"{out['name']} added to the cast."
+        cast = st.select("studio_characters", {"project_id": p["id"]})
+        if kind == "update_character":
+            c = _find_by_name(cast, d.get("character") or d.get("name"), "character")
+            await update_character(c["id"], CharacterPatch(description=d.get("description") or c["description"]), user_id)
+            return f"{c['name']} updated."
+        if kind == "add_outfit":
+            c = _find_by_name(cast, d.get("character"), "character")
+            parts = {k: d[k] for k in ("clothing", "shoes", "accessories", "makeup") if d.get(k)}
+            await add_outfit(c["id"], OutfitIn(name=d.get("name") or "New outfit", description=d.get("description") or "",
+                                               parts=parts), user_id)
+            return f"Outfit \"{d.get('name') or 'New outfit'}\" added for {c['name']}."
+        if kind in ("add_place", "add_object"):
+            details = {"owner": d["owner"]} if d.get("owner") else {}
+            e = await add_element(p["id"], ElementIn(kind="location" if kind == "add_place" else "prop", name=d.get("name") or "",
+                                                     description=d.get("description") or "", details=details), user_id)
+            return f"{e['name']} added to places & objects."
+        if kind == "rewrite_scene":
+            s = _scene_by_number(p, d.get("scene"))
+            lines = [Line(character=(x.get("character") or "")[:60], text=(x.get("text") or "")[:600],
+                          emotion=(x.get("emotion") or "")[:40]) for x in (d.get("dialogue") or []) if x.get("text")]
+            patch = {k: d[k] for k in ("heading", "visual") if d.get(k)}
+            if d.get("dialogue") is not None:
+                patch["dialogue"] = lines
+            if not patch:
+                raise HTTPException(status_code=409, detail="This suggestion has nothing to change.")
+            await update_scene(s["id"], ScenePatch(**patch), user_id)
+            return f"Scene {d.get('scene')} rewritten. Remake its picture or video to see the change."
+        if kind == "set_scene_outfit":
+            s = _scene_by_number(p, d.get("scene"))
+            c = _find_by_name(cast, d.get("character"), "character")
+            outs = [o for o in _outfits(p["id"]) if o["character_id"] == c["id"] and (o.get("status") or "saved") == "saved"]
+            o = _find_by_name(outs, d.get("outfit"), f"outfit for {c['name']}")
+            await update_scene(s["id"], ScenePatch(outfits={**(s.get("outfits") or {}), c["id"]: o["id"]}), user_id)
+            return f"{c['name']} wears \"{o['name']}\" in scene {d.get('scene')}."
+    except ValidationError as e:
+        raise HTTPException(status_code=409, detail="This suggestion isn't complete: " + str(e.errors()[0].get("msg", ""))[:160])
+    raise HTTPException(status_code=409, detail="This kind of suggestion can't be applied here.")
+
+
+@router.post("/assistant/messages/{message_id}/proposals/{index}/apply")
+async def apply_proposal(message_id: str, index: int, user_id: str = Depends(creator)):
+    """The creator applies one suggestion. Free changes are saved now through
+    the Studio's own code; paid steps answer needs_price so the app shows
+    the normal price check."""
+    m = _owned_message(message_id, user_id)
+    props = list(m.get("proposals") or [])
+    if not 0 <= index < len(props):
+        raise HTTPException(status_code=404, detail="Not found.")
+    prop = props[index]
+    if prop.get("status") != "proposed":
+        raise HTTPException(status_code=409, detail="This suggestion was already used or dismissed.")
+    if prop.get("paid"):
+        raise HTTPException(status_code=409, detail={"code": "needs_price", "job": prop.get("job"),
+                                                     "message": "This step costs credits: check the price first."})
+    p = _project(m["project_id"], user_id)
+    try:
+        result = await _apply(p, prop, user_id)
+    except HTTPException as e:
+        msg = e.detail if isinstance(e.detail, str) else (e.detail or {}).get("message", "It couldn't be applied.")
+        props[index] = {**prop, "status": "proposed", "error": msg}
+        get_store().update("studio_messages", {"id": m["id"]}, {"proposals": props})
+        raise HTTPException(status_code=e.status_code, detail=msg)
+    props[index] = {**prop, "status": "applied", "result": result, "applied_at": _now_iso(), "error": None}
+    st = get_store()
+    st.update("studio_messages", {"id": m["id"]}, {"proposals": props})
+    conv = st.one("studio_conversations", {"id": m["conversation_id"]})
+    if conv:
+        memory = conv.get("memory") or {}
+        st.update("studio_conversations", {"id": conv["id"]}, {
+            "memory": {**memory, "decisions": ((memory.get("decisions") or []) + [f"Applied: {prop['title']}. {prop.get('summary') or ''}"])[-60:]},
+            "updated_at": _now_iso()})
+    return {"proposal": props[index], "result": result}
+
+
+@router.post("/assistant/messages/{message_id}/proposals/{index}/status")
+async def set_proposal_status(message_id: str, index: int, body: ProposalStatus, user_id: str = Depends(creator)):
+    m = _owned_message(message_id, user_id)
+    props = list(m.get("proposals") or [])
+    if not 0 <= index < len(props):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if props[index].get("status") != "proposed":
+        raise HTTPException(status_code=409, detail="This suggestion was already used or dismissed.")
+    if body.status == "started" and not props[index].get("paid"):
+        raise HTTPException(status_code=409, detail="Apply this suggestion instead.")
+    props[index] = {**props[index], "status": body.status, "updated_at": _now_iso()}
+    get_store().update("studio_messages", {"id": m["id"]}, {"proposals": props})
+    return {"proposal": props[index]}
+
+
 # ---------------------------------------------------------------- places and objects
 
 class ElementIn(BaseModel):

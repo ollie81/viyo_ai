@@ -275,6 +275,25 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
+    def chat(self, prompt: str):
+        """One assistant reply (studio_chat): {reply, proposals, decisions}."""
+        import studio_chat
+        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=studio_chat.CHAT_SCHEMA)
+        try:
+            data = json.loads(resp.text)
+        except (TypeError, ValueError):
+            raise ProviderError("The assistant's answer couldn't be read.")
+        if not (data.get("reply") or "").strip():
+            raise ProviderError("The assistant returned an empty answer.")
+        i, o = self._text_usage(resp)
+        return data, pricing.text_cost(i, o)
+
+    def summarize(self, prompt: str):
+        """A short plain-text summary (the assistant's memory of older messages)."""
+        resp = self._text(prompt)
+        i, o = self._text_usage(resp)
+        return (resp.text or "").strip(), pricing.text_cost(i, o)
+
     def extract_elements(self, prompt: str):
         """Recurring places and objects in the script (studio_elements)."""
         import studio_elements
@@ -474,6 +493,25 @@ class FakeStudioAI:
                 {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running down a wet street",
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
+
+    def chat(self, prompt):
+        self.calls.append(("chat",))
+        self.chat_prompts = getattr(self, "chat_prompts", []) + [prompt]
+        self._maybe_fail("chat")
+        if getattr(self, "chat_result", None) is not None:
+            r = self.chat_result
+            return (r(prompt) if callable(r) else r), pricing.text_cost(3000, 400)
+        return {"reply": "Love it. What if he finds out on the day he's evicted? One question: who raised him?",
+                "proposals": [{"type": "update_story", "title": "Set the idea",
+                               "summary": "Title 'Hidden Heir' and this logline.",
+                               "data": {"title": "Hidden Heir", "logline": "An evicted courier learns he is a billionaire's son.",
+                                        "genre": "Drama"}}],
+                "decisions": []}, pricing.text_cost(3000, 400)
+
+    def summarize(self, prompt):
+        self.calls.append(("summarize",))
+        self.summary_prompts = getattr(self, "summary_prompts", []) + [prompt]
+        return "Summary: the creator is developing a rags-to-riches drama.", pricing.text_cost(1500, 120)
 
     def extract_elements(self, prompt):
         self.calls.append(("elements",))
