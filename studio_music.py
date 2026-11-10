@@ -14,6 +14,8 @@ import httpx
 MODEL = "lyria-3.5"
 COST_PER_SONG_USD = 0.08
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+API_REVISION = "2026-05-20"
+SONG_SECONDS = 120  # one Lyria song is about two minutes; longer films loop it
 
 
 class MusicGenerationError(RuntimeError):
@@ -22,7 +24,12 @@ class MusicGenerationError(RuntimeError):
         self.retry = retry
 
 
-def music_prompt(project: dict) -> str:
+def wanted(project: dict) -> bool:
+    """Make a score only when the creator has no track and hasn't turned it off."""
+    return not project.get("music_path") and project.get("auto_music") is not False
+
+
+def music_prompt(project: dict, film_seconds: float = 0) -> str:
     genre = (project.get("genre") or "cinematic drama").strip()[:80]
     logline = (project.get("logline") or project.get("title") or "an emotional story").strip()[:500]
     style = (project.get("visual_style") or "cinematic and emotionally expressive").strip()[:160]
@@ -31,7 +38,10 @@ def music_prompt(project: dict) -> str:
         "No vocals, no lyrics, no speech, and no sound effects. "
         f"Genre: {genre}. Story mood and context: {logline}. Visual atmosphere: {style}. "
         "Use an emotionally coherent instrumental arrangement with a memorable but subtle "
-        "original motif, gentle development, and a natural ending. Keep the music supportive "
+        "original motif and gentle development. "
+        + ("End so the music flows smoothly back into its opening, because it will repeat under a longer film. "
+           if film_seconds > SONG_SECONDS else "Give it a natural ending. ")
+        + "Keep the music supportive "
         "rather than overpowering dialogue. Do not imitate any existing song, artist, film score, "
         "or recognizable melody. Create approximately two minutes of music."
     )
@@ -60,7 +70,7 @@ def _audio_from_response(payload: dict) -> bytes:
     raise MusicGenerationError("The music service returned no usable audio.")
 
 
-def generate(project: dict, api_key: Optional[str] = None) -> bytes:
+def generate(project: dict, film_seconds: float = 0, api_key: Optional[str] = None) -> bytes:
     """Generate one original instrumental MP3. Never silently substitute silence."""
     key = api_key or os.environ.get("GEMINI_API_KEY", "")
     if not key:
@@ -68,8 +78,8 @@ def generate(project: dict, api_key: Optional[str] = None) -> bytes:
     try:
         response = httpx.post(
             API_URL,
-            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-            json={"model": MODEL, "input": music_prompt(project)},
+            headers={"x-goog-api-key": key, "Content-Type": "application/json", "Api-Revision": API_REVISION},
+            json={"model": MODEL, "input": music_prompt(project, film_seconds)},
             timeout=httpx.Timeout(180.0, connect=15.0),
         )
     except httpx.TimeoutException as exc:
