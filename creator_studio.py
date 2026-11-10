@@ -1541,13 +1541,23 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         return pricing.estimate_voice(text), (_voice_problem(target, cast) if text.strip() else "This scene has no lines.")
     if kind == "video":
         from studio_worker import speech_clip_seconds, talks_in_video
+        import studio_fal
+
+        def with_backup(secs, talking):
+            # When backup models are on, the price covers the dearest try, so a
+            # scene Google refuses can still be made. Only the real cost is kept.
+            main = pricing.estimate_video(secs)
+            backup = studio_fal.estimate(secs, talking, p.get("language") or "English") \
+                if target.get("image_path") else None
+            return backup if backup and backup.total_usd > main.total_usd else main
+
         if talks_in_video(dict(target, mode="video"), p):
             secs = speech_clip_seconds(target)
             if secs is None:
                 return pricing.estimate_video(15), ("This scene has too much dialogue for one video clip "
                                                     "(15 seconds at most). Split it into two scenes.")
-            return pricing.estimate_video(secs), None
-        return pricing.estimate_video(target.get("duration_seconds") or 8.0), None
+            return with_backup(secs, True), None
+        return with_backup(target.get("duration_seconds") or 8.0, False), None
     if kind == "lipsync":
         from studio_worker import needs_lipsync, speech_seconds
         lines = [d for d in target.get("dialogue") or [] if (d.get("text") or "").strip()]
