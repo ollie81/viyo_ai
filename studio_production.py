@@ -2,6 +2,7 @@
 under one confirmed price.
 
 Stages, each waiting for the one before it:
+  places  -> a reference picture for each place and object (studio_elements)
   sheets  -> each character's reference sheet (or a portrait, if sheets are off)
   images  -> a picture for every scene that has none (the first frame of its video)
   voices  -> saved-voice recordings for scenes whose lines aren't spoken in the video
@@ -26,10 +27,10 @@ from typing import Optional
 import studio_identity as ident
 import studio_pricing as pricing
 
-STAGES = ("sheets", "images", "voices", "videos", "lipsync", "render")
-STAGE_KIND = {"sheets": "portrait", "images": "image", "voices": "voice", "videos": "video",
+STAGES = ("places", "sheets", "images", "voices", "videos", "lipsync", "render")
+STAGE_KIND = {"places": "element", "sheets": "portrait", "images": "image", "voices": "voice", "videos": "video",
               "lipsync": "lipsync", "render": "render"}
-STAGE_LABEL = {"sheets": "Character sheets", "images": "Scene pictures", "voices": "Voices", "videos": "Video clips",
+STAGE_LABEL = {"places": "Places and objects", "sheets": "Character sheets", "images": "Scene pictures", "voices": "Voices", "videos": "Video clips",
                "lipsync": "Lip sync", "render": "Final film"}
 ATTEMPTS = 2          # each step: the first try and one automatic retry
 # Reasons a step can't run *yet* that an earlier stage of the run takes care of.
@@ -65,6 +66,15 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
         stages[stage].append({"target_id": target["id"], "label": label, "credits": pricing.hold_credits(STAGE_KIND[stage], cost),
                               "input": opts or {}})
 
+    try:
+        elements = st.select("studio_elements", {"project_id": p["id"]})
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        elements = []
+    for e in sorted(elements, key=lambda e: (e["kind"] != "location", e.get("position") or 0)):
+        if not e.get("reference_path"):
+            add("places", e, f"{e['name']} picture", {"element_id": e["id"]})
     for c in cast:
         has_front = ((c.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")
         if options["sheets"] and not has_front and not c.get("identity_locked_at"):

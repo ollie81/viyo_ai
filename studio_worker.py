@@ -20,6 +20,7 @@ from typing import Optional
 
 import studio_ai as ai_mod
 import studio_casting as casting
+import studio_elements as world_mod
 import studio_identity as ident
 import studio_pricing as pricing
 import studio_render as render
@@ -549,6 +550,93 @@ class StudioWorker:
             self.store.insert("studio_outfits", rows)
         return {"suggested": len(rows)}, cost
 
+    # ------------------------------------------------ places and objects
+
+    def _elements(self, project) -> list:
+        try:
+            return self.store.select("studio_elements", {"project_id": project["id"]})
+        except Exception:
+            self._rollback()          # creator_studio_elements.sql not run yet
+            return []
+
+    def _world(self, project, scene):
+        """(location, objects) this scene uses."""
+        elements = self._elements(project)
+        return world_mod.scene_location(scene, elements), world_mod.scene_props(scene, elements)
+
+    def _world_files(self, location, props, limit) -> list:
+        out = []
+        for label, path in world_mod.reference_labels(location, props, limit):
+            try:
+                out.append((label, self.files.get(path)))
+            except Exception:
+                pass
+        return out
+
+    def do_elements(self, job, project):
+        """The production designer: finds the recurring places and objects in
+        the script, adds the new ones (existing ones are kept as they are), and
+        notes which scenes use them."""
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        if not (project.get("script") or "").strip() and not scenes:
+            raise JobFailed("no_script", "Write the script first. Your credits were returned.")
+        data, cost = self.ai.extract_elements(world_mod.extract_prompt(project.get("script") or "", scenes, cast,
+                                                                        project.get("visual_style") or ""))
+        existing = self._elements(project)
+        have = {(e["kind"], e["name"].strip().lower()): e for e in existing}
+        made = 0
+        assign_loc: dict = {}
+        assign_props: dict = {}
+        for kind, items in (("location", data.get("locations") or []), ("prop", data.get("props") or [])):
+            for i, it in enumerate(items[:40]):
+                name = world_mod.clean(it.get("name"), 80)
+                if not name:
+                    continue
+                row = have.get((kind, name.lower()))
+                if row is None:
+                    details = {k: world_mod.clean(it.get(k), 120) for k in
+                               (("time_of_day", "mood") if kind == "location" else ("owner",)) if it.get(k)}
+                    row = self.store.insert("studio_elements", [{
+                        "project_id": project["id"], "owner_id": project["owner_id"], "kind": kind, "name": name,
+                        "description": world_mod.clean(it.get("description")), "details": details,
+                        "position": len(existing) + made}])[0]
+                    have[(kind, name.lower())] = row
+                    made += 1
+                for n in it.get("scenes") or []:
+                    if isinstance(n, int) and 1 <= n <= len(scenes):
+                        sid = scenes[n - 1]["id"]
+                        if kind == "location":
+                            assign_loc.setdefault(sid, row["id"])
+                        else:
+                            assign_props.setdefault(sid, []).append(row["id"])
+        for s in scenes:
+            fields = {}
+            if s["id"] in assign_loc and not s.get("location_id"):
+                fields["location_id"] = assign_loc[s["id"]]
+            if s["id"] in assign_props and s.get("props") is None:
+                fields["props"] = list(dict.fromkeys(assign_props[s["id"]]))
+            if fields:
+                self.store.update("studio_scenes", {"id": s["id"]}, fields)
+        return {"added": made, "locations": len(data.get("locations") or []), "props": len(data.get("props") or [])}, cost
+
+    def do_element(self, job, project):
+        """One place's or object's reference picture."""
+        inp = job.get("input") or {}
+        if isinstance(inp, str):
+            inp = json.loads(inp or "{}")
+        el = self.store.one("studio_elements", {"id": inp.get("element_id")}) if inp.get("element_id") else None
+        if not el or el["project_id"] != project["id"]:
+            raise JobFailed("not_found", "That place or object no longer exists.")
+        prompt = world_mod.picture_prompt(el, project.get("visual_style") or "", project["aspect_ratio"])
+        ar = project["aspect_ratio"] if el["kind"] == "location" else "1:1"
+        data, mime, cost = self.ai.image(prompt, [], ar, _size(project))
+        ext = "png" if "png" in mime else "jpg"
+        path = self._save(job, project, "image", ext, data, mime)
+        self.store.update("studio_elements", {"id": el["id"]}, {"reference_path": path, "status": "draft",
+                                                                "updated_at": _now()})
+        return {"path": path, "element_id": el["id"]}, cost
+
     def do_cover(self, job, project):
         """A cover: an art-director step reads the story and decides what the
         poster shows (any number of characters, or none); the poster is then
@@ -650,12 +738,16 @@ class StudioWorker:
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
         expressions = self._expressions(scene, entries)
-        labelled = self._reference_files(entries, camera, IMAGE_REFS, expressions=expressions)
+        location, props = self._world(project, scene)
+        n_world = len(world_mod.reference_labels(location, props, IMAGE_REFS))
+        world_take = min(n_world, 2 if entries else IMAGE_REFS)
+        labelled = self._reference_files(entries, camera, IMAGE_REFS - world_take, expressions=expressions)
+        labelled += self._world_files(location, props, IMAGE_REFS - len(labelled))
         refs = [data for _label, data in labelled]
         roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
         prompt = ident.scene_prompt(scene["visual"] or scene["heading"], entries, camera, project["visual_style"],
                                     project["aspect_ratio"], extra=(roles + "\n") if roles else "",
-                                    expressions=expressions)
+                                    expressions=expressions, world=world_mod.world_block(location, props))
         prompt += "\nNo text, captions, logos or watermarks in the image."
         data, mime, cost = self.ai.image(prompt, refs[:IMAGE_REFS], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
@@ -731,9 +823,10 @@ class StudioWorker:
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
         expressions = self._expressions(scene, entries)
+        location, props = self._world(project, scene)
         block = ident.cast_block(entries, expressions)
         notes = (f"Characters (permanent identity: never change their face, hair, skin, height or build):\n{block}\n"
-                 if block else "")
+                 if block else "") + world_mod.world_block(location, props)
         lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
         style = f"Style: {project['visual_style'] or 'cinematic'}. "
         references = None
@@ -748,7 +841,7 @@ class StudioWorker:
             prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}"
                       f"{talking_direction(lines, cast, project)} "
                       "No subtitles, captions, text or watermarks. Do not add music.")
-            references = self._references(scene, entries, frame, camera, expressions)
+            references = self._references(scene, entries, frame, camera, expressions, (location, props))
         else:
             has_lines = bool(lines)
             # Saved voices speak this scene: the video model must not talk,
@@ -769,7 +862,7 @@ class StudioWorker:
         if references is None and frame is None and entries:
             # No scene picture to start from: the characters' reference views
             # keep them the same person.
-            references = self._references(scene, entries, None, camera, expressions) or None
+            references = self._references(scene, entries, None, camera, expressions, (location, props)) or None
         data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
             else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
@@ -781,7 +874,7 @@ class StudioWorker:
         self._made_with(scene, entries, labels)
         return {"path": path, "references": labels}, cost
 
-    def _references(self, scene, entries, frame, camera="front", expressions=None) -> list:
+    def _references(self, scene, entries, frame, camera="front", expressions=None, world=(None, [])) -> list:
         """Labelled images for Omni (6 at most; Google: 3 per character, 2
         characters): the scene picture (setting and framing), then each of
         the first two characters' reference views for this camera angle,
@@ -790,7 +883,12 @@ class StudioWorker:
         if frame:
             refs.append(("the scene: its setting, lighting and framing (not a character)", frame))
         room = VIDEO_REFS - len(refs)
-        refs += self._reference_files(entries[:2], camera, min(room, 3 * len(entries[:2])), expressions=expressions)
+        location, props = world
+        n_world = len(world_mod.reference_labels(None if frame else location, props, room))
+        chars = min(room - min(n_world, 2), 3 * len(entries[:2]))
+        refs += self._reference_files(entries[:2], camera, max(chars, 0), expressions=expressions)
+        # The scene picture already shows the place; otherwise send its picture too.
+        refs += self._world_files(None if frame else location, props, VIDEO_REFS - len(refs))
         return refs
 
     def do_lipsync(self, job, project):
