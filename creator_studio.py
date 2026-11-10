@@ -32,6 +32,7 @@ import studio_identity as ident
 import studio_lipsync
 import studio_sfx
 import studio_pricing as pricing
+import studio_music as music_mod
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
@@ -181,6 +182,7 @@ class ProjectPatch(BaseModel):
     script: Optional[str] = Field(None, max_length=60000)
     aspect_ratio: Optional[Literal["9:16", "16:9"]] = None
     music_volume: Optional[float] = Field(None, ge=0, le=1)
+    auto_music: Optional[bool] = None
     image_quality: Optional[Literal["standard", "high"]] = None
     production_style: Optional[Literal["video", "pictures"]] = None
 
@@ -558,6 +560,7 @@ def _project_out(p: dict) -> dict:
             "captions", "script", "created_at", "updated_at", "music_name", "series_id")
     out = {k: p.get(k) for k in keys}
     out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
+               auto_music=p.get("auto_music") is not False,
                image_quality=p.get("image_quality") or "standard",
                production_style=p.get("production_style") or "pictures",
                story_bible=p.get("story_bible") or None)
@@ -1575,7 +1578,7 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
                          if needs_lipsync(s, p) and not s.get("lipsync_path")), None)
         if reason is None and unsynced:
             reason = f"Scene {unsynced}'s lip sync isn't made yet."
-        return pricing.render_cost(secs), reason
+        return pricing.render_cost(secs, music_generated=music_mod.wanted(p)), reason
     raise HTTPException(status_code=400, detail="Unknown job type.")
 
 
