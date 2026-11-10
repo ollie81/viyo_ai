@@ -26,6 +26,7 @@ import wave
 from typing import Optional, Protocol
 
 import studio_pricing as pricing
+import studio_continuity as continuity
 
 THINKING_BUDGET = pricing.THINKING_BUDGET
 
@@ -114,7 +115,10 @@ BREAKDOWN_SCHEMA = {
         }, "required": ["name", "description", "gender", "age_category", "age_confidence"]}},
         "scenes": {"type": "array", "items": {"type": "object", "properties": {
             "heading": {"type": "string"},
-            "visual": {"type": "string", "description": "One-shot image prompt: who is in frame, what they do, setting, lighting, camera framing."},
+            "visual": {"type": "string", "description": "The scene's opening frame as one coherent shot: who is in frame and "
+                                                       "where, what they do and hold, the place, light and camera. It must "
+                                                       "match continuity.start_state."},
+            "continuity": continuity.SCHEMA,
             "dialogue": {"type": "array", "items": {"type": "object", "properties": {
                 "character": {"type": "string"}, "text": {"type": "string"},
                 "emotion": {"type": "string", "description": "The feeling of this one line in 1-3 English words "
@@ -123,7 +127,7 @@ BREAKDOWN_SCHEMA = {
                              "(e.g. 'soft, hesitant'). Empty if not needed."}},
                 "required": ["character", "text"]}},
             "duration_seconds": {"type": "number"},
-        }, "required": ["heading", "visual", "dialogue", "duration_seconds"]}},
+        }, "required": ["heading", "visual", "dialogue", "duration_seconds", "continuity"]}},
     },
     "required": ["characters", "scenes"],
 }
@@ -144,9 +148,29 @@ def breakdown_prompt(b: dict, script: str) -> str:
     return _plan_cast(b) + f"""Break this screenplay into a shot list for an AI-made {b.get('kind')} ({b.get('aspect_ratio')}).
 Visual style: {b.get('visual_style') or 'cinematic, realistic'}.
 The production language is {lang}.
-For each scene give: the heading, ONE visual prompt describing a single strong shot (characters by name, action, setting, lighting, framing),
-the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over),
-and a duration in seconds (2-12; long enough for its lines).
+You are the director and the continuity supervisor. FIRST read the whole screenplay as ONE continuous film: who is
+where, what they wear and carry, how they feel, and how each moment leads to the next. THEN write the scenes in order,
+each one starting exactly where the scene before it ended, unless the screenplay cuts to another place or time.
+
+For each scene give:
+- the heading;
+- visual: the scene's opening frame as one coherent shot (characters by name, positions, action, what they hold,
+  setting, lighting, framing), matching its start_state;
+- the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over);
+- a duration in seconds (2-12; long enough for its lines);
+- continuity: purpose; transition from the scene before (continuous, same_place_cut, new_place, time_jump,
+  flashback; the first scene is new_place) with a note for the last three; time of day; location; important objects;
+  every character involved with in_frame (false if only heard), position and facing, what they hold at the start and
+  at the end, outfit, feeling at the start and at the end, enters/leaves; start_state; action (who moves, who stays
+  still); end_state; camera and camera movement; lighting; what carries over from the previous scene; what it sets
+  up next; and intentional_changes (only changes the screenplay MEANS to make: a new outfit, a new place, time passing).
+
+Continuity rules:
+- A continuous scene starts from the previous end_state: same place, same clothes, same objects in the same hands,
+  the same feelings, unless this scene shows them changing.
+- Objects only appear, move or disappear when someone picks them up, puts them down, hands them over or leaves with them.
+- Never change an outfit, place or time of day without listing it in intentional_changes and the transition.
+- Characters only appear when they are already there or enter; when they leave they are gone until they come back.
 Describe every character visually so they can be drawn the same way every time.
 When characters share a moment in the same place (talking face to face, arguing, fighting, hugging, a kiss), show
 them TOGETHER in one shot (a two-shot or over-the-shoulder shot), naming each one and where they stand. Don't turn
