@@ -17,7 +17,12 @@ PLAN = {"title": "The Last Bus", "logline": "A nurse must choose between her job
         "beats": [{"purpose": "hook", "what_happens": "A patient says her name", "emotional_turn": "tired -> afraid", "seconds": 5},
                   {"purpose": "end_hook", "what_happens": "Her brother's ring on the patient's hand", "emotional_turn": "relief -> dread",
                    "seconds": 5}],
-        "ending": "The bus leaves without her."}
+        "ending": "The bus leaves without her.",
+        "hook_plan": {"opening_technique": "emotional_revelation", "opening_moment": "A patient says her name",
+                      "opening_why": "a stranger knows her", "ending_technique": "disturbing_news",
+                      "ending_moment": "The ring", "viewer_question": "Is the patient her brother?"},
+        "questions": [{"question": "Who is the patient?", "raised_in_beat": 1, "answered_in_beat": 0}],
+        "knowledge": [{"character": "Ama", "knows": "a patient knows her name"}]}
 DRAFT = "INT. WARD - NIGHT\n\nAMA checks a chart.\n\nPATIENT\nAma?\n" * 3
 
 
@@ -61,7 +66,7 @@ def test_three_steps_keep_the_idea_and_apply_the_craft():
     assert bible["scores"] == {"hook": 5, "dialogue": 6} and bible["open_threads"] == ["Who sent the patient?"]
     assert bible["opening_hook"] == "PATIENT: Ama?" and bible["ending_hook"] == "AMA: Then I'll drive."
     assert bible["hooks_planned"] is True
-    assert (i, o) == (1500 + 1000 + 3000, 2000 + 900 + 2500)
+    assert (i, o) == (1500 + 1000 + 3000 + 3000, 2000 + 900 + 2500 + 2500), "plan, draft, doctor, story check"
 
 
 def test_a_film_resolves_instead_of_a_cliffhanger():
@@ -114,9 +119,10 @@ def test_google_runs_the_three_calls_and_prices_them():
     g = object.__new__(studio_ai.GoogleStudioAI)
     g.client = types.SimpleNamespace(models=Models())
     text, bible, cost = g.develop_script({"title": "T", "target_seconds": 60}, [])
-    assert len(calls) == 3 and text == DRAFT.strip() and bible["logline"] == PLAN["logline"]
-    assert cost.units == {"input_tokens": 3000, "output_tokens": 1800}
-    assert pricing.estimate_script(60, 100).provider_cost_usd < 0.06
+    assert len(calls) == 4 and text == DRAFT.strip() and bible["logline"] == PLAN["logline"]
+    assert cost.units == {"input_tokens": 3000, "output_tokens": 1800}, "an unreadable check isn't charged"
+    assert "couldn't run" in bible["evaluation"]["error"], "an unreadable check is reported, never scored"
+    assert pricing.estimate_script(60, 100).provider_cost_usd < 0.08, "worst case incl. the story check and one revision"
 
 
 def test_studio_saves_the_plan_and_episode_2_builds_on_episode_1(env):
@@ -147,7 +153,8 @@ def test_a_plan_without_both_hooks_is_sent_back_once():
     f = Fake(plan=[bad, PLAN])
     text, bible, *_ = story.develop(f.text, f.json, {"title": "T"}, [])
     plan_calls = [c for c in f.prompts if c[0] == "json" and c[2] is story.PLAN_SCHEMA]
-    assert len(plan_calls) == 2 and "YOUR PREVIOUS PLAN BROKE THE RULE" in plan_calls[1][1]
+    assert len(plan_calls) == 2 and "YOUR PREVIOUS PLAN HAS THESE PROBLEMS" in plan_calls[1][1]
+    assert "must start with a 'hook' beat" in plan_calls[1][1]
     assert bible["beats"][0]["purpose"] == "hook" and bible["beats"][-1]["purpose"] == "end_hook"
     assert bible["hooks_planned"] is True
 

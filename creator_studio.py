@@ -2284,7 +2284,13 @@ def _episodes(p: dict) -> list:
     rows = sorted(get_store().select("studio_projects", {"series_id": p["series_id"], "owner_id": p["owner_id"]}),
                   key=lambda r: str(r.get("created_at") or ""))
     rows = [r for r in rows if r.get("status") != "archived"]
-    return [{"number": i, "title": r.get("title"), "logline": r.get("logline"), "current": r["id"] == p["id"]}
+    def rec(r):
+        sb = r.get("story_bible") or {}
+        er = sb.get("episode_record") or {}
+        return {"ending": er.get("ending") or sb.get("ending_hook") or "",
+                "end_technique": er.get("end_technique") or "",
+                "open_questions": (er.get("open_questions") or sb.get("open_threads") or [])[:6]} if sb else {}
+    return [{"number": i, "title": r.get("title"), "logline": r.get("logline"), "current": r["id"] == p["id"], **rec(r)}
             for i, r in enumerate(rows, start=1)] if len(rows) > 1 else []
 
 

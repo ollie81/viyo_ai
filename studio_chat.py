@@ -185,6 +185,22 @@ How you talk:
 - The creator is in charge. Never insist; never pretend a suggestion was used.
 - Every Viyo story starts with a hook in the first seconds and ends on a hook.
 
+Episode storytelling (hooks and cliffhangers):
+- When you look at a story, an episode or an opening/ending, judge it like a showrunner: what the opening hook is and
+  whether it makes leaving impossible in the first 3-5 seconds (or is slow: greetings, background, calm); where the
+  suspense rises and where it sags (a scene that changes nothing, a repeated conversation); whether the ending grows
+  out of the story and leaves a question the viewer needs answered; what viewers will want to know next.
+- Use the STORY CHECK when it exists (it judged the final script with quoted lines); never invent scores. If there is
+  no check, give your own reasoned opinion and say it's your opinion.
+- A weak idea gets honest, specific help: say what's weak, why, and offer up to 3 stronger options that keep the
+  creator's idea, each with its trade-off. Don't just agree.
+- Fit the technique to the genre and story (a mystery deepens a question; a romance shifts the relationship; a
+  thriller brings the threat closer); don't use the same kind of cliffhanger as the previous episode.
+- For a series: the next episode starts from the previous episode's actual final moment, keeps who knows what, pays
+  off at least one open question and raises a new one, and never re-explains what viewers already saw.
+- To change the opening or ending, propose rewrite_scene for that scene (or write_screenplay if the creator asked for
+  a rewrite). An approved script or plan is only changed when the creator applies a proposal.
+
 Changes of mind and approved decisions:
 - MEMORY items are listed oldest first. When the creator changes the story, the newer statement wins: work from it,
   say which earlier facts, scenes, shots or pictures it affects, and suggest removing the outdated memory item.
@@ -399,6 +415,41 @@ def _bible_block(bible: dict) -> list[str]:
     for e in (bible.get("episodes") or [])[:30]:
         if isinstance(e, dict):
             out.append(f"  Episode {e.get('number', '')}: {_short(e.get('title') or '', 80)} – {_short(e.get('summary') or '', 200)}")
+    hp = bible.get("hook_plan") or {}
+    if hp:
+        out.append(f"  Opening hook ({(hp.get('opening_technique') or '').replace('_', ' ')}): {_short(hp.get('opening_moment'), 240)}"
+                   f" – why: {_short(hp.get('opening_why'), 200)}")
+        out.append(f"  Ending hook ({(hp.get('ending_technique') or '').replace('_', ' ')}): {_short(hp.get('ending_moment'), 240)}"
+                   f" – leaves the viewer asking: {_short(hp.get('viewer_question'), 200)}")
+    if bible.get("continues_from"):
+        out.append(f"  Picks up the previous episode: {_short(bible['continues_from'], 240)}")
+    qs = [q for q in bible.get("questions") or [] if isinstance(q, dict)]
+    if qs:
+        out.append("  Questions the story raises: " + "; ".join(
+            f"{_short(q.get('question'), 100)} (beat {q.get('raised_in_beat')} -> "
+            f"{'beat ' + str(q['answered_in_beat']) if q.get('answered_in_beat') else 'left open'})" for q in qs[:8]))
+    for k in (bible.get("knowledge") or [])[:10]:
+        if isinstance(k, dict):
+            out.append(f"  Knows: {k.get('character')}: {_short(k.get('knows'), 120)}"
+                       + (f"; hides {_short(k['hides'], 100)}" if k.get("hides") else "")
+                       + (f"; doesn't know {_short(k['does_not_know'], 100)}" if k.get("does_not_know") else ""))
+    ev = bible.get("evaluation") or {}
+    if ev.get("evaluated"):
+        out.append("  STORY CHECK of the final script (1-10, with the line judged): " + "; ".join(
+            f"{k.replace('_', ' ')} {v['score']} ({_short(v.get('reason'), 90)})" for k, v in ev["scores"].items()))
+        if ev.get("revised"):
+            out.append(f"  It was revised once to fix: {', '.join(ev.get('fixed') or [])} (before: {ev.get('before')}).")
+        if ev.get("below_bar"):
+            out.append(f"  Still below the bar: {', '.join(ev['below_bar'])}.")
+        for w in (ev.get("weak") or [])[:5]:
+            out.append(f"  Weak: {w['area']}: {_short(w['problem'], 160)} Fix: {_short(w['fix'], 160)}")
+        if ev.get("viewer_questions"):
+            out.append("  What viewers will want to know next: " + "; ".join(_short(q, 120) for q in ev["viewer_questions"][:4]))
+    elif ev.get("error"):
+        out.append(f"  Story check: not run ({_short(ev['error'], 160)}). Don't claim scores.")
+    nxt = (bible.get("episode_record") or {}).get("next_episode") or bible.get("next_episode") or []
+    if nxt:
+        out.append("  Planned for the next episode: " + "; ".join(_short(x, 120) for x in nxt[:5]))
     return out
 
 
@@ -485,6 +536,10 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
         for e in episodes[:40]:
             lines.append(f"- Episode {e.get('number')}: {e.get('title') or '(untitled)'} – {_short(e.get('logline') or '', 200)}"
                          f"{' (this one)' if e.get('current') else ''}")
+            if not e.get("current") and e.get("ending"):
+                lines.append(f"    It ended on ({(e.get('end_technique') or 'ending').replace('_', ' ')}): {_short(e['ending'], 240)}")
+            if not e.get("current") and e.get("open_questions"):
+                lines.append("    Left open: " + "; ".join(_short(q, 120) for q in e["open_questions"][:4]))
     lines += _bible_block(p.get("story_bible") or {})
     lines.append(screenplay_block(p.get("script") or "", question, focus, names))
     if cast:
@@ -621,6 +676,7 @@ _DEEP = re.compile(r"\b(continuity|consisten|audit|review (the|all|every|whole)|
                    r"what('s| is) (still )?missing|what('s| is) left|production plan|plan the production|whole film|"
                    r"full movie|feature film|every scene|all (the )?scenes|whole (story|screenplay|series))", re.I)
 _STORY = re.compile(r"\b(story|plot|character|arc|twist|ending|screenplay|script|dialogue|rewrite|develop|episode|"
+                    r"hook|cliffhanger|opening|suspense|"
                     r"series|movie|film|scene|idea|mysterious|motivation|conflict|outline|structure)", re.I)
 
 

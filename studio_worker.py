@@ -177,7 +177,10 @@ class StudioWorker:
         self.store.update("studio_projects", {"id": project["id"]}, {"script": text, "updated_at": _now()})
         if bible:
             self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
-        return {"chars": len(text), "scores": (bible or {}).get("scores"), "rewritten": (bible or {}).get("rewrite_used")}, cost
+        ev = (bible or {}).get("evaluation") or {}
+        return {"chars": len(text), "scores": (bible or {}).get("scores"), "rewritten": (bible or {}).get("rewrite_used"),
+                "story_check": {k: v.get("score") for k, v in (ev.get("scores") or {}).items()},
+                "revised": ev.get("revised", False), "below_bar": ev.get("below_bar", [])}, cost
 
     def earlier_episodes(self, project) -> list[dict]:
         """The story bibles of the episodes before this one in its series,
@@ -191,7 +194,10 @@ class StudioWorker:
         for e in sorted(eps, key=lambda e: e.get("created_at") or ""):
             sb = e.get("story_bible") or {}
             if sb:
-                out.append({**sb, "title": e.get("title") or sb.get("title")})
+                import studio_story
+                # The episode's actual last scene, as the script is now (the creator may have edited it).
+                end = studio_story._last_section(e.get("script") or "") if (e.get("script") or "").strip() else ""
+                out.append({**sb, "title": e.get("title") or sb.get("title"), **({"_screenplay_end": end} if end else {})})
         return out
 
     def do_breakdown(self, job, project):
