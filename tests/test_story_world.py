@@ -58,7 +58,7 @@ JAPAN_1600 = {"setting": {"country": "Japan", "place": "a castle town in Owari",
               "material": {"clothing": "kimono and hakama; armour for war", "architecture": "castle keeps, tiled roofs"},
               "technology": {"available": ["matchlock guns (tanegashima)"], "not_available": ["printing press newspapers"]},
               "facts": [{"claim": "Matchlocks arrived in 1543", "status": "documented", "source": 1}],
-              "unknown": ["The fictional lord's clan"], "avoid": ["Chinese qipao"]}
+              "unknown": ["The fictional lord's clan"], "avoid": ["Chinese qipao", "Korean hanbok", "hanbok"]}
 LAGOS_TODAY = {"setting": {"country": "Nigeria", "place": "Yaba, Lagos", "era": "today", "year": 2025,
                            "summary": "A tech hub with danfo buses and traffic."},
                "material": {"clothing": "ankara prints, jeans, agbada for occasions"},
@@ -109,7 +109,8 @@ def test_a_historical_rwanda_world_is_researched_and_labelled_honestly(studio):
     assert w["facts"][0]["source"]["title"] == "Encyclopaedia of Rwanda"
     assert out["check"]["facts"]["unsourced"] == 1 and any(p["kind"] == "unsourced" for p in out["check"]["problems"])
     prompt = ai.world_prompts[-1]
-    assert "a Rwandan story is not Nigerian" in prompt and "Never label a guess as documented" in prompt
+    assert "never treat a continent, region or country as one culture" in prompt and "Never label a guess as documented" in prompt
+    assert "Required for every real place" in prompt
     assert "Historically grounded fiction" in prompt and "Rwanda around 1500" in prompt
     assert 0 < before - balance(client, u)["available"] <= cs.pricing.estimate_world(True).credits
 
@@ -155,7 +156,8 @@ def test_the_world_check_catches_thin_overconfident_and_self_contradicting_world
     (RWANDA_1500, "grounded", "His guards carry firearms beside a wheeled cart.", ["firearms", "wheeled carts"], []),
     (JAPAN_1600, "grounded", "The ashigaru fire matchlock guns; a lady in a hanbok watches.", [], ["hanbok"]),
     (JAPAN_1600, "grounded", "A samurai in kimono reads a letter by lamplight.", [], []),
-    ({"setting": {"country": "Egypt", "place": "Thebes", "era": "New Kingdom", "year": -1300, "summary": "s"}}, "grounded",
+    ({"setting": {"country": "Egypt", "place": "Thebes", "era": "New Kingdom", "year": -1300, "summary": "s"},
+      "avoid": ["toga", "camel caravans"]}, "grounded",
      "The scribe rides a bicycle past a man in a toga.", ["bicycle"], ["toga"]),
     (LAGOS_TODAY, "modern", "Tunde checks his phone in a danfo bus.", [], []),
     (FICTION, "fictional", "On Oru, a merchant checks a phone-like shell; a guard wears Viking helmets.", [], ["viking helmets"]),
@@ -348,7 +350,8 @@ def test_the_assistant_uses_the_world_keeps_labels_and_can_correct_it(studio):
     assert "Unknown/disputed: Precise dates of reigns" in prompt
     assert "WORLD CHECK scene 1: Things that don't exist in around 1500, the early kingdom: phone." in prompt
     assert "WORLD CHECK scene 1: Details from another culture: kente cloth." in prompt
-    assert "a Rwandan story is not Nigerian" in prompt and "Never present an invented or uncertain detail as history" in prompt
+    assert "for any country, region or invented world alike" in prompt
+    assert "Never present an invented or uncertain detail as history" in prompt
     fix, rebuild = r.json()["reply"]["proposals"]
     assert fix["paid"] is False and rebuild["paid"] is True and rebuild["job"] == "world"
     msg = r.json()["reply"]["id"]
@@ -361,3 +364,35 @@ def test_a_detail_mentioned_only_as_absent_is_not_a_mistake():
     w = wb.clean_world(RWANDA_1500, "grounded")
     assert wb.anachronisms("Barkcloth, never woven cotton cloth; no firearms at court.", w) == []
     assert wb.anachronisms("A servant drapes woven cotton cloth over the stool.", w) == ["woven cotton cloth"]
+
+
+# Every country and place is handled the same way: the confusions come from each world's own research.
+PLACES = [
+    ({"setting": {"country": "Peru", "place": "Cusco", "era": "Inca Empire, 1500", "year": 1500, "summary": "s"},
+      "avoid": ["sombrero", "Aztec feathered headdress"], "technology": {"not_available": ["horses"]}},
+     "A runner in a sombrero rides horses toward the Aztec feathered headdress seller.",
+     ["horses"], ["aztec feathered headdress", "sombrero"]),
+    ({"setting": {"country": "Norway", "place": "a fjord farm", "era": "Viking Age, 900s", "year": 950, "summary": "s"},
+      "avoid": ["horned helmets"]}, "The jarl wears horned helmets and checks his wristwatch.", ["wristwatch"], ["horned helmets"]),
+    ({"setting": {"country": "South Korea", "place": "Mapo, Seoul", "era": "today", "year": 2025, "summary": "s"},
+      "avoid": ["kimono", "Chinese lanterns for every street"]}, "She checks her phone; her mother wears a kimono.", [], ["kimono"]),
+    ({"setting": {"country": "India", "place": "Agra", "era": "Mughal court, 1640s", "year": 1645, "summary": "s"},
+      "avoid": ["Bollywood dance number"]}, "Courtiers break into a Bollywood dance number lit by a light bulb.",
+     ["light bulb"], ["bollywood dance number"]),
+]
+
+
+@pytest.mark.parametrize("world,text,anach,conf", PLACES)
+def test_any_country_is_checked_the_same_way_from_its_own_researched_world(world, text, anach, conf):
+    w = wb.clean_world(world, "grounded")
+    assert wb.anachronisms(text, w) == sorted(anach)
+    assert wb.confusions(text, w) == sorted(conf)
+
+
+def test_no_country_has_a_built_in_list_and_a_world_without_confusions_is_flagged():
+    assert not hasattr(wb, "CONFUSIONS"), "the same rule for every place"
+    bare = wb.clean_world({**RWANDA_1500, "avoid": []}, "grounded")
+    assert wb.confusions("He wears kente cloth.", bare) == [], "nothing is assumed about any country"
+    assert any(p["kind"] == "no_confusions" for p in wb.evaluate(bare)["problems"])
+    fictional = wb.clean_world({**FICTION, "avoid": []}, "fictional")
+    assert not any(p["kind"] == "no_confusions" for p in wb.evaluate(fictional)["problems"])

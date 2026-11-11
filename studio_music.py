@@ -30,7 +30,7 @@ def wanted(project: dict) -> bool:
 
 
 def _world_sound(project: dict) -> str:
-    """The story world's music and instruments (studio_world), so a 1500s Rwandan court doesn't get a synth score."""
+    """The story world's music and instruments (studio_world), so a story from any place and period gets music that belongs to it."""
     import studio_world
     world = (project.get("story_bible") or {}).get("world") or project.get("_world")
     text = studio_world.block(world, "sound") if world else ""

@@ -1128,7 +1128,7 @@ async def creator_assistant_approve(project_id: str, body: AssistantApproveIn,
 class WorldIn(BaseModel):
     request_id: str = Field(..., min_length=8, max_length=80)
     mode: Literal["grounded", "alternate", "fictional", "modern"] = "grounded"
-    setting: str = Field("", max_length=300)       # e.g. "Rwanda, around 1500, a royal court"
+    setting: str = Field("", max_length=300)       # any place and time, e.g. "a fishing village, 1800s" or "Seoul, today"
 
 
 class WorldCorrection(BaseModel):
