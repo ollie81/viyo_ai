@@ -271,6 +271,12 @@ def _mentions(text: str, thing: str) -> bool:
     return bool(words) and any(re.search(rf"\b{re.escape(w)}", text.lower()) for w in words[-1:])
 
 
+def _words_overlap(a: str, b: str) -> float:
+    wa = {w for w in re.findall(r"[a-z]{3,}", (a or "").lower()) if w not in ("her", "his", "the", "and", "with")}
+    wb = {w for w in re.findall(r"[a-z]{3,}", (b or "").lower()) if w not in ("her", "his", "the", "and", "with")}
+    return len(wa & wb) / max(1, min(len(wa), len(wb))) if wa and wb else 1.0
+
+
 def _intended(scene: dict, *words: str) -> bool:
     text = " ".join(of(scene).get("intentional_changes") or []).lower()
     return any(w.lower() in text for w in words if w)
@@ -306,6 +312,22 @@ def review(scenes: list[dict], outfits_by_scene: dict, outfit_names: dict, char_
                         add("outfit", "fix", f"{who} wears \"{outfit_names.get(po[cid], 'one outfit')}\" in scene {pn} "
                                              f"but \"{new}\" in scene {n}, with no change in the story.",
                             f"Set {who}'s outfit in scene {n} to the one from scene {pn}, or add the change to the script.")
+            # Outfits written in the scene records (before outfits are saved, or
+            # for characters without one): a different description is worth a look.
+            by_name = {v.lower(): k for k, v in char_names.items()}
+            cur_rec = {x["name"].lower(): x for x in cc.get("characters") or []}
+            for x in cp.get("characters") or []:
+                y = cur_rec.get(x["name"].lower())
+                cid = by_name.get(x["name"].lower())
+                if not y or not x.get("outfit") or not y.get("outfit") or x.get("leaves"):
+                    continue
+                if cid and po.get(cid) and co.get(cid):
+                    continue                      # the saved outfits above decide
+                if _words_overlap(x["outfit"], y["outfit"]) < 0.34 and \
+                        not _intended(cur, x["name"].split(" ")[0], y["outfit"], "outfit", "change", "dress", "clothes"):
+                    add("outfit", "check", f"{x['name']} wears {x['outfit']} in scene {pn} but {y['outfit']} in scene "
+                                           f"{n} (from the scene records), with no change in the story.",
+                        f"Keep {x['name']} in {x['outfit']} in scene {n}, or add the change to the script.")
             # Place: a continuous scene somewhere else.
             pl, cl = location_of.get(prev["id"]), location_of.get(cur["id"])
             if pl and cl and pl != cl and t == "continuous":

@@ -221,3 +221,86 @@ def develop(text_fn, json_fn, brief: dict, previous: Optional[list[dict]] = None
              "episode_summary": doc.get("episode_summary") or "", "open_threads": doc.get("open_threads") or [],
              "rewrite_used": doc.get("rewrite_used", False)}
     return final, bible, i1 + i2 + i3, o1 + o2 + o3
+
+
+# ------------------------------------------------------------------ dialogue check
+import re as _re
+
+_CUE = _re.compile(r"^\s*([A-Z][A-Z0-9 .'\-]{0,40}?)\s*(\((?:V\.O\.|O\.S\.|O\.C\.|CONT'D|CONT’D|cont'd)\))?\s*$")
+_NOT_CUE = ("INT.", "EXT.", "INT/EXT", "EXT/INT", "I/E", "CUT TO", "FADE", "DISSOLVE", "SMASH CUT", "THE END", "TITLE")
+
+
+def screenplay_lines(script: str) -> list[tuple[str, str]]:
+    """(SPEAKER, line) for every line of dialogue in a standard screenplay."""
+    out, speaker, buf = [], None, []
+
+    def flush():
+        if speaker and buf:
+            out.append((speaker, " ".join(buf)))
+
+    for raw in (script or "").splitlines():
+        line = raw.strip()
+        m = _CUE.match(line) if line else None
+        if not line:
+            flush()
+            speaker, buf = None, []
+        elif m and not line.upper().startswith(_NOT_CUE) and any(ch.isalpha() for ch in m.group(1)):
+            flush()
+            speaker, buf = m.group(1).strip().title(), []
+        elif speaker and not (line.startswith("(") and line.endswith(")")):
+            buf.append(line)
+    flush()
+    return out
+
+
+def _words(text: str) -> list[str]:
+    return _re.findall(r"[a-z0-9']+", (text or "").lower())
+
+
+def _close(a: str, b: str) -> bool:
+    wa, wb = set(_words(a)), set(_words(b))
+    return bool(wa) and bool(wb) and len(wa & wb) / max(len(wa), len(wb)) >= 0.6
+
+
+def dialogue_check(script: str, scenes: list[dict]) -> dict:
+    """Possible dialogue problems after the screenplay was broken into scenes:
+    lines of the screenplay no scene says (forgotten), and lines said in more
+    than one place (repeated). Fuzzy on purpose: a slightly reworded line counts
+    as said. Returns {"forgotten": [(speaker, text)], "repeated": [(speaker, text, [scene numbers])]}."""
+    wanted = screenplay_lines(script)
+    said = [(n, (d.get("character") or "").strip(), d.get("text") or "")
+            for n, s in enumerate(scenes, start=1) for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
+    used = set()
+    forgotten = []
+    for who, text in wanted:
+        hit = next((k for k, (_n, w, t) in enumerate(said) if k not in used and _close(text, t)
+                    and (not w or w.split(" ")[0].lower() == who.split(" ")[0].lower())), None)
+        if hit is None:
+            forgotten.append((who, text))
+        else:
+            used.add(hit)
+    repeated, seen = [], set()
+    for k, (n, w, t) in enumerate(said):
+        if k in seen:
+            continue
+        twins = [j for j in range(k + 1, len(said)) if said[j][1].lower() == w.lower() and _close(t, said[j][2])]
+        written = sum(1 for who, text in wanted if _close(text, t))
+        if twins and len(twins) + 1 > max(1, written):
+            seen.update(twins)
+            repeated.append((w, t, [n] + [said[j][0] for j in twins]))
+    return {"forgotten": forgotten if wanted else [], "repeated": repeated}
+
+
+def dialogue_lines(check: dict) -> list[str]:
+    """For the assistant's project facts."""
+    f, r = check.get("forgotten") or [], check.get("repeated") or []
+    if not f and not r:
+        return ["DIALOGUE CHECK (screenplay vs scenes): every screenplay line is said once in the scenes."]
+    out = ["DIALOGUE CHECK (screenplay vs scenes, possible problems: ask whether they are intended):"]
+    for who, text in f[:6]:
+        out.append(f"- Possibly forgotten: {who}: \"{text[:160]}\" is in the screenplay but no scene says it.")
+    if len(f) > 6:
+        out.append(f"- ...and {len(f) - 6} more screenplay lines no scene says.")
+    for who, text, where in r[:6]:
+        out.append(f"- Possibly repeated: {who}: \"{text[:160]}\" is said in scenes {', '.join(map(str, where))}.")
+    return out

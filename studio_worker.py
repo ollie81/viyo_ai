@@ -1075,7 +1075,10 @@ class StudioWorker:
             raise JobFailed("not_approved", "Approve the scene's shot plan first. Your credits were returned.")
         if shot.get("approved_at"):
             raise JobFailed("approved", "This shot is approved. Unapprove it to remake it. Your credits were returned.")
-        return shot, scene, self._shots(scene["id"])
+        shots = self._shots(scene["id"])
+        if shots_mod.plan_outdated(scene, shots):
+            raise JobFailed("outdated", shots_mod.OUTDATED.format(n=scene["position"] + 1) + " Your credits were returned.")
+        return shot, scene, shots
 
     def _shot_entries(self, project, scene, shot, cast):
         names = [c["name"] for c in shot.get("characters") or []]
@@ -1263,7 +1266,7 @@ class StudioWorker:
         for s in scenes:
             if s["id"] in shot_based:
                 problem = shots_mod.shot_problem(s["position"] + 1, shot_rows[s["id"]],
-                                                 scene_speech(s, project) == "video_model")
+                                                 scene_speech(s, project) == "video_model", s)
                 if problem:
                     raise JobFailed("not_ready", problem + " Make it first.")
         single = [s for s in scenes if s["id"] not in shot_based]

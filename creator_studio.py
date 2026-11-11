@@ -964,7 +964,8 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
                                           libraries.get(c["id"])) for c in chars],
             "scenes": [dict(_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {}), elements),
                             shots=[_shot_out(sh, shot_urls) for sh in sorted(shots_by.get(s["id"], []), key=lambda r: r["position"])],
-                            shot_plan_approved=bool(s.get("shot_plan_approved")))
+                            shot_plan_approved=bool(s.get("shot_plan_approved")),
+                            shot_plan_outdated=studio_shots.plan_outdated(s, shots_by.get(s["id"], [])))
                        for s in scenes],
             "elements": [_element_out(e, eurls) for e in elements],
             "renders": [_render_out(r) for r in renders],
@@ -1536,6 +1537,19 @@ def _project_shots(project_id: str) -> list:
         return []
 
 
+def _project_shots_of(scene: dict) -> list:
+    """One scene's shots (only that scene is read)."""
+    if not scene or not scene.get("id"):
+        return []
+    try:
+        return get_store().select("studio_shots", {"scene_id": scene["id"]})
+    except Exception:
+        st = get_store()
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        return []
+
+
 def _shot_out(sh: dict, urls: dict) -> dict:
     return {"id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
             "camera_angle": sh.get("camera_angle") or "", "camera_movement": sh.get("camera_movement") or "static",
@@ -1832,6 +1846,8 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
             return cost, "Approve the scene's shot plan first."
         if target.get("approved_at"):
             return cost, "This shot is approved. Unapprove it to remake it."
+        if studio_shots.plan_outdated(scene, _project_shots_of(scene)):
+            return cost, studio_shots.OUTDATED.format(n=(scene.get("position") or 0) + 1)
         if kind == "shot_video" and not target.get("image_path"):
             return cost, "Make this shot's picture first."
         return cost, None
@@ -1845,7 +1861,7 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         for sc in sorted(scenes, key=lambda x: x["position"]):
             rows = sorted(by_scene.get(sc["id"], []), key=lambda r: r["position"])
             if studio_shots.uses_shots(sc, rows):
-                problem = studio_shots.shot_problem(sc["position"] + 1, rows, scene_speech(sc, p) == "video_model")
+                problem = studio_shots.shot_problem(sc["position"] + 1, rows, scene_speech(sc, p) == "video_model", sc)
                 if problem:
                     return pricing.render_cost(secs, music_generated=music_mod.wanted(p)), problem
         scenes = [sc for sc in scenes if not studio_shots.uses_shots(sc, by_scene.get(sc["id"], []))]

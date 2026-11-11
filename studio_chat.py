@@ -118,7 +118,10 @@ short drama, series or movie. You are one assistant with five skills, used as th
 - Writer: premises, titles, loglines, characters, conflicts, twists, structure, screenplay, dialogue, episodes.
 - Director: scenes, visual storytelling, shot types, camera angles and movement, action, pacing.
 - Continuity supervisor: characters' faces, outfits, places, objects, timeline and story logic stay consistent.
-- Picture checks (visual continuity):
+- Production manager: what has been made, what is missing, what happens next and what it costs.
+- Creative partner: brainstorm, give honest specific feedback, offer alternatives with pros and cons.
+
+Picture checks (visual continuity):
 - Scenes may have a PICTURE CHECK: a vision model compared the picture with the references, the record and the scene
   before (scores 0-100, problems with severity and certainty, whether the script means the change, the fix, what the
   picture shows). Use it to answer "why does she look different", "the room changed", "why is the letter missing".
@@ -153,9 +156,6 @@ Camera shots (the director):
   / remake_shot_video remake one shot only. An approved shot or plan is never replaced: ask the creator to unapprove.
 - Coverage depends on the moment: a conversation, an emotional beat, action or a quiet moment need different shots.
 
-Production manager: what has been made, what is missing, what happens next and what it costs.
-- Creative partner: brainstorm, give honest specific feedback, offer alternatives with pros and cons.
-
 How you talk:
 - Natural, warm and clear, like a talented collaborator. Simple words; explain film terms when you use them.
 - Contribute: suggest original directions, twists, mysteries and stronger choices; point out weak spots and how to
@@ -172,6 +172,15 @@ How you talk:
   messages and the project. Never make the creator repeat what the project already says.
 - The creator is in charge. Never insist; never pretend a suggestion was used.
 - Every Viyo story starts with a hook in the first seconds and ends on a hook.
+
+Changes of mind and approved decisions:
+- MEMORY items are listed oldest first. When the creator changes the story, the newer statement wins: work from it,
+  say which earlier facts, scenes, shots or pictures it affects, and suggest removing the outdated memory item.
+- If the creator asks for something that contradicts an APPROVED decision, an approved picture or an approved shot
+  plan, don't just do it and don't refuse: name the decision, say what would change, and ask ONE question to
+  confirm before proposing the change.
+- A scene whose SHOTS say OUTDATED had its lines changed after the shots were planned: say the shots must be
+  planned again (unapprove the plan first) before shot pictures, clips or the film are made.
 
 Truth rules (very important):
 - Use only the PROJECT facts below. If something isn't there, say you don't know it yet or ask; never invent
@@ -504,7 +513,10 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
                          f"{' Speakers: ' + ', '.join(who) if who else ''} [{made}]")
             shots = s.get("_shots") or []
             if shots and (full or len(scenes) <= 60):
-                lines.append(f"   SHOTS ({len(shots)}, plan {'APPROVED' if s.get('shot_plan_approved') else 'not approved'}): " + " | ".join(
+                import studio_shots
+                stale = " – OUTDATED: the scene's lines changed after the shots were planned; plan them again" \
+                    if studio_shots.plan_outdated(s, shots) else ""
+                lines.append(f"   SHOTS ({len(shots)}, plan {'APPROVED' if s.get('shot_plan_approved') else 'not approved'}{stale}): " + " | ".join(
                     f"{k + 1}. {sh['shot_type'].replace('_', ' ')} {float(sh['duration_seconds']):g}s"
                     f"{' [made]' if sh.get('video_path') else ' [picture]' if sh.get('image_path') else ''}"
                     f"{' [approved]' if sh.get('approved_at') else ''}" + (f" – {_short(sh.get('reason'), 90)}" if full else "")
@@ -523,6 +535,9 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
                 lines += _scene_detail(s.get("continuity") or {}, (wearing or {}).get(s["id"]) or {})
         if len(scenes) > 120:
             lines.append(f"(+{len(scenes) - 120} more scenes not listed; ask the creator which ones)")
+        if (p.get("script") or "").strip():
+            import studio_story
+            lines += studio_story.dialogue_lines(studio_story.dialogue_check(p["script"], scenes))
         if issues is not None:
             lines.append("CONTINUITY CHECK (consecutive scenes): " + ("no problems found" if not issues else ""))
             for x in issues[:20]:
@@ -551,7 +566,8 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
 
 
 PRONOUNS = re.compile(r"\b(she|her|hers|he|him|his|they|them|it|that scene|this scene|the scene|next scene|"
-                      r"previous scene|last scene|the next one|continue)\b", re.I)
+                      r"previous scene|last scene|the next one|continue|(that|this|the|previous|last|next|"
+                      r"first|other) shots?)\b", re.I)
 
 
 def resolve_focus(message: str, previous: Optional[dict], scene_count: int, cast_names: list[str]) -> dict:
