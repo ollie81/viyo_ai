@@ -318,3 +318,77 @@ def shot_problem(scene_number: int, shots: list[dict], talking: bool, scene: Opt
         if talking and s.get("dialogue") and not s.get("video_path"):
             return f"Scene {scene_number}, shot {n}'s talking video isn't made yet."
     return None
+
+
+# ------------------------------------------------------------------ the director's own review (cinematography)
+
+STRONG = re.compile(r"\b(afraid|terrified|frightened|scared|furious|angry|rage|crying|cries|tears|devastated|heartbroken|"
+                    r"shocked|stunned|desperate|pleading|begging|horrified|grief|sobbing|panic)", re.I)
+CLOSE = ("close_up", "extreme_close_up", "reaction")
+
+
+def plan_quality(scene: dict, shots: list[dict]) -> list[dict]:
+    """A cinematography review of a cleaned shot plan (not continuity): coverage, variety, the speaker seen
+    when they speak, the reaction to the key line, an emotional beat held close, an establishing view of a
+    new place, a reason for every shot, and screen direction kept. Each problem names the shot and the fix."""
+    out = []
+    lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
+    speakers = [ (d.get("character") or "").split(" ")[0].lower() for d in lines]
+    c = scene.get("continuity") or {}
+    dur = float(scene.get("duration_seconds") or 6)
+    types = [s.get("shot_type") for s in shots]
+
+    def add(n, kind, problem, fix):
+        out.append({"shot": n, "kind": kind, "problem": problem, "fix": fix})
+    if (len(lines) >= 2 or dur >= 7) and len(shots) < 2:
+        add(0, "coverage", f"One shot for a {'conversation' if len(lines) >= 2 else f'{dur:g}-second moment'}.",
+            "Cover it: an establishing or two-shot, then singles on whoever speaks and a reaction.")
+    for i in range(1, len(shots)):
+        if types[i] == types[i - 1]:
+            add(i + 1, "variety", f"Shots {i} and {i + 1} are both {types[i].replace('_', ' ')}.",
+                "Change the size or angle between consecutive shots.")
+    for i, s in enumerate(shots, start=1):
+        if not (s.get("reason") or "").strip():
+            add(i, "purpose", f"Shot {i} has no reason.", "Say what this shot shows that the others don't, or cut it.")
+        visible = {(x.get("name") or "").split(" ")[0].lower() for x in s.get("characters") or []}
+        for d in s.get("dialogue") or []:
+            who = (d.get("character") or "").split(" ")[0].lower()
+            if who and who not in visible and s.get("shot_type") not in ("over_the_shoulder", "insert", "pov", "reaction") and \
+                    "narrator" not in who and "v.o" not in (d.get("character") or "").lower():
+                add(i, "speaker", f"In shot {i}, {d.get('character')} speaks but isn't in frame.",
+                    f"Frame {d.get('character')} for their line, or make it an over-the-shoulder.")
+    if len(set(speakers)) >= 2 and len(shots) >= 2 and not any(t in CLOSE for t in types):
+        add(0, "reaction", "A conversation with no close-up or reaction shot.",
+            "Show how the key line lands: a close-up or reaction on the listener.")
+    if any(STRONG.search((d.get("emotion") or "") + " " + (d.get("text") or "")) for d in lines) and \
+            not any(t in CLOSE for t in types):
+        add(0, "emotion", "A strong emotional beat with no close shot.", "Hold the strongest moment on a close-up.")
+    if c.get("transition") in ("new_place", "time_jump") and len(shots) >= 3 and \
+            types[0] not in ("establishing_wide", "wide_two_shot"):
+        add(1, "geography", "A new place opens without showing where we are.", "Open on a wide or establishing shot.")
+    sides = {}
+    for i, s in enumerate(shots, start=1):
+        for x in s.get("characters") or []:
+            pos = (x.get("position") or "").lower()
+            side = "left" if "left" in pos else "right" if "right" in pos else None
+            name = (x.get("name") or "").lower()
+            if side and name in sides and sides[name] != side and s.get("shot_type") != "pov":
+                add(i, "screen_direction", f"{x.get('name')} jumps from the {sides[name]} to the {side} in shot {i}.",
+                    "Keep the 180-degree rule: each person stays on the same side.")
+            elif side:
+                sides.setdefault(name, side)
+    return out
+
+
+def review_text(problems: list[dict]) -> str:
+    return "\n".join(f"- {('shot ' + str(p['shot'])) if p['shot'] else 'the scene'} ({p['kind']}): {p['problem']} "
+                     f"FIX: {p['fix']}" for p in problems)
+
+
+def estimate_shots(scene: dict) -> int:
+    """How many shots to reserve for before the director has planned (an upper bound, refunded if unused)."""
+    lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
+    dur = float(scene.get("duration_seconds") or 6)
+    speakers = len({(d.get("character") or "").lower() for d in lines})
+    want = 1 + (1 if lines else 0) + (1 if speakers >= 2 else 0) + (1 if dur >= 8 or len(lines) >= 3 else 0)
+    return max(1, min(MAX_SHOTS, want, int(dur // MIN_SHOT) or 1))

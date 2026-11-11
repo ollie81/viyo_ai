@@ -27,11 +27,11 @@ from typing import Optional
 import studio_identity as ident
 import studio_pricing as pricing
 
-STAGES = ("places", "sheets", "images", "voices", "videos", "lipsync", "render")
-STAGE_KIND = {"places": "element", "sheets": "portrait", "images": "image", "voices": "voice", "videos": "video",
-              "lipsync": "lipsync", "render": "render"}
-STAGE_LABEL = {"places": "Places and objects", "sheets": "Character sheets", "images": "Scene pictures", "voices": "Voices", "videos": "Video clips",
-               "lipsync": "Lip sync", "render": "Final film"}
+STAGES = ("places", "sheets", "direct", "images", "voices", "videos", "lipsync", "render")
+STAGE_KIND = {"places": "element", "sheets": "portrait", "direct": "shotplan", "images": "image", "voices": "voice",
+              "videos": "video", "lipsync": "lipsync", "render": "render"}
+STAGE_LABEL = {"places": "Places and objects", "sheets": "Character sheets", "direct": "Directing (camera shots)",
+               "images": "Pictures", "voices": "Voices", "videos": "Video clips", "lipsync": "Lip sync", "render": "Final film"}
 ATTEMPTS = 2          # each step: the first try and one automatic retry
 # Reasons a step can't run *yet* that an earlier stage of the run takes care of.
 LATER = ("has no picture yet", "isn't made yet", "Record this scene's voices first", "shot's picture first")
@@ -50,7 +50,7 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
     from studio_worker import needs_lipsync, scene_speech
     cs = _cs()
     st = cs.get_store()
-    options = {"sheets": True, **(options or {})}
+    options = {"sheets": True, "direct": True, **(options or {})}
     cast = sorted(st.select("studio_characters", {"project_id": p["id"]}), key=lambda c: c.get("position") or 0)
     scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
     stages: dict[str, list] = {s: [] for s in STAGES}
@@ -84,6 +84,22 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
         elif not options["sheets"] and not c.get("reference_path") and (c.get("description") or "").strip():
             add("sheets", c, f"{c['name']}'s portrait")
     import studio_shots
+    pending: list = []
+    size = "2K" if p.get("image_quality") == "high" else "1K"
+    one_check = pricing.estimate_inspection(4) if p.get("auto_inspect") is not False else None
+
+    def _reserve(scene, i, k):
+        chars = len((scene.get("continuity") or {}).get("characters") or []) or 1
+        img = pricing.image_cost(1, 400 + 1300 * min(chars + 1, 4), size)
+        pic = pricing.combine([img, one_check, img, one_check] if one_check else [img])   # incl. one correction
+        stages["images"].append({"target_id": f"reserve-{scene['id']}", "label": f"Scene {i}: up to {k} shot pictures",
+                                 "credits": k * pricing.hold_credits("shot_image", pic), "reserve_only": True,
+                                 "kind": "shot_image", "input": {}})
+        if scene.get("mode") == "video":
+            secs = max(3, min(15, int(float(scene.get("duration_seconds") or 6) / k + 0.999) + 2))
+            stages["videos"].append({"target_id": f"reserve-{scene['id']}", "label": f"Scene {i}: up to {k} shot clips",
+                                     "credits": k * pricing.estimate_video(secs).credits, "reserve_only": True,
+                                     "kind": "shot_video", "input": {}})
     shots_by: dict = {}
     for sh in cs._project_shots(p["id"]):
         shots_by.setdefault(sh["scene_id"], []).append(sh)
@@ -101,6 +117,23 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
                     add("images", sh, f"Scene {i}, shot {n} picture", {"shot_id": sh["id"]}, "shot_image")
                 if s.get("mode") == "video" and not sh.get("video_path") and not sh.get("approved_at"):
                     add("videos", sh, f"Scene {i}, shot {n} clip", {"shot_id": sh["id"]}, "shot_video")
+            lines = [d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
+            if lines and not s.get("audio_path") and scene_speech(s, p) != "video_model":
+                add("voices", s, f"Scene {i} voices")
+            continue
+        # A scene that already has its picture or clip is reused as it is, never directed again.
+        finished = s.get("image_path") or s.get("video_path")
+        approved_single = s.get("image_approved_path") and s.get("image_approved_path") == s.get("image_path")
+        if options.get("direct") and not finished and not approved_single and \
+                not (s.get("made_with") or {}).get("_direct_failed"):
+            # The AI director takes the scene: it plans the shots (unless a plan already exists, which is
+            # used as it is), the run approves the plan, then every shot is made. What the shots will cost
+            # is reserved now (an upper bound) and what isn't used is returned at the end.
+            if shots:
+                pending.append(s["id"])
+            else:
+                add("direct", s, f"Scene {i} directing", {"auto": True})
+            _reserve(s, i, len(shots) or studio_shots.estimate_shots(s))
             lines = [d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
             if lines and not s.get("audio_path") and scene_speech(s, p) != "video_model":
                 add("voices", s, f"Scene {i} voices")
@@ -131,11 +164,17 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
               if not studio_shots.uses_shots(s, shots_by.get(s["id"], []))
               and (len([d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]) >= 2
                    or float(s.get("duration_seconds") or 0) >= 7)]
+    if options.get("direct"):
+        single = [(i, s) for i, s in single if (s.get("made_with") or {}).get("_direct_failed")]
     advice = [f"{len(single)} scene{'s' if len(single) != 1 else ''} ({', '.join(str(i) for i, _ in single[:12])}"
               f"{'...' if len(single) > 12 else ''}) would be filmed as one shot each. Plan their camera shots first "
               "(wide, over-the-shoulder, close-up, reaction) for real coverage."] if single else []
+    directed = sum(1 for x in stages["direct"]) + len(pending)
     return {"stages": out, "total_credits": sum(x["credits"] for x in out), "blocked": blocked, "advice": advice,
-            "single_shot_scenes": [s["id"] for _, s in single],
+            "single_shot_scenes": [s["id"] for _, s in single], "pending_plans": pending, "directed_scenes": directed,
+            "note_direct": ("The AI director plans every scene's camera shots before anything is made. Shot "
+                            "pictures and clips are reserved at most; what isn't used is returned at the end.")
+            if directed else "",
             "scenes": len(scenes), "characters": len(cast), "options": options}
 
 
@@ -169,9 +208,13 @@ def advance(st, run: dict) -> bool:
     options = run.get("options") or {}
     if isinstance(options, str):
         options = json.loads(options)
+    options = {"direct": False, **options}      # runs started before automatic directing keep their plan
     rnd = _round(run)
     jobs = _run_jobs(st, run)
     now = plan(p, options)
+    if options.get("direct") and _approve_directed(st, p, jobs, now):
+        p = st.one("studio_projects", {"id": run["project_id"]}) or p
+        now = plan(p, options)
     needed = {x["stage"]: x["items"] for x in now["stages"]}
     for stage in STAGES:
         mine = [j for j in jobs if _stage_of(j) == stage]
@@ -185,7 +228,7 @@ def advance(st, run: dict) -> bool:
                           {"render_id": (render or {}).get("id")})
                 st.rpc("studio_run_finish", {"p_run": run["id"], "p_status": "done", "p_problem": None})
                 return False
-        items = needed.get(stage) or []
+        items = [i for i in needed.get(stage) or [] if not i.get("reserve_only")]
         if not items:
             continue
         stuck, started = [], False
@@ -201,7 +244,7 @@ def advance(st, run: dict) -> bool:
             r = st.rpc("studio_run_create_job", {
                 "p_run": run["id"], "p_kind": kind, "p_lane": LANE.get(stage, "generation"), "p_key": key,
                 "p_credits": item["credits"], "p_input": item["input"],
-                "p_scene": item["target_id"] if kind in ("image", "voice", "video", "lipsync")
+                "p_scene": item["target_id"] if kind in ("image", "voice", "video", "lipsync", "shotplan")
                 else item.get("scene_id") if kind in ("shot_image", "shot_video") else None,
                 "p_character": item["target_id"] if kind == "portrait" else None,
                 # The first try of a step draws from the reservation; retries
@@ -218,6 +261,16 @@ def advance(st, run: dict) -> bool:
                 return started
         if started:
             return True
+        if stuck and stage == "direct":
+            # Directing failed twice: that scene is made as one clip instead (never left unmade).
+            for item in items:
+                tries = [j for j in mine if j["idempotency_key"].split(":")[3] == item["target_id"]]
+                if len(tries) >= ATTEMPTS and all(j["status"] == "failed" for j in tries):
+                    sc = st.one("studio_scenes", {"id": item["target_id"]})
+                    if sc:
+                        st.update("studio_scenes", {"id": sc["id"]},
+                                  {"made_with": {**(sc.get("made_with") or {}), "_direct_failed": True}})
+            return False
         if stuck:
             st.rpc("studio_run_finish", {"p_run": run["id"], "p_status": "needs_attention",
                                          "p_problem": "These need you: " + " · ".join(stuck[:6])})
@@ -225,6 +278,25 @@ def advance(st, run: dict) -> bool:
     # Everything is made but no render was asked for.
     st.rpc("studio_run_finish", {"p_run": run["id"], "p_status": "done", "p_problem": None})
     return False
+
+
+def _approve_directed(st, p: dict, jobs: list, now: dict) -> bool:
+    """The run approves the plans the director made for it (and plans that already existed), once no
+    directing is still running. Never touches a scene the creator approved or made already."""
+    if any(_stage_of(j) == "direct" and j["status"] in ("queued", "running") for j in jobs):
+        return False
+    directed = {j.get("scene_id") for j in jobs if _stage_of(j) == "direct" and j["status"] == "succeeded"}
+    todo = (directed | set(now.get("pending_plans") or [])) - {None}
+    changed = False
+    for sid in todo:
+        sc = st.one("studio_scenes", {"id": sid})
+        if not sc or sc.get("shot_plan_approved") or not st.select("studio_shots", {"scene_id": sid}):
+            continue
+        st.update("studio_scenes", {"id": sid}, {"shot_plan_approved": True, "made_with": {
+            **(sc.get("made_with") or {}), "_direction": {**((sc.get("made_with") or {}).get("_direction") or {}),
+                                                         "auto_approved": True}}})
+        changed = True
+    return changed
 
 
 def advance_all(st) -> bool:
@@ -255,7 +327,9 @@ def progress(st, run: dict) -> dict:
     jobs = _run_jobs(st, run)
     p = st.one("studio_projects", {"id": run["project_id"]}) or {}
     try:
-        now = {x["stage"]: len(x["items"]) for x in plan(p, run.get("options") or {})["stages"]} if p else {}
+        ro = run.get("options") or {}
+        ro = json.loads(ro) if isinstance(ro, str) else ro
+        now = {x["stage"]: len(x["items"]) for x in plan(p, {"direct": False, **ro})["stages"]} if p else {}
     except Exception:
         now = {}
     stages = []

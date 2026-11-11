@@ -830,6 +830,7 @@ class StudioWorker:
                             "anchor": ((c.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")}
                   for c, o in entries}
         record["_refs"] = labels[:8]
+        record.update({k: v for k, v in (scene.get("made_with") or {}).items() if k.startswith("_direct")})   # director's notes
         if previous:
             record["_previous_shot"] = previous   # lets the review spot pictures made from an older scene
         self._optional_update("studio_scenes", {"id": scene["id"]}, {"made_with": record})
@@ -1121,6 +1122,21 @@ class StudioWorker:
         except ValueError as e:
             raise JobFailed("bad_plan", f"The director couldn't plan this scene ({e}). Your credits were returned.",
                             absorbed=cost)
+        # The director's own cinematography review (coverage, variety, the speaker seen, the reaction, the
+        # emotional beat, geography, screen direction). Weak plans are re-planned once; the better one is kept.
+        review = shots_mod.plan_quality(scene, plan)
+        replanned = False
+        if review:
+            try:
+                raw2, cost2 = self.ai.plan_shots(prompt + "\n\nYOUR PLAN WAS SENT BACK. Fix these problems:\n" +
+                                                 shots_mod.review_text(review), scene=scene, cast_names=names)
+                cost = pricing.combine([cost, cost2])
+                plan2 = shots_mod.clean_plan(raw2, scene, names)
+                review2 = shots_mod.plan_quality(scene, plan2)
+                if len(review2) < len(review):
+                    plan, review, replanned = plan2, review2, True
+            except Exception as e:          # a failed re-plan never loses the first, valid plan
+                print(f"[INFO] studio shotplan {job['id']}: re-plan not used: {str(e)[:120]}")
         for old in self._shots(scene["id"]):
             if old.get("approved_at"):
                 raise JobFailed("approved", "A shot in this scene is approved. Unapprove it to plan again. "
@@ -1131,7 +1147,11 @@ class StudioWorker:
                                       "characters", "line_indices", "dialogue", "audio", "frame_prompt", "video_prompt",
                                       "continuity", "reason")}} for i, sh in enumerate(plan)]
         self.store.insert("studio_shots", rows)
-        return {"shots": len(rows), "types": [r["shot_type"] for r in rows]}, cost
+        made = dict(scene.get("made_with") or {})
+        made["_direction"] = {"review": review, "replanned": replanned, "auto": bool((job.get("input") or {}).get("auto")),
+                              "shots": len(rows)}
+        self._optional_update("studio_scenes", {"id": scene["id"]}, {"made_with": made})
+        return {"shots": len(rows), "types": [r["shot_type"] for r in rows], "review": review, "replanned": replanned}, cost
 
     def _shot_job(self, job, project):
         sid = (job.get("input") or {}).get("shot_id")

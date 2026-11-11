@@ -29,6 +29,9 @@ def setup(env, style="pictures", scenes=SCENES, credits=8000):
 
 
 def quote(client, u, pid, **body):
+    # These tests cover the run's mechanics on single-clip scenes; automatic directing (the default)
+    # is covered in test_auto_director.py.
+    body = {"direct": False, **body}
     r = client.post(f"/api/v1/studio/projects/{pid}/production/quote", headers=H(u), json=body)
     assert r.status_code == 200, r.text
     return r.json()
@@ -36,7 +39,7 @@ def quote(client, u, pid, **body):
 
 def start(client, u, pid, total, **body):
     return client.post(f"/api/v1/studio/projects/{pid}/production", headers=H(u),
-                       json={"request_id": uuid.uuid4().hex, "confirm_credits": total, **body})
+                       json={"request_id": uuid.uuid4().hex, "confirm_credits": total, "direct": False, **body})
 
 
 def drive(gen, ren, rounds=12):
