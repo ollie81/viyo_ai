@@ -1,13 +1,15 @@
 """Evaluates the story-world builder against REAL Gemini (with Google Search
-grounding for real places): historical Rwanda around 1500, late-Sengoku Japan,
-modern Lagos and a fictional world, plus (with --with-story) one Rwandan
-episode written inside its world and judged by the strict story check.
+grounding for real places) on settings from different continents and periods
+(Rwanda ~1500, late-Sengoku Japan, Inca Peru, Viking-age Norway, modern Seoul,
+modern Lagos and a fictional world), all through the same code path, plus
+(with --with-story) one episode written inside the first world and judged by
+the strict story check.
 
 Checks that need no AI, on what the real model returned:
   researched     real places were researched with web search and have sources
   labelled       documented claims carry a source (unsourced ones are counted)
   honest         a historical world admits what is unknown or uncertain
-  no_confusion   the world doesn't borrow another culture's markers
+  no_confusion   the world lists what's often confused with this place, and doesn't borrow it itself
   no_anachronism the world's own look doesn't contain things that didn't exist yet
   depth          no thin sections (setting, society, culture, language, material, environment)
   story          (--with-story) the episode's story check is complete, authenticity is verified by a real quote,
@@ -17,7 +19,7 @@ No database, no pictures. It spends real Gemini credits (about $0.05-0.10 a
 world with search; the story adds about $0.09) and refuses to run unless both
 are given: GEMINI_API_KEY in the environment, and --approve-spend.
 
-  python scripts/eval_world.py --approve-spend [--max-usd 0.60] [--with-story]
+  python scripts/eval_world.py --approve-spend [--max-usd 0.90] [--with-story]
 """
 from __future__ import annotations
 
@@ -37,6 +39,12 @@ CASES = [
      "A fictional prince must choose between his father's throne and the woman his clan has sworn to destroy."),
     ("Feudal Japan", "grounded", "Owari province, Japan, 1590s",
      "A merchant's daughter hides a wounded samurai from the lord who wants him dead."),
+    ("Inca Peru", "grounded", "Cusco, Inca Empire, around 1500",
+     "A young chasqui runner carries a message that could start a civil war."),
+    ("Viking Norway", "grounded", "a fjord farm in western Norway, 950s",
+     "A widow must defend her farm and her daughter's marriage against her husband's brother."),
+    ("Modern Seoul", "modern", "Mapo-gu, Seoul, South Korea, today",
+     "A webtoon artist realises her bestselling story is predicting real crimes."),
     ("Modern Lagos", "modern", "Yaba, Lagos, Nigeria, today",
      "A young coder discovers her startup's investor is laundering money for her father."),
     ("Fictional", "fictional", "a floating trading city inspired by the medieval Swahili coast",
@@ -47,7 +55,7 @@ CASES = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--approve-spend", action="store_true", help="required: this calls real Gemini")
-    ap.add_argument("--max-usd", type=float, default=0.60)
+    ap.add_argument("--max-usd", type=float, default=0.90)
     ap.add_argument("--with-story", action="store_true")
     args = ap.parse_args()
     if not args.approve_spend or not os.environ.get("GEMINI_API_KEY"):
@@ -74,7 +82,7 @@ def main():
             "researched": mode == "fictional" or (world.get("researched") and len(world.get("sources") or []) > 0),
             "labelled": ev["facts"]["unsourced"] == 0,
             "honest": mode in ("modern", "fictional") or bool(world.get("unknown")) or ev["facts"]["uncertain"] > 0,
-            "no_confusion": not wb.confusions(look, world),
+            "no_confusion": (mode == "fictional" or len(world.get("avoid") or []) >= 3) and not wb.confusions(look, world),
             "no_anachronism": not wb.anachronisms(look, world),
             "depth": not any(p["kind"] == "thin" for p in ev["problems"]),
         }

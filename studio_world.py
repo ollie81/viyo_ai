@@ -9,8 +9,9 @@ the material world (buildings, clothes, objects, food, work), technology and
 transport (and what does NOT exist yet), environment and sound, history,
 a visual identity, FACTS each labelled documented / interpretation / invented
 / uncertain (documented ones carry their source when the world was researched
-with web search), what is unknown, and confusions to avoid (e.g. a Rwandan
-story borrowing Nigerian or Ghanaian dress).
+with web search), what is unknown, and the confusions to avoid for THIS place
+(details of neighbouring or often-confused cultures, researched for every
+setting the same way: no country has a special list).
 
 The creator can correct it; corrections override everything and are shown
 first to every model. Nothing here proves historical accuracy: it says where a
@@ -94,22 +95,6 @@ INVENTIONS = {
     "rifle": 1500, "pistol": 1500, "revolver": 1836, "machine gun": 1884, "sunglasses": 1929, "refrigerator": 1913,
 }
 
-# Neighbouring cultures that AI models often mix up. A starting list, not the
-# whole world: the world's own "avoid" list (from research) adds to it.
-CONFUSIONS = {
-    "rwanda": ["kente", "agbada", "gele", "aso oke", "dashiki", "yoruba", "igbo", "zulu", "maasai shuka", "pharaoh"],
-    "nigeria": ["kente", "kinyarwanda", "intore", "maasai shuka", "zulu"],
-    "ghana": ["agbada", "gele", "kinyarwanda", "maasai shuka"],
-    "kenya": ["kente", "agbada", "kinyarwanda", "zulu"],
-    "japan": ["hanbok", "qipao", "cheongsam", "kimchi", "great wall", "pagoda roofs of china"],
-    "china": ["kimono", "samurai", "katana", "hanbok", "geisha"],
-    "korea": ["kimono", "samurai", "qipao", "geisha"],
-    "india": ["kimono", "hanbok", "sombrero"],
-    "egypt": ["toga", "viking", "samurai"],
-    "mexico": ["poncho of the andes", "kimono"],
-    "peru": ["sombrero", "aztec", "maya pyramids"],
-}
-
 _SECTIONS = ("setting", "society", "culture", "language", "material", "technology", "environment", "history",
              "visual", "sound")
 
@@ -158,13 +143,16 @@ LANGUAGE OF THE FILM: {brief.get('language') or 'English'}
 {('RESEARCH NOTES:' + chr(10) + research[:12000] + chr(10)) if research else 'No web research was done: label claims honestly (interpretation or uncertain unless you are certain).' + chr(10)}
 {('SOURCES:' + chr(10) + src + chr(10)) if src else ''}
 RULES:
-- Be specific to THIS place and period. Never default to American, European or modern life, and never treat a
-  continent as one culture: a Rwandan story is not Nigerian, a Japanese story is not generic East Asian.
+- Be specific to THIS place and period, wherever it is. Never default to American, European or modern life, and
+  never treat a continent, region or country as one culture: a story keeps its own people's dress, words, food,
+  buildings and customs, not their neighbours'.
 - facts: the claims the film relies on, each labelled: documented (with the source number when there is one),
   interpretation (a reasonable reading), invented (made up for the story), uncertain (disputed or unknown).
   Never label a guess as documented.
 - unknown: say plainly what isn't known.
-- avoid: concrete confusions (other cultures' dress, words, buildings, customs) that would be wrong here.
+- avoid: 5-15 concrete things that are often wrongly shown for THIS place and period: the dress, words, buildings,
+  food and customs of neighbouring or commonly confused cultures, and common stereotypes or film clichés about it.
+  Specific words (a garment's name, a building type), not general advice. Required for every real place.
 - technology.not_available: everyday things that did not exist yet and must never appear.
 - For an alternate history, name the one deliberate change in setting.summary; for a fictional world, say which
   real culture inspires it and keep that inspiration coherent.
@@ -330,11 +318,11 @@ def anachronisms(text: str, world: Optional[dict]) -> list[str]:
 
 
 def confusions(text: str, world: Optional[dict]) -> list[str]:
-    """Other cultures' markers in the text (the starter list plus the world's own avoid list)."""
+    """Other cultures' markers in the text: the world's own researched avoid list and the creator's
+    corrections. The same rule for every place; no country has a built-in list."""
     if not world:
         return []
-    country = ((world.get("setting") or {}).get("country") or "").lower()
-    terms = [t for k, v in CONFUSIONS.items() if k in country for t in v] + list(world.get("avoid") or [])
+    terms = list(world.get("avoid") or [])
     return _longest(t for t in terms if 2 < len(t) <= 40 and _found(t, text))
 
 
@@ -364,6 +352,10 @@ def evaluate(world: Optional[dict]) -> dict:
     thin = [s for s in ("setting", "society", "culture", "language", "material", "environment") if sections.get(s, 0) < 2]
     if thin:
         problems.append({"kind": "thin", "problem": f"Thin: {', '.join(thin)}.", "fix": "Build those parts of the world."})
+    if world.get("mode") != "fictional" and len(world.get("avoid") or []) < 3:
+        problems.append({"kind": "no_confusions", "problem": "Few or no confusions listed for this place, so mix-ups with "
+                                                             "neighbouring cultures can't be caught.",
+                         "fix": "Rebuild the world, or add what is often wrongly shown for this place."})
     facts = world.get("facts") or []
     counts = {s: sum(1 for f in facts if f["status"] == s) for s in STATUSES + ("unsourced",)}
     if counts["unsourced"]:
