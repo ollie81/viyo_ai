@@ -62,6 +62,7 @@ ACTIONS = {
     "remake_shot_picture": "paid",   # data: scene, shot: a new opening picture of that one shot
     "remake_shot_video": "paid",     # data: scene, shot: a new clip of that one shot
     "build_world": "paid",       # data: mode (grounded/alternate/fictional/modern), setting: research and build the story world
+    "edit_voice": "free",        # data: character, field (identity, pitch, texture, accent, speed, rhythm...), value
     "correct_world": "free",     # data: field (e.g. material.clothing, avoid, setting.era), value, note: the creator's correction
     "plan_saga": "paid",         # data: length_mode (episodes/seasons/open), count: plan the larger story before episodes
     "check_shots": "paid",       # data: scenes [numbers] (empty = every shot with a picture): shot-to-shot continuity check
@@ -228,6 +229,18 @@ Story worlds, history and culture:
   conflict, characters who feel real (history, fears, secrets, inner conflict), the larger storyline and seasons,
   and the emotional direction; offer up to 3 alternatives and let the creator choose.
 
+Voices (you are the voice director):
+- VOICE BIBLE lists each character's permanent voice identity (pitch, texture, accent, pace, rhythm, habits,
+  personality and emotional range). The identity never changes between scenes or episodes; the PERFORMANCE does
+  (feeling, volume, subtext), and it's understated unless the scene truly calls for more.
+- The video models speak the lines themselves. None of them takes a voice ID or a voice reference: the voice is
+  held by the same description each time, so it can drift between clips. Say so honestly; never promise identical
+  voices. Saved voices (a named voice that never changes) are the steadiest fallback, but the clip's lips then
+  don't follow them unless lip sync is on.
+- VOICE CHECK lines report clips whose sound failed (lines missing, wrong voice, wrong language, extra speech) or
+  need work. Name the exact line, then offer: remake that clip only (remake_video / remake_shot_video), or switch
+  that scene to saved voices. To change a voice, propose edit_voice (data.character, data.field, data.value).
+
 Changes of mind and approved decisions:
 - MEMORY items are listed oldest first. When the creator changes the story, the newer statement wins: work from it,
   say which earlier facts, scenes, shots or pictures it affects, and suggest removing the outdated memory item.
@@ -288,6 +301,7 @@ Proposals (0 to 3, only when a concrete change would help now):
 - plan_shots: data.scenes. edit_shot / remake_shot_picture / remake_shot_video: data.scene and data.shot (numbers).
 - check_shots: data.scenes. fix_shot_picture: data.scene, data.shot, data.correction.
 - build_world: data.mode, data.setting. correct_world: data.field, data.value, data.note. plan_saga: data.length_mode, data.count.
+- edit_voice: data.character, data.field, data.value.
 - develop_story, break_into_scenes, find_places_objects, suggest_outfits, make_cover, make_film: paid steps, data may
   be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -583,6 +597,17 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
         import studio_world
         lines += studio_world.summary_lines(world[0])
         lines += studio_saga.summary_lines(world[1])
+        if len(world) > 2:
+            import studio_voice
+            lines += studio_voice.summary_lines(world[2], ["omni", "tts"])
+            for i, sc in enumerate(scenes[:120], start=1):
+                v = (sc.get("made_with") or {}).get("_voice") or {}
+                chk = v.get("check") or {}
+                if chk.get("status") in ("failed", "needs_work"):
+                    lines.append(f"VOICE CHECK scene {i} ({(v.get('provider') or '').upper()}): {chk['status'].upper()} – "
+                                 + "; ".join(x["problem"] for x in chk.get("problems") or [])[:300])
+                for lim in (v.get("limitations") or [])[:1]:
+                    lines.append(f"  voice limit scene {i}: {lim}")
         if world[0] and scenes:
             bad = [(i, c) for i, sc in enumerate(scenes[:120], start=1)
                    for c in studio_world.check_text(" ".join([sc.get("visual") or "", sc.get("heading") or ""] +

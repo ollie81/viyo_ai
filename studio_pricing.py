@@ -301,3 +301,8 @@ def estimate_world(researched: bool = True) -> Cost:
 def estimate_saga() -> Cost:
     """Planning the larger story: one call, sent back at most once."""
     return text_cost(2 * 5000, 2 * (THINKING_BUDGET + 5000))
+
+
+def estimate_listen(seconds: float = 15) -> Cost:
+    """The AI listening to one talking clip's sound (about 32 audio tokens a second) to check its dialogue."""
+    return text_cost(1500 + int(32 * max(1.0, seconds)), THINKING_BUDGET + 700)

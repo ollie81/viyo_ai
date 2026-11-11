@@ -206,8 +206,7 @@ def test_D_H_same_voice_in_three_scenes_while_emotion_changes(env):
     assert {v for _t, v, _s in log} == {ana["voice"]}, "one speaker"
     styles = {t: s for t, _v, s in log}
     assert [styles[x] for x in ("We won!", "He's gone.", "Get out!", "Who's there?")] == \
-        [f"{ana['voice_style']}, happy".lstrip(", "), f"{ana['voice_style']}, sad".lstrip(", "),
-         f"{ana['voice_style']}, angry".lstrip(", "), f"{ana['voice_style']}, frightened".lstrip(", ")]
+        [f"{ana['voice_style']}, {e}, felt but held back, not overplayed" for e in ("happy", "sad", "angry", "frightened")]
     assert ana["voice_style"] == "warm", "a short, stable note from the personality"
 
 

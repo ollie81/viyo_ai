@@ -388,6 +388,35 @@ class GoogleStudioAI:
                 pass
         return saga, pricing.text_cost(tin, tout)
 
+    def voice_bible(self, prompt: str):
+        """Voice identities for characters (studio_voice.BIBLE_SCHEMA)."""
+        import studio_voice
+        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=studio_voice.BIBLE_SCHEMA)
+        i, o = self._text_usage(resp)
+        try:
+            return json.loads(resp.text), pricing.text_cost(i, o)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned unreadable voice profiles.")
+
+    def listen(self, prompt: str, audio: bytes):
+        """Gemini listens to a clip's sound (16 kHz mono WAV) and reports which lines were said and how."""
+        import studio_voice
+        from google.genai import types
+        try:
+            resp = self.client.models.generate_content(
+                model=pricing.TEXT_MODEL,
+                contents=[types.Part.from_bytes(data=audio, mime_type="audio/wav"), types.Part.from_text(text=prompt)],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET), safety_settings=drama_safety(),
+                    response_mime_type="application/json", response_json_schema=studio_voice.LISTEN_SCHEMA))
+        except Exception as e:
+            raise _classify(e)
+        i, o = self._text_usage(resp)
+        try:
+            return json.loads(resp.text), pricing.text_cost(i, o)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned an unreadable sound check.")
+
     def story_check(self, brief: dict, plan: dict, script: str, previous: list):
         """The strict story check of an existing script (studio_story_check). Never rewrites it."""
         import studio_story
@@ -691,6 +720,36 @@ class FakeStudioAI:
         r = getattr(self, "saga_result", None)
         raw = (r(brief, length) if callable(r) else r) if r is not None else {"premise": "A story.", "main_storyline": "x"}
         return studio_saga.clean(raw, length), pricing.text_cost(5000, 4000)
+
+    def voice_bible(self, prompt):
+        """voice_result: a raw answer or fn(prompt) -> dict; default: a distinct voice for each character in the prompt."""
+        self.calls.append(("voice_bible",))
+        self.voice_prompts = getattr(self, "voice_prompts", []) + [prompt]
+        self._maybe_fail("voice_bible")
+        r = getattr(self, "voice_result", None)
+        if r is not None:
+            return (r(prompt) if callable(r) else r), pricing.text_cost(3000, 1500)
+        names = re.findall(r"^- ([^:\n]+):", prompt.split("CHARACTERS TO CAST:")[1].split("VOICES ALREADY CAST")[0]
+                           .split("RULES:")[0], re.M) if "CHARACTERS TO CAST:" in prompt else []
+        pitches, textures, speeds = ["low", "high-middle", "middle", "high"], ["husky", "bright", "smooth", "gravelly"], \
+            ["measured", "brisk", "slow", "fast"]
+        return {"voices": [{"character": n.strip(), "identity": f"a {pitches[i % 4]}, {textures[i % 4]} voice",
+                            "vocal_age": "adult", "pitch": pitches[i % 4], "texture": textures[i % 4],
+                            "speed": speeds[i % 4], "rhythm": "even", "personality": "x", "emotional_range": "y",
+                            "accent": "neutral"} for i, n in enumerate(names)]}, pricing.text_cost(3000, 1500)
+
+    def listen(self, prompt, audio):
+        """listen_result: a raw answer or fn(prompt) -> dict; default: every line heard, correct voice."""
+        self.calls.append(("listen", len(audio)))
+        self.listen_prompts = getattr(self, "listen_prompts", []) + [prompt]
+        self._maybe_fail("listen")
+        r = getattr(self, "listen_result", None)
+        if r is not None:
+            return (r(prompt) if callable(r) else r), pricing.text_cost(2000, 500)
+        n = len(re.findall(r"^\d+\. ", prompt, re.M))
+        return {"lines": [{"index": i, "heard": True, "heard_text": "x", "speaker_ok": True} for i in range(n)],
+                "language_ok": True, "natural": 8, "clarity": 8, "extra_speech": False, "voices_distinct": True}, \
+            pricing.text_cost(2000, 500)
 
     def story_check(self, brief, plan, script, previous):
         """story_fns' json function judges (tests); otherwise story_check_result (raw judge answer)."""

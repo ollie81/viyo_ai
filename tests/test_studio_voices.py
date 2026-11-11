@@ -145,7 +145,9 @@ def test_delivery_note_and_line_emotion_reach_the_voice_model(env):
         {"character": "NARRATOR", "text": "She never came back.", "emotion": "sad"}]}).json()
     assert s["dialogue"][0]["emotion"] == "angry"
     voice_all(client, gen, u, pid, [s["id"]])
-    assert voice_calls(ai) == [("Get out.", "Kore", "calm, low, angry"), ("Please.", "Kore", "calm, low"),
+    # The named voice never changes; the style adds the performance, held back unless the script asks for more.
+    assert voice_calls(ai) == [("Get out.", "Kore", "calm, low, angry, felt but held back, not overplayed"),
+                               ("Please.", "Kore", "calm, low"),
                                ("She never came back.", sw.NARRATOR_VOICE, "sad")]
 
 

@@ -74,8 +74,10 @@ def test_a_talking_scene_gives_omni_the_lines_voices_and_faces(env):
     run(gen)
     prompt = ai.last_video_prompt
     assert "speak on camera with natural lip movement, in English" in prompt
-    assert 'MAYA (voice: ' + cast["Maya"]["voice_description"].rstrip(".") + '; delivery: hopeful): "You came back."' in prompt
-    assert 'DANIEL (voice: ' in prompt and 'delivery: tender, quiet): "I never left."' in prompt
+    # The voice bible's identity, the casting engine's age-correct note, and this line's performance.
+    maya = prompt[prompt.index("MAYA (voice: "):prompt.index('"You came back."')]
+    assert "base: " + cast["Maya"]["voice_description"].rstrip(".") in maya and "performance: hopeful" in maya
+    assert 'DANIEL (voice: ' in prompt and 'performance: tender, quiet' in prompt
     assert prompt.index("You came back.") < prompt.index("I never left."), "lines in order"
     assert "No subtitles" in prompt and "No dialogue and no speech" not in prompt
     assert ai.last_video_refs == ["the scene: its setting, lighting and framing (not a character)",
@@ -104,7 +106,8 @@ def test_clip_length_fits_the_dialogue_and_long_dialogue_is_refused_before_charg
     assert r.status_code == 400 and balance(client, u) == before
     start(client, u, p["id"], "video", [s1["id"]])
     run(gen)
-    assert ai.calls[-1] == ("video", "9:16", 10), "20 words need about 9.8 s, not the 3 s scene length"
+    assert [c for c in ai.calls if c[0] == "video"][-1] == ("video", "9:16", 10), \
+        "20 words need about 9.8 s, not the 3 s scene length"
 
 
 def test_no_separate_voice_track_for_scenes_spoken_in_the_video(env):
@@ -186,7 +189,8 @@ def test_a_child_in_a_talking_video_gets_a_childlike_voice_description(env):
     s = detail(client, u, p["id"])["scenes"][0]
     start(client, u, p["id"], "video", [s["id"]])
     run(gen)
-    assert 'LILY (voice: A natural childlike female speaking voice' in ai.last_video_prompt
+    lily = ai.last_video_prompt[ai.last_video_prompt.index("LILY (voice: "):]
+    assert "base: A natural childlike female speaking voice" in lily.split('"')[0], "the child keeps a childlike voice"
     assert "adult" not in ai.last_video_prompt.split("LILY (voice:")[1].split(")")[0]
 
 
