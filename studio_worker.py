@@ -31,6 +31,7 @@ import studio_shots as shots_mod
 import studio_shot_continuity as shotcheck
 import studio_world as wb
 import studio_saga as saga_mod
+import studio_voice as voice_mod
 import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
@@ -216,6 +217,121 @@ class StudioWorker:
                 return ep["saga"]
         return None
 
+    def story_voices(self, project, cast: Optional[list] = None) -> dict:
+        """The Character Voice Bible: earlier episodes' voices, then this one's (by character name), with each
+        character's saved voice description as a fallback for anyone not in it yet."""
+        voices = {}
+        for ep in self.earlier_episodes(project):
+            voices.update(ep.get("voices") or {})
+        voices.update((project.get("story_bible") or {}).get("voices") or {})
+        for c in cast or []:
+            k = voice_mod.key(c["name"])
+            note = (c.get("voice_description") or "").strip()
+            if not note:
+                try:      # worked out from the character's age and gender, as casting does
+                    note = casting.describe_voice(profile_from_row(c, project), None, project.get("language") or "English",
+                                                  c.get("description") or "")
+                except Exception:
+                    note = ""
+            if k not in voices and note:
+                voices[k] = {"character": c["name"], "identity": note, "fallback": True}
+            elif k in voices and note and not voices[k].get("fallback"):
+                # The casting engine's age- and language-correct note travels with the profile (a child stays childlike).
+                voices[k] = {**voices[k], "casting": note}
+            # The character's real age group wins over a profile that guessed wrong (no "adult" voice for a child).
+            group = casting._CATEGORY_GROUP.get(c.get("age_category") or "")
+            if k in voices and group in ("child", "teen", "elderly"):
+                word = {"child": "child", "teen": "teen", "elderly": "older"}[group]
+                va = (voices[k].get("vocal_age") or "").lower()
+                if word not in va and not (group == "elderly" and "old" in va):
+                    voices[k] = {**voices[k], "vocal_age": {"child": "a child", "teen": "a teenager",
+                                                            "elderly": "an older adult"}[group], "age_corrected": True}
+        return voices
+
+    def _hides(self, project) -> dict:
+        """Who hides what (story plan / series plan), so a line can carry its subtext."""
+        sb = project.get("story_bible") or {}
+        out = {}
+        for c in (sb.get("characters") or []) + ((sb.get("saga") or {}).get("characters") or []):
+            if isinstance(c, dict) and c.get("name") and (c.get("secret") or c.get("hides")):
+                out[voice_mod.key(c["name"])] = c.get("hides") or c.get("secret")
+        for k in sb.get("knowledge") or []:
+            if isinstance(k, dict) and k.get("character") and k.get("hides"):
+                out[voice_mod.key(k["character"])] = k["hides"]
+        return out
+
+    def direct_voices(self, project, cast: list, scenes: list, recast: tuple = ()) -> tuple[dict, Optional[pricing.Cost]]:
+        """Casts a voice identity for every speaking character not cast yet (established voices are kept, so a
+        character never changes voice between scenes or episodes). Returns (voices, cost or None)."""
+        established = {k: v for k, v in self.story_voices(project).items() if not v.get("fallback") and k not in recast}
+        missing = [c for c in cast if voice_mod.key(c["name"]) not in established]
+        if not missing or getattr(self.ai, "voice_bible", None) is None:
+            return established, None
+        prompt = voice_mod.bible_prompt(project, missing, scenes, project.get("story_bible") or {},
+                                        self._w(project, "characters"), established)
+        raw, cost = self.ai.voice_bible(prompt)
+        new = voice_mod.clean_bible(raw, missing)
+        same = voice_mod.too_similar(voice_mod.merge(established, new))
+        if same:
+            raw2, cost2 = self.ai.voice_bible(prompt + "\n\nTHESE VOICES ARE TOO ALIKE; make each pair clearly "
+                                              "different (pitch, texture, speed): " +
+                                              "; ".join(f"{a} and {b}" for a, b in same))
+            cost = pricing.combine([cost, cost2])
+            again = voice_mod.clean_bible(raw2, missing)
+            if again and len(voice_mod.too_similar(voice_mod.merge(established, again))) < len(same):
+                new = again
+        voices = voice_mod.merge(established, new)
+        bible = dict(project.get("story_bible") or {})
+        bible["voices"] = {**(bible.get("voices") or {}), **voices}
+        self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
+        project["story_bible"] = bible
+        return voices, cost
+
+    def _dialogue(self, provider, project, lines, cast) -> dict:
+        voices = self.story_voices(project, cast)
+        return voice_mod.for_provider(provider, lines, voices, project.get("language") or "English",
+                                      self._hides(project), is_narrator)
+
+    def _voice_check(self, project, data: bytes, lines: list, cast: list):
+        """Checks a talking clip's sound: ffmpeg (sound present, silent, clipping) and an AI that listens
+        (which lines were said, by whom, language, naturalness, clarity). Returns (verdict, cost or None)."""
+        tech = {"has_audio": False}
+        audio = None
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "clip.mp4")
+            with open(src, "wb") as f:
+                f.write(data)
+            try:
+                info = render.probe(src)
+                tech["has_audio"] = bool(info.get("has_audio"))
+                if tech["has_audio"]:
+                    import subprocess
+                    out = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", src, "-vn", "-af", "volumedetect",
+                                          "-f", "null", "-"], capture_output=True, text=True, timeout=120).stderr
+                    mean = re.search(r"mean_volume: (-?[\d.]+) dB", out)
+                    peak = re.search(r"max_volume: (-?[\d.]+) dB", out)
+                    tech["mean_db"] = float(mean.group(1)) if mean else None
+                    tech["peak_db"] = float(peak.group(1)) if peak else None
+                    tech["silent"] = tech["mean_db"] is not None and tech["mean_db"] < -50
+                    tech["clipping"] = tech["peak_db"] is not None and tech["peak_db"] >= -0.1
+                    wav = os.path.join(tmp, "a.wav")
+                    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000", wav],
+                                   check=True, timeout=120)
+                    with open(wav, "rb") as f:
+                        audio = f.read()
+            except Exception as e:
+                print(f"[INFO] studio voice check: couldn't read the clip's sound: {str(e)[:120]}")
+        heard, cost = None, None
+        if audio and not tech.get("silent") and getattr(self.ai, "listen", None) is not None:
+            try:
+                raw, cost = self.ai.listen(voice_mod.listen_prompt(lines, self.story_voices(project, cast),
+                                                                    project.get("language") or "English"), audio)
+                heard = voice_mod.clean_listen(raw, len(lines))
+            except Exception as e:
+                self._rollback()
+                print(f"[INFO] studio voice check: listening failed: {str(e)[:120]}")
+        return voice_mod.verdict(tech, heard, lines), cost
+
     def _w(self, project, purpose: str) -> str:
         """The world text for one department (cached for this job)."""
         key = (project.get("id"), project.get("updated_at"))
@@ -322,6 +438,15 @@ class StudioWorker:
         if not r or not r.get("ok"):
             raise JobFailed("not_found", "This production no longer exists.", absorbed=cost)
         self._carry_identities(project, earlier, [c["name"] for c in new_chars])
+        try:
+            cast_now = self.store.select("studio_characters", {"project_id": project["id"]})
+            fresh = self.store.one("studio_projects", {"id": project["id"]}) or project
+            _v, vcost = self.direct_voices(fresh, cast_now, incoming)
+            if vcost:
+                cost = pricing.combine([cost, vcost])
+        except Exception as e:
+            self._rollback()
+            print(f"[INFO] studio breakdown {job['id']}: voice bible skipped: {str(e)[:160]}")
         # The continuity record of every scene, kept or new: the story around
         # each scene may have changed even when its own words didn't.
         for row in self.store.select("studio_scenes", {"project_id": project["id"]}):
@@ -830,7 +955,8 @@ class StudioWorker:
                             "anchor": ((c.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path")}
                   for c, o in entries}
         record["_refs"] = labels[:8]
-        record.update({k: v for k, v in (scene.get("made_with") or {}).items() if k.startswith("_direct")})   # director's notes
+        record.update({k: v for k, v in (scene.get("made_with") or {}).items()
+                       if k.startswith("_direct") or k == "_voice"})   # the director's and voice director's notes
         if previous:
             record["_previous_shot"] = previous   # lets the review spot pictures made from an older scene
         self._optional_update("studio_scenes", {"id": scene["id"]}, {"made_with": record})
@@ -968,7 +1094,9 @@ class StudioWorker:
                                 f"\"{speaker}\" speaks in this scene but isn't in your cast. Add them to the cast "
                                 "or change the line. Your credits were returned.")
             voice = self.ensure_voice(ch, project, list(cast.values()))
-            voices.append((voice, ch, _style(ch.get("voice_style") or "", line.get("emotion"), line.get("delivery"))))
+            prof = self.story_voices(project).get(voice_mod.key(ch["name"]))
+            voices.append((voice, ch, voice_mod.tts_style(ch.get("voice_style") or "", line, prof,
+                                                          self._hides(project).get(voice_mod.key(ch["name"]), ""))))
         total = pricing.voice_cost(0)
         seconds_total = 0.0
         with tempfile.TemporaryDirectory() as tmp:
@@ -1027,6 +1155,11 @@ class StudioWorker:
         labels = [label for label, _d in references or []] or (["the scene picture"] if frame else [])
         if backup_used:
             labels = ["the scene picture"]
+        voice = self._after_talking(project, scene, data, cast)
+        if voice:
+            cost = pricing.combine([cost, voice.pop("_cost")]) if voice.get("_cost") else cost
+            voice.pop("_cost", None)
+            scene = dict(scene, made_with={**(scene.get("made_with") or {}), "_voice": voice})
         self._made_with(scene, entries, labels)
         return {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}, cost
 
@@ -1057,9 +1190,15 @@ class StudioWorker:
             if seconds is None:
                 raise JobFailed("too_long", "This scene has too much dialogue for one video clip (15 seconds at most). "
                                             "Split it into two scenes. Your credits were returned.")
-            prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}{direction}"
-                      f"{talking_direction(lines, cast, project)} "
-                      "No subtitles, captions, text or watermarks. Do not add music.")
+            scene_text = f"{scene['visual'] or scene['heading']}. {notes} {style}{direction}"
+            tail = " No subtitles, captions, text or watermarks. Do not add music."
+
+            def talking_prompt(provider):
+                d = self._dialogue(provider, project, lines, cast)
+                self._last_voice = {"provider": provider, "limitations": d["limitations"], "speakers": d["speakers"]}
+                return voice_mod.video_prompt(provider, scene_text, d["text"] + tail)
+            prompt = talking_prompt("omni")
+            self._talking_prompt = talking_prompt
             references = self._references(scene, entries, frame, camera, expressions, (location, props))
         else:
             has_lines = bool(lines)
@@ -1084,13 +1223,16 @@ class StudioWorker:
             # keep them the same person.
             references = self._references(scene, entries, None, camera, expressions, (location, props)) or None
         talking = bool(lines) and scene_speech(scene, project) == "video_model"
+        if not talking:
+            self._talking_prompt, self._last_voice = None, None
         backup_used = None
         try:
             data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
                 else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
         except ai_mod.PolicyBlocked as refused:
             data, cost, backup_used = self._video_backup(job, project, prompt, frame, seconds, talking,
-                                                         audio=talking or not lines, refused=refused)
+                                                         audio=talking or not lines, refused=refused,
+                                                         prompt_for=self._talking_prompt if talking else None)
         return data, cost, references, backup_used, entries
 
     # ------------------------------------------------------------ multi-shot scenes
@@ -1393,7 +1535,16 @@ class StudioWorker:
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
                           duration_seconds=cost.units.get("video_seconds"))
         self.store.update("studio_shots", {"id": shot["id"]}, {"video_path": path, "status": "ready", "updated_at": _now()})
-        return {"path": path, **({"model": backup} if backup else {})}, cost
+        voice = self._after_talking(project, shot_scene, data, cast)
+        out = {"path": path, **({"model": backup} if backup else {})}
+        if voice:
+            if voice.get("_cost"):
+                cost = pricing.combine([cost, voice["_cost"]])
+            voice.pop("_cost", None)
+            self._optional_update("studio_shots", {"id": shot["id"]}, {"made_with": {**(shot.get("made_with") or {}),
+                                                                                  "_voice": voice}})
+            out["voice"] = (voice.get("check") or {}).get("status")
+        return out, cost
 
     @staticmethod
     def _film_edit(scene, scenes, spoken_in_clip) -> dict:
@@ -1450,7 +1601,21 @@ class StudioWorker:
             lines=(), video_audio=talking or not has_lines,
             sfx=tuple(x for x in (scene.get("sfx") or []) if isinstance(x, str)))
 
-    def _video_backup(self, job, project, prompt, frame, seconds, talking, audio, refused):
+    def _after_talking(self, project, scene_like, data, cast) -> Optional[dict]:
+        """The voice record of a talking clip: which provider spoke it, its limits, and its sound check."""
+        lv = getattr(self, "_last_voice", None)
+        if not lv:
+            return None
+        lines = [d for d in scene_like.get("dialogue") or [] if (d.get("text") or "").strip()]
+        rec = {**lv, "at": _now()}
+        if project.get("auto_inspect") is not False:
+            check, c = self._voice_check(project, data, lines, cast)
+            rec["check"] = check
+            rec["_cost"] = c
+        self._last_voice = None
+        return rec
+
+    def _video_backup(self, job, project, prompt, frame, seconds, talking, audio, refused, prompt_for=None):
         """Google refused the video: try the backup models (fal.ai) from the
         scene picture. Raises the original refusal when none can make it."""
         names = fal_mod.models()
@@ -1461,8 +1626,13 @@ class StudioWorker:
             if not fal_mod.usable(name, talking, lang):
                 continue
             try:
-                data, cost = fal_mod.generate(name, prompt, frame, project["aspect_ratio"], seconds, audio)
+                # Each backup gets the dialogue in the form IT can take; the lines are never cut by its length limit.
+                p = prompt_for(name) if prompt_for else voice_mod.video_prompt(name, prompt, "") if name in voice_mod.CAPS \
+                    else prompt
+                data, cost = fal_mod.generate(name, p, frame, project["aspect_ratio"], seconds, audio)
                 print(f"[INFO] studio job {job['id']}: Google refused the video; made with backup {name}")
+                if prompt_for and getattr(self, "_last_voice", None):
+                    self._last_voice = {**self._last_voice, "provider": name}
                 return data, cost, name
             except fal_mod.BackupFailed as e:
                 print(f"[INFO] studio job {job['id']}: backup {name} failed: {e}")

@@ -554,6 +554,7 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "continuity": s.get("continuity") or {},
             "image_approved": bool(s.get("image_approved_path")) and s.get("image_approved_path") == s.get("image_path"),
             "inspection": _inspection_out(s),
+            "voice_check": ((s.get("made_with") or {}).get("_voice") or None),
             **_scene_world(s, elements),
             "consistency": _consistency(s, cast, resolved)}
 
@@ -1270,6 +1271,75 @@ async def approve_saga(project_id: str, body: Approve2, user_id: str = Depends(c
     return {"ok": True, "approved": body.approved}
 
 
+class VoiceEdit(BaseModel):
+    # Any of the voice bible's fields, e.g. {"pitch": "low", "accent": "soft Kigali Kinyarwanda accent"}.
+    fields: dict[str, str] = Field(..., min_length=1)
+
+
+class VoicesIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    recast: list[str] = Field(default_factory=list, max_length=20)     # names to cast again (others are kept)
+
+
+@router.get("/projects/{project_id}/voices")
+async def get_voices(project_id: str, user_id: str = Depends(creator)):
+    """The Character Voice Bible (own + series), the providers' voice capabilities and each clip's voice check."""
+    import studio_voice
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    cast = get_store().select("studio_characters", {"project_id": p["id"]})
+    voices = StudioWorker(get_store(), get_files(), None, "generation").story_voices(p, cast)
+    return {"voices": voices, "similar": studio_voice.too_similar({k: v for k, v in voices.items() if not v.get("fallback")}),
+            "providers": studio_voice.CAPS, "price": pricing.text_cost(6000, 3000).credits}
+
+
+@router.post("/projects/{project_id}/voices/direct")
+async def direct_voices(project_id: str, body: VoicesIn, user_id: str = Depends(creator)):
+    """Casts voice identities for characters that have none (or the ones named in recast). Established voices
+    are kept, so nobody changes voice by accident."""
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    _rate_limit(user_id)
+    st = get_store()
+    cast = st.select("studio_characters", {"project_id": p["id"]})
+    if not cast:
+        raise HTTPException(status_code=409, detail="Add characters first.")
+    scenes = st.select("studio_scenes", {"project_id": p["id"]})
+    w = StudioWorker(st, get_files(), get_ai(), "generation")
+    recast = tuple(k.strip().lower() for k in body.recast)
+
+    def run():
+        voices, cost = w.direct_voices(p, cast, scenes, recast)
+        return voices, cost or pricing.text_cost(0, 0)
+    voices = _paid_call(user_id, pricing.text_cost(2 * 6000, 2 * 3000).credits, run, "the voice direction")
+    return {"voices": voices, "balance": _balance(user_id)}
+
+
+@router.patch("/projects/{project_id}/voices/{name}")
+async def edit_voice(project_id: str, name: str, body: VoiceEdit, user_id: str = Depends(creator)):
+    """The creator changes a character's voice direction (free). It's used for every clip from now on."""
+    import studio_voice
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    allowed = set(studio_voice._FIELDS) | {"habits", "samples"}
+    bad = [k for k in body.fields if k not in allowed]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown voice field: {bad[0]}.")
+    cast = get_store().select("studio_characters", {"project_id": p["id"]})
+    k = studio_voice.key(name)
+    voices = StudioWorker(get_store(), get_files(), None, "generation").story_voices(p, cast)
+    if k not in voices and k not in {studio_voice.key(c["name"]) for c in cast}:
+        raise HTTPException(status_code=404, detail="That character isn't in this production.")
+    prof = {**(voices.get(k) or {"character": name}), "fallback": False}
+    for f, v in body.fields.items():
+        prof[f] = [x.strip() for x in v.split(",") if x.strip()][:4] if f in ("habits", "samples") else v.strip()[:300]
+    prof["edited_by_creator"] = True
+    bible = dict(p.get("story_bible") or {})
+    bible["voices"] = {**(bible.get("voices") or {}), k: {kk: vv for kk, vv in prof.items() if kk != "fallback"}}
+    get_store().update("studio_projects", {"id": p["id"]}, {"story_bible": bible})
+    return {"voice": bible["voices"][k]}
+
+
 class StoryCheckIn(BaseModel):
     request_id: str = Field(..., min_length=8, max_length=80)
 
@@ -1759,7 +1829,8 @@ def _project_shots_of(scene: dict) -> list:
 
 
 def _shot_out(sh: dict, urls: dict) -> dict:
-    return {"continuity_check": studio_shot_continuity.report(sh.get("inspection"), sh.get("image_path")),"id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
+    return {"continuity_check": studio_shot_continuity.report(sh.get("inspection"), sh.get("image_path")),
+            "voice_check": ((sh.get("made_with") or {}).get("_voice") or None), "id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
             "camera_angle": sh.get("camera_angle") or "", "camera_movement": sh.get("camera_movement") or "static",
             "duration_seconds": float(sh["duration_seconds"]), "description": sh.get("description") or "",
             "characters": sh.get("characters") or [], "dialogue": sh.get("dialogue") or [], "audio": sh.get("audio") or "",
@@ -2083,7 +2154,10 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
             if secs is None:
                 return pricing.estimate_video(15), ("This scene has too much dialogue for one video clip "
                                                     "(15 seconds at most). Split it into two scenes.")
-            return with_backup(secs, True), None
+            main = with_backup(secs, True)
+            # The talking clip's sound is listened to after it's made (included here; only what runs is charged).
+            return (pricing.combine([main, pricing.estimate_listen(secs)]) if p.get("auto_inspect") is not False
+                    else main), None
         return with_backup(target.get("duration_seconds") or 8.0, False), None
     if kind == "lipsync":
         from studio_worker import needs_lipsync, speech_seconds
@@ -2132,6 +2206,9 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
                 return pricing.estimate_video(15), ("This shot has too much dialogue for one clip (15 seconds at "
                                                     "most). Edit the plan or split the scene.")
             cost = pricing.estimate_video(secs)
+            from studio_worker import scene_speech
+            if target.get("dialogue") and scene_speech(scene, p) == "video_model" and p.get("auto_inspect") is not False:
+                cost = pricing.combine([cost, pricing.estimate_listen(secs)])
         if not scene.get("shot_plan_approved"):
             return cost, "Approve the scene's shot plan first."
         if target.get("approved_at"):
@@ -2549,10 +2626,11 @@ def _world_and_saga(p: dict) -> tuple:
     from studio_worker import StudioWorker
     try:
         w = StudioWorker(get_store(), get_files(), None, "generation")
-        return w.story_world(p), w.story_saga(p)
+        return w.story_world(p), w.story_saga(p), w.story_voices(p, get_store().select("studio_characters",
+                                                                                     {"project_id": p["id"]}))
     except Exception as e:
         print(f"[WARN] studio world for chat {p.get('id')}: {str(e)[:120]}")
-        return None, None
+        return None, None, {}
 
 
 def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
@@ -2914,6 +2992,10 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
                 raise HTTPException(status_code=409, detail="This suggestion has no screenplay text.")
             await update_project(p["id"], ProjectPatch(script=d["script"]), user_id)
             return "Screenplay saved."
+        if kind == "edit_voice":
+            await edit_voice(p["id"], d.get("character") or "", VoiceEdit(fields={d.get("field") or "identity": d.get("value") or ""}),
+                             user_id)
+            return f"{d.get('character')}'s voice direction changed."
         if kind == "correct_world":
             out = await correct_world(p["id"], WorldCorrection(field=d.get("field") or "", value=d.get("value") or "",
                                                                note=d.get("note") or ""), user_id)
