@@ -41,6 +41,7 @@ def studio_schema(migrated):
         conn.execute((ROOT / "creator_studio_assistant_safety.sql").read_text())
         conn.execute((ROOT / "creator_studio_visual_audit.sql").read_text())
         conn.execute((ROOT / "creator_studio_shots.sql").read_text())
+        conn.execute((ROOT / "creator_studio_shot_continuity.sql").read_text())
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated

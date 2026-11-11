@@ -48,4 +48,4 @@ alter table public.studio_scenes add column if not exists shot_plan_approved boo
 alter table public.studio_jobs drop constraint if exists studio_jobs_kind_check;
 alter table public.studio_jobs add constraint studio_jobs_kind_check
   check (kind in ('script', 'breakdown', 'portrait', 'image', 'voice', 'video', 'render', 'lipsync', 'outfits', 'cover',
-                  'elements', 'element', 'inspect', 'shotplan', 'shot_image', 'shot_video'));
+                  'elements', 'element', 'inspect', 'shotplan', 'shot_image', 'shot_video', 'shot_inspect'));

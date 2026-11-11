@@ -21,10 +21,10 @@ import json
 import re
 from typing import Optional
 
-KINDS = ("character", "outfit", "location", "prop", "position", "lighting", "transition", "story")
+KINDS = ("character", "outfit", "location", "prop", "position", "lighting", "transition", "story", "camera")
 SEVERITIES = ("high", "medium", "low")
 CERTAINTY = ("certain", "likely", "uncertain")
-SCORES = ("overall", "character", "outfit", "location", "props", "transition")
+SCORES = ("overall", "character", "outfit", "location", "props", "transition", "lighting", "camera")
 ATTENTION_SCORE = 70
 MAX_IMAGES = 6
 

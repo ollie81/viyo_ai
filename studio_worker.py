@@ -28,6 +28,7 @@ import studio_music as music_mod
 import studio_continuity as continuity
 import studio_inspect as inspect_mod
 import studio_shots as shots_mod
+import studio_shot_continuity as shotcheck
 import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
@@ -1087,46 +1088,197 @@ class StudioWorker:
             [(c, o) for c, o in self._cast_for_scene(project, dict(scene, continuity={}, visual=" ".join(names)), cast)
              if c["name"] in names]
 
-    def do_shot_image(self, job, project):
-        """The opening picture of one shot: its own framing, the scene's
-        continuity, and the previous shot's picture so it all matches."""
-        shot, scene, shots = self._shot_job(job, project)
-        idx = next(i for i, x in enumerate(shots) if x["id"] == shot["id"])
-        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+    def _shot_before(self, project, scene, shots, idx) -> Optional[dict]:
+        """The picture a shot follows: the previous shot of this scene, or (for
+        the first shot of a scene that carries on from the one before) the last
+        shot or picture of the previous scene. None when it starts fresh."""
+        if idx > 0:
+            p = shots[idx - 1]
+            if not p.get("image_path"):
+                return None
+            return {"image_path": p["image_path"], "label": f"shot {idx} of this scene (the shot just before)",
+                    "shot_type": p.get("shot_type"), "description": p.get("description"), "same_scene": True,
+                    "observed": ((p.get("inspection") or {}).get("result") or {}).get("observed")}
+        before = self._scene_before(project, scene)
+        if not before or not continuity.carries_look(before, scene):
+            return None
+        last = (self._shots(before["id"]) or [None])[-1] if before.get("shot_plan_approved") else None
+        path = (last or {}).get("image_path") or before.get("image_path")
+        if not path:
+            return None
+        src = last if last and last.get("image_path") else before
+        return {"image_path": path, "label": "the last shot of the previous scene", "same_scene": False,
+                "shot_type": (last or {}).get("shot_type") or "medium",
+                "description": (last or {}).get("description") or before.get("visual"),
+                "transition": continuity.transition(before, scene),
+                "observed": ((src.get("inspection") or {}).get("result") or {}).get("observed")}
+
+    def _shot_picture(self, job, project, scene, shot, shots, idx, cast, correction="", rejected=None):
+        """Makes one shot picture with real reference images: the characters'
+        approved views for this framing (in the outfit they wear here), the
+        picture it follows, and the place. Returns (path, cost, labels, prev)."""
         entries = self._shot_entries(project, scene, shot, cast)
         camera = shots_mod.reference_camera(shot)
         location, props = self._world(project, scene)
-        prev_pic, prev_label = None, None
-        if idx > 0 and shots[idx - 1].get("image_path"):
-            prev_pic, prev_label = shots[idx - 1]["image_path"], "the previous shot of this scene"
-        elif idx == 0:
-            before = self._scene_before(project, scene)
-            if before and continuity.carries_look(before, scene):
-                last = (self._shots(before["id"]) or [None])[-1]
-                prev_pic = (last or {}).get("image_path") or before.get("image_path")
-                prev_label = "the last shot of the previous scene"
-        labelled = self._reference_files(entries, camera, IMAGE_REFS - (2 if prev_pic else 1), )
-        if prev_pic:
+        prev = self._shot_before(project, scene, shots, idx)
+        labelled = self._reference_files(entries, camera, IMAGE_REFS - (2 if prev else 1))
+        if prev:
             try:
-                labelled.append((f"{prev_label} (same place, light and clothes; NOT its framing)", self.files.get(prev_pic)))
+                labelled.append((f"{prev['label']} (same people, place, light and clothes; NOT its framing)",
+                                 self.files.get(prev["image_path"])))
             except Exception:
-                prev_pic = None
-        labelled += self._world_files(None if prev_pic else location, props, IMAGE_REFS - len(labelled))
+                prev = None
+        labelled += self._world_files(None if prev else location, props, IMAGE_REFS - len(labelled))
         roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
         before = self._scene_before(project, scene)
+        state = ""
+        if prev and prev.get("observed"):
+            state = ("\nTHE PICTURE BEFORE WAS SEEN TO SHOW (carry this over unless the action changes it): "
+                     + json.dumps(prev["observed"], ensure_ascii=False)[:900])
         prompt = ident.scene_prompt(shot["frame_prompt"] or shot["description"], entries, camera, project["visual_style"],
                                     project["aspect_ratio"], extra=(roles + "\n") if roles else "",
                                     world=world_mod.world_block(location, props),
                                     continuity=continuity.image_block(before, scene) + shots_mod.continuity_block(
-                                        scene, shots, idx, (before or {}).get("continuity", {}).get("end_state", "")),
+                                        scene, shots, idx, (before or {}).get("continuity", {}).get("end_state", "")) + state,
                                     camera_text=shots_mod.camera_text(shot))
+        if correction:
+            prompt += ("\nCORRECTION (the last picture of this shot got this wrong; fix it and keep everything else "
+                       f"the same): {correction}")
         prompt += "\nNo text, captions, logos or watermarks in the image."
         data, mime, cost = self.ai.image(prompt, [d for _l, d in labelled][:IMAGE_REFS], project["aspect_ratio"], _size(project))
         path = self._save(job, project, "image", "png" if "png" in mime else "jpg", data, mime, scene_id=scene["id"])
+        labels = [label for label, _d in labelled]
         self.store.update("studio_shots", {"id": shot["id"]}, {
-            "image_path": path, "status": "picture", "video_path": None,   # a new picture needs a new clip "made_with": {"_refs": [label for label, _d in labelled][:8], "_previous": prev_pic},
+            "image_path": path, "status": "picture", "video_path": None,      # a new picture needs a new clip
+            "made_with": {"_refs": labels[:8], "_previous": (prev or {}).get("image_path"),
+                          **({"_correction": correction} if correction else {}),
+                          **({"_rejected": rejected} if rejected else {})},
             "updated_at": _now()})
-        return {"path": path, "shot": idx + 1}, cost
+        return path, cost, labels, prev
+
+    def shot_check_inputs(self, project, scene, shot, shots, cast=None):
+        """(picture it follows, entries, signature) for a shot check."""
+        cast = cast if cast is not None else self.store.select("studio_characters", {"project_id": project["id"]})
+        idx = next((i for i, x in enumerate(shots) if x["id"] == shot["id"]), 0)
+        prev = self._shot_before(project, scene, shots, idx)
+        entries = self._shot_entries(project, scene, shot, cast)
+        sig = shotcheck.signature(shot, (prev or {}).get("image_path"), scene, [(o or {}).get("id") for _c, o in entries],
+                                  [f"{c['id']}:{c.get('identity_version') or 0}" for c, _o in entries])
+        return idx, prev, entries, sig
+
+    def _inspect_shot(self, project, scene, shot, shots, cast=None):
+        """Compares a shot picture with the picture before it and the approved
+        references (vision model). Saves and returns the record."""
+        if not shot.get("image_path"):
+            raise JobFailed("no_picture", "Make this shot's picture first. Your credits were returned.")
+        idx, prev, entries, sig = self.shot_check_inputs(project, scene, shot, shots, cast)
+        try:
+            images = [("this shot's picture (check this one)", self.files.get(shot["image_path"]))]
+        except Exception:
+            raise JobFailed("unreadable", "This shot's picture couldn't be loaded, so it wasn't checked. "
+                                          "Your credits were returned.")
+        if prev:
+            try:
+                images.append((f"{prev['label']} (this shot follows it)", self.files.get(prev["image_path"])))
+            except Exception:
+                prev = dict(prev, observed=prev.get("observed"), label=prev["label"] + " (its picture couldn't be loaded)")
+        for c, outfit in entries[:3]:      # each person's approved face reference
+            if len(images) >= shotcheck.MAX_IMAGES - 1:
+                break
+            for label, path in ident.references_for(c, "front", outfit, 1):
+                try:
+                    images.append((f"reference: {label}", self.files.get(path)))
+                except Exception:
+                    pass
+        location, props = self._world(project, scene)
+        for label, data in self._world_files(location, props, shotcheck.MAX_IMAGES - len(images)):
+            images.append((f"reference: {label}", data))
+        text = shotcheck.prompt(scene, scene["position"] + 1, shot, idx, shots, prev,
+                                ident.cast_block(entries).splitlines(), world_mod.world_block(location, props),
+                                [label for label, _d in images])
+        result, cost = self.ai.inspect(text, images)
+        rec = inspect_mod.record(result, sig, shot["image_path"], cost.total_usd)
+        rec["previous"] = (prev or {}).get("image_path")
+        self._optional_update("studio_shots", {"id": shot["id"]}, {"inspection": rec})
+        return rec, cost
+
+    def do_shot_inspect(self, job, project):
+        """Checks one shot picture (reused for free if nothing changed)."""
+        sid = (job.get("input") or {}).get("shot_id")
+        shot = self.store.one("studio_shots", {"id": sid}) if sid else None
+        if not shot or shot["owner_id"] != job["owner_id"] or shot["project_id"] != project["id"]:
+            raise JobFailed("not_found", "This shot no longer exists. Your credits were returned.")
+        scene = self.store.one("studio_scenes", {"id": shot["scene_id"]})
+        shots = self._shots(scene["id"])
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        if shot.get("image_path"):
+            _i, _p, _e, sig = self.shot_check_inputs(project, scene, shot, shots, cast)
+            saved = shotcheck.current(shot, sig)
+            if saved:
+                return {"reused": True, "status": shotcheck.report(saved, shot["image_path"])["status"]}, \
+                    pricing.Cost("viyo", "reused", {"reused": 1})
+        rec, cost = self._inspect_shot(project, scene, shot, shots, cast)
+        rep = shotcheck.report(rec, shot["image_path"])
+        return {"status": rep["status"], "overall": rep.get("overall"),
+                "failed": [c["check"] for c in rep["checks"] if not c["passed"]]}, cost
+
+    def do_shot_image(self, job, project):
+        """The opening picture of one shot, then its continuity check. If the
+        check finds a real mistake, one corrected picture is made (its price
+        was reserved in the estimate; unused credits are returned) and the
+        better of the two is kept. Both stay in the asset history."""
+        shot, scene, shots = self._shot_job(job, project)
+        idx = next(i for i, x in enumerate(shots) if x["id"] == shot["id"])
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        inp = job.get("input") or {}
+        correction = (inp.get("correction") or "").strip()[:600]
+        path, cost, labels, prev = self._shot_picture(job, project, scene, shot, shots, idx, cast, correction)
+        costs = [cost]
+        out = {"path": path, "shot": idx + 1, "references": labels, "attempts": 1}
+        if project.get("auto_inspect") is False:
+            return out, cost
+        shot = dict(shot, image_path=path)
+        shots[idx] = shot
+        try:
+            rec, c1 = self._inspect_shot(project, scene, shot, shots, cast)
+            costs.append(c1)
+        except Exception as e:
+            self._rollback()
+            print(f"[INFO] studio job {job['id']}: shot picture made, check skipped: {str(e)[:160]}")
+            out["check"] = "skipped"
+            return out, pricing.combine(costs)
+        rep = shotcheck.report(rec, path)
+        out["continuity"] = rep["status"]
+        if rep["status"] == "failed" and inp.get("auto_fix", True) and shotcheck.MAX_AUTO_FIX > 0:
+            fix = rep.get("fix") or "Match the references and the shot before exactly."
+            try:
+                path2, c2, labels2, _p = self._shot_picture(job, project, scene, shot, shots, idx, cast,
+                                                            (correction + " " + fix).strip()[:600], rejected=path)
+                costs.append(c2)
+                shot2 = dict(shot, image_path=path2)
+                shots[idx] = shot2
+                rec2, c3 = self._inspect_shot(project, scene, shot2, shots, cast)
+                costs.append(c3)
+                rep2 = shotcheck.report(rec2, path2)
+                out.update(attempts=2, first_try=rep["status"])
+                if shotcheck.better(rep, rep2):
+                    out.update(path=path2, references=labels2, continuity=rep2["status"])
+                else:
+                    # The first picture was better: put it (and its check) back. The new one stays in the history.
+                    self.store.update("studio_shots", {"id": shot["id"]}, {
+                        "image_path": path, "made_with": {"_refs": labels[:8], "_previous": (prev or {}).get("image_path"),
+                                                          "_kept_over": path2}, "updated_at": _now()})
+                    self._optional_update("studio_shots", {"id": shot["id"]}, {"inspection": rec})
+                    out["continuity"] = rep["status"]
+            except JobFailed:
+                raise
+            except Exception as e:
+                self._rollback()
+                print(f"[INFO] studio job {job['id']}: corrected shot picture failed, keeping the first: {str(e)[:160]}")
+                self.store.update("studio_shots", {"id": shot["id"]}, {"image_path": path, "updated_at": _now()})
+                self._optional_update("studio_shots", {"id": shot["id"]}, {"inspection": rec})
+                out["auto_fix"] = "failed"
+        return out, pricing.combine(costs)
 
     def do_shot_video(self, job, project):
         """One shot's clip, from its opening picture: the shot's movement and
