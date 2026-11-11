@@ -102,7 +102,9 @@ def test_a_character_keeps_the_same_voice_in_every_scene_and_recording(env):
     assert {(t, v) for t, v, _ in voice_calls(ai)} == {("They said I'd never come back.", maya), ("Maya! Wait!", daniel)}
     scenes = detail(client, u, pid)["scenes"]
     rows = dict(db.execute("select position, audio_voices from public.studio_scenes where project_id=%s", (pid,)).fetchall())
-    assert rows[0] == {cast["Maya"]["id"]: maya} and rows[1] == {cast["Daniel"]["id"]: daniel}
+    voices = {k: {c: v for c, v in r.items() if not c.startswith("_")} for k, r in rows.items()}   # "_timings" is line timing
+    assert voices[0] == {cast["Maya"]["id"]: maya} and voices[1] == {cast["Daniel"]["id"]: daniel}
+    assert all("_timings" in r for r in rows.values()), "each recording keeps when its lines are heard"
     assert all(s["voice_outdated"] == [] for s in scenes)
     assert cast_of(client, u, pid)["Maya"]["voice_locked"] is True
 
