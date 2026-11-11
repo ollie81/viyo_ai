@@ -1427,7 +1427,8 @@ def start_background(store: Store, files: Files, ai, bunny_upload=None) -> list[
     except Exception as e:
         print(f"[WARN] studio: lip sync not started: {str(e)[:120]}")
     workers = [StudioWorker(store, files, ai, "generation", lipsync=lipsync),
-               StudioWorker(store, files, ai, "render", bunny_upload=bunny_upload)]
+               StudioWorker(store, files, ai, "render", bunny_upload=bunny_upload),
+               StudioWorker(store, files, ai, "inspect")]      # picture checks, one scene per job
     for w in workers:
         threading.Thread(target=w.run_forever, name=f"studio-{w.lane}", daemon=True).start()
     return workers

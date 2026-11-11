@@ -30,7 +30,8 @@ TOKENS_PER_IMAGE = 560          # a 768px image is about two tiles for Gemini; a
 _VISUAL = re.compile(r"\b(look(s|ing)?( different| the same| like)?|appearance|face|hair|hairstyle|outfit|wear(s|ing)?|"
                      r"dress|clothes|costume|shirt|jacket|coat|picture|image|photo|frame|visual(ly)?|see|shot|"
                      r"background|room|place|location|prop|bag|letter|phone|consistent|consistency|match(es)?|"
-                     r"same person|changed)\b", re.I)
+                     r"same person|changed|compare|comparison|different|differ|inspect|check the (pictures|images|scenes))\b",
+                     re.I)
 _ALL = re.compile(r"\b(all|every|entire|whole) (the )?(scenes?|episode|film|movie|production|pictures)\b", re.I)
 
 _frames: "OrderedDict[str, bytes]" = OrderedDict()     # video frame cache (path -> jpeg), small
@@ -91,8 +92,10 @@ def _scene_numbers_for(names: list[str], scenes: list[dict]) -> list[int]:
 
 
 def gather(files, scenes: list[dict], cast: list[dict], elements: list[dict], focus: dict,
-           message: str) -> tuple[list[tuple[str, bytes]], list[str], list[str]]:
-    """(images [(label, jpeg)], attached labels, unavailable notes) for one message."""
+           message: str, where: str = "", owner: Optional[str] = None) -> tuple[list[tuple[str, bytes]], list[str], list[str]]:
+    """(images [(label, jpeg)], attached labels, unavailable notes) for one message.
+    Labels name the production/episode (`where`) and the scene number."""
+    tag = f"{where} · " if where else ""
     import studio_identity as ident
     wanted: list[tuple[str, str, str]] = []      # (label, kind, path or scene id)
     n = len(scenes)
@@ -112,8 +115,8 @@ def gather(files, scenes: list[dict], cast: list[dict], elements: list[dict], fo
                        "check of every scene: for that, propose check_scenes.")
         else:
             nums = with_pics
-    else:
-        nums = sorted({x for k in nums for x in (k - 1, k) if 1 <= x <= n})     # the scene before, to compare
+    elif len(nums) == 1:
+        nums = [x for x in (nums[0] - 1, nums[0]) if 1 <= x <= n]     # one scene: the scene before, to compare
     for c in cast:
         if c["name"] in names or (not names and len(cast) <= 2):
             for label, path in ident.references_for(c, "front", None, 1):
@@ -121,15 +124,19 @@ def gather(files, scenes: list[dict], cast: list[dict], elements: list[dict], fo
     for k in nums:
         s = scenes[k - 1]
         if s.get("image_path"):
-            wanted.append((f"scene {k} picture ({s.get('heading') or ''})", "image", s["image_path"]))
+            wanted.append((f"{tag}scene {k} picture ({s.get('heading') or ''})", "image", s["image_path"]))
         elif s.get("video_path"):
-            wanted.append((f"scene {k} video frame ({s.get('heading') or ''})", "video", s["video_path"]))
+            wanted.append((f"{tag}scene {k} video frame ({s.get('heading') or ''})", "video", s["video_path"]))
         else:
-            wanted.append((f"scene {k}", "missing", ""))
+            wanted.append((f"{tag}scene {k}", "missing", ""))
     images, attached, unavailable = [], [], []
     for label, kind, path in wanted:
         if kind == "missing":
             unavailable.append(f"{label}: no picture or video made yet")
+            continue
+        if owner and not str(path).startswith(f"{owner}/"):
+            # Studio files are stored under their owner's id; anything else is never read.
+            unavailable.append(f"{label}: not accessible")
             continue
         if len(images) >= MAX_IMAGES:
             unavailable.append(f"{label}: not attached (limit of {MAX_IMAGES} images per message)")

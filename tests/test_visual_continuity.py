@@ -151,18 +151,20 @@ def test_a_failed_check_never_fails_the_picture_or_costs_anything(env):
 
 
 def test_checking_an_existing_picture_is_refunded_if_it_fails_and_reused_if_nothing_changed(env):
+    import studio_worker
     client, db, ai, gen, u, pid = build(env)
+    insp = studio_worker.StudioWorker(env[2], env[3], ai, "inspect")     # picture checks have their own lane
     s = scenes(client, u, pid)[0]
     client.patch(f"/api/v1/studio/projects/{pid}", headers=H(u), json={"auto_inspect": False})
     picture(client, gen, u, pid, s["id"])
     before = balance(client, u)["available"]
     ai.fail["inspect"] = studio_ai.ProviderError("vision down")
     assert start(client, u, pid, "inspect", [s["id"]]).status_code == 200
-    run(gen)
+    run(insp)
     assert job_of(client, u, pid, "inspect")["status"] == "failed" and balance(client, u)["available"] == before
     ai.fail.pop("inspect")
     start(client, u, pid, "inspect", [s["id"]])
-    run(gen)
+    run(insp)
     assert job_of(client, u, pid, "inspect")["status"] == "succeeded"
     calls = ai.calls.count(("inspect",))
     again = start(client, u, pid, "inspect", [s["id"]])

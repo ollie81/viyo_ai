@@ -177,3 +177,90 @@ RULES:
 - Score 0-100 (100 = perfect). Omit a score that doesn't apply.
 - Each fix is a short instruction for a new picture of this scene (e.g. "Maya's dress must be red, as in scene 2").
 - observed: what the picture actually shows, so the next scene can follow it."""
+
+
+def _ranges(nums: list[int]) -> str:
+    """[1, 2, 3, 7, 9, 10] -> '1-3, 7, 9-10'."""
+    out, start, prev = [], None, None
+    for n in sorted(nums):
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(f"{start}-{prev}" if prev != start else f"{start}")
+            start = prev = n
+    if start is not None:
+        out.append(f"{start}-{prev}" if prev != start else f"{start}")
+    return ", ".join(out)
+
+
+def audit(scenes: list[dict], jobs: list[dict]) -> dict:
+    """The whole-production picture audit, from every scene (not a sample):
+    what is checked, outdated, queued/running, failed, never checked or has no
+    picture; every mistake found; and whether the audit is complete."""
+    ordered = sorted(scenes, key=lambda s: s.get("position") or 0)
+    latest = {}
+    for j in sorted([j for j in jobs if j.get("kind") == "inspect"], key=lambda j: str(j.get("created_at") or "")):
+        latest[j.get("scene_id")] = j
+    rows, problems, cost = [], [], 0.0
+    buckets = {k: [] for k in ("checked", "outdated", "queued", "failed", "unchecked", "no_picture")}
+    scores = []
+    for i, s in enumerate(ordered, start=1):
+        ins = s.get("inspection") or {}
+        job = latest.get(s.get("id")) or {}
+        if not s.get("image_path"):
+            state = "no_picture"
+        elif job.get("status") in ("queued", "running"):
+            state = "queued"
+        elif ins.get("result") and ins.get("image_path") == s.get("image_path"):
+            state = "checked"
+        elif job.get("status") == "failed":
+            state = "failed"
+        elif ins.get("result"):
+            state = "outdated"
+        else:
+            state = "unchecked"
+        buckets[state].append(i)
+        cost += float(ins.get("cost_usd") or 0)
+        row = {"scene": i, "scene_id": s.get("id"), "state": state}
+        if state == "checked":
+            r = ins["result"]
+            row.update(overall=r["scores"].get("overall"), needs_attention=needs_attention(r))
+            scores.append(r["scores"].get("overall") or 0)
+            for p in errors(r):
+                problems.append({"scene": i, "scene_id": s.get("id"), **{k: p.get(k) for k in
+                                 ("kind", "severity", "certainty", "expected", "seen", "fix", "characters")}})
+        if state == "failed":
+            row["error"] = (job.get("error_message") or "")[:200]
+        rows.append(row)
+    with_pictures = len(ordered) - len(buckets["no_picture"])
+    return {"total": len(ordered), "with_pictures": with_pictures, "scenes": rows, "problems": problems,
+            **{k: len(v) for k, v in buckets.items()}, "lists": {k: _ranges(v) for k, v in buckets.items() if v},
+            "complete": with_pictures > 0 and len(buckets["checked"]) == with_pictures,
+            "average_score": round(sum(scores) / len(scores)) if scores else None,
+            "attention": [r["scene"] for r in rows if r.get("needs_attention")],
+            "cost_usd": round(cost, 4)}
+
+
+def audit_lines(a: dict) -> list[str]:
+    """The audit for the assistant: covers every scene, says what is missing."""
+    if not a["total"]:
+        return []
+    out = [f"VISUAL AUDIT (every scene of the production): {a['checked']} of {a['with_pictures']} scene pictures checked"
+           f"{' (complete)' if a['complete'] else ' (NOT complete)'}; {a['queued']} queued or running; {a['failed']} "
+           f"failed; {a['outdated']} outdated; {a['unchecked']} never checked; {a['no_picture']} scenes have no picture."]
+    for k, label in (("queued", "Being checked now"), ("failed", "Check failed (not checked)"),
+                     ("outdated", "Checked before the picture changed"), ("unchecked", "Never checked"),
+                     ("no_picture", "No picture yet")):
+        if a["lists"].get(k):
+            out.append(f"  {label}: scenes {a['lists'][k]}")
+    if a["average_score"] is not None:
+        out.append(f"  Average score of checked pictures: {a['average_score']}/100. Need attention: scenes "
+                   f"{_ranges(a['attention']) or 'none'}.")
+    for p in a["problems"][:30]:
+        out.append(f"  - Scene {p['scene']} [{p['kind']}, {p['severity']}, {p['certainty']}]: expected {p['expected']}; "
+                   f"seen {p['seen']}. Fix: {p['fix']}")
+    if len(a["problems"]) > 30:
+        out.append(f"  (+{len(a['problems']) - 30} more problems; ask about a scene to see them)")
+    return out

@@ -621,6 +621,7 @@ class FakeStudioAI:
         self.chat_prompts = getattr(self, "chat_prompts", []) + [prompt]
         self.chat_modes = getattr(self, "chat_modes", []) + [mode]
         self.chat_images = getattr(self, "chat_images", []) + [[label for label, _d in images or []]]
+        self.chat_image_bytes = getattr(self, "chat_image_bytes", []) + [[data for _l, data in images or []]]
         self._maybe_fail("chat")
         if getattr(self, "chat_result", None) is not None:
             r = self.chat_result

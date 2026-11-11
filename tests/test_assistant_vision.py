@@ -60,8 +60,8 @@ def test_a_visual_question_attaches_the_real_pictures_and_says_which(setup):
     ai.chat_result = reply()
     r = say(client, u, pid, "Why does Maya look different in scene 2?")
     labels = ai.chat_images[-1]
-    assert any(label.startswith("scene 1 picture") for label in labels), "the scene before, to compare"
-    assert any(label.startswith("scene 2 picture") for label in labels)
+    assert any("scene 1 picture" in label for label in labels), "the scene before, to compare"
+    assert any("scene 2 picture" in label for label in labels)
     assert "Maya's approved reference picture" in labels
     assert r["seen"] == labels
     prompt = ai.chat_prompts[-1]
@@ -111,7 +111,7 @@ def test_a_scene_with_only_a_video_sends_one_frame(setup):
     db.execute("update public.studio_scenes set image_path = null where id = %s", (s["id"],))
     ai.chat_result = reply()
     say(client, u, pid, "How does scene 2 look?")
-    assert any(label.startswith("scene 2 video frame") for label in ai.chat_images[-1])
+    assert any("scene 2 video frame" in label for label in ai.chat_images[-1])
 
 
 # ------------------------------------------------------------------ big productions

@@ -124,8 +124,12 @@ short drama, series or movie. You are one assistant with five skills, used as th
 Seeing and auditing:
 - You only see a picture if it is listed under VISUAL MATERIAL for this message. Never describe a picture you
   weren't given; if none are attached, say you haven't seen it and use the PICTURE CHECK results or offer to look.
-- An audit of the whole production must cover every scene. AUDIT COVERAGE says what has really been checked: if it
-  isn't everything, say "I checked X of Y" and offer check_scenes for the rest. Never say "all scenes" otherwise.
+- An audit of the whole production must cover every scene. VISUAL AUDIT lists every scene's state from the
+  per-scene picture checks (each one compared that scene with the characters' references and the scene before). If
+  it isn't complete, say "X of Y checked", name what's missing, and offer check_scenes for the rest (it runs one
+  scene at a time and reports progress). Never say "all scenes" unless VISUAL AUDIT says complete. While checks are
+  queued or running, say they're in progress.
+- Looking at images and checking pictures never changes the production. Changes are proposals the creator applies.
 - Story continuity too: dialogue that contradicts saved facts or MEMORY, events out of order, characters acting
   against their established motivation. Call these "possible" problems and ask whether they're intended.
 - When something might be intended (a wardrobe change, a new place), explain why it might be and ask; give a
@@ -424,7 +428,8 @@ def _status_lines(st: dict) -> list[str]:
 def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: list[dict], scenes: list[dict],
                     production: Optional[dict], jobs: list[dict], wearing: Optional[dict] = None,
                     issues: Optional[list] = None, focus: Optional[set] = None, question: str = "",
-                    focus_names: Optional[set] = None, episodes: Optional[list] = None, renders: int = 0) -> str:
+                    focus_names: Optional[set] = None, episodes: Optional[list] = None, renders: int = 0,
+                    audit: Optional[dict] = None) -> str:
     """What the assistant knows as fact: only what is saved, retrieved for the question."""
     import studio_identity as ident
     focus = set(focus or set())
@@ -500,6 +505,9 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
     else:
         lines.append("Scenes: (not broken into scenes yet)")
     lines += _status_lines(status(scenes, cast, jobs, issues, renders, elements))
+    if audit:
+        import studio_inspect
+        lines += studio_inspect.audit_lines(audit)
     if production:
         lines.append(f"One-click production: {production.get('status')} ({production.get('percent', 0)}%)"
                      f"{' – ' + production['problem'] if production.get('problem') else ''}")

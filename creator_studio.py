@@ -44,7 +44,8 @@ router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
 SIGN_SECONDS = 3600
 JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits", "cover", "elements",
              "element")
-LANE = {"render": "render"}
+LANE = {"render": "render", "inspect": "inspect"}
+MAX_AUDIT = 150        # scenes one picture audit can queue at once (each scene is its own small request)
 CREDIT_PACKS = [  # credits are worth $0.01 each to Viyo after payment fees
     {"id": "starter", "credits": 500, "label": "500 credits"},
     {"id": "creator", "credits": 1500, "label": "1,500 credits"},
@@ -268,7 +269,7 @@ class JobRequest(BaseModel):
                   "elements", "element", "inspect"]
     # Image only: what a new picture must fix (from the picture check), approved by the creator.
     correction: Optional[str] = Field(None, max_length=600)
-    target_ids: list[str] = Field(default_factory=list, max_length=100)
+    target_ids: list[str] = Field(default_factory=list, max_length=200)
     request_id: str = Field(..., min_length=8, max_length=80)
     # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
     views: list[str] = Field(default_factory=list, max_length=7)
@@ -284,7 +285,7 @@ class JobRequest(BaseModel):
 class EstimateRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
                   "elements", "element", "inspect"]
-    target_ids: list[str] = Field(default_factory=list, max_length=100)
+    target_ids: list[str] = Field(default_factory=list, max_length=200)
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
     # Cover jobs only: the creator's idea for the poster (optional).
@@ -958,7 +959,13 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id),
             "production": _production_out(p),
-            "continuity_issues": _continuity_issues(scenes, chars, outfits, resolved, elements)}
+            "continuity_issues": _continuity_issues(scenes, chars, outfits, resolved, elements),
+            "visual_audit": _audit_out(studio_inspect.audit(scenes, jobs))}
+
+
+def _audit_out(a: dict) -> dict:
+    return {k: a[k] for k in ("total", "with_pictures", "checked", "outdated", "queued", "failed", "unchecked",
+                              "no_picture", "complete", "average_score", "attention", "cost_usd", "lists")}
 
 
 def _continuity_issues(scenes, chars, outfits, resolved, elements) -> list:
@@ -979,6 +986,18 @@ def _project_continuity(p: dict) -> list:
     from studio_worker import characters_in_scene
     return _continuity_issues(scenes, chars, outfits, ident.resolve_outfits(scenes, outfits, chars, characters_in_scene),
                               _elements(p["id"]))
+
+
+@router.get("/projects/{project_id}/visual-audit")
+async def visual_audit(project_id: str, user_id: str = Depends(creator)):
+    """The whole-production picture audit: every scene's state (checked,
+    being checked, failed, outdated, never checked, no picture), every mistake
+    found, progress, and whether it is complete."""
+    p = _project(project_id, user_id)
+    st = get_store()
+    scenes = st.select("studio_scenes", {"project_id": p["id"]})
+    jobs = st.select("studio_jobs", {"project_id": p["id"], "kind": "inspect"}, order="created_at", desc=True, limit=1000)
+    return studio_inspect.audit(scenes, jobs)
 
 
 @router.get("/projects/{project_id}/continuity")
@@ -1757,6 +1776,13 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
         items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover", "elements") else t["id"],
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
                       "blocked": reason})
+    if kind == "inspect":
+        ready = 0
+        for it in items:
+            if not it["blocked"]:
+                ready += 1
+                if ready > MAX_AUDIT:
+                    it["blocked"] = f"Next batch: at most {MAX_AUDIT} scenes are checked at a time. Start again when these finish."
     return items
 
 
@@ -1809,12 +1835,23 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
             problems.append({"target_id": item["target_id"], "error": item["blocked"]})
             continue
         key = f"{user_id}:{body.request_id}:{body.kind}:{item['target_id'] or p['id']}"
-        r = st.rpc("studio_create_job", {
+        args = {
             "p_owner": user_id, "p_project": p["id"], "p_kind": body.kind, "p_lane": LANE.get(body.kind, "generation"),
             "p_key": key, "p_credits": item["credits"],
             "p_input": {"element_id": item["target_id"]} if body.kind == "element" else job_input,
             "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync", "inspect") else None,
-            "p_character": item["target_id"] if body.kind == "portrait" else None, "p_max_open": 30})
+            "p_character": item["target_id"] if body.kind == "portrait" else None,
+            # A picture audit queues one small job per scene; it may queue a whole film at once.
+            "p_max_open": 30 + MAX_AUDIT if body.kind == "inspect" else 30}
+        try:
+            r = st.rpc("studio_create_job", args)
+        except Exception as e:
+            if args["p_lane"] != "inspect":
+                raise
+            if hasattr(st, "conn"):
+                st.conn.rollback()
+            print(f"[WARN] inspect lane unavailable (run creator_studio_visual_audit.sql): {str(e)[:120]}")
+            r = st.rpc("studio_create_job", {**args, "p_lane": "generation"})
         if r and r.get("ok"):
             created.append(r["job_id"])
         else:
@@ -2008,8 +2045,9 @@ def _chat_state(p: dict) -> dict:
     outfits, elements = _outfits(p["id"]), _elements(p["id"])
     resolved = ident.resolve_outfits(scenes, outfits, cast, characters_in_scene)
     renders = len(st.select("studio_renders", {"project_id": p["id"]}, limit=50))
+    checks = st.select("studio_jobs", {"project_id": p["id"], "kind": "inspect"}, order="created_at", desc=True, limit=1000)
     return {"cast": cast, "scenes": scenes, "jobs": jobs, "outfits": outfits, "elements": elements,
-            "resolved": resolved, "renders": renders,
+            "resolved": resolved, "renders": renders, "audit": studio_inspect.audit(scenes, checks),
             "issues": _continuity_issues(scenes, cast, outfits, resolved, elements)}
 
 
@@ -2034,7 +2072,7 @@ def _chat_context(p: dict, message: str = "", focus: Optional[dict] = None, stat
     return studio_chat.project_context(p, s["cast"], s["outfits"], s["elements"], s["scenes"], _production_out(p),
                                        s["jobs"], wearing=wearing, issues=s["issues"], focus=set(focus.get("scenes") or []),
                                        question=message, focus_names=set(focus.get("characters") or []),
-                                       episodes=_episodes(p), renders=s["renders"])
+                                       episodes=_episodes(p), renders=s["renders"], audit=s.get("audit"))
 
 
 def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
@@ -2195,8 +2233,10 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         project_memory = _memory_of(p, conv)
         images, seen, unseen = [], [], []
         if visual:   # real pictures from this (owner-checked) production
+            ep = next((e["number"] for e in _episodes(p) if e.get("current")), None)
+            where = f"{p.get('title') or 'Production'}{f' · Episode {ep}' if ep else ''}"
             images, seen, unseen = studio_visual.gather(get_files(), state["scenes"], state["cast"], state["elements"],
-                                                        focus, body.message)
+                                                        focus, body.message, where=where, owner=user_id)
         prompt = studio_chat.build_prompt(_chat_context(p, body.message, focus, state), conv.get("summary") or "",
                                           studio_memory.render(project_memory), recent, body.message.strip(),
                                           studio_chat.focus_text(focus), mode,
