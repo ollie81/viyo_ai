@@ -66,7 +66,9 @@ def test_three_steps_keep_the_idea_and_apply_the_craft():
     assert bible["scores"] == {"hook": 5, "dialogue": 6} and bible["open_threads"] == ["Who sent the patient?"]
     assert bible["opening_hook"] == "PATIENT: Ama?" and bible["ending_hook"] == "AMA: Then I'll drive."
     assert bible["hooks_planned"] is True
-    assert (i, o) == (1500 + 1000 + 3000 + 3000, 2000 + 900 + 2500 + 2500), "plan, draft, doctor, story check"
+    assert (i, o) == (1500 + 1000 + 3000 + 3000 + 3000, 2000 + 900 + 2500 + 2500 + 2500), \
+        "plan, draft, doctor, story check, and the check asked again once because nothing could be verified"
+    assert bible["evaluation"]["status"] == "incomplete", "a check that verifies nothing is never a pass"
 
 
 def test_a_film_resolves_instead_of_a_cliffhanger():
@@ -122,7 +124,7 @@ def test_google_runs_the_three_calls_and_prices_them():
     assert len(calls) == 4 and text == DRAFT.strip() and bible["logline"] == PLAN["logline"]
     assert cost.units == {"input_tokens": 3000, "output_tokens": 1800}, "an unreadable check isn't charged"
     assert "couldn't run" in bible["evaluation"]["error"], "an unreadable check is reported, never scored"
-    assert pricing.estimate_script(60, 100).provider_cost_usd < 0.08, "worst case incl. the story check and one revision"
+    assert pricing.estimate_script(60, 100).provider_cost_usd < 0.09, "worst case incl. two checks, one revision and a re-check"
 
 
 def test_studio_saves_the_plan_and_episode_2_builds_on_episode_1(env):

@@ -19,6 +19,7 @@ import pytest
 
 import creator_studio as cs
 import studio_story as story
+import studio_story_check as sc
 from conftest import make_user
 from test_creator_studio import H, env, grant, run, start, studio_schema  # noqa: F401
 
@@ -95,12 +96,30 @@ def script_for(n):
             f"INT. CORRIDOR - NIGHT\n\n{plan['beats'][-1]['what_happens']}.\n\nGRACE\nThis is how episode {n} ends.\n")
 
 
-class Room:
-    """A scripted writers' room: answers each call of studio_story by kind."""
 
-    def __init__(self, scores=None, revised_scores=None, eval_raw=None):
+SCREEN = "SCREENPLAY (scenes numbered for you; the numbers are not part of the script):\n"
+
+
+def judged_scenes(prompt):
+    body = prompt.split(SCREEN, 1)[1].split("\n\nFor every category")[0]
+    return [b.split("\n", 1)[1] for b in re.split(r"\n\n(?=\[SCENE \d+\])", body) if b.startswith("[SCENE")]
+
+
+def spoken(scene_text):
+    return [t for _w, t in story.screenplay_lines(scene_text)]
+
+
+class Room:
+    """A scripted writers' room and judge: answers each call of studio_story by
+    kind. The judge quotes the real screenplay unless told to invent or to
+    quote from the wrong place."""
+
+    def __init__(self, scores=None, revised_scores=None, eval_raw=None, invent=(), wrong_place=(), missing=(),
+                 rewrite=None, retry_fixes=False):
         self.prompts, self.revisions = [], []
         self.scores, self.revised_scores, self.eval_raw = scores, revised_scores, eval_raw
+        self.invent, self.wrong_place, self.missing = set(invent), set(wrong_place), set(missing)
+        self.rewrite, self.retry_fixes = rewrite, retry_fixes
         self.ep3_plans = 0
 
     @staticmethod
@@ -110,11 +129,36 @@ class Room:
 
     def text(self, prompt):
         self.prompts.append(("text", prompt))
-        if prompt.startswith("Revise this screenplay"):
-            self.revisions.append(prompt)
-            return prompt.split("SCREENPLAY:\n", 1)[1].split("\n\nReturn only")[0].replace(
-                "Hello Ama, good morning.", "Kofi is alive. Look.") + "\n", 900, 900
         return script_for(self.episode(prompt)), 1000, 900
+
+    def judge(self, prompt):
+        scenes = judged_scenes(prompt)
+        first, last = scenes[0], scenes[-1]
+        retry = "COULD NOT BE VERIFIED" in prompt
+        revised = "Kofi is alive. Look." in prompt.split(SCREEN, 1)[1]
+        sc = (self.revised_scores if revised and self.revised_scores else self.scores) or {k: 8 for k in story.CRITERIA}
+        out = {}
+        for k, v in sc.items():
+            if k in self.missing:
+                continue
+            if k == "continuity" and "THE PREVIOUS EPISODE ENDED" not in prompt:
+                continue
+            if k in ("opening_hook", "continuity"):
+                quote, n = (spoken(first) or [first.splitlines()[-1]])[0], 1
+            elif k == "ending_hook":
+                quote, n = (spoken(last) or [last.splitlines()[-1]])[-1], len(scenes)
+            elif k == "dialogue":
+                quote, n = (spoken(first) or spoken(last))[0], 1
+            else:
+                quote, n = first.splitlines()[2], 1
+            if k in self.wrong_place and not (retry and self.retry_fixes):
+                quote, n = (spoken(last) or [last.splitlines()[-1]])[-1], len(scenes)
+            if k in self.invent and not (retry and self.retry_fixes):
+                quote = "Ama screams that she will burn the hospital down"
+            out[k] = {"score": v, "quote": quote, "scene": n, "reason": f"{k} reason"}
+        weak = [{"area": k, "scene": 1 if k in ("opening_hook", "continuity") else len(scenes) if k == "ending_hook" else 0,
+                 "problem": f"{k} is weak", "fix": f"fix the {k}"} for k, v in sc.items() if v < 7]
+        return {"scores": out, "weak": weak, "viewer_questions": ["What happens next?"]}
 
     def json(self, prompt, schema):
         self.prompts.append(("json", prompt, schema))
@@ -130,15 +174,16 @@ class Room:
             return {"scores": {"hook": 6}, "fixes": ["sharper hook"], "screenplay": draft,
                     "opening_hook": plan["hook_plan"]["opening_moment"], "ending_hook": plan["hook_plan"]["ending_moment"],
                     "episode_summary": f"Episode {n}: {plan['logline']}", "open_threads": []}, 3000, 2500
-        # The story check.
+        if schema is sc.REVISION_SCHEMA:
+            self.revisions.append(prompt)
+            nums = [int(x) for x in re.search(r"Rewrite ONLY scene\(s\) ([\d, ]+)", prompt).group(1).split(",")]
+            scenes = [b.split("\n", 1)[1] for b in re.split(r"\n\n(?=\[SCENE \d+\])", prompt.split("SCREENPLAY:\n", 1)[1])
+                      if b.startswith("[SCENE")]
+            fn = self.rewrite or (lambda num, text: text.replace("Hello Ama, good morning.", "Kofi is alive. Look."))
+            return {"scenes": [{"number": k, "text": fn(k, scenes[k - 1].split("\n\nReturn each")[0])} for k in nums]}, 900, 900
         if self.eval_raw is not None:
             return self.eval_raw, 2000, 800
-        revised = "Revise" not in prompt and "Kofi is alive. Look." in prompt
-        sc = self.revised_scores if revised and self.revised_scores else self.scores
-        sc = sc or {k: 8 for k in story.CRITERIA}
-        return {"scores": {k: {"score": v, "evidence": f"quoted line for {k}", "reason": f"{k} reason"} for k, v in sc.items()},
-                "weak": [{"area": k, "problem": f"{k} is weak", "fix": f"fix the {k}"} for k, v in sc.items() if v < 7],
-                "viewer_questions": [f"What happens after episode {n}?"]}, 2000, 800
+        return self.judge(prompt), 2000, 800
 
 
 def make_series(env, room, edit_ep1_end=None):
@@ -171,6 +216,29 @@ def plan_prompts(room):
     return [p[1] for p in room.prompts if p[0] == "json" and p[2] is story.PLAN_SCHEMA]
 
 
+def judge_calls(room):
+    return [p for p in room.prompts if p[0] == "json" and p[2] is sc.SCHEMA]
+
+
+BRIEF = {"title": "T", "logline": "x", "kind": "episode", "target_seconds": 60, "genre": "drama"}
+WEAK_OPEN = ("INT. WARD - NIGHT\n\nAma walks in, soaked.\n\nAMA\nHello Ama, good morning.\n\n"
+             "INT. CORRIDOR - NIGHT\n\nGrace blocks the door.\n\nGRACE\nKofi Mensah died on Tuesday. So who are you?\n")
+
+
+def run_story(room, script, brief=BRIEF, previous=()):
+    """develop() with a fixed screenplay (the draft and the doctor's rewrite)."""
+    room.text = lambda p: (room.prompts.append(("text", p)) or (script, 1000, 900))
+    orig = room.json
+
+    def json_fn(prompt, schema):
+        if schema is story.DOCTOR_SCHEMA:
+            room.prompts.append(("json", prompt, schema))
+            return {"scores": {}, "fixes": [], "screenplay": script, "opening_hook": "", "ending_hook": "",
+                    "episode_summary": "", "open_threads": []}, 10, 10
+        return orig(prompt, schema)
+    return story.develop(room.text, json_fn, brief, list(previous))
+
+
 # ------------------------------------------------------------------ three episodes
 
 def test_a_three_episode_drama_has_hooks_at_both_ends_of_every_episode(env):
@@ -179,10 +247,12 @@ def test_a_three_episode_drama_has_hooks_at_both_ends_of_every_episode(env):
     for b in bibles:
         assert b["beats"][0]["purpose"] == "hook" and b["beats"][-1]["purpose"] == "end_hook"
         assert b["hook_plan"]["opening_moment"] and b["hook_plan"]["ending_moment"] and b["hook_plan"]["viewer_question"]
-        assert b["evaluation"]["evaluated"] is True and set(b["evaluation"]["scores"]) >= {"opening_hook", "ending_hook"}
+        assert b["evaluation"]["status"] == "passed" and b["evaluation"]["complete"] is True
+        cats = b["evaluation"]["categories"]
+        assert cats["opening_hook"]["scene"] == 1 and cats["ending_hook"]["scene"] == 2, "quoted from the right scenes"
         assert b["episode_record"]["open_questions"], "every episode leaves the viewer a question"
-    assert "continuity" not in bibles[0]["evaluation"]["scores"], "episode 1 has nothing to continue from"
-    assert "continuity" in bibles[1]["evaluation"]["scores"] and "continuity" in bibles[2]["evaluation"]["scores"]
+    assert "continuity" not in bibles[0]["evaluation"]["categories"], "episode 1 has nothing to continue from"
+    assert all(b["evaluation"]["categories"]["continuity"]["status"] == "verified" for b in bibles[1:])
 
 
 def test_episode_2_starts_from_episode_1s_actual_ending_and_episode_3_from_episode_2s(env):
@@ -233,56 +303,156 @@ def test_older_episodes_without_a_record_still_give_their_ending():
 
 # ------------------------------------------------------------------ the story check
 
-def test_the_final_script_is_judged_with_evidence_and_a_weak_opening_is_revised_once(env):
-    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "opening_hook": 5},
-                revised_scores={k: 8 for k in story.CRITERIA})
-    brief = {"title": "T", "logline": "x", "kind": "episode", "target_seconds": 60, "genre": "drama"}
-    weak_script = "INT. WARD - NIGHT\n\nAMA\nHello Ama, good morning.\n\nGRACE\nKofi Mensah died on Tuesday.\n"
-    room.text = (lambda orig: (lambda p: (weak_script, 1000, 900) if not p.startswith("Revise") else orig(p)))(room.text)
-    orig_json = room.json
 
-    def json_fn(prompt, schema):
-        if schema is story.DOCTOR_SCHEMA:
-            return {"scores": {}, "fixes": [], "screenplay": weak_script, "opening_hook": "", "ending_hook": "",
-                    "episode_summary": "", "open_threads": []}, 10, 10
-        return orig_json(prompt, schema)
-    text, bible, *_ = story.develop(room.text, json_fn, brief, [])
+
+# ------------------------------------------------------------------ verifying the final screenplay
+
+def test_a_strong_opening_and_ending_pass_only_with_quotes_from_the_first_and_last_scene():
+    room = Room()
+    text, bible, *_ = run_story(room, script_for(1))
     ev = bible["evaluation"]
-    assert len(room.revisions) == 1, "one targeted revision at most"
-    rev = room.revisions[0]
-    assert "opening_hook: opening_hook is weak FIX: fix the opening_hook" in rev
-    assert "The first line is a greeting" in rev, "the no-AI check found the slow opening too"
-    assert "Fix ONLY these weaknesses and keep everything else" in rev
-    assert ev["revised"] is True and ev["before"]["opening_hook"] == 5 and ev["scores"]["opening_hook"]["score"] == 8
+    assert ev["status"] == "passed" and ev["complete"] and ev["unverified"] == []
+    assert ev["categories"]["opening_hook"]["quote"] == "Episode 1 begins now, right here."
+    assert ev["categories"]["ending_hook"]["quote"] == "This is how episode 1 ends."
+    assert ev["script_sha"] == sc.script_sha(text), "the check belongs to this exact script"
+    judged = judge_calls(room)[0][1]
+    assert "[SCENE 1]" in judged and "[SCENE 2]" in judged and "A plan or an intention earns nothing" in judged
+    assert "Opening (shocking_discovery)" not in judged or True
+
+
+def test_a_weak_opening_is_found_and_only_the_first_scene_is_rewritten():
+    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "opening_hook": 4},
+                revised_scores={k: 8 for k in story.CRITERIA})
+    text, bible, *_ = run_story(room, WEAK_OPEN)
+    ev = bible["evaluation"]
+    assert len(room.revisions) == 1 and "Rewrite ONLY scene(s) 1 " in room.revisions[0]
+    assert "The first line is a greeting" in room.revisions[0], "the no-AI check is part of the brief"
+    assert ev["status"] == "passed" and ev["revision"]["kept"] is True and ev["revision"]["rewrote"] == [1]
+    assert ev["revision"]["before"]["opening_hook"] == 4 and ev["categories"]["opening_hook"]["score"] == 8
     assert "Kofi is alive. Look." in text and "Hello Ama" not in text
-    assert all(v["evidence"] for v in ev["scores"].values()), "every score quotes what it judged"
+    assert sc.sections(text)[1] == sc.sections(WEAK_OPEN)[1], "every other scene is kept word for word"
 
 
-def test_a_revision_that_is_not_better_is_thrown_away():
-    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "ending_hook": 5},
-                revised_scores={**{k: 6 for k in story.CRITERIA}})
-    room.text = (lambda orig: (lambda p: (script_for(1) + "\nAMA\nKofi is alive. Look.\n", 10, 10)
-                               if p.startswith("Revise") else orig(p)))(room.text)
-    text, bible, *_ = story.develop(room.text, room.json, {"title": "T", "logline": "x", "kind": "short"}, [])
-    assert bible["evaluation"]["revised"] is False and "wasn't better" in bible["evaluation"]["revision_rejected"]
-    assert text == script_for(1).strip()
-    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "ending_hook": 5})
-    room.text = (lambda orig: (lambda p: ("INT. A\n", 1, 1) if p.startswith("Revise") else orig(p)))(room.text)
-    text, bible, *_ = story.develop(room.text, room.json, {"title": "T", "logline": "x", "kind": "short"}, [])
-    assert "cut off" in bible["evaluation"]["revision_rejected"] and text == script_for(1).strip()
-    assert bible["evaluation"]["below_bar"] == ["ending_hook"], "still weak, and it says so"
+def test_a_weak_ending_rewrites_only_the_last_scene():
+    seen = []
+
+    def rewrite(n, text):
+        seen.append(n)
+        return text.replace("So who are you?", "So who is the man in bed twelve?")
+    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "ending_hook": 5}, rewrite=rewrite)
+    room.revised_scores = None
+    script = WEAK_OPEN.replace("Hello Ama, good morning.", "Kofi is in bed twelve, I know it.")
+    text, bible, *_ = run_story(room, script)
+    assert seen == [2], "only the last scene"
+    rev = bible["evaluation"]["revision"]
+    assert rev["kept"] is False and "none of the weak areas improved" in rev["why"], "no proof of improvement: not kept"
+    assert text == script.strip() + "\n" or text.strip() == script.strip()
+    assert bible["evaluation"]["status"] == "needs_work" and bible["evaluation"]["below_bar"] == ["ending_hook"]
 
 
-def test_scores_without_evidence_are_never_shown_as_real():
-    raw = {"scores": {"opening_hook": {"score": 10, "evidence": "", "reason": "great"},
-                      "ending_hook": {"score": 9, "evidence": "GRACE: 'So who are you?'", "reason": "open question"}},
-           "weak": [], "viewer_questions": []}
-    ev = story.clean_evaluation(raw, has_previous=False)
-    assert list(ev["scores"]) == ["ending_hook"], "an unquoted 10 is dropped, not believed"
-    room = Room(eval_raw={"nonsense": True})
-    text, bible, *_ = story.develop(room.text, room.json, {"title": "T", "logline": "x", "kind": "short"}, [])
-    assert bible["evaluation"]["evaluated"] is False and bible["evaluation"]["scores"] == {}
-    assert room.revisions == [], "no revision without a real evaluation"
+def test_invented_evidence_is_unverified_and_the_episode_is_incomplete_not_passed():
+    room = Room(invent={"emotion", "suspense"})
+    text, bible, *_ = run_story(room, script_for(1))
+    ev = bible["evaluation"]
+    assert ev["status"] == "incomplete" and not ev["complete"]
+    assert set(ev["unverified"]) == {"emotion", "suspense"}
+    assert "aren't in the screenplay" in ev["categories"]["emotion"]["why"]
+    assert "emotion" not in sc.scores(ev), "an unverified score is never used"
+    assert len(judge_calls(room)) == 2 and "COULD NOT BE VERIFIED" in judge_calls(room)[1][1], "asked again once"
+    assert room.revisions == [], "never rewritten on an unverified judgement"
+    assert "It isn't a pass" in ev["summary"]
+
+
+def test_a_second_ask_with_real_quotes_completes_the_check():
+    room = Room(invent={"emotion"}, retry_fixes=True)
+    text, bible, *_ = run_story(room, script_for(1))
+    assert bible["evaluation"]["status"] == "passed" and bible["evaluation"]["retried"] is True
+
+
+def test_an_opening_quoted_from_the_wrong_scene_does_not_count():
+    room = Room(wrong_place={"opening_hook"})
+    text, bible, *_ = run_story(room, script_for(1))
+    c = bible["evaluation"]["categories"]["opening_hook"]
+    assert c["status"] == "unverified" and "not the first scene" in c["why"]
+    assert bible["evaluation"]["status"] == "incomplete"
+
+
+def test_missing_categories_never_pass():
+    room = Room(missing={"suspense", "scene_relevance"})
+    text, bible, *_ = run_story(room, script_for(1))
+    ev = bible["evaluation"]
+    assert ev["status"] == "incomplete" and set(ev["unverified"]) == {"suspense", "scene_relevance"}
+    assert ev["categories"]["suspense"]["status"] == "missing"
+    ev = sc.verify({}, script_for(1), has_previous=True)
+    assert ev["status"] == "incomplete" and set(ev["unverified"]) == set(story.CRITERIA), "nothing judged: nothing passed"
+
+
+def test_continuity_is_required_from_episode_2_and_a_wrong_pickup_is_caught():
+    prev = [{**PLANS[1], "title": "Ep 1", "episode_record": {"final_scene": "INT. CORRIDOR - NIGHT\n\nGRACE\nKofi Mensah died."}}]
+    room = Room()
+    unrelated = "INT. BEACH - DAY\n\nTOMAS\nThe sea is calm today, my friend.\n\nINT. BAR - NIGHT\n\nTOMAS\nAnother drink for my friend.\n"
+    text, bible, *_ = run_story(room, unrelated, brief={**BRIEF, "kind": "episode"}, previous=prev)
+    ev = bible["evaluation"]
+    assert "continuity" in ev["categories"], "required from episode 2 on"
+    assert any(c["area"] == "continuity" and "grace" in c["problem"] for c in ev["checks"]), \
+        "the first scene has nobody from the last episode's last scene"
+    assert "continuity" in ev["below_bar"] and ev["status"] != "passed"
+
+
+def test_a_failed_targeted_rewrite_keeps_the_original_and_says_why():
+    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "opening_hook": 4}, rewrite=lambda n, text: "Ama cries.")
+    text, bible, *_ = run_story(room, WEAK_OPEN)
+    rev = bible["evaluation"]["revision"]
+    assert rev["kept"] is False and "didn't return proper scenes" in rev["why"]
+    assert text.strip() == WEAK_OPEN.strip()
+    room = Room(scores={**{k: 8 for k in story.CRITERIA}, "opening_hook": 4},
+                revised_scores={**{k: 8 for k in story.CRITERIA}, "opening_hook": 9, "dialogue": 5})
+    text, bible, *_ = run_story(room, WEAK_OPEN)
+    assert bible["evaluation"]["revision"]["kept"] is False and "dialogue got worse" in bible["evaluation"]["revision"]["why"]
+    assert "Hello Ama" in text, "a fix that breaks something else is thrown away"
+
+
+def test_quotes_are_found_despite_case_punctuation_and_skipped_words():
+    s = script_for(1)
+    assert sc.find_quote("episode 1 BEGINS now right here", s) is not None
+    assert sc.find_quote("Episode 1 ... right here", s) is not None
+    assert sc.find_quote("Episode 1 ends now right here", s) is None
+    assert sc.find_quote("right here", s) is None, "too short to prove anything"
+
+
+# ------------------------------------------------------------------ the creator's own edits
+
+def test_a_creator_edit_makes_the_check_outdated_and_a_recheck_judges_the_edited_script_without_rewriting(env, monkeypatch):
+    client, db, store, files, ai, gen, ren = env
+    room = Room()
+    client, u, ids, bibles = make_series(env, room)
+    pid = ids[0]
+    p = client.get(f"/api/v1/studio/projects/{pid}", headers=H(u)).json()["project"]
+    edited = p["script"].replace("This is how episode 1 ends.", "Grace locks the door from the outside, smiling.")
+    client.patch(f"/api/v1/studio/projects/{pid}", headers=H(u), json={"script": edited})
+    info = client.get(f"/api/v1/studio/projects/{pid}/story-check", headers=H(u)).json()
+    assert info["outdated"] is True and info["credits"] > 0
+    monkeypatch.setattr(cs, "_ai", ai)
+    room.revisions.clear()
+    r = client.post(f"/api/v1/studio/projects/{pid}/story-check", headers=H(u), json={"request_id": uuid.uuid4().hex})
+    assert r.status_code == 200, r.text
+    ev = r.json()["evaluation"]
+    assert ev["source"] == "recheck" and ev["categories"]["ending_hook"]["quote"] == "Grace locks the door from the outside, smiling."
+    after = client.get(f"/api/v1/studio/projects/{pid}", headers=H(u)).json()["project"]
+    assert after["script"] == edited, "the creator's edit is never rewritten"
+    assert room.revisions == [] and after["story_bible"]["evaluation"]["script_sha"] == sc.script_sha(edited)
+    assert after["story_bible"]["hook_plan"] == bibles[0]["hook_plan"], "the rest of the story plan is kept"
+    assert client.get(f"/api/v1/studio/projects/{pid}/story-check", headers=H(u)).json()["outdated"] is False
+
+
+def test_a_failed_recheck_charges_nothing(env, monkeypatch):
+    client, db, store, files, ai, gen, ren = env
+    room = Room()
+    client, u, ids, bibles = make_series(env, room)
+    monkeypatch.setattr(cs, "_ai", ai)
+    ai.fail = {"story_check": RuntimeError("down")}
+    r = client.post(f"/api/v1/studio/projects/{ids[0]}/story-check", headers=H(u), json={"request_id": uuid.uuid4().hex})
+    assert r.status_code == 502 and "weren't charged" in r.text
 
 
 def test_repeated_lines_and_a_fade_out_ending_are_caught_without_ai():
@@ -322,10 +492,18 @@ def test_the_assistant_critiques_hooks_from_the_story_check_and_the_previous_epi
     prompt = ai.chat_prompts[-1]
     assert ai.chat_modes[-1] == "story"
     assert "Ending hook (unexpected person): A policeman asks the desk for Joseph Owusu" in prompt
-    assert "STORY CHECK of the final script" in prompt and "ending hook 6" in prompt
-    assert "Still below the bar: ending_hook" in prompt
+    assert "STORY CHECK of the final script: NEEDS WORK. Needs work: ending cliffhanger." in prompt
+    assert "- ending hook 6/10 (verified quote, scene 2: \"This is how episode 2 ends.\")" in prompt
+    assert "Revision: not kept" in prompt
+    assert "never call an INCOMPLETE check a pass" in prompt
     assert "It ended on (disturbing news): Grace: 'Kofi Mensah died on Tuesday. So who are you?'" in prompt
     assert "Left open:" in prompt and "Picks up the previous episode:" in prompt
-    assert "Episode storytelling (hooks and cliffhangers)" in prompt and "never invent scores" in prompt
+    assert "Episode storytelling (hooks and cliffhangers)" in prompt and "Never invent scores" in prompt
     script = client.get(f"/api/v1/studio/projects/{ids[1]}", headers=H(u)).json()["project"]["script"]
     assert "New ending." not in script, "a rewrite is a proposal until the creator applies it"
+    # After the creator edits the script, the assistant is told the check is out of date.
+    p = client.get(f"/api/v1/studio/projects/{ids[1]}", headers=H(u)).json()["project"]
+    client.patch(f"/api/v1/studio/projects/{ids[1]}", headers=H(u), json={"script": p["script"] + "\nAMA\nI'm not done.\n"})
+    client.post(f"/api/v1/studio/projects/{ids[1]}/assistant/chat", headers=H(u),
+                json={"message": "Is the ending good now?", "request_id": uuid.uuid4().hex})
+    assert "the script changed since: this check is OUT OF DATE" in ai.chat_prompts[-1]

@@ -183,11 +183,17 @@ def estimate_script(target_seconds: int, brief_chars: int) -> Cost:
     plan_in, plan_out = 1600 + brief_chars // 3, THINKING_BUDGET + 2200
     draft_in, draft_out = 1200 + plan_out, THINKING_BUDGET + script_out
     doctor_in, doctor_out = 1300 + plan_out + script_out, THINKING_BUDGET + script_out + 700
-    # The story check of the final script, and (at most once) a targeted revision and a second check.
+    # The story check of the final script (asked again once if its quotes can't be verified), and at
+    # most one targeted revision with a second check.
     eval_in, eval_out = 1500 + script_out, THINKING_BUDGET + 1200
     rev_in, rev_out = 900 + script_out, THINKING_BUDGET + script_out
-    return text_cost(plan_in + draft_in + doctor_in + 2 * eval_in + rev_in,
-                     plan_out + draft_out + doctor_out + 2 * eval_out + rev_out)
+    return text_cost(plan_in + draft_in + doctor_in + 3 * eval_in + rev_in,
+                     plan_out + draft_out + doctor_out + 3 * eval_out + rev_out)
+
+
+def estimate_story_check(script_chars: int) -> Cost:
+    """Re-checking an existing script (never rewrites it): up to two judge calls."""
+    return text_cost(2 * (1800 + script_chars // 3), 2 * (THINKING_BUDGET + 1200))
 
 
 def estimate_breakdown(script_chars: int, target_seconds: int) -> Cost:

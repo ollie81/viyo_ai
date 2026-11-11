@@ -328,6 +328,25 @@ class GoogleStudioAI:
             raise ProviderError(f"The story couldn't be written: {e}")
         return text, bible, pricing.text_cost(i, o)
 
+    def story_check(self, brief: dict, plan: dict, script: str, previous: list):
+        """The strict story check of an existing script (studio_story_check). Never rewrites it."""
+        import studio_story
+        import studio_story_check as sc
+        tin = tout = 0
+
+        def j(prompt, schema):
+            nonlocal tin, tout
+            resp = self._text(prompt, response_mime_type="application/json", response_json_schema=schema)
+            i, o = self._text_usage(resp)
+            tin, tout = tin + i, tout + o
+            try:
+                return json.loads(resp.text)
+            except (TypeError, ValueError):
+                return {}
+        ev = sc.check(j, brief, plan, script, studio_story._continuity(previous), bool(previous),
+                      studio_story.structure_checks(script, brief, previous))
+        return ev, pricing.text_cost(tin, tout)
+
     def identity(self, name: str, description: str, context: str = ""):
         """The character's permanent identity profile (studio_identity)."""
         import studio_identity
@@ -587,6 +606,18 @@ class FakeStudioAI:
                     raise err.pop(0)
                 return
             raise err
+
+    def story_check(self, brief, plan, script, previous):
+        """story_fns' json function judges (tests); otherwise story_check_result (raw judge answer)."""
+        import studio_story
+        import studio_story_check as sc
+        self.calls.append(("story_check",))
+        self._maybe_fail("story_check")
+        fns = getattr(self, "story_fns", None)
+        j = (lambda p, s: fns[1](p, s)[0]) if fns else (lambda p, s: getattr(self, "story_check_result", {}))
+        ev = sc.check(j, brief, plan, script, studio_story._continuity(previous), bool(previous),
+                      studio_story.structure_checks(script, brief, previous))
+        return ev, pricing.text_cost(4000, 1500)
 
     def develop_script(self, brief, previous):
         self.last_story_previous = list(previous)

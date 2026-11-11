@@ -330,24 +330,8 @@ def plan_problems(plan: dict, brief: dict, previous: list[dict]) -> list[str]:
     return out
 
 
-CRITERIA = ("opening_hook", "progression", "emotion", "suspense", "dialogue", "scene_relevance", "ending_hook", "continuity")
-THRESHOLD = {"opening_hook": 8, "ending_hook": 8, "continuity": 8}      # the rest: 7
-EVAL_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "scores": {"type": "object", "properties": {k: {"type": "object", "properties": {
-            "score": {"type": "integer", "description": "1-10. Omit continuity for a first episode."},
-            "evidence": {"type": "string", "description": "Quote the exact line(s) or describe the exact moment judged."},
-            "reason": {"type": "string"}}, "required": ["score", "evidence", "reason"]} for k in CRITERIA}},
-        "weak": {"type": "array", "items": {"type": "object", "properties": {
-            "area": {"type": "string", "enum": list(CRITERIA)}, "problem": {"type": "string"},
-            "fix": {"type": "string", "description": "A concrete rewrite instruction."}},
-            "required": ["area", "problem", "fix"]}},
-        "viewer_questions": {"type": "array", "items": {"type": "string"},
-                             "description": "What a viewer wants to know after the last moment."},
-    },
-    "required": ["scores", "weak", "viewer_questions"],
-}
+from studio_story_check import CRITERIA, THRESHOLD  # noqa: E402,F401  (the strict check lives there)
+
 
 def structure_checks(script: str, brief: dict, previous: list[dict]) -> list[dict]:
     """Checks that need no AI: a slow opening, repeated lines, a flat last moment."""
@@ -367,71 +351,27 @@ def structure_checks(script: str, brief: dict, previous: list[dict]) -> list[dic
     if rep:
         out.append({"area": "dialogue", "problem": f"A line is said more than once: \"{rep[0][:80]}\".",
                     "fix": "Say it once; give the repeat a new line that moves the scene."})
+    if previous:
+        # The first scene should share someone with the previous episode's last scene.
+        # The first scene should share someone or something with the previous episode's last scene:
+        # its speakers, the names in it, or its distinctive words (a policeman, the ID card...).
+        end = _record_of(previous[-1]).get("final_scene") or ""
+        import studio_story_check as sc
+        who = {w.split(" ")[0].lower() for w, _t in screenplay_lines(end)}
+        names = {w.lower() for w in re.findall(r"\b[A-Z][a-z]{2,}\b", end)} - {"the", "she", "his", "her", "then", "int", "ext"}
+        things = {w for w in re.findall(r"[a-z]{6,}", end.lower())} - {"night", "morning", "evening", "suddenly", "through",
+                                                                      "corridor", "outside", "inside", "behind", "toward"}
+        first = sc.sections(script)[0].lower() if script else ""
+        shared = [n for n in who | names | things if re.search(rf"\b{re.escape(n)}\b", first)]
+        if (who or names or things) and not shared:
+            out.append({"area": "continuity", "problem": "The first scene shares nobody and nothing with the previous "
+                                                         f"episode's last scene ({', '.join(sorted(who | names))[:120]}).",
+                        "fix": "Open on the people and the moment the previous episode ended on."})
     tail = (script or "").strip().splitlines()[-1:] or [""]
     if re.search(r"\b(the end|fade out|fades to black|to be continued)\b", tail[0], re.I) and brief.get("kind") in ("episode", "series"):
         out.append({"area": "ending_hook", "problem": "It ends on a fade-out instead of a moment.",
                     "fix": "End on the final image or line that leaves the viewer's question open."})
     return out
-
-
-def evaluation_prompt(b: dict, plan: dict, script: str, previous: list[dict]) -> str:
-    return f"""You are the head of story at a short-drama studio deciding whether this episode is ready for
-viewers. Judge the FINAL screenplay below (not the plan). Be honest and specific: a 9 or 10 means a viewer could not
-stop watching; 5 means forgettable. Quote the exact line or moment for every score.
-
-{_continuity(previous)}WHAT THE WRITERS PLANNED:
-Opening ({(plan.get('hook_plan') or {}).get('opening_technique', '')}): {(plan.get('hook_plan') or {}).get('opening_moment', '')}
-Ending ({(plan.get('hook_plan') or {}).get('ending_technique', '')}): {(plan.get('hook_plan') or {}).get('ending_moment', '')}
-Format: {b.get('kind')} of about {int(b.get('target_seconds') or 90)} seconds; genre {b.get('genre') or 'drama'}.
-
-SCREENPLAY:
-{script}
-
-Score 1-10 with evidence: opening_hook (do the first 3-5 seconds make leaving impossible?), progression (does every
-scene change something?), emotion (do we feel for someone?), suspense (do questions build?), dialogue (natural, with
-subtext, no repetition?), scene_relevance (any filler?), ending_hook (does the last moment leave a question the
-viewer needs answered, grown from the story?), continuity ({'does it pick up the previous ending, keep who knows what, and not re-explain?' if previous else 'omit: first episode'}).
-List every weak area with a concrete fix. List the viewer's questions after the last moment."""
-
-
-def revision_prompt(b: dict, plan: dict, script: str, weak: list[dict], previous: list[dict]) -> str:
-    fixes = "\n".join(f"- {w['area']}: {w['problem']} FIX: {w['fix']}" for w in weak[:8])
-    return f"""Revise this screenplay. Fix ONLY these weaknesses and keep everything else (characters, names,
-events, length, format, language):
-{fixes}
-
-{_continuity(previous)}{HOOK_RULE}
-
-SCREENPLAY:
-{script}
-
-Return only the full revised screenplay."""
-
-
-def clean_evaluation(raw, has_previous: bool) -> dict:
-    """Only scores backed by evidence count; a score without a quote is dropped."""
-    raw = raw if isinstance(raw, dict) else {}
-    scores = {}
-    for k in CRITERIA:
-        v = (raw.get("scores") or {}).get(k) if isinstance(raw.get("scores"), dict) else None
-        if k == "continuity" and not has_previous:
-            continue
-        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)) and str(v.get("evidence") or "").strip():
-            scores[k] = {"score": max(1, min(10, int(v["score"]))), "evidence": str(v["evidence"])[:300],
-                         "reason": str(v.get("reason") or "")[:300]}
-    weak = [{"area": w["area"], "problem": str(w.get("problem") or "")[:300], "fix": str(w.get("fix") or "")[:300]}
-            for w in raw.get("weak") or [] if isinstance(w, dict) and w.get("area") in CRITERIA]
-    return {"scores": scores, "weak": weak,
-            "viewer_questions": [str(q)[:200] for q in (raw.get("viewer_questions") or [])[:6] if str(q).strip()]}
-
-
-def below(ev: dict) -> list[str]:
-    """Areas under the bar (missing scores count as unknown, not as passed)."""
-    return [k for k, v in ev["scores"].items() if v["score"] < THRESHOLD.get(k, 7)]
-
-
-def total(ev: dict) -> int:
-    return sum(v["score"] for v in ev["scores"].values())
 
 
 def _last_section(script: str, n: int = 900) -> str:
@@ -497,33 +437,18 @@ def develop(text_fn, json_fn, brief: dict, previous: Optional[list[dict]] = None
     else:
         doc["rewrite_used"] = True
 
-    # The final screenplay is judged (not the draft), with quoted evidence and checks that need no AI.
-    evaluation = {"scores": {}, "weak": [], "viewer_questions": [], "evaluated": False}
+    # The FINAL screenplay is judged; only quotes found in it count (studio_story_check).
+    import studio_story_check as sc
+    cont = _continuity(previous)
     try:
-        ev = clean_evaluation(j(evaluation_prompt(brief, plan, final, previous), EVAL_SCHEMA), bool(previous))
-        checks = structure_checks(final, brief, previous)
-        weak_areas = set(below(ev)) | {c["area"] for c in checks}
-        evaluation = {**ev, "checks": checks, "evaluated": bool(ev["scores"]), "revised": False}
-        if weak_areas:
-            weak = [w for w in ev["weak"] if w["area"] in weak_areas] + checks
-            weak += [{"area": a, "problem": ev["scores"][a]["reason"], "fix": f"Make the {a.replace('_', ' ')} stronger."}
-                     for a in weak_areas if a in ev["scores"] and not any(w["area"] == a for w in weak)]
-            revised = t(revision_prompt(brief, plan, final, weak, previous))
-            if len(revised) >= 0.6 * len(final):
-                ev2 = clean_evaluation(j(evaluation_prompt(brief, plan, revised, previous), EVAL_SCHEMA), bool(previous))
-                checks2 = structure_checks(revised, brief, previous)
-                if ev2["scores"] and total(ev2) - 3 * len(checks2) >= total(ev) - 3 * len(checks):
-                    evaluation = {**ev2, "checks": checks2, "evaluated": True, "revised": True,
-                                  "before": {k: v["score"] for k, v in ev["scores"].items()},
-                                  "fixed": [w["area"] for w in weak]}
-                    final = revised
-                else:
-                    evaluation["revision_rejected"] = "The revision wasn't better, so the original was kept."
-            else:
-                evaluation["revision_rejected"] = "The revision came back cut off, so the original was kept."
-        evaluation["below_bar"] = sorted(set(below(evaluation)) | {c["area"] for c in evaluation.get("checks", [])})
+        evaluation = sc.check(j, brief, plan, final, cont, bool(previous), structure_checks(final, brief, previous))
+        final, evaluation = sc.improve(j, brief, plan, final, evaluation, cont, bool(previous),
+                                       lambda text: structure_checks(text, brief, previous), HOOK_RULE)
     except Exception as e:
-        evaluation["error"] = f"The story check couldn't run ({str(e)[:120]}); the screenplay is unchanged."
+        evaluation = {"status": "incomplete", "complete": False, "categories": {}, "unverified": list(sc.required(bool(previous))),
+                      "below_bar": [], "weak": [], "checks": [], "viewer_questions": [], "script_sha": sc.script_sha(final),
+                      "error": f"The story check couldn't run ({str(e)[:120]}); the screenplay is unchanged.",
+                      "summary": "Incomplete: the story check couldn't run. It isn't a pass."}
     bible = {**plan, "draft_scores": doc.get("scores") or {}, "scores": doc.get("scores") or {},
              "fixes": doc.get("fixes") or [],
              "opening_hook": doc.get("opening_hook") or "", "ending_hook": doc.get("ending_hook") or "",

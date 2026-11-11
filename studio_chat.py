@@ -190,8 +190,10 @@ Episode storytelling (hooks and cliffhangers):
   whether it makes leaving impossible in the first 3-5 seconds (or is slow: greetings, background, calm); where the
   suspense rises and where it sags (a scene that changes nothing, a repeated conversation); whether the ending grows
   out of the story and leaves a question the viewer needs answered; what viewers will want to know next.
-- Use the STORY CHECK when it exists (it judged the final script with quoted lines); never invent scores. If there is
-  no check, give your own reasoned opinion and say it's your opinion.
+- Use the STORY CHECK when it exists: only VERIFIED categories have real scores (their quote was found in the
+  script). Never quote a score for a NOT VERIFIED category, never call an INCOMPLETE check a pass, and if the check
+  is OUT OF DATE say the script changed since and offer to check it again. Never invent scores; without a check,
+  give your own reasoned opinion and say it's your opinion.
 - A weak idea gets honest, specific help: say what's weak, why, and offer up to 3 stronger options that keep the
   creator's idea, each with its trade-off. Don't just agree.
 - Fit the technique to the genre and story (a mystery deepens a question; a romance shifts the relationship; a
@@ -394,7 +396,7 @@ def _check_lines(r: dict, outdated: bool, approved: bool) -> list[str]:
     return out
 
 
-def _bible_block(bible: dict) -> list[str]:
+def _bible_block(bible: dict, script: str = "") -> list[str]:
     if not bible:
         return []
     approved = (bible.get("_assistant_approval") or {}).get("approved")
@@ -434,19 +436,29 @@ def _bible_block(bible: dict) -> list[str]:
                        + (f"; hides {_short(k['hides'], 100)}" if k.get("hides") else "")
                        + (f"; doesn't know {_short(k['does_not_know'], 100)}" if k.get("does_not_know") else ""))
     ev = bible.get("evaluation") or {}
-    if ev.get("evaluated"):
-        out.append("  STORY CHECK of the final script (1-10, with the line judged): " + "; ".join(
-            f"{k.replace('_', ' ')} {v['score']} ({_short(v.get('reason'), 90)})" for k, v in ev["scores"].items()))
-        if ev.get("revised"):
-            out.append(f"  It was revised once to fix: {', '.join(ev.get('fixed') or [])} (before: {ev.get('before')}).")
-        if ev.get("below_bar"):
-            out.append(f"  Still below the bar: {', '.join(ev['below_bar'])}.")
+    if ev.get("categories") or ev.get("status"):
+        import studio_story_check as sc
+        stale = sc.outdated(ev, script)
+        out.append(f"  STORY CHECK of the {'final script' if not stale else 'script as it WAS (the script changed since: this check is OUT OF DATE)'}: "
+                   f"{(ev.get('status') or 'incomplete').upper().replace('_', ' ')}. {ev.get('summary') or ''}")
+        for k, c in (ev.get("categories") or {}).items():
+            if c.get("status") == "verified":
+                out.append(f"  - {k.replace('_', ' ')} {c['score']}/10 (verified quote, scene {c.get('scene')}: "
+                           f"\"{_short(c.get('quote'), 90)}\"): {_short(c.get('reason'), 120)}")
+            else:
+                out.append(f"  - {k.replace('_', ' ')}: NOT VERIFIED – {_short(c.get('why'), 140)} (don't quote a score)")
+        rev = ev.get("revision") or {}
+        if rev.get("attempted"):
+            out.append(f"  Revision: {'kept' if rev.get('kept') else 'not kept'} – {_short(rev.get('why'), 160)}"
+                       f" (scenes {', '.join(map(str, rev.get('scenes') or []))})")
         for w in (ev.get("weak") or [])[:5]:
-            out.append(f"  Weak: {w['area']}: {_short(w['problem'], 160)} Fix: {_short(w['fix'], 160)}")
+            out.append(f"  Weak: {w['area']} (scene {w.get('scene') or 'all'}): {_short(w['problem'], 160)} Fix: {_short(w['fix'], 160)}")
+        for c in (ev.get("checks") or [])[:4]:
+            out.append(f"  Script check: {c['area']}: {_short(c['problem'], 160)}")
         if ev.get("viewer_questions"):
             out.append("  What viewers will want to know next: " + "; ".join(_short(q, 120) for q in ev["viewer_questions"][:4]))
-    elif ev.get("error"):
-        out.append(f"  Story check: not run ({_short(ev['error'], 160)}). Don't claim scores.")
+        if ev.get("error"):
+            out.append(f"  {_short(ev['error'], 160)}")
     nxt = (bible.get("episode_record") or {}).get("next_episode") or bible.get("next_episode") or []
     if nxt:
         out.append("  Planned for the next episode: " + "; ".join(_short(x, 120) for x in nxt[:5]))
@@ -540,7 +552,7 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
                 lines.append(f"    It ended on ({(e.get('end_technique') or 'ending').replace('_', ' ')}): {_short(e['ending'], 240)}")
             if not e.get("current") and e.get("open_questions"):
                 lines.append("    Left open: " + "; ".join(_short(q, 120) for q in e["open_questions"][:4]))
-    lines += _bible_block(p.get("story_bible") or {})
+    lines += _bible_block(p.get("story_bible") or {}, p.get("script") or "")
     lines.append(screenplay_block(p.get("script") or "", question, focus, names))
     if cast:
         lines.append("Characters:")
