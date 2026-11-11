@@ -38,6 +38,7 @@ import studio_memory
 import studio_inspect
 import studio_visual
 import studio_shots
+import studio_shot_continuity
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
@@ -45,7 +46,7 @@ router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
 SIGN_SECONDS = 3600
 JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits", "cover", "elements",
              "element")
-LANE = {"render": "render", "inspect": "inspect"}
+LANE = {"render": "render", "inspect": "inspect", "shot_inspect": "inspect"}
 MAX_AUDIT = 150        # scenes one picture audit can queue at once (each scene is its own small request)
 CREDIT_PACKS = [  # credits are worth $0.01 each to Viyo after payment fees
     {"id": "starter", "credits": 500, "label": "500 credits"},
@@ -268,9 +269,12 @@ class OrderIn(BaseModel):
 class JobRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
                   "elements", "element", "inspect", "shotplan", "shot_image",
-                  "shot_video"]
-    # Image only: what a new picture must fix (from the picture check), approved by the creator.
+                  "shot_video", "shot_inspect"]
+    # Image / shot_image: what a new picture must fix (from the picture check), approved by the creator.
     correction: Optional[str] = Field(None, max_length=600)
+    # shot_image only: if its continuity check finds a real mistake, make one corrected picture
+    # (its price is included in the estimate; unused credits are returned).
+    auto_fix: bool = True
     target_ids: list[str] = Field(default_factory=list, max_length=200)
     request_id: str = Field(..., min_length=8, max_length=80)
     # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
@@ -287,12 +291,13 @@ class JobRequest(BaseModel):
 class EstimateRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
                   "elements", "element", "inspect", "shotplan", "shot_image",
-                  "shot_video"]
+                  "shot_video", "shot_inspect"]
     target_ids: list[str] = Field(default_factory=list, max_length=200)
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
     # Cover jobs only: the creator's idea for the poster (optional).
     cover_note: Optional[str] = Field(None, max_length=300)
+    auto_fix: bool = True
 
 
 class IdentityPatch(BaseModel):
@@ -1551,7 +1556,7 @@ def _project_shots_of(scene: dict) -> list:
 
 
 def _shot_out(sh: dict, urls: dict) -> dict:
-    return {"id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
+    return {"continuity_check": studio_shot_continuity.report(sh.get("inspection"), sh.get("image_path")),"id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
             "camera_angle": sh.get("camera_angle") or "", "camera_movement": sh.get("camera_movement") or "static",
             "duration_seconds": float(sh["duration_seconds"]), "description": sh.get("description") or "",
             "characters": sh.get("characters") or [], "dialogue": sh.get("dialogue") or [], "audio": sh.get("audio") or "",
@@ -1621,6 +1626,39 @@ async def approve_shot(shot_id: str, body: Approve, user_id: str = Depends(creat
         raise HTTPException(status_code=409, detail="Make this shot first.")
     get_store().update("studio_shots", {"id": sh["id"]}, {"approved_at": _now_iso() if body.approved else None})
     return {"ok": True, "approved": body.approved}
+
+
+class AcceptContinuity(BaseModel):
+    accepted: bool
+    note: str = Field("", max_length=300)
+
+
+@router.post("/shots/{shot_id}/continuity/accept")
+async def accept_shot_continuity(shot_id: str, body: AcceptContinuity, user_id: str = Depends(creator)):
+    """The creator says a flagged change in this shot is intentional (a wardrobe
+    change, a new angle...). It holds for this exact picture only."""
+    sh = _owned_shot(shot_id, user_id)
+    ins = sh.get("inspection") or {}
+    if not sh.get("image_path") or ins.get("image_path") != sh.get("image_path") or not ins.get("result"):
+        raise HTTPException(status_code=409, detail="Check this shot's picture first.")
+    ins = studio_shot_continuity.accept(ins, sh["image_path"], body.note) if body.accepted else \
+        {k: v for k, v in ins.items() if k != "accepted"}
+    get_store().update("studio_shots", {"id": sh["id"]}, {"inspection": ins})
+    return {"ok": True, "continuity_check": studio_shot_continuity.report(ins, sh["image_path"])}
+
+
+@router.get("/projects/{project_id}/continuity-memory")
+async def continuity_memory(project_id: str, user_id: str = Depends(creator)):
+    """The production's structured continuity memory: characters, places, props,
+    every scene's state and every shot's state, from what is saved."""
+    p = _project(project_id, user_id)
+    st = get_store()
+    scenes = st.select("studio_scenes", {"project_id": p["id"]})
+    shots_by: dict = {}
+    for sh in _project_shots(p["id"]):
+        shots_by.setdefault(sh["scene_id"], []).append(sh)
+    return studio_shot_continuity.memory(p, st.select("studio_characters", {"project_id": p["id"]}), _outfits(p["id"]),
+                                         _elements(p["id"]), scenes, shots_by)
 
 
 class ApproveImage(BaseModel):
@@ -1703,7 +1741,7 @@ def _targets(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
     st = get_store()
     if kind in ("script", "breakdown", "render", "outfits", "cover", "elements"):
         return [p]
-    if kind in ("shot_image", "shot_video"):
+    if kind in ("shot_image", "shot_video", "shot_inspect"):
         # In film order (scene, then shot), so each shot can follow the one before it.
         order = {sc["id"]: sc["position"] for sc in st.select("studio_scenes", {"project_id": p["id"]})}
         rows = _project_shots(p["id"])
@@ -1831,11 +1869,27 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         return pricing.estimate_shotplan(len(target.get("visual") or "") + sum(len(d.get("text") or "")
                                                                               for d in target.get("dialogue") or [])), \
             (None if (target.get("visual") or target.get("heading") or "").strip() else "Describe what this scene shows first.")
+    if kind == "shot_inspect":
+        if not target.get("image_path"):
+            return pricing.estimate_inspection(4), "Make this shot's picture first."
+        from studio_worker import StudioWorker
+        scene = get_store().one("studio_scenes", {"id": target["scene_id"]}) or {}
+        rows = sorted(_project_shots_of(scene), key=lambda r: r["position"])
+        _i, _p, _e, sig = StudioWorker(get_store(), get_files(), None, "generation").shot_check_inputs(p, scene, target, rows)
+        if studio_shot_continuity.current(target, sig):
+            return pricing.estimate_inspection(4), "Already checked, and nothing has changed since."
+        return pricing.estimate_inspection(4), None
     if kind in ("shot_image", "shot_video"):
         size = "2K" if p.get("image_quality") == "high" else "1K"
         scene = get_store().one("studio_scenes", {"id": target["scene_id"]}) or {}
         if kind == "shot_image":
             cost = pricing.image_cost(1, 400 + 1300 * min(len(target.get("characters") or []) + 1, 4), size)
+            if p.get("auto_inspect") is not False:
+                # The check, and room for one corrected picture + check if it finds a mistake
+                # (only what runs is charged).
+                check = pricing.estimate_inspection(4)
+                one = pricing.combine([cost, check])
+                cost = pricing.combine([one, one] if (opts or {}).get("auto_fix", True) else [one])
         else:
             secs = studio_shots.clip_seconds(target)        # the same length the worker asks for
             if secs is None:
@@ -1929,7 +1983,7 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
     for t in _targets(kind, p, target_ids):
         cost, reason = _price(kind, p, t, cast, opts)
         items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover", "elements") else t["id"],
-                      **({"scene_id": t.get("scene_id")} if kind in ("shot_image", "shot_video") else {}),
+                      **({"scene_id": t.get("scene_id")} if kind in ("shot_image", "shot_video", "shot_inspect") else {}),
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
                       "blocked": reason})
     if kind == "inspect":
@@ -1945,12 +1999,16 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
 @router.post("/projects/{project_id}/estimate")
 async def estimate(project_id: str, body: EstimateRequest, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
-    opts = _portrait_opts(body.views, body.outfit_id, user_id) if body.kind == "portrait" else None
+    opts = _portrait_opts(body.views, body.outfit_id, user_id) if body.kind == "portrait" else \
+        {"auto_fix": body.auto_fix} if body.kind == "shot_image" else None
     items = _quote(body.kind, p, body.target_ids, opts)
     ready = [i for i in items if not i["blocked"]]
+    note = "Text steps hold a little extra and return what isn't used." if body.kind in ("script", "breakdown", "outfits") \
+        else ("Each picture is checked against the shot before it and the approved references. The price includes "
+              "one corrected picture if the check finds a real mistake; you're only charged for what is made."
+              if body.kind == "shot_image" and p.get("auto_inspect") is not False and body.auto_fix else None)
     return {"kind": body.kind, "items": items, "total_credits": sum(i["credits"] for i in ready),
-            "ready_count": len(ready), "balance": _balance(user_id),
-            "note": "Text steps hold a little extra and return what isn't used." if body.kind in ("script", "breakdown", "outfits") else None}
+            "ready_count": len(ready), "balance": _balance(user_id), "note": note}
 
 
 @router.post("/projects/{project_id}/jobs")
@@ -1986,22 +2044,26 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
         job_input = {"note": body.cover_note.strip()}
     if body.kind == "image" and (body.correction or "").strip():
         job_input = {"correction": body.correction.strip()[:600]}     # a fix from the picture check
+    if body.kind == "shot_image":
+        opts = {"auto_fix": body.auto_fix}
     for item in _quote(body.kind, p, body.target_ids, opts):
         if item["blocked"]:
             problems.append({"target_id": item["target_id"], "error": item["blocked"]})
             continue
         key = f"{user_id}:{body.request_id}:{body.kind}:{item['target_id'] or p['id']}"
-        shot_kind = body.kind in ("shot_image", "shot_video")
+        shot_kind = body.kind in ("shot_image", "shot_video", "shot_inspect")
         args = {
             "p_owner": user_id, "p_project": p["id"], "p_kind": body.kind, "p_lane": LANE.get(body.kind, "generation"),
             "p_key": key, "p_credits": item["credits"],
             "p_input": {"element_id": item["target_id"]} if body.kind == "element"
-            else {"shot_id": item["target_id"]} if shot_kind else job_input,
+            else {"shot_id": item["target_id"], **({"auto_fix": body.auto_fix} if body.kind == "shot_image" else {}),
+                  **({"correction": body.correction.strip()[:600]}
+                     if body.kind == "shot_image" and (body.correction or "").strip() else {})} if shot_kind else job_input,
             "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync", "inspect", "shotplan")
             else item.get("scene_id") if shot_kind else None,
             "p_character": item["target_id"] if body.kind == "portrait" else None,
             # A picture audit queues one small job per scene; it may queue a whole film at once.
-            "p_max_open": 30 + MAX_AUDIT if body.kind == "inspect" else 30}
+            "p_max_open": 30 + MAX_AUDIT if body.kind in ("inspect", "shot_inspect") else 30}
         try:
             r = st.rpc("studio_create_job", args)
         except Exception as e:
@@ -2321,6 +2383,24 @@ def _proposal_targets(p: dict, props: list) -> list:
                 prop["status"], prop["error"] = "failed", "That shot is approved. Unapprove it first."
             elif prop["type"] != "edit_shot":
                 prop["targets"] = [shot["id"]]
+        elif prop.get("type") == "fix_shot_picture":
+            shot = _shot_by_numbers(scenes, d.get("scene"), d.get("shot"))
+            if not shot:
+                prop["status"], prop["error"] = "failed", "That shot doesn't exist."
+            elif shot.get("approved_at"):
+                prop["status"], prop["error"] = "failed", "That shot is approved. Unapprove it first."
+            else:
+                prop["targets"] = [shot["id"]]
+                prop["extra"] = {"correction": str(d.get("correction") or "")[:600]}
+        elif prop.get("type") == "check_shots":
+            nums = [n for n in (d.get("scenes") or []) if isinstance(n, int) and 1 <= n <= len(scenes)]
+            picked = {scenes[n - 1]["id"] for n in nums} if nums else {x["id"] for x in scenes}
+            order = {x["id"]: x["position"] for x in scenes}
+            rows = sorted([x for x in _project_shots(p["id"]) if x["scene_id"] in picked and x.get("image_path")],
+                          key=lambda r: (order.get(r["scene_id"], 0), r["position"]))
+            prop["targets"] = [x["id"] for x in rows]
+            if not prop["targets"]:
+                prop["status"], prop["error"] = "failed", "None of those scenes has a shot picture yet."
         elif prop.get("type") == "check_scenes":
             nums = [n for n in (d.get("scenes") or []) if isinstance(n, int) and 1 <= n <= len(scenes)]
             picked = [scenes[n - 1] for n in nums] if nums else scenes

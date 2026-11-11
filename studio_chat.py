@@ -61,12 +61,15 @@ ACTIONS = {
     "edit_shot": "free",         # data: scene, shot, and shot_type / camera_angle / camera_movement / duration_seconds / description
     "remake_shot_picture": "paid",   # data: scene, shot: a new opening picture of that one shot
     "remake_shot_video": "paid",     # data: scene, shot: a new clip of that one shot
+    "check_shots": "paid",       # data: scenes [numbers] (empty = every shot with a picture): shot-to-shot continuity check
+    "fix_shot_picture": "paid",  # data: scene, shot, correction: a new picture of that one shot fixing what the check found
 }
 PAID_JOB = {"develop_story": "script", "break_into_scenes": "breakdown", "find_places_objects": "elements",
             "make_cover": "cover", "make_film": "production", "remake_picture": "image", "remake_video": "video",
             "suggest_outfits": "outfits", "make_character_sheet": "portrait", "record_voices": "voice",
             "make_place_object_picture": "element", "check_scenes": "inspect", "fix_scene_picture": "image",
-            "plan_shots": "shotplan", "remake_shot_picture": "shot_image", "remake_shot_video": "shot_video"}
+            "plan_shots": "shotplan", "remake_shot_picture": "shot_image", "remake_shot_video": "shot_video",
+            "check_shots": "shot_inspect", "fix_shot_picture": "shot_image"}
 
 _STR = {"type": "string"}
 CHAT_SCHEMA = {
@@ -155,6 +158,15 @@ Camera shots (the director):
   each shot's picture and clip are made. edit_shot changes one shot (free, the creator applies it); remake_shot_picture
   / remake_shot_video remake one shot only. An approved shot or plan is never replaced: ask the creator to unapprove.
 - Coverage depends on the moment: a conversation, an emotional beat, action or a quiet moment need different shots.
+- Shot continuity: each shot picture may have a continuity check against the shot before it and the approved
+  references (shown after the shot as [continuity ...]: passed, ATTENTION, FAILED with the failed checks, or ACCEPTED
+  when the creator said the change is intentional). Explain a failure naturally, e.g. "Ama's raincoat changed between
+  shots 3 and 4; her outfit in this scene is the mustard raincoat. Should I fix shot 4?", then propose
+  fix_shot_picture (data.scene, data.shot, data.correction). To check shots, propose check_shots (data.scenes).
+  A cut to a new framing, a reverse angle, a new place, a time jump or an approved outfit change is NOT a mistake.
+  Never call an ACCEPTED change a problem. A check can be wrong: say "the check thinks" when it was uncertain.
+- "Closer to her face" / "from the opposite angle" / "more emotional" for a shot: propose edit_shot (shot_type,
+  camera_angle, description) for that shot, then remake_shot_picture. "Keep the same room" is already the rule.
 
 How you talk:
 - Natural, warm and clear, like a talented collaborator. Simple words; explain film terms when you use them.
@@ -231,6 +243,7 @@ Proposals (0 to 3, only when a concrete change would help now):
 - make_character_sheet: data.character. make_place_object_picture: data.name. record_voices: data.scene.
 - check_scenes: data.scenes. fix_scene_picture: data.scene, data.correction.
 - plan_shots: data.scenes. edit_shot / remake_shot_picture / remake_shot_video: data.scene and data.shot (numbers).
+- check_shots: data.scenes. fix_shot_picture: data.scene, data.shot, data.correction.
 - develop_story, break_into_scenes, find_places_objects, suggest_outfits, make_cover, make_film: paid steps, data may
   be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -514,12 +527,14 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
             shots = s.get("_shots") or []
             if shots and (full or len(scenes) <= 60):
                 import studio_shots
+                import studio_shot_continuity
                 stale = " – OUTDATED: the scene's lines changed after the shots were planned; plan them again" \
                     if studio_shots.plan_outdated(s, shots) else ""
                 lines.append(f"   SHOTS ({len(shots)}, plan {'APPROVED' if s.get('shot_plan_approved') else 'not approved'}{stale}): " + " | ".join(
                     f"{k + 1}. {sh['shot_type'].replace('_', ' ')} {float(sh['duration_seconds']):g}s"
                     f"{' [made]' if sh.get('video_path') else ' [picture]' if sh.get('image_path') else ''}"
                     f"{' [approved]' if sh.get('approved_at') else ''}" + (f" – {_short(sh.get('reason'), 90)}" if full else "")
+                    + studio_shot_continuity.chat_line(studio_shot_continuity.report(sh.get("inspection"), sh.get("image_path")))
                     for k, sh in enumerate(shots)))
             ins = (s.get("inspection") or {}).get("result")
             if ins and (full or ins.get("problems")):
