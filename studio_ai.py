@@ -398,14 +398,23 @@ class GoogleStudioAI:
         except (TypeError, ValueError):
             raise ProviderError("The AI returned unreadable voice profiles.")
 
-    def listen(self, prompt: str, audio: bytes):
-        """Gemini listens to a clip's sound (16 kHz mono WAV) and reports which lines were said and how."""
+    def listen(self, prompt: str, audio: bytes, video: Optional[bytes] = None, references: Optional[list] = None):
+        """Gemini listens to a clip and reports which lines were said, how, and when. With `video` (the mp4,
+        sound included) it also watches the mouths. `references`: [(character, 16 kHz WAV)] approved recordings,
+        sent first in the order the prompt lists them. Not yet verified with a live call."""
         import studio_voice
         from google.genai import types
+        parts = []
+        for i, (name, data) in enumerate(references or [], start=1):
+            parts += [types.Part.from_text(text=f"Reference {i}: {str(name).upper()}"),
+                      types.Part.from_bytes(data=data, mime_type="audio/wav")]
+        parts.append(types.Part.from_text(text="The clip to check:"))
+        parts.append(types.Part.from_bytes(data=video, mime_type="video/mp4") if video
+                     else types.Part.from_bytes(data=audio, mime_type="audio/wav"))
         try:
             resp = self.client.models.generate_content(
                 model=pricing.TEXT_MODEL,
-                contents=[types.Part.from_bytes(data=audio, mime_type="audio/wav"), types.Part.from_text(text=prompt)],
+                contents=parts + [types.Part.from_text(text=prompt)],
                 config=types.GenerateContentConfig(
                     thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET), safety_settings=drama_safety(),
                     response_mime_type="application/json", response_json_schema=studio_voice.LISTEN_SCHEMA))
@@ -738,16 +747,24 @@ class FakeStudioAI:
                             "speed": speeds[i % 4], "rhythm": "even", "personality": "x", "emotional_range": "y",
                             "accent": "neutral"} for i, n in enumerate(names)]}, pricing.text_cost(3000, 1500)
 
-    def listen(self, prompt, audio):
-        """listen_result: a raw answer or fn(prompt) -> dict; default: every line heard, correct voice."""
+    def listen(self, prompt, audio, video=None, references=None):
+        """listen_result: a raw answer, a list of answers (one per check, the last repeats) or fn(prompt) -> dict;
+        default: every line heard word for word, in the right voice, spread evenly over the 3 s fake clip."""
         self.calls.append(("listen", len(audio)))
         self.listen_prompts = getattr(self, "listen_prompts", []) + [prompt]
+        self.listen_refs = getattr(self, "listen_refs", []) + [[n for n, _d in references or []]]
+        self.listen_watched = getattr(self, "listen_watched", []) + [video is not None]
         self._maybe_fail("listen")
         r = getattr(self, "listen_result", None)
+        if isinstance(r, list):
+            r = r.pop(0) if len(r) > 1 else r[0]
         if r is not None:
             return (r(prompt) if callable(r) else r), pricing.text_cost(2000, 500)
-        n = len(re.findall(r"^\d+\. ", prompt, re.M))
-        return {"lines": [{"index": i, "heard": True, "heard_text": "x", "speaker_ok": True} for i in range(n)],
+        said = re.findall(r'^(\d+)\. [^\n]*?: "(.*)" — expected voice', prompt, re.M)
+        n = len(said)
+        return {"lines": [{"index": i, "heard": True, "heard_text": t, "speaker_ok": True,
+                           "start": round(0.1 + i * 2.8 / max(1, n), 2), "end": round(0.1 + (i + 1) * 2.8 / max(1, n) - 0.05, 2)}
+                          for i, (_n, t) in enumerate(said)],
                 "language_ok": True, "natural": 8, "clarity": 8, "extra_speech": False, "voices_distinct": True}, \
             pricing.text_cost(2000, 500)
 
