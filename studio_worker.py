@@ -981,6 +981,15 @@ class StudioWorker:
                 wavs.append(p)
             out = os.path.join(tmp, "scene.m4a")
             dur = render.join_audio(wavs, out)
+            # When each line is heard (join_audio pads every line with the same gap), so captions follow the voices.
+            timings, t = [], 0.0
+            for wv in wavs:
+                try:
+                    secs = render.probe(wv)["duration"]
+                except Exception:
+                    secs = 0.0
+                timings.append([round(t, 2), round(t + secs, 2)])
+                t += secs + 0.25
             with open(out, "rb") as f:
                 data = f.read()
         total = pricing.voice_cost(seconds_total)
@@ -988,6 +997,8 @@ class StudioWorker:
         self.store.update("studio_scenes", {"id": scene["id"]}, {"audio_path": path, "audio_seconds": round(dur, 2),
                                                                  "updated_at": _now()})
         used = {("narrator" if ch is None else ch["id"]): v for v, ch, _s in voices}
+        if all(b > a for a, b in timings):
+            used["_timings"] = timings
         self._optional_update("studio_scenes", {"id": scene["id"]}, {"audio_voices": used})
         if scene.get("lipsync_path"):   # new words: the old lip sync no longer matches (its file is kept)
             self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
@@ -1364,6 +1375,20 @@ class StudioWorker:
         self.store.update("studio_shots", {"id": shot["id"]}, {"video_path": path, "status": "ready", "updated_at": _now()})
         return {"path": path, **({"model": backup} if backup else {})}, cost
 
+    @staticmethod
+    def _film_edit(scene, scenes, spoken_in_clip) -> dict:
+        """Editing choices for one scene: how its still picture moves (its planned camera movement), a dip from
+        black for the opening, a time jump or a flashback, a fade out at the very end, and the recorded timing
+        of each line for the captions."""
+        c = scene.get("continuity") or {}
+        ordered = sorted(scenes, key=lambda r: r["position"])
+        first = bool(ordered) and ordered[0]["id"] == scene["id"]
+        last = bool(ordered) and ordered[-1]["id"] == scene["id"]
+        timings = () if spoken_in_clip else tuple(tuple(x) for x in ((scene.get("audio_voices") or {}).get("_timings") or []))
+        return {"move": render.movement(" ".join(x for x in (c.get("camera_movement"), c.get("camera")) if x)),
+                "fade_in": 0.6 if first else 0.5 if c.get("transition") in ("time_jump", "flashback") else 0.0,
+                "fade_out": 0.8 if last else 0.0, "line_times": timings}
+
     def _shot_scene_input(self, project, scene, shots, fetch, tmp):
         """A scene made of shots: each shot is rendered for its own length (its
         clip, or its picture with a slow push-in), then joined in order into
@@ -1383,6 +1408,7 @@ class StudioWorker:
                 image=None if sh.get("video_path") else fetch(sh["image_path"], f"s{n}_shot{k}.img"),
                 video=fetch(sh["video_path"], f"s{n}_shot{k}_v.mp4") if sh.get("video_path") else None,
                 lines=tuple(d["text"] for d in sh.get("dialogue") or [] if d.get("text")),
+                move=render.movement(sh.get("camera_movement") or "", sh.get("shot_type") or ""),
                 video_audio=bool(sh.get("video_path")) and (talking or not (sh.get("dialogue") or []))),
                 w, h, clip, tmp, n * 10 + k, captions)
             clips.append(clip)
@@ -1393,7 +1419,10 @@ class StudioWorker:
         render._run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined],
                     f"joining the shots of scene {n + 1}")
         has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
+        film = {k: v for k, v in self._film_edit(scene, scenes, True).items() if k in ("fade_in", "fade_out")}
         return render.SceneInput(
+            **film,
             duration=render.probe(joined)["duration"], video=joined,
             # Saved voices speak over the joined shots; talking shots carry their own speech.
             audio=None if talking else fetch(scene.get("audio_path"), f"aud{n}.m4a"),
@@ -1505,7 +1534,8 @@ class StudioWorker:
                 synced = s.get("lipsync_path") if needs_lipsync(s, project) else None
                 use_video = synced or (s["mode"] == "video" and s.get("video_path"))
                 spoken_in_clip = bool(synced) or (bool(use_video) and talks_in_video(s, project))
-                inputs.append(render.SceneInput(
+                film = self._film_edit(s, scenes, spoken_in_clip)
+                inputs.append(render.SceneInput(**film,
                     duration=float(s["duration_seconds"]),
                     image=None if use_video else fetch(s["image_path"], f"img{n}"),
                     video=fetch(synced or s["video_path"], f"vid{n}.mp4") if use_video else None,

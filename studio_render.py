@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
@@ -36,6 +37,51 @@ class SceneInput:
     # characters speak, their saved voices are the only dialogue audio, so a
     # second (different) voice from the video model can never be heard.
     video_audio: bool = True
+    # How a still picture moves (studio_render.movement): push_in, pull_out, pan_left, pan_right, tilt_up,
+    # tilt_down or static. Taken from the scene's / shot's planned camera movement.
+    move: str = "push_in"
+    fade_in: float = 0.0     # seconds from black (a time jump, a flashback, the film's opening)
+    fade_out: float = 0.0    # seconds to black (the film's last shot)
+    # (start, end) seconds of each spoken line in the scene's voice track, so captions follow the voices.
+    line_times: tuple = ()
+
+
+MOVES = ("push_in", "pull_out", "pan_left", "pan_right", "tilt_up", "tilt_down", "static")
+_MOVE_WORDS = [
+    ("static", r"\b(static|locked[- ]off|locked|still camera|no (camera )?movement|holds? still)\b"),
+    ("pull_out", r"\b(pull(s|ing)? (back|out)|dolly (out|back)|zoom(s|ing)? out|widens?|reveal(s|ing)? the room)\b"),
+    ("pan_left", r"\b(pan(s|ning)? (to the )?left|track(s|ing)? left|truck(s|ing)? left)\b"),
+    ("pan_right", r"\b(pan(s|ning)? (to the )?right|track(s|ing)? right|truck(s|ing)? right)\b"),
+    ("tilt_up", r"\b(tilt(s|ing)? up|crane(s|ing)? up|pedestal up|rises? up)\b"),
+    ("tilt_down", r"\b(tilt(s|ing)? down|crane(s|ing)? down|pedestal down)\b"),
+    ("push_in", r"\b(push(es|ing)? in|slow push|dolly in|zoom(s|ing)? in|creep(s|ing)? in|move(s)? closer)\b"),
+]
+_SHOT_MOVE = {"establishing_wide": "pan_right", "wide_two_shot": "pull_out", "insert": "static", "pov": "push_in",
+              "extreme_close_up": "static", "over_the_shoulder": "push_in", "close_up": "push_in", "reaction": "push_in",
+              "medium": "push_in"}
+
+
+def movement(text: str = "", shot_type: str = "") -> str:
+    """The planned camera movement in words -> a move for a still picture (not one push-in for everything)."""
+    low = (text or "").lower()
+    for move, pattern in _MOVE_WORDS:
+        if re.search(pattern, low):
+            return move
+    return _SHOT_MOVE.get(shot_type or "", "push_in")
+
+
+def _zoompan(move: str, frames: int, w: int, h: int) -> str:
+    p = f"on/{frames}"
+    z, x, y = {
+        "push_in": (f"1+0.10*{p}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+        "pull_out": (f"1.10-0.10*{p}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+        "pan_left": ("1.18", f"(iw-iw/zoom)*(1-{p})", "ih/2-(ih/zoom/2)"),
+        "pan_right": ("1.18", f"(iw-iw/zoom)*{p}", "ih/2-(ih/zoom/2)"),
+        "tilt_up": ("1.18", "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(1-{p})"),
+        "tilt_down": ("1.18", "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*{p}"),
+        "static": ("1.03", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+    }.get(move, (f"1+0.10*{p}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"))
+    return f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={FPS}"
 
 
 class RenderError(Exception):
@@ -80,16 +126,28 @@ def _wrap(text: str, width_chars: int) -> str:
     return "\n".join(lines[:3])
 
 
-def _caption_filter(lines: tuple, duration: float, w: int, h: int, tmp: str, idx: int) -> str:
+def caption_times(lines: tuple, duration: float, line_times: tuple = ()) -> list[tuple[float, float]]:
+    """When each caption shows: the recorded timing of each line when known (captions follow the voices),
+    otherwise spread over the scene by word count."""
+    if line_times and len(line_times) == len(lines):
+        return [(max(0.0, float(a)), min(duration, max(float(a) + 0.4, float(b)))) for a, b in line_times]
+    weights = [max(1, len(t.split())) for t in lines]
+    total = sum(weights) or 1
+    t0, out = 0.15, []
+    span = max(0.5, duration - 0.3)
+    for wt in weights:
+        t1 = t0 + span * wt / total
+        out.append((t0, t1))
+        t0 = t1
+    return out
+
+
+def _caption_filter(lines: tuple, duration: float, w: int, h: int, tmp: str, idx: int, line_times: tuple = ()) -> str:
     if not lines:
         return ""
-    weights = [max(1, len(t.split())) for t in lines]
-    total = sum(weights)
-    t0, parts = 0.15, []
-    span = max(0.5, duration - 0.3)
+    parts = []
     size = int(w * (0.05 if h > w else 0.032))
-    for n, (text, wt) in enumerate(zip(lines, weights)):
-        t1 = t0 + span * wt / total
+    for n, (text, (t0, t1)) in enumerate(zip(lines, caption_times(lines, duration, line_times))):
         txt_path = os.path.join(tmp, f"cap_{idx}_{n}.txt")
         with open(txt_path, "w") as f:
             f.write(_wrap(text, 26 if h > w else 48))
@@ -97,14 +155,19 @@ def _caption_filter(lines: tuple, duration: float, w: int, h: int, tmp: str, idx
             f"drawtext=fontfile={FONT}:textfile='{txt_path}':fontsize={size}:fontcolor=white:borderw={max(2, size // 12)}"
             f":bordercolor=black@0.85:line_spacing={size // 4}:x=(w-text_w)/2:y=h*{0.72 if h > w else 0.82}-text_h/2"
             f":enable='between(t,{t0:.2f},{t1:.2f})'")
-        t0 = t1
     return "," + ",".join(parts)
 
 
 def render_scene(s: SceneInput, w: int, h: int, out: str, tmp: str, idx: int, captions: bool) -> float:
     voice = s.audio_seconds or 0.0
     d = round(max(s.duration, voice + 0.5, 1.5), 2)
-    caps = _caption_filter(s.lines, d, w, h, tmp, idx) if captions else ""
+    caps = _caption_filter(s.lines, d, w, h, tmp, idx, s.line_times) if captions else ""
+    fades = ""
+    if s.fade_in > 0:
+        fades += f",fade=t=in:st=0:d={min(s.fade_in, d / 3):.2f}"
+    if s.fade_out > 0:
+        fades += f",fade=t=out:st={max(0.0, d - min(s.fade_out, d / 3)):.2f}:d={min(s.fade_out, d / 3):.2f}"
+    caps = fades + caps
     cmd = ["ffmpeg", "-y", "-v", "error"]
     if s.video:
         cmd += ["-i", s.video]
@@ -116,7 +179,7 @@ def render_scene(s: SceneInput, w: int, h: int, out: str, tmp: str, idx: int, ca
         bw, bh = int(w * 1.25) // 2 * 2, int(h * 1.25) // 2 * 2
         frames = max(1, int(d * FPS))
         v = (f"[0:v]scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=lanczos,crop={bw}:{bh},"
-             f"zoompan=z='1+0.10*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={FPS},"
+             f"{_zoompan(s.move if s.move in MOVES else 'push_in', frames, w, h)},"
              f"setsar=1,format=yuv420p{caps}[v]")
     else:
         raise RenderError("a scene has no image or video")
@@ -146,7 +209,9 @@ def render_scene(s: SceneInput, w: int, h: int, out: str, tmp: str, idx: int, ca
     else:
         mix = (f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0,"
                if len(labels) > 1 else f"{labels[0]}anull,")
-        a = ";".join(parts) + f";{mix}apad,atrim=duration={d},alimiter=limit=0.89:level=false[a]"
+        afade = (f"afade=t=in:d={min(s.fade_in, d / 3):.2f}," if s.fade_in > 0 else "") + \
+            (f"afade=t=out:st={max(0.0, d - min(s.fade_out, d / 3)):.2f}:d={min(s.fade_out, d / 3):.2f}," if s.fade_out > 0 else "")
+        a = ";".join(parts) + f";{mix}apad,atrim=duration={d},{afade}alimiter=limit=0.89:level=false[a]"
     cmd += ["-filter_complex", f"{v};{a}", "-map", "[v]", "-map", "[a]", "-t", str(d),
             "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-maxrate", "8M", "-bufsize", "16M",
             "-profile:v", "high", "-pix_fmt", "yuv420p", "-r", str(FPS),

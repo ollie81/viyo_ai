@@ -125,7 +125,17 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
         add("render", p, "The finished film")
     out = [{"stage": s, "label": STAGE_LABEL[s], "items": stages[s], "credits": sum(i["credits"] for i in stages[s])}
            for s in STAGES if stages[s]]
-    return {"stages": out, "total_credits": sum(x["credits"] for x in out), "blocked": blocked,
+    # Coverage: a conversation or a long moment filmed as ONE still or clip looks like a slideshow. Say which
+    # scenes would be single shots, so the creator can have them directed as several shots first.
+    single = [(i, s) for i, s in enumerate(scenes, start=1)
+              if not studio_shots.uses_shots(s, shots_by.get(s["id"], []))
+              and (len([d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]) >= 2
+                   or float(s.get("duration_seconds") or 0) >= 7)]
+    advice = [f"{len(single)} scene{'s' if len(single) != 1 else ''} ({', '.join(str(i) for i, _ in single[:12])}"
+              f"{'...' if len(single) > 12 else ''}) would be filmed as one shot each. Plan their camera shots first "
+              "(wide, over-the-shoulder, close-up, reaction) for real coverage."] if single else []
+    return {"stages": out, "total_credits": sum(x["credits"] for x in out), "blocked": blocked, "advice": advice,
+            "single_shot_scenes": [s["id"] for _, s in single],
             "scenes": len(scenes), "characters": len(cast), "options": options}
 
 
