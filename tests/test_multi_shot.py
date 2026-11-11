@@ -155,7 +155,7 @@ def test_every_shot_keeps_continuity_with_the_previous_one(prod):
         assert "Screen direction (keep it): Maya on the left; Daniel on the right" in p
         assert "Same light and time in every shot: night, one warm lamp" in p
     assert "CAMERA: Over-the-shoulder shot" in ots and "The previous shot (wide two shot) showed: Maya and Daniel" in ots
-    assert "Reference image" in ots and "the previous shot of this scene (same place, light and clothes" in ots
+    assert "Reference image" in ots and "shot 1 of this scene (the shot just before) (same people, place, light and clothes" in ots
     cast_part = reaction.split("SHOT CONTINUITY")[0]
     assert "- Daniel" in cast_part and "- Maya" not in cast_part, "only who is in the shot"
 
