@@ -78,6 +78,9 @@ PLAN_SCHEMA = {
             "speech": {"type": "string", "description": "How they talk: rhythm, words they use, what they avoid saying."},
             "look": {"type": "string", "description": "Face, hair, build, clothes. No real people."},
             "arc": {"type": "string"},
+            "history": {"type": "string"}, "fears_losing": {"type": "string"},
+            "inner_conflict": {"type": "string"}, "outer_conflict": {"type": "string"},
+            "vulnerability": {"type": "string"},
         }, "required": ["name", "age", "role", "want", "flaw", "speech", "look"]}},
         "beats": {"type": "array", "items": {"type": "object", "properties": {
             "purpose": {"type": "string", "enum": ["hook", "setup", "inciting", "escalation", "reversal", "twist",
@@ -228,13 +231,29 @@ def _continuity(previous: list[dict]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+IMMERSION = """IMMERSION (use the world, don't decorate with it):
+- People speak, greet, show respect, hide fear and argue the way people of THIS place and time do; names and forms
+  of address come from the world. Wealth, family, rank and tradition shape what each person can say and do.
+- Show the place through what characters touch, hear and do (work, food, weather, rituals), and through silence,
+  looks and gestures, not through explanation. Every detail serves the scene.
+- Characters are real people: a history, something they're afraid of losing, a secret, an inner conflict. Their
+  choices have consequences; they make mistakes and misunderstand each other believably.
+- Never present invented or uncertain things as historical fact; nothing that didn't exist yet appears.
+
+"""
+
+
 def plan_prompt(b: dict, previous: list[dict]) -> str:
     seconds = int(b.get("target_seconds") or 90)
     scenes = max(3, seconds // 8)
     episode = b.get("kind") in ("episode", "series")
+    import studio_saga
+    import studio_world
+    world = studio_world.block(b.get("world"), "story")
+    saga = studio_saga.position(b.get("saga"), len(previous) + 1)
     return f"""You are the head writer of a top short-drama studio. Develop the creator's idea into a story plan.
 
-{_continuity(previous)}CREATOR'S IDEA (keep its core: the same people, situation and promise; make it stronger, not different):
+{world + IMMERSION if world else ''}{saga}{_continuity(previous)}CREATOR'S IDEA (keep its core: the same people, situation and promise; make it stronger, not different):
 Title: {b.get('title')}
 Idea: {b.get('logline') or '(none given: invent a gripping original story in this genre)'}
 Genre: {b.get('genre') or 'drama'}
@@ -264,9 +283,11 @@ Write the plan in English (character names as they would be in the story)."""
 
 
 def draft_prompt(b: dict, plan: dict, previous: list[dict]) -> str:
+    import studio_world
+    world = studio_world.block(b.get("world"), "story")
     return f"""Write the screenplay for this story plan.
 
-{_continuity(previous)}STORY PLAN:
+{world + IMMERSION if world else ''}{_continuity(previous)}STORY PLAN:
 {json.dumps(plan, ensure_ascii=False, indent=1)}
 
 {CRAFT}
@@ -280,9 +301,11 @@ Rules:
 
 
 def doctor_prompt(b: dict, plan: dict, draft: str, previous: Optional[list[dict]] = None) -> str:
+    import studio_world
+    world = studio_world.block(b.get("world"), "story")
     return f"""You are a demanding script doctor. Here is a story plan and a first-draft screenplay.
 
-{_continuity(previous or [])}STORY PLAN:
+{world + IMMERSION if world else ''}{_continuity(previous or [])}STORY PLAN:
 {json.dumps(plan, ensure_ascii=False, indent=1)}
 
 DRAFT:
@@ -367,6 +390,9 @@ def structure_checks(script: str, brief: dict, previous: list[dict]) -> list[dic
             out.append({"area": "continuity", "problem": "The first scene shares nobody and nothing with the previous "
                                                          f"episode's last scene ({', '.join(sorted(who | names))[:120]}).",
                         "fix": "Open on the people and the moment the previous episode ended on."})
+    if brief.get("world"):
+        import studio_world
+        out += [{"area": c["area"], "problem": c["problem"], "fix": c["fix"]} for c in studio_world.check_text(script, brief["world"])]
     tail = (script or "").strip().splitlines()[-1:] or [""]
     if re.search(r"\b(the end|fade out|fades to black|to be continued)\b", tail[0], re.I) and brief.get("kind") in ("episode", "series"):
         out.append({"area": "ending_hook", "problem": "It ends on a fade-out instead of a moment.",
@@ -439,14 +465,18 @@ def develop(text_fn, json_fn, brief: dict, previous: Optional[list[dict]] = None
 
     # The FINAL screenplay is judged; only quotes found in it count (studio_story_check).
     import studio_story_check as sc
+    import studio_world
     cont = _continuity(previous)
+    wtext = studio_world.block(brief.get("world"), "story")
     try:
-        evaluation = sc.check(j, brief, plan, final, cont, bool(previous), structure_checks(final, brief, previous))
+        evaluation = sc.check(j, brief, plan, final, cont, bool(previous), structure_checks(final, brief, previous),
+                              world_text=wtext)
         final, evaluation = sc.improve(j, brief, plan, final, evaluation, cont, bool(previous),
-                                       lambda text: structure_checks(text, brief, previous), HOOK_RULE)
+                                       lambda text: structure_checks(text, brief, previous), HOOK_RULE, world_text=wtext)
     except Exception as e:
         evaluation = {"status": "incomplete", "complete": False, "categories": {}, "unverified": list(sc.required(bool(previous))),
                       "below_bar": [], "weak": [], "checks": [], "viewer_questions": [], "script_sha": sc.script_sha(final),
+                      "world": bool(wtext),
                       "error": f"The story check couldn't run ({str(e)[:120]}); the screenplay is unchanged.",
                       "summary": "Incomplete: the story check couldn't run. It isn't a pass."}
     bible = {**plan, "draft_scores": doc.get("scores") or {}, "scores": doc.get("scores") or {},

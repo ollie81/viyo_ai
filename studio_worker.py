@@ -29,6 +29,8 @@ import studio_continuity as continuity
 import studio_inspect as inspect_mod
 import studio_shots as shots_mod
 import studio_shot_continuity as shotcheck
+import studio_world as wb
+import studio_saga as saga_mod
 import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
@@ -169,19 +171,58 @@ class StudioWorker:
         if not ai_mod.moderate_text(f"{project['title']}\n{project['logline']}"):
             raise JobFailed("content_blocked", "This idea can't be made on Viyo. Please change it.")
         develop = getattr(self.ai, "develop_script", None)
+        earlier = self.earlier_episodes(project)
+        world, saga = self.story_world(project), self.story_saga(project)
+        if world:
+            brief["world"] = world
+        if saga:
+            brief["saga"] = saga
         if develop is None:
             text, cost = self.ai.write_script(brief)
             bible = None
         else:
-            text, bible, cost = develop(brief, self.earlier_episodes(project))
+            text, bible, cost = develop(brief, earlier)
         self.store.update("studio_projects", {"id": project["id"]}, {"script": text, "updated_at": _now()})
         if bible:
+            # The world and the larger story belong to the production, not to one draft: keep them.
+            bible = {k: v for k, v in bible.items() if k not in ("world", "saga")}
+            if world:
+                bible["world"] = world
+            if saga:
+                bible["saga"] = saga_mod.mark_revealed(saga, len(earlier) + 1)
             self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
         ev = (bible or {}).get("evaluation") or {}
         import studio_story_check as sc
         return {"chars": len(text), "scores": (bible or {}).get("scores"), "rewritten": (bible or {}).get("rewrite_used"),
                 "story_check": ev.get("status"), "verified_scores": sc.scores(ev), "unverified": ev.get("unverified", []),
                 "below_bar": ev.get("below_bar", []), "revision": ev.get("revision")}, cost
+
+    def story_world(self, project) -> Optional[dict]:
+        """The production's story world: its own, or the latest one of its series (built once, reused)."""
+        own = (project.get("story_bible") or {}).get("world")
+        if own and own.get("setting"):
+            return own
+        for ep in reversed(self.earlier_episodes(project)):
+            if (ep.get("world") or {}).get("setting"):
+                return ep["world"]
+        return None
+
+    def story_saga(self, project) -> Optional[dict]:
+        own = (project.get("story_bible") or {}).get("saga")
+        if own and own.get("premise"):
+            return own
+        for ep in reversed(self.earlier_episodes(project)):
+            if (ep.get("saga") or {}).get("premise"):
+                return ep["saga"]
+        return None
+
+    def _w(self, project, purpose: str) -> str:
+        """The world text for one department (cached for this job)."""
+        key = (project.get("id"), project.get("updated_at"))
+        cache = getattr(self, "_world_cache", None)
+        if not cache or cache[0] != key:
+            self._world_cache = cache = (key, self.story_world(project))
+        return wb.block(cache[1], purpose)
 
     def earlier_episodes(self, project) -> list[dict]:
         """The story bibles of the episodes before this one in its series,
@@ -209,6 +250,7 @@ class StudioWorker:
             raise JobFailed("content_blocked", "This script can't be made on Viyo. Please change it.")
         brief = {k: project.get(k) for k in ("title", "kind", "aspect_ratio", "visual_style", "target_seconds", "language",
                                              "story_bible")}
+        brief["world"] = self.story_world(project)
         brief["language"] = brief.get("language") or "English"
         data, cost = self.ai.breakdown(brief, script)
         chars = data.get("characters") or []
@@ -398,6 +440,9 @@ class StudioWorker:
         prompt = (f"Character reference portrait for a {project['genre'] or 'drama'} production. {ch['name']}: "
                   f"{ch['description']}. Waist-up, facing the camera, face fully visible, neutral studio background, "
                   f"soft even light. Style: {project['visual_style'] or 'cinematic, realistic'}. No text.")
+        if self._w(project, "characters"):
+            prompt += ("\nThe character belongs to this world (clothing, hair, adornment and manner from it):\n"
+                       + self._w(project, "characters"))
         data, mime, cost = self.ai.image(prompt, [], "9:16", _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "portrait", ext, data, mime, character_id=ch["id"])
@@ -448,7 +493,8 @@ class StudioWorker:
             costs.append(c0)
             self._optional_update("studio_characters", {"id": ch["id"]}, {"identity": identity})
         ch = dict(ch, identity=identity)
-        size, style = _size(project), project.get("visual_style") or ""
+        size, style = _size(project), (project.get("visual_style") or "") + (
+            "\n" + self._w(project, "characters") + self._w(project, "image") if self._w(project, "image") else "")
         anchor = self.files.get(anchor_path) if anchor_path and ident.ANCHOR not in order else None
         face = None
         made, failed = [], []
@@ -530,7 +576,9 @@ class StudioWorker:
             raise JobFailed("needs_front", "Make the character's front view first: outfits are made from it. "
                                            "Your credits were returned.")
         prompt = ident.outfit_prompt(ch["name"], ch.get("identity"), ch.get("description") or "",
-                                     project.get("visual_style") or "", outfit["name"], outfit.get("description") or "",
+                                     (project.get("visual_style") or "") + ("\n" + self._w(project, "characters")
+                                                                            if self._w(project, "characters") else ""),
+                                     outfit["name"], outfit.get("description") or "",
                                      outfit.get("parts"))
         # Only the clothes change: the approved front view is the reference,
         # and the identity and reference sheet are never re-made for an outfit.
@@ -549,7 +597,8 @@ class StudioWorker:
         if not cast:
             raise JobFailed("no_cast", "Add characters first. Your credits were returned.")
         scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
-        prompt = ident.outfit_suggest_prompt(project.get("script") or "", cast, scenes, project.get("visual_style") or "")
+        prompt = self._w(project, "characters") + ident.outfit_suggest_prompt(project.get("script") or "", cast, scenes,
+                                                                               project.get("visual_style") or "")
         items, cost = self.ai.suggest_outfits(prompt)
         by_name = {c["name"].strip().lower(): c for c in cast}
         existing = self.store.select("studio_outfits", {"project_id": project["id"]})
@@ -627,8 +676,8 @@ class StudioWorker:
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         if not (project.get("script") or "").strip() and not scenes:
             raise JobFailed("no_script", "Write the script first. Your credits were returned.")
-        data, cost = self.ai.extract_elements(world_mod.extract_prompt(project.get("script") or "", scenes, cast,
-                                                                        project.get("visual_style") or ""))
+        data, cost = self.ai.extract_elements(self._w(project, "image") + world_mod.extract_prompt(
+            project.get("script") or "", scenes, cast, project.get("visual_style") or ""))
         existing = self._elements(project)
         have = {(e["kind"], e["name"].strip().lower()): e for e in existing}
         made = 0
@@ -813,7 +862,7 @@ class StudioWorker:
         roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
         prompt = ident.scene_prompt(scene["visual"] or scene["heading"], entries, camera, project["visual_style"],
                                     project["aspect_ratio"], extra=(roles + "\n") if roles else "",
-                                    expressions=expressions, world=world_mod.world_block(location, props),
+                                    expressions=expressions, world=self._w(project, "image") + world_mod.world_block(location, props),
                                     continuity=continuity.image_block(before, scene),
                                     camera_text=continuity.of(scene).get("camera", "") if scene.get("camera") in (None, "", "auto") else "")
         if correction:
@@ -873,7 +922,7 @@ class StudioWorker:
         for label, data in self._world_files(location, props, room):
             images.append((f"reference: {label}", data))
         prev_seen = (((prev or {}).get("inspection") or {}).get("result") or {}).get("observed") if prev else None
-        text = inspect_mod.prompt(scene, prev, ident.cast_block(entries).splitlines(), world_mod.world_block(location, props),
+        text = inspect_mod.prompt(scene, prev, ident.cast_block(entries).splitlines(), self._w(project, "image") + world_mod.world_block(location, props),
                                   [label for label, _d in images], prev_seen, continuity.transition(prev, scene))
         result, cost = self.ai.inspect(text, images)
         rec = inspect_mod.record(result, sig, scene["image_path"], cost.total_usd)
@@ -980,7 +1029,7 @@ class StudioWorker:
         location, props = self._world(project, scene)
         block = ident.cast_block(entries, expressions)
         notes = (f"Characters (permanent identity: never change their face, hair, skin, height or build):\n{block}\n"
-                 if block else "") + world_mod.world_block(location, props)
+                 if block else "") + self._w(project, "video") + world_mod.world_block(location, props)
         lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
         style = f"Style: {project['visual_style'] or 'cinematic'}. "
         # Beginning, during and end of the clip, the camera, and what must not change.
@@ -1144,7 +1193,7 @@ class StudioWorker:
                      + json.dumps(prev["observed"], ensure_ascii=False)[:900])
         prompt = ident.scene_prompt(shot["frame_prompt"] or shot["description"], entries, camera, project["visual_style"],
                                     project["aspect_ratio"], extra=(roles + "\n") if roles else "",
-                                    world=world_mod.world_block(location, props),
+                                    world=self._w(project, "image") + world_mod.world_block(location, props),
                                     continuity=continuity.image_block(before, scene) + shots_mod.continuity_block(
                                         scene, shots, idx, (before or {}).get("continuity", {}).get("end_state", "")) + state,
                                     camera_text=shots_mod.camera_text(shot))
@@ -1201,7 +1250,7 @@ class StudioWorker:
         for label, data in self._world_files(location, props, shotcheck.MAX_IMAGES - len(images)):
             images.append((f"reference: {label}", data))
         text = shotcheck.prompt(scene, scene["position"] + 1, shot, idx, shots, prev,
-                                ident.cast_block(entries).splitlines(), world_mod.world_block(location, props),
+                                ident.cast_block(entries).splitlines(), self._w(project, "image") + world_mod.world_block(location, props),
                                 [label for label, _d in images])
         result, cost = self.ai.inspect(text, images)
         rec = inspect_mod.record(result, sig, shot["image_path"], cost.total_usd)
@@ -1475,7 +1524,7 @@ class StudioWorker:
                 # and the score isn't charged. The next render tries again.
                 track = None
                 try:
-                    track = self.make_music(project, sum(i.duration for i in inputs))
+                    track = self.make_music({**project, "_world": self.story_world(project)}, sum(i.duration for i in inputs))
                 except music_mod.MusicGenerationError as exc:
                     print(f"[INFO] studio job {job['id']}: film made without background music: {exc}")
                 if track:

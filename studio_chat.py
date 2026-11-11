@@ -61,6 +61,9 @@ ACTIONS = {
     "edit_shot": "free",         # data: scene, shot, and shot_type / camera_angle / camera_movement / duration_seconds / description
     "remake_shot_picture": "paid",   # data: scene, shot: a new opening picture of that one shot
     "remake_shot_video": "paid",     # data: scene, shot: a new clip of that one shot
+    "build_world": "paid",       # data: mode (grounded/alternate/fictional/modern), setting: research and build the story world
+    "correct_world": "free",     # data: field (e.g. material.clothing, avoid, setting.era), value, note: the creator's correction
+    "plan_saga": "paid",         # data: length_mode (episodes/seasons/open), count: plan the larger story before episodes
     "check_shots": "paid",       # data: scenes [numbers] (empty = every shot with a picture): shot-to-shot continuity check
     "fix_shot_picture": "paid",  # data: scene, shot, correction: a new picture of that one shot fixing what the check found
 }
@@ -69,7 +72,7 @@ PAID_JOB = {"develop_story": "script", "break_into_scenes": "breakdown", "find_p
             "suggest_outfits": "outfits", "make_character_sheet": "portrait", "record_voices": "voice",
             "make_place_object_picture": "element", "check_scenes": "inspect", "fix_scene_picture": "image",
             "plan_shots": "shotplan", "remake_shot_picture": "shot_image", "remake_shot_video": "shot_video",
-            "check_shots": "shot_inspect", "fix_shot_picture": "shot_image"}
+            "check_shots": "shot_inspect", "fix_shot_picture": "shot_image", "build_world": "world", "plan_saga": "saga"}
 
 _STR = {"type": "string"}
 CHAT_SCHEMA = {
@@ -92,6 +95,8 @@ CHAT_SCHEMA = {
                 "shot_type": {"type": "string", "enum": ["establishing_wide", "wide_two_shot", "medium", "close_up",
                                                          "extreme_close_up", "over_the_shoulder", "reaction", "pov", "insert"]},
                 "camera_angle": _STR, "camera_movement": _STR, "duration_seconds": {"type": "number"},
+                "mode": _STR, "setting": _STR, "field": _STR, "value": _STR, "note": _STR, "length_mode": _STR,
+                "count": {"type": "integer"},
                 "transition": {"type": "string", "enum": ["continuous", "same_place_cut", "new_place", "time_jump",
                                                           "flashback"]},
                 "dialogue": {"type": "array", "items": {"type": "object", "properties": {
@@ -203,6 +208,23 @@ Episode storytelling (hooks and cliffhangers):
 - To change the opening or ending, propose rewrite_scene for that scene (or write_screenplay if the creator asked for
   a rewrite). An approved script or plan is only changed when the creator applies a proposal.
 
+Story worlds, history and culture:
+- STORY WORLD (below) is the production's researched world: setting, society, manners, names, clothing, buildings,
+  technology, sounds, and FACTS labelled documented (with a source) / interpretation / invented / uncertain /
+  unsourced. Use it for every suggestion. Never default to American, European or modern life; never treat a
+  continent as one culture (a Rwandan story is not Nigerian; a Japanese story is not generic East Asian).
+- Keep the labels when you talk: say "historians document", "a reasonable interpretation is", "for the story we'd
+  invent", "this isn't known". Never present an invented or uncertain detail as history. If you don't know, say so.
+- The creator chooses historically grounded fiction, alternate history, a fictional world inspired by a culture, or
+  a modern setting; don't push strict accuracy on someone who wants invention. Ask ONE question if the choice matters.
+- When the creator corrects a cultural or historical assumption, propose correct_world (data.field, data.value,
+  data.note); corrections override everything. To build or rebuild the world propose build_world (data.mode,
+  data.setting) before writing a story set in a specific culture or period; for a series, plan_saga (data.length_mode
+  episodes / seasons / open, data.count) before episodes. Both are paid and show a price first.
+- When developing an idea (e.g. "a fictional prince in Rwanda around 1500"), help with the setting, the central
+  conflict, characters who feel real (history, fears, secrets, inner conflict), the larger storyline and seasons,
+  and the emotional direction; offer up to 3 alternatives and let the creator choose.
+
 Changes of mind and approved decisions:
 - MEMORY items are listed oldest first. When the creator changes the story, the newer statement wins: work from it,
   say which earlier facts, scenes, shots or pictures it affects, and suggest removing the outdated memory item.
@@ -262,6 +284,7 @@ Proposals (0 to 3, only when a concrete change would help now):
 - check_scenes: data.scenes. fix_scene_picture: data.scene, data.correction.
 - plan_shots: data.scenes. edit_shot / remake_shot_picture / remake_shot_video: data.scene and data.shot (numbers).
 - check_shots: data.scenes. fix_shot_picture: data.scene, data.shot, data.correction.
+- build_world: data.mode, data.setting. correct_world: data.field, data.value, data.note. plan_saga: data.length_mode, data.count.
 - develop_story, break_into_scenes, find_places_objects, suggest_outfits, make_cover, make_film: paid steps, data may
   be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -397,8 +420,8 @@ def _check_lines(r: dict, outdated: bool, approved: bool) -> list[str]:
 
 
 def _bible_block(bible: dict, script: str = "") -> list[str]:
-    if not bible:
-        return []
+    if not bible or not (bible.get("beats") or bible.get("logline") or bible.get("characters")):
+        return []          # a world or series plan alone isn't a story plan (shown on its own)
     approved = (bible.get("_assistant_approval") or {}).get("approved")
     out = [f"Story plan ({'approved by the creator' if approved else 'not approved yet'}):"]
     for k, label in (("logline", "Logline"), ("central_conflict", "Conflict"), ("stakes", "Stakes"),
@@ -532,7 +555,7 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
                     production: Optional[dict], jobs: list[dict], wearing: Optional[dict] = None,
                     issues: Optional[list] = None, focus: Optional[set] = None, question: str = "",
                     focus_names: Optional[set] = None, episodes: Optional[list] = None, renders: int = 0,
-                    audit: Optional[dict] = None) -> str:
+                    audit: Optional[dict] = None, world: Optional[tuple] = None) -> str:
     """What the assistant knows as fact: only what is saved, retrieved for the question."""
     import studio_identity as ident
     focus = set(focus or set())
@@ -552,6 +575,17 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
                 lines.append(f"    It ended on ({(e.get('end_technique') or 'ending').replace('_', ' ')}): {_short(e['ending'], 240)}")
             if not e.get("current") and e.get("open_questions"):
                 lines.append("    Left open: " + "; ".join(_short(q, 120) for q in e["open_questions"][:4]))
+    if world is not None:
+        import studio_saga
+        import studio_world
+        lines += studio_world.summary_lines(world[0])
+        lines += studio_saga.summary_lines(world[1])
+        if world[0] and scenes:
+            bad = [(i, c) for i, sc in enumerate(scenes[:120], start=1)
+                   for c in studio_world.check_text(" ".join([sc.get("visual") or "", sc.get("heading") or ""] +
+                                                             [d.get("text") or "" for d in sc.get("dialogue") or []]), world[0])]
+            for i, c in bad[:8]:
+                lines.append(f"WORLD CHECK scene {i}: {c['problem']} Fix: {c['fix']}")
     lines += _bible_block(p.get("story_bible") or {}, p.get("script") or "")
     lines.append(screenplay_block(p.get("script") or "", question, focus, names))
     if cast:

@@ -29,6 +29,15 @@ def wanted(project: dict) -> bool:
     return not project.get("music_path") and project.get("auto_music") is not False
 
 
+def _world_sound(project: dict) -> str:
+    """The story world's music and instruments (studio_world), so a 1500s Rwandan court doesn't get a synth score."""
+    import studio_world
+    world = (project.get("story_bible") or {}).get("world") or project.get("_world")
+    text = studio_world.block(world, "sound") if world else ""
+    return ("Musical world (use instruments and colours that belong to this place and time, as an original score): "
+            + " ".join(text.split())[:600] + " ") if text else ""
+
+
 def music_prompt(project: dict, film_seconds: float = 0) -> str:
     genre = (project.get("genre") or "cinematic drama").strip()[:80]
     logline = (project.get("logline") or project.get("title") or "an emotional story").strip()[:500]
@@ -37,6 +46,7 @@ def music_prompt(project: dict, film_seconds: float = 0) -> str:
         "Create an original, instrumental-only cinematic background score for a film. "
         "No vocals, no lyrics, no speech, and no sound effects. "
         f"Genre: {genre}. Story mood and context: {logline}. Visual atmosphere: {style}. "
+        + _world_sound(project) +
         "Use an emotionally coherent instrumental arrangement with a memorable but subtle "
         "original motif and gentle development. "
         + ("End so the music flows smoothly back into its opening, because it will repeat under a longer film. "

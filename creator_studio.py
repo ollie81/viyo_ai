@@ -1125,6 +1125,151 @@ async def creator_assistant_approve(project_id: str, body: AssistantApproveIn,
             "project": _project_out(p)}
 
 
+class WorldIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    mode: Literal["grounded", "alternate", "fictional", "modern"] = "grounded"
+    setting: str = Field("", max_length=300)       # e.g. "Rwanda, around 1500, a royal court"
+
+
+class WorldCorrection(BaseModel):
+    field: str = Field(..., min_length=3, max_length=80)     # e.g. "material.clothing", "avoid", "setting.era"
+    value: str = Field(..., min_length=1, max_length=600)
+    note: str = Field("", max_length=300)
+
+
+class SagaIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    mode: Literal["episodes", "seasons", "open"] = "open"
+    count: int = Field(0, ge=0, le=200)
+
+
+class Approve2(BaseModel):
+    approved: bool
+
+
+def _save_bible_part(p: dict, key: str, value) -> dict:
+    bible = dict(p.get("story_bible") or {})
+    bible[key] = value
+    get_store().update("studio_projects", {"id": p["id"]}, {"story_bible": bible, "updated_at": _now_iso()})
+    return bible
+
+
+def _paid_call(user_id: str, limit: int, fn, what: str):
+    """A synchronous paid AI step: hold, run, settle what was used; nothing if it fails."""
+    st = get_store()
+    hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": limit})
+    if not hold or not hold.get("ok"):
+        raise HTTPException(status_code=402, detail={"message": f"Not enough credits for {what}.", "balance": _balance(user_id)})
+    try:
+        out, cost = _ai_call(fn)
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": min(limit, max(1, cost.credits))})
+        return out
+    except HTTPException:
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
+        raise
+    except Exception as e:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
+        print(f"[WARN] studio {what}: {str(e)[:200]}")
+        raise HTTPException(status_code=502, detail=f"Viyo couldn't make {what} just now. You weren't charged.")
+
+
+@router.get("/projects/{project_id}/world")
+async def get_world(project_id: str, user_id: str = Depends(creator)):
+    """The story world and larger story (own, or the series'), their checks and prices."""
+    import studio_saga
+    import studio_world
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    w = StudioWorker(get_store(), get_files(), None, "generation")
+    world, saga = w.story_world(p), w.story_saga(p)
+    own = bool(((p.get("story_bible") or {}).get("world") or {}).get("setting"))
+    return {"world": world, "inherited": bool(world) and not own, "check": studio_world.evaluate(world),
+            "saga": saga, "saga_problems": studio_saga.problems(saga) if saga else [],
+            "modes": studio_world.MODES,
+            "prices": {"world": pricing.estimate_world(True).credits, "world_fictional": pricing.estimate_world(False).credits,
+                       "saga": pricing.estimate_saga().credits}}
+
+
+@router.post("/projects/{project_id}/world")
+async def build_world(project_id: str, body: WorldIn, user_id: str = Depends(creator)):
+    """Builds the story world once (a real place is researched with web search). Reused by every step after."""
+    import studio_world
+    p = _project(project_id, user_id)
+    _rate_limit(user_id)
+    idea = (p.get("logline") or p.get("title") or "").strip()
+    if not idea and not body.setting.strip():
+        raise HTTPException(status_code=409, detail="Describe your idea or the setting first.")
+    old = (p.get("story_bible") or {}).get("world") or {}
+    brief = {k: p.get(k) for k in ("title", "logline", "genre", "kind", "language")}
+    brief["setting"] = body.setting.strip()
+    world = _paid_call(user_id, pricing.estimate_world(body.mode != "fictional").credits,
+                       lambda: get_ai().build_world(brief, idea, body.mode, old.get("corrections") or []), "the story world")
+    if old.get("corrections"):
+        world["corrections"] = old["corrections"]          # the creator's corrections always survive a rebuild
+    _save_bible_part(p, "world", world)
+    return {"world": world, "check": studio_world.evaluate(world), "balance": _balance(user_id)}
+
+
+@router.post("/projects/{project_id}/world/correct")
+async def correct_world(project_id: str, body: WorldCorrection, user_id: str = Depends(creator)):
+    """The creator corrects the world (free). It overrides what the AI assumed, everywhere."""
+    import studio_world
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    world = StudioWorker(get_store(), get_files(), None, "generation").story_world(p)
+    if not world:
+        raise HTTPException(status_code=409, detail="Build the story world first.")
+    try:
+        world = studio_world.apply_correction(world, body.field, body.value, body.note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _save_bible_part(p, "world", world)
+    return {"world": world, "check": studio_world.evaluate(world)}
+
+
+@router.post("/projects/{project_id}/world/approve")
+async def approve_world(project_id: str, body: Approve2, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    world = (p.get("story_bible") or {}).get("world")
+    if not world:
+        raise HTTPException(status_code=409, detail="Build the story world first.")
+    _save_bible_part(p, "world", {**world, "approved": body.approved})
+    return {"ok": True, "approved": body.approved}
+
+
+@router.post("/projects/{project_id}/saga")
+async def plan_saga(project_id: str, body: SagaIn, user_id: str = Depends(creator)):
+    """Plans the larger story before episodes (length chosen by the creator)."""
+    import studio_saga
+    import studio_world
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    _rate_limit(user_id)
+    if not (p.get("logline") or p.get("title") or "").strip():
+        raise HTTPException(status_code=409, detail="Describe your idea first.")
+    w = StudioWorker(get_store(), get_files(), None, "generation")
+    world = w.story_world(p)
+    cast = [c["name"] for c in get_store().select("studio_characters", {"project_id": p["id"]})]
+    brief = {k: p.get(k) for k in ("title", "logline", "genre", "kind", "target_seconds", "language")}
+    length = {"mode": body.mode, "count": body.count}
+    saga = _paid_call(user_id, pricing.estimate_saga().credits,
+                      lambda: get_ai().plan_saga(brief, studio_world.block(world, "story"), length, cast), "the series plan")
+    _save_bible_part(p, "saga", saga)
+    return {"saga": saga, "problems": studio_saga.problems(saga), "balance": _balance(user_id)}
+
+
+@router.post("/projects/{project_id}/saga/approve")
+async def approve_saga(project_id: str, body: Approve2, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    saga = (p.get("story_bible") or {}).get("saga")
+    if not saga:
+        raise HTTPException(status_code=409, detail="Plan the larger story first.")
+    _save_bible_part(p, "saga", {**saga, "approved": body.approved})
+    return {"ok": True, "approved": body.approved}
+
+
 class StoryCheckIn(BaseModel):
     request_id: str = Field(..., min_length=8, max_length=80)
 
@@ -1161,6 +1306,7 @@ async def story_check(project_id: str, body: StoryCheckIn, user_id: str = Depend
     bible = dict(p.get("story_bible") or {})
     brief = {k: p.get(k) for k in ("title", "logline", "genre", "kind", "aspect_ratio", "target_seconds", "language")}
     try:
+        brief["world"] = StudioWorker(st, get_files(), None, "generation").story_world(p)
         previous = StudioWorker(st, get_files(), None, "generation").earlier_episodes(p)
         ev, cost = _ai_call(lambda: get_ai().story_check(brief, bible, script, previous))
         ev = {**ev, "source": "recheck", "request_id": body.request_id}
@@ -2077,7 +2223,8 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
     # here, not only in the client, so direct API calls cannot bypass review.
     if body.kind == "breakdown":
         bible = p.get("story_bible") or {}
-        if isinstance(bible, dict) and bible and not (bible.get("_assistant_approval") or {}).get("approved"):
+        if isinstance(bible, dict) and (bible.get("beats") or bible.get("logline")) and \
+                not (bible.get("_assistant_approval") or {}).get("approved"):
             raise HTTPException(status_code=409, detail={
                 "code": "story_approval_required",
                 "message": "Review and approve the story before creating cast and scenes."
@@ -2361,7 +2508,18 @@ def _chat_context(p: dict, message: str = "", focus: Optional[dict] = None, stat
     return studio_chat.project_context(p, s["cast"], s["outfits"], s["elements"], s["scenes"], _production_out(p),
                                        s["jobs"], wearing=wearing, issues=s["issues"], focus=set(focus.get("scenes") or []),
                                        question=message, focus_names=set(focus.get("characters") or []),
-                                       episodes=_episodes(p), renders=s["renders"], audit=s.get("audit"))
+                                       episodes=_episodes(p), renders=s["renders"], audit=s.get("audit"),
+                                       world=_world_and_saga(p))
+
+
+def _world_and_saga(p: dict) -> tuple:
+    from studio_worker import StudioWorker
+    try:
+        w = StudioWorker(get_store(), get_files(), None, "generation")
+        return w.story_world(p), w.story_saga(p)
+    except Exception as e:
+        print(f"[WARN] studio world for chat {p.get('id')}: {str(e)[:120]}")
+        return None, None
 
 
 def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
@@ -2723,6 +2881,10 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
                 raise HTTPException(status_code=409, detail="This suggestion has no screenplay text.")
             await update_project(p["id"], ProjectPatch(script=d["script"]), user_id)
             return "Screenplay saved."
+        if kind == "correct_world":
+            out = await correct_world(p["id"], WorldCorrection(field=d.get("field") or "", value=d.get("value") or "",
+                                                               note=d.get("note") or ""), user_id)
+            return f"Story world corrected: {d.get('field')}."
         if kind == "add_character":
             out = await add_character(p["id"], CharacterIn(name=d.get("name") or "", description=d.get("description") or ""), user_id)
             return f"{out['name']} added to the cast."
