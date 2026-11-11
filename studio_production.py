@@ -89,6 +89,9 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
         shots_by.setdefault(sh["scene_id"], []).append(sh)
     for i, s in enumerate(scenes, start=1):
         shots = sorted(shots_by.get(s["id"], []), key=lambda r: r["position"])
+        if studio_shots.uses_shots(s, shots) and studio_shots.plan_outdated(s, shots):
+            blocked.append(studio_shots.OUTDATED.format(n=i))
+            continue
         if studio_shots.uses_shots(s, shots):
             # A scene with an approved shot plan is made shot by shot (and its
             # voices once, if saved voices speak it); never a single clip it won't use.

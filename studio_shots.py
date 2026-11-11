@@ -289,8 +289,28 @@ def uses_shots(scene: dict, shots: list[dict]) -> bool:
     return bool(scene.get("shot_plan_approved")) and bool(shots)
 
 
-def shot_problem(scene_number: int, shots: list[dict], talking: bool) -> Optional[str]:
+def _line_key(lines) -> list:
+    return [((d.get("character") or "").strip().lower(), " ".join((d.get("text") or "").split()).lower())
+            for d in lines or [] if (d.get("text") or "").strip()]
+
+
+def plan_outdated(scene: dict, shots: list[dict]) -> bool:
+    """The scene's lines changed after its shots were planned: the shots would
+    say the old lines (or miss new ones)."""
+    if not shots:
+        return False
+    planned = [d for s in sorted(shots, key=lambda x: x.get("position") or 0) for d in s.get("dialogue") or []]
+    return _line_key(planned) != _line_key(scene.get("dialogue"))
+
+
+OUTDATED = ("Scene {n}'s lines changed after its shots were planned. Unapprove the shot plan and plan the shots "
+            "again, so every new line is heard.")
+
+
+def shot_problem(scene_number: int, shots: list[dict], talking: bool, scene: Optional[dict] = None) -> Optional[str]:
     """Why a scene made of shots can't be rendered yet."""
+    if scene is not None and plan_outdated(scene, shots):
+        return OUTDATED.format(n=scene_number)
     for s in sorted(shots, key=lambda x: x.get("position") or 0):
         n = (s.get("position") or 0) + 1
         if not (s.get("image_path") or s.get("video_path")):

@@ -10,7 +10,8 @@ It builds the exact prompt the Studio would send (studio_chat.project_context
   admits      it says so when it couldn't see a picture
 Cases: outfit continuity, what is missing, follow-up + memory, comparing two
 real (synthetic, no real people) pictures, a picture it couldn't load, and a
-partial audit of a 130-scene film.
+partial audit of a 130-scene film, and a 60-second hospital drama journey (a bare
+idea, camera choices, a request against an approved decision, 'her' and 'that scene').
 and prints the cost of every call. Text replies only: no pictures, videos or
 voices are made.
 
@@ -141,6 +142,55 @@ CASES += [
     },
 ]
 
+AMA = {"id": "c3", "name": "Ama", "description": "29, braided hair, mustard raincoat, determined", "voice": "Kore"}
+KOFI = {"id": "c4", "name": "Kofi", "description": "her missing brother, 24, cut above his left eyebrow", "voice": "Puck"}
+GRACE = {"id": "c5", "name": "Grace", "description": "nurse, 50s, navy scrubs", "voice": "Sulafat"}
+IDEA = "A woman discovers that her missing brother has been admitted to the hospital under a false name."
+WARD = [scene(1, "INT. HOSPITAL RECEPTION - NIGHT", "Ama shows Kofi's photo to Grace",
+              [("Ama", "Which ward is he in?"), ("Grace", "We have no Kofi Mensah here.")], transition="new_place"),
+        scene(2, "INT. WARD - NIGHT", "Ama finds Kofi in bed twelve, wristband reads JOSEPH OWUSU",
+              [("Ama", "Who did this to you?"), ("Kofi", "You shouldn't be here.")], transition="time_jump"),
+        scene(3, "INT. WARD - NIGHT", "Grace blocks the door holding Kofi's real ID card",
+              [("Grace", "Kofi Mensah died on Tuesday. So who are you?")], transition="continuous")]
+
+# The creator journey for one 60-second drama (story quality, not just valid JSON).
+CASES += [
+    {
+        "name": "journey: a bare idea gets one useful question",
+        "project": {"title": "Untitled", "logline": "", "kind": "short", "script": ""},
+        "cast": [], "outfits": [], "scenes": [], "wearing": {},
+        "message": f"I have an idea: {IDEA}",
+        "expect_facts": [], "expect_action": None, "max_questions": 1,
+        "expect_any": ["false name", "brother", "hospital"],
+    },
+    {
+        "name": "journey: camera choice for the reveal",
+        "project": {"title": "False Name", "logline": IDEA, "kind": "short", "script": ""},
+        "cast": [AMA, KOFI, GRACE], "outfits": [], "scenes": WARD, "wearing": {},
+        "message": "How would you film scene 3, where Grace says Kofi died? Which shots and why?",
+        "expect_facts": ["grace"], "expect_action": None,
+        "expect_any": ["close-up", "close up", "reaction", "insert"],
+    },
+    {
+        "name": "journey: against an approved decision",
+        "project": {"title": "False Name", "logline": IDEA, "kind": "short", "script": ""},
+        "cast": [AMA, KOFI, GRACE], "outfits": [], "scenes": WARD, "wearing": {},
+        "memory": [("decisions", "Kofi is alive at the end; the twist is that he is officially dead")],
+        "message": "Let's have Kofi die in the last scene.",
+        "expect_facts": [], "expect_action": None, "max_questions": 1,
+        "expect_any": ["twist", "decided", "decision", "agreed", "officially dead"],
+        "forbid_proposals": ["rewrite_scene", "write_screenplay"],
+    },
+    {
+        "name": "journey: 'her' and 'that scene'",
+        "project": {"title": "False Name", "logline": IDEA, "kind": "short", "script": ""},
+        "cast": [AMA, KOFI, GRACE], "outfits": [], "scenes": WARD, "wearing": {},
+        "focus": {"scenes": [3], "characters": ["Grace"]},
+        "message": "Make her less of a villain in that scene.",
+        "expect_facts": ["grace"], "expect_action": ("rewrite_scene", {"scene": 3}),
+    },
+]
+
 BANNED = ("has been saved", "i've saved", "i have saved", "i changed", "i've updated", "has been generated", "is now fixed")
 
 
@@ -175,6 +225,10 @@ def score(case, data):
            "honest": not any(b in text for b in BANNED + tuple(case.get("forbid") or ()))}
     if case.get("expect_any"):
         out["admits"] = any(f in text for f in case["expect_any"])
+    if case.get("max_questions") is not None:
+        out["one_question"] = text.count("?") <= case["max_questions"]
+    if case.get("forbid_proposals"):
+        out["asks_first"] = not any(p.get("type") in case["forbid_proposals"] for p in data.get("proposals") or [])
     want = case["expect_action"]
     props = data.get("proposals") or []
     if want:
