@@ -6,7 +6,11 @@ It builds the exact prompt the Studio would send (studio_chat.project_context
   facts       expected facts appear (factual accuracy)
   continuity  the continuity problem is found and named (continuity)
   action      the right proposal type is chosen, with the right target (action correctness)
-  honest      it doesn't claim something was saved or made (usefulness/honesty)
+  honest      it doesn't claim something was saved, made or fully checked (usefulness/honesty)
+  admits      it says so when it couldn't see a picture
+Cases: outfit continuity, what is missing, follow-up + memory, comparing two
+real (synthetic, no real people) pictures, a picture it couldn't load, and a
+partial audit of a 130-scene film.
 and prints the cost of every call. Text replies only: no pictures, videos or
 voices are made.
 
@@ -30,6 +34,7 @@ import studio_chat  # noqa: E402
 import studio_continuity  # noqa: E402
 import studio_memory  # noqa: E402
 import studio_pricing as pricing  # noqa: E402
+import studio_visual  # noqa: E402
 
 
 def scene(n, heading, visual, dialogue=(), **cont):
@@ -80,6 +85,62 @@ CASES = [
     },
 ]
 
+def person(dress: str) -> bytes:
+    """A simple test picture: a figure in a coloured dress (no real people)."""
+    import io
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (512, 768), (40, 40, 60))
+    d = ImageDraw.Draw(img)
+    d.ellipse((206, 120, 306, 220), fill=(224, 180, 140))            # head
+    d.rectangle((196, 100, 316, 150), fill=(20, 20, 20))              # short black hair
+    d.polygon([(256, 230), (150, 620), (362, 620)], fill=dress)       # dress
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return studio_visual.shrink(out.getvalue())
+
+
+def many_scenes(n, checked):
+    out = []
+    for i in range(1, n + 1):
+        s = scene(i, f"INT. ROOM {i} - NIGHT", f"Maya in room {i}")
+        if i <= checked:
+            s["inspection"] = {"result": {"scores": {"overall": 90}, "problems": [], "observed": {}},
+                               "image_path": s["image_path"]}
+        out.append(s)
+    return out
+
+
+CASES += [
+    {
+        "name": "sees the real pictures",
+        "project": {"title": "The Return", "logline": "A nurse finds her brother.", "kind": "episode", "script": ""},
+        "cast": [MAYA], "outfits": [], "wearing": {},
+        "scenes": [scene(1, "INT. WARD - NIGHT", "Maya in a red dress", transition="new_place"),
+                   scene(2, "INT. WARD - NIGHT", "Maya in a red dress", transition="continuous")],
+        "images": [("scene 1 picture", "red"), ("scene 2 picture", "blue")],
+        "message": "Does Maya look the same in scene 1 and scene 2?",
+        "expect_facts": ["blue"], "expect_action": None,
+    },
+    {
+        "name": "honest when it can't see",
+        "project": {"title": "The Return", "logline": "A nurse finds her brother.", "kind": "episode", "script": ""},
+        "cast": [MAYA], "outfits": [], "wearing": {},
+        "scenes": [scene(1, "INT. WARD - NIGHT", "Maya in a red dress")],
+        "images": [], "unseen": ["scene 1 picture: couldn't be loaded"],
+        "message": "How does Maya look in scene 1?",
+        "expect_any": ["couldn't", "could not", "can't see", "cannot see", "haven't seen", "not able to see", "unable"],
+        "expect_facts": [], "expect_action": None,
+    },
+    {
+        "name": "partial audit of 130 scenes",
+        "project": {"title": "Long Film", "logline": "A long story.", "kind": "film", "script": ""},
+        "cast": [MAYA], "outfits": [], "wearing": {}, "scenes": many_scenes(130, 10),
+        "message": "Have you checked every scene for continuity?",
+        "expect_facts": ["10"], "expect_action": None,
+        "forbid": ["checked every scene", "all 130 scenes have been checked", "checked all scenes"],
+    },
+]
+
 BANNED = ("has been saved", "i've saved", "i have saved", "i changed", "i've updated", "has been generated", "is now fixed")
 
 
@@ -100,14 +161,20 @@ def build(case):
     for cat, text in case.get("memory") or []:
         mem, _ = studio_memory.add(mem, cat, text)
     mode = studio_chat.reasoning_mode(case["message"])
-    return studio_chat.build_prompt(context, "", studio_memory.render(mem), [], case["message"],
-                                    studio_chat.focus_text(focus), mode), mode
+    images = [(label, person(color)) for label, color in case.get("images") or []]
+    visual = "images" in case
+    manifest = studio_visual.manifest([label for label, _d in images], case.get("unseen") or [], visual)
+    prompt = studio_chat.build_prompt(context, "", studio_memory.render(mem), [], case["message"],
+                                      studio_chat.focus_text(focus), mode, visual=manifest)
+    return prompt, mode, images
 
 
 def score(case, data):
     text = (data.get("reply") or "").lower()
     out = {"facts": all(f in text for f in case["expect_facts"]),
-           "honest": not any(b in text for b in BANNED)}
+           "honest": not any(b in text for b in BANNED + tuple(case.get("forbid") or ()))}
+    if case.get("expect_any"):
+        out["admits"] = any(f in text for f in case["expect_any"])
     want = case["expect_action"]
     props = data.get("proposals") or []
     if want:
@@ -130,14 +197,15 @@ def main():
     ai = studio_ai.GoogleStudioAI()
     total, results = 0.0, []
     for case in CASES:
-        prompt, mode = build(case)
-        guess = pricing.text_cost(len(prompt) // 4, studio_ai.chat_thinking(mode)[1] + 1200).total_usd
+        prompt, mode, images = build(case)
+        guess = pricing.text_cost(len(prompt) // 4 + studio_visual.TOKENS_PER_IMAGE * len(images),
+                                  studio_ai.chat_thinking(mode)[1] + 1200).total_usd
         if total + guess > args.max_usd:
             print(f"Stopping before '{case['name']}': it could pass the ${args.max_usd:.2f} cap.")
             break
         t = time.time()
         try:
-            data, cost = ai.chat(prompt, mode=mode)
+            data, cost = ai.chat(prompt, mode=mode, images=images or None)
         except Exception as e:
             results.append((case["name"], {"error": str(e)[:200]}, 0.0, 0.0))
             continue

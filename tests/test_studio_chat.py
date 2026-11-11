@@ -77,7 +77,8 @@ def test_memory_uses_a_summary_and_recent_messages_not_the_whole_history(chat, m
     monkeypatch.setattr(studio_chat, "SUMMARIZE_AFTER", 6)
     monkeypatch.setattr(studio_chat, "RECENT", 4)
     ai.chat_result = lambda p: {"reply": "Noted.", "proposals": [],
-                                "decisions": ["Make it an action movie"] if "action movie" in p.split("CREATOR: ")[-1] else []}
+                                "memory": [{"category": "decisions", "text": "Make it an action movie", "from_creator": True}]
+                                if "action movie" in p.split("CREATOR: ")[-1] else []}
     for i in range(6):
         assert say(client, u, pid, f"message number {i}" + (" I want this to be an action movie" if i == 1 else "")).status_code == 200
     last = ai.chat_prompts[-1]

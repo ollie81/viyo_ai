@@ -339,7 +339,7 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
-    def chat(self, prompt: str, mode: str = "quick"):
+    def chat(self, prompt: str, mode: str = "quick", images: Optional[list] = None):
         """One assistant reply (studio_chat): {reply, proposals, memory, focus}.
 
         The thinking depth follows the task (chat_thinking): the SDK's
@@ -350,9 +350,17 @@ class GoogleStudioAI:
         level, budget = chat_thinking(mode)
         model = os.environ.get("STUDIO_CHAT_MODEL") or pricing.TEXT_MODEL
 
+        contents = prompt
+        if images:   # real pictures from the production (studio_visual): labelled, then the text
+            contents = []
+            for i, (label, data) in enumerate(images, start=1):
+                contents.append(types.Part.from_text(text=f"Image {i}: {label}"))
+                contents.append(types.Part.from_bytes(data=data, mime_type=_mime(data)))
+            contents.append(types.Part.from_text(text=prompt))
+
         def call(thinking):
             return self.client.models.generate_content(
-                model=model, contents=prompt,
+                model=model, contents=contents,
                 config=types.GenerateContentConfig(
                     thinking_config=thinking, safety_settings=drama_safety(),
                     response_mime_type="application/json", response_json_schema=studio_chat.CHAT_SCHEMA))
@@ -608,10 +616,11 @@ class FakeStudioAI:
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
 
-    def chat(self, prompt, mode="quick"):
+    def chat(self, prompt, mode="quick", images=None):
         self.calls.append(("chat",))
         self.chat_prompts = getattr(self, "chat_prompts", []) + [prompt]
         self.chat_modes = getattr(self, "chat_modes", []) + [mode]
+        self.chat_images = getattr(self, "chat_images", []) + [[label for label, _d in images or []]]
         self._maybe_fail("chat")
         if getattr(self, "chat_result", None) is not None:
             r = self.chat_result

@@ -36,6 +36,7 @@ import studio_music as music_mod
 import studio_continuity as continuity
 import studio_memory
 import studio_inspect
+import studio_visual
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
@@ -2046,15 +2047,23 @@ def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
     return mem
 
 
-def _save_memory(p: dict, mem: dict) -> dict:
+def _save_memory(p: dict, mem: dict) -> bool:
+    """True only if the memory was really saved."""
     st = get_store()
     try:
         st.update("studio_projects", {"id": p["id"]}, {"assistant_memory": studio_memory.clean(mem)})
-    except Exception as e:      # creator_studio_assistant_memory.sql not run yet
+        return True
+    except Exception as e:      # e.g. creator_studio_assistant_memory.sql not run yet, or the database is down
         if hasattr(st, "conn"):
             st.conn.rollback()
         print(f"[WARN] studio assistant memory not saved for {p['id']}: {str(e)[:160]}")
-    return mem
+        return False
+
+
+def _saved_or_503(p: dict, mem: dict) -> dict:
+    if not _save_memory(p, mem):
+        raise HTTPException(status_code=503, detail="Viyo couldn't save the memory just now. Nothing was changed; try again.")
+    return _memory_out(mem)
 
 
 def _proposal_targets(p: dict, props: list) -> list:
@@ -2155,7 +2164,10 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
     if mine and mine["conversation_id"] != conv["id"]:
         raise HTTPException(status_code=409, detail="That message belongs to another chat.")
     mode = studio_chat.reasoning_mode(body.message)
-    limit = CHAT_HOLDS[mode]
+    visual = studio_visual.wants_visual(body.message)
+    if visual and mode == "quick":
+        mode = "story"
+    limit = CHAT_HOLDS["deep"] if visual else CHAT_HOLDS[mode]     # images cost a little more
     hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": limit})
     if not hold or not hold.get("ok"):
         raise HTTPException(status_code=402, detail={"message": "Not enough credits for the assistant.", "balance": _balance(user_id)})
@@ -2181,29 +2193,35 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         focus = studio_chat.resolve_focus(body.message, memory.get("focus"), len(state["scenes"]),
                                           [c["name"] for c in state["cast"]])
         project_memory = _memory_of(p, conv)
+        images, seen, unseen = [], [], []
+        if visual:   # real pictures from this (owner-checked) production
+            images, seen, unseen = studio_visual.gather(get_files(), state["scenes"], state["cast"], state["elements"],
+                                                        focus, body.message)
         prompt = studio_chat.build_prompt(_chat_context(p, body.message, focus, state), conv.get("summary") or "",
                                           studio_memory.render(project_memory), recent, body.message.strip(),
-                                          studio_chat.focus_text(focus), mode)
-        data, c2 = _ai_call(lambda: get_ai().chat(prompt, mode=mode))
-        if not isinstance(data, dict) or not str(data.get("reply") or "").strip():
-            raise ValueError("incomplete answer")
+                                          studio_chat.focus_text(focus), mode,
+                                          visual=studio_visual.manifest(seen, unseen, visual))
+        raw, c2 = _ai_call(lambda: get_ai().chat(prompt, mode=mode, images=images or None))
+        data = studio_chat.validate_reply(raw)        # malformed parts are dropped, never executed
+        if data["dropped"]:
+            print(f"[INFO] studio chat {p['id']}: dropped malformed {', '.join(data['dropped'])}")
         costs.append(c2)
         cost = pricing.combine(costs)
         credits = min(limit, max(1, cost.credits))
+        new_memory, added = studio_memory.apply_updates(project_memory, data["memory"], body.message)
+        memory_saved = _save_memory(p, new_memory) if added else True
+        text = data["reply"]
+        if not memory_saved and any(it["source"] == "creator" for it in added):
+            text += ("\n\n(I couldn't save this to the production's memory just now, so I may not remember it in "
+                     "another chat. Please tell me again later.)")
         reply = st.insert("studio_messages", [{
             "conversation_id": conv["id"], "project_id": p["id"], "owner_id": user_id, "role": "assistant",
-            "content": str(data.get("reply") or "").strip()[:20000], "proposals": _proposal_targets(p, studio_chat.clean_proposals(data.get("proposals"))),
+            "content": text[:20000], "proposals": _proposal_targets(p, studio_chat.clean_proposals(data["proposals"])),
             "credits": credits, "client_key": key + ":reply"}])[0]
-        new_decisions = [str(d).strip()[:300] for d in data.get("decisions") or [] if str(d).strip()]
-        updates = [u for u in data.get("memory") or [] if isinstance(u, dict)] + \
-            [{"category": "decisions", "text": d, "from_creator": True} for d in new_decisions]
-        _save_memory(p, studio_memory.apply_updates(project_memory, updates))
-        said = data.get("focus") if isinstance(data.get("focus"), dict) else {}
-        next_focus = {"scenes": [n for n in (said.get("scenes") or focus["scenes"]) if isinstance(n, int)][:6],
-                      "characters": [str(c) for c in (said.get("characters") or focus["characters"])][:6]}
+        said = data["focus"]
+        next_focus = {"scenes": said["scenes"] or focus["scenes"], "characters": said["characters"] or focus["characters"]}
         st.update("studio_conversations", {"id": conv["id"]}, {
-            "memory": {**memory, "decisions": ((memory.get("decisions") or []) + new_decisions)[-60:], "focus": next_focus},
-            "updated_at": _now_iso()})
+            "memory": {**memory, "focus": next_focus}, "updated_at": _now_iso()})
         st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": credits})
     except HTTPException:
         st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
@@ -2216,19 +2234,20 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         raise HTTPException(status_code=502, detail={"code": "assistant_failed", "message":
                             "The assistant couldn't answer just now. Try again; you weren't charged."})
     return {"message": _message_out(mine), "reply": _message_out(reply), "conversation_id": conv["id"],
-            "mode": mode, "balance": _balance(user_id)}
+            "mode": mode, "seen": seen, "not_seen": unseen, "memory_saved": memory_saved, "balance": _balance(user_id)}
 
 
 # ------------------------------------------------ assistant memory (the creator can see and correct it)
 
 class MemoryIn(BaseModel):
-    category: Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas"]
+    category: Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas", "assumptions"]
     text: str = Field(..., min_length=1, max_length=300)
 
 
 class MemoryPatch(BaseModel):
     text: Optional[str] = Field(None, min_length=1, max_length=300)
-    category: Optional[Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas"]] = None
+    category: Optional[Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas",
+                               "assumptions"]] = None
 
 
 def _memory_out(mem: dict) -> dict:
@@ -2248,7 +2267,7 @@ async def add_memory(project_id: str, body: MemoryIn, user_id: str = Depends(cre
     mem, item = studio_memory.add(_memory_of(p), body.category, body.text, "creator")
     if item is None:
         raise HTTPException(status_code=409, detail="That's already remembered.")
-    return _memory_out(_save_memory(p, mem))
+    return _saved_or_503(p, mem)
 
 
 @router.patch("/projects/{project_id}/assistant/memory/{item_id}")
@@ -2258,7 +2277,7 @@ async def edit_memory(project_id: str, item_id: str, body: MemoryPatch, user_id:
         mem = studio_memory.edit(_memory_of(p), item_id, body.text, body.category)
     except KeyError:
         raise HTTPException(status_code=404, detail="Not found.")
-    return _memory_out(_save_memory(p, mem))
+    return _saved_or_503(p, mem)
 
 
 @router.delete("/projects/{project_id}/assistant/memory/{item_id}")
@@ -2268,7 +2287,7 @@ async def forget_memory(project_id: str, item_id: str, user_id: str = Depends(cr
         mem = studio_memory.remove(_memory_of(p), item_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Not found.")
-    return _memory_out(_save_memory(p, mem))
+    return _saved_or_503(p, mem)
 
 
 def SUMMARY_WINDOW() -> int:
@@ -2383,6 +2402,29 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
     raise HTTPException(status_code=409, detail="This kind of suggestion can't be applied here.")
 
 
+_claims = __import__("threading").Lock()
+
+
+def _claim_proposal(m: dict, index: int, user_id: str) -> bool:
+    """Marks the suggestion as being applied, once: two taps at the same moment
+    can't both apply it (creator_studio_assistant_safety.sql)."""
+    st = get_store()
+    try:
+        return bool(st.rpc("studio_claim_proposal", {"p_message": m["id"], "p_owner": user_id, "p_index": index}))
+    except Exception as e:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        print(f"[WARN] studio_claim_proposal unavailable ({str(e)[:120]}); using a local lock")
+    with _claims:          # one server process: re-read and mark under a lock
+        fresh = _owned_message(m["id"], user_id)
+        props = list(fresh.get("proposals") or [])
+        if not 0 <= index < len(props) or props[index].get("status") != "proposed":
+            return False
+        props[index] = {**props[index], "status": "applying"}
+        st.update("studio_messages", {"id": m["id"]}, {"proposals": props})
+        return True
+
+
 @router.post("/assistant/messages/{message_id}/proposals/{index}/apply")
 async def apply_proposal(message_id: str, index: int, user_id: str = Depends(creator)):
     """The creator applies one suggestion. Free changes are saved now through
@@ -2399,6 +2441,8 @@ async def apply_proposal(message_id: str, index: int, user_id: str = Depends(cre
         raise HTTPException(status_code=409, detail={"code": "needs_price", "job": prop.get("job"),
                                                      "message": "This step costs credits: check the price first."})
     p = _project(m["project_id"], user_id)
+    if not _claim_proposal(m, index, user_id):
+        raise HTTPException(status_code=409, detail="This suggestion is already being applied or was already used.")
     try:
         result = await _apply(p, prop, user_id)
     except HTTPException as e:
