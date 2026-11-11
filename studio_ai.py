@@ -144,8 +144,10 @@ def _plan_cast(b: dict) -> str:
 
 
 def breakdown_prompt(b: dict, script: str) -> str:
+    import studio_world
     lang = b.get("language") or "English"
-    return _plan_cast(b) + f"""Break this screenplay into a shot list for an AI-made {b.get('kind')} ({b.get('aspect_ratio')}).
+    world = studio_world.block(b.get("world"), "characters") + studio_world.block(b.get("world"), "image")
+    return _plan_cast(b) + (world + "Every scene's look, clothing, objects and place follow this world.\n\n" if world else "") + f"""Break this screenplay into a shot list for an AI-made {b.get('kind')} ({b.get('aspect_ratio')}).
 Visual style: {b.get('visual_style') or 'cinematic, realistic'}.
 The production language is {lang}.
 You are the director and the continuity supervisor. FIRST read the whole screenplay as ONE continuous film: who is
@@ -328,6 +330,64 @@ class GoogleStudioAI:
             raise ProviderError(f"The story couldn't be written: {e}")
         return text, bible, pricing.text_cost(i, o)
 
+    def build_world(self, brief: dict, idea: str, mode: str, corrections: Optional[list] = None):
+        """The story world (studio_world). A real place is researched first with Google Search grounding
+        (its sources are kept); a fictional world isn't. If search isn't available the world is still built,
+        marked as not researched, and nothing is labelled documented without a source."""
+        import studio_world
+        from google.genai import types
+        tin = tout = searches = 0
+        research, sources = "", []
+        if mode != "fictional":
+            try:
+                resp = self._text(studio_world.research_prompt(brief, idea, mode),
+                                  tools=[types.Tool(google_search=types.GoogleSearch())])
+                i, o = self._text_usage(resp)
+                tin, tout, searches = tin + i, tout + o, 1
+                research = resp.text or ""
+                meta = getattr(resp.candidates[0], "grounding_metadata", None) if getattr(resp, "candidates", None) else None
+                for ch in (getattr(meta, "grounding_chunks", None) or [])[:20]:
+                    web = getattr(ch, "web", None)
+                    if web and getattr(web, "uri", None):
+                        sources.append({"title": getattr(web, "title", "") or "", "url": web.uri})
+            except Exception as e:
+                print(f"[INFO] studio world research skipped: {str(e)[:160]}")
+        resp = self._text(studio_world.world_prompt(brief, idea, mode, research, sources, corrections),
+                          response_mime_type="application/json", response_json_schema=studio_world.WORLD_SCHEMA)
+        i, o = self._text_usage(resp)
+        try:
+            raw = json.loads(resp.text)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned an unreadable story world.")
+        world = studio_world.clean_world(raw, mode, sources, researched=bool(research and sources))
+        cost = pricing.text_cost(tin + i, tout + o)
+        return world, pricing.combine([cost, pricing.search_cost(searches)])
+
+    def plan_saga(self, brief: dict, world_text: str, length: dict, cast: list):
+        """The larger story (studio_saga), sent back once if a showrunner would reject it."""
+        import studio_saga
+        prompt = studio_saga.prompt(brief, world_text, length, cast)
+        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=studio_saga.SCHEMA)
+        tin, tout = self._text_usage(resp)
+        try:
+            saga = studio_saga.clean(json.loads(resp.text), length)
+        except (TypeError, ValueError):
+            raise ProviderError("The AI returned an unreadable series plan.")
+        bad = studio_saga.problems(saga)
+        if bad:
+            resp = self._text(prompt + "\n\nYOUR PLAN HAS THESE PROBLEMS:\n" + "\n".join(f"- {b}" for b in bad) +
+                              "\nReturn it fixed:\n" + json.dumps(saga, ensure_ascii=False)[:12000],
+                              response_mime_type="application/json", response_json_schema=studio_saga.SCHEMA)
+            i, o = self._text_usage(resp)
+            tin, tout = tin + i, tout + o
+            try:
+                fixed = studio_saga.clean(json.loads(resp.text), length)
+                if len(studio_saga.problems(fixed)) <= len(bad):
+                    saga = fixed
+            except (TypeError, ValueError):
+                pass
+        return saga, pricing.text_cost(tin, tout)
+
     def story_check(self, brief: dict, plan: dict, script: str, previous: list):
         """The strict story check of an existing script (studio_story_check). Never rewrites it."""
         import studio_story
@@ -343,8 +403,10 @@ class GoogleStudioAI:
                 return json.loads(resp.text)
             except (TypeError, ValueError):
                 return {}
+        import studio_world
         ev = sc.check(j, brief, plan, script, studio_story._continuity(previous), bool(previous),
-                      studio_story.structure_checks(script, brief, previous))
+                      studio_story.structure_checks(script, brief, previous),
+                      world_text=studio_world.block(brief.get("world"), "story"))
         return ev, pricing.text_cost(tin, tout)
 
     def identity(self, name: str, description: str, context: str = ""):
@@ -607,6 +669,29 @@ class FakeStudioAI:
                 return
             raise err
 
+    def build_world(self, brief, idea, mode, corrections=None):
+        """world_result: a raw world (dict) or fn(brief, idea, mode) -> dict; default: a small generic one."""
+        import studio_world
+        self.calls.append(("build_world", mode))
+        self.world_prompts = getattr(self, "world_prompts", []) + [studio_world.world_prompt(brief, idea, mode, "", [], corrections)]
+        self._maybe_fail("build_world")
+        r = getattr(self, "world_result", None)
+        raw = (r(brief, idea, mode) if callable(r) else r) if r is not None else {
+            "setting": {"country": "Testland", "place": "a river town", "era": "today", "year": 2025, "summary": "A town."},
+            "facts": [], "unknown": [], "avoid": []}
+        sources = getattr(self, "world_sources", []) if mode != "fictional" else []
+        return studio_world.clean_world(raw, mode, sources, researched=bool(sources)), \
+            pricing.combine([pricing.text_cost(6000, 3000), pricing.search_cost(1 if sources else 0)])
+
+    def plan_saga(self, brief, world_text, length, cast):
+        import studio_saga
+        self.calls.append(("plan_saga",))
+        self.saga_prompts = getattr(self, "saga_prompts", []) + [studio_saga.prompt(brief, world_text, length, cast)]
+        self._maybe_fail("plan_saga")
+        r = getattr(self, "saga_result", None)
+        raw = (r(brief, length) if callable(r) else r) if r is not None else {"premise": "A story.", "main_storyline": "x"}
+        return studio_saga.clean(raw, length), pricing.text_cost(5000, 4000)
+
     def story_check(self, brief, plan, script, previous):
         """story_fns' json function judges (tests); otherwise story_check_result (raw judge answer)."""
         import studio_story
@@ -615,8 +700,10 @@ class FakeStudioAI:
         self._maybe_fail("story_check")
         fns = getattr(self, "story_fns", None)
         j = (lambda p, s: fns[1](p, s)[0]) if fns else (lambda p, s: getattr(self, "story_check_result", {}))
+        import studio_world
         ev = sc.check(j, brief, plan, script, studio_story._continuity(previous), bool(previous),
-                      studio_story.structure_checks(script, brief, previous))
+                      studio_story.structure_checks(script, brief, previous),
+                      world_text=studio_world.block(brief.get("world"), "story"))
         return ev, pricing.text_cost(4000, 1500)
 
     def develop_script(self, brief, previous):

@@ -31,9 +31,11 @@ import re
 from typing import Optional
 
 CRITERIA = ("opening_hook", "progression", "emotion", "suspense", "dialogue", "scene_relevance", "ending_hook", "continuity")
+WORLD_CRITERIA = ("authenticity", "immersion")      # only when the production has a story world
 LABELS = {"opening_hook": "Opening hook", "progression": "Story progression", "emotion": "Emotional engagement",
           "suspense": "Suspense", "dialogue": "Dialogue", "scene_relevance": "Every scene matters",
-          "ending_hook": "Ending cliffhanger", "continuity": "Continues the last episode"}
+          "ending_hook": "Ending cliffhanger", "continuity": "Continues the last episode",
+          "authenticity": "True to its world and time", "immersion": "You feel you're there"}
 THRESHOLD = {"opening_hook": 8, "ending_hook": 8, "continuity": 8}      # the rest: 7
 WHERE = {"opening_hook": "first", "ending_hook": "last", "continuity": "first"}
 MIN_QUOTE_WORDS = 3
@@ -48,9 +50,9 @@ SCHEMA = {
             "quote": {"type": "string", "description": "Words copied EXACTLY from the screenplay (at least 4 words) "
                                                        "that show what you judged. Never paraphrase."},
             "scene": {"type": "integer", "description": "The number of the scene the quote is from."},
-            "reason": {"type": "string"}}, "required": ["score", "quote", "scene", "reason"]} for k in CRITERIA}},
+            "reason": {"type": "string"}}, "required": ["score", "quote", "scene", "reason"]} for k in CRITERIA + WORLD_CRITERIA}},
         "weak": {"type": "array", "items": {"type": "object", "properties": {
-            "area": {"type": "string", "enum": list(CRITERIA)},
+            "area": {"type": "string", "enum": list(CRITERIA + WORLD_CRITERIA)},
             "scene": {"type": "integer", "description": "The scene with the problem (0 if it's the whole episode)."},
             "problem": {"type": "string"}, "fix": {"type": "string", "description": "A concrete rewrite instruction."}},
             "required": ["area", "scene", "problem", "fix"]}},
@@ -119,18 +121,18 @@ def _spoken(quote: str, script: str) -> bool:
     return any(q and q in _norm(text) for _who, text in studio_story.screenplay_lines(script))
 
 
-def required(has_previous: bool) -> list[str]:
-    return [k for k in CRITERIA if k != "continuity" or has_previous]
+def required(has_previous: bool, has_world: bool = False) -> list[str]:
+    return [k for k in CRITERIA if k != "continuity" or has_previous] + (list(WORLD_CRITERIA) if has_world else [])
 
 
-def verify(raw, script: str, has_previous: bool, checks: Optional[list] = None) -> dict:
+def verify(raw, script: str, has_previous: bool, checks: Optional[list] = None, has_world: bool = False) -> dict:
     """The model's judgement, verified against the screenplay."""
     raw = raw if isinstance(raw, dict) else {}
     got = raw.get("scores") if isinstance(raw.get("scores"), dict) else {}
     secs = sections(script)
     last = len(secs) - 1
     cats = {}
-    for k in required(has_previous):
+    for k in required(has_previous, has_world):
         v = got.get(k)
         if not isinstance(v, dict) or not isinstance(v.get("score"), (int, float)) or isinstance(v.get("score"), bool):
             cats[k] = {"status": "missing", "why": "The check gave no score for this."}
@@ -159,7 +161,7 @@ def verify(raw, script: str, has_previous: bool, checks: Optional[list] = None) 
         cats[k] = item
     weak = []
     for w in raw.get("weak") or []:
-        if isinstance(w, dict) and w.get("area") in CRITERIA:
+        if isinstance(w, dict) and w.get("area") in CRITERIA + WORLD_CRITERIA:
             sc = w.get("scene") if isinstance(w.get("scene"), int) and 1 <= w.get("scene") <= len(secs) else 0
             weak.append({"area": w["area"], "scene": sc, "problem": str(w.get("problem") or "")[:300],
                          "fix": str(w.get("fix") or "")[:300]})
@@ -209,14 +211,14 @@ def improved(before: dict, after: dict, targets: list[str]) -> tuple[bool, str]:
     return True, ", ".join(LABELS.get(k, k).lower() for k in fixed) + " improved"
 
 
-def evaluation_prompt(brief: dict, plan: dict, script: str, continuity: str, retry: bool = False) -> str:
+def evaluation_prompt(brief: dict, plan: dict, script: str, continuity: str, retry: bool = False, world_text: str = "") -> str:
     hp = plan.get("hook_plan") or {}
     numbered = "\n\n".join(f"[SCENE {i}]\n{s}" for i, s in enumerate(sections(script), start=1))
     return f"""You are the head of story at a short-drama studio deciding whether this episode is ready for
 viewers. Judge the FINAL screenplay below, exactly as written. A plan or an intention earns nothing: only what the
 scenes actually show and say counts.
 
-{continuity}WHAT THE WRITERS PLANNED (check whether the screenplay really delivers it):
+{world_text}{continuity}WHAT THE WRITERS PLANNED (check whether the screenplay really delivers it):
 - Opening ({hp.get('opening_technique', '')}): {hp.get('opening_moment', '')}
 - Ending ({hp.get('ending_technique', '')}): {hp.get('ending_moment', '')}
 Format: {brief.get('kind')} of about {int(brief.get('target_seconds') or 90)} seconds; genre {brief.get('genre') or 'drama'}.
@@ -234,7 +236,7 @@ screenplay, at least 4 words, never paraphrased. Quotes are checked against the 
 - scene_relevance: is any scene filler? Name it in weak if so.
 - ending_hook: quote the LAST scene. Does the final moment leave a question the viewer needs answered, grown from the story?
 {'- continuity: quote SCENE 1. Does it pick up the previous episode' + "'" + 's actual ending, keep who knows what, and not re-explain?' if continuity else '- continuity: leave it out (first episode).'}
-A 9-10 means a viewer could not stop watching; 5 means forgettable. List each weak area with its scene number and a
+{('- authenticity: quote a line or action. Do the speech, manners, names, objects and customs belong to THIS world and time (above)? Anything that did not exist yet, or comes from another culture, scores low.' + chr(10) + '- immersion: quote the moment that best puts us there (what we see, hear, touch). Decoration that serves nothing does not count.' + chr(10)) if world_text else ''}A 9-10 means a viewer could not stop watching; 5 means forgettable. List each weak area with its scene number and a
 concrete fix, and the viewer's questions after the last moment.{chr(10) + 'YOUR LAST ANSWER COULD NOT BE VERIFIED: copy the quotes letter for letter from the screenplay.' if retry else ''}"""
 
 
@@ -286,12 +288,15 @@ def target_scenes(script: str, weak: list[dict]) -> list[int]:
     return sorted(out)
 
 
-def check(j, brief: dict, plan: dict, script: str, continuity: str, has_previous: bool, structure: list) -> dict:
+def check(j, brief: dict, plan: dict, script: str, continuity: str, has_previous: bool, structure: list,
+          world_text: str = "") -> dict:
     """One verified check; asked again once if the quotes couldn't be verified."""
-    ev = verify(j(evaluation_prompt(brief, plan, script, continuity), SCHEMA), script, has_previous, structure)
+    w = bool(world_text)
+    ev = verify(j(evaluation_prompt(brief, plan, script, continuity, world_text=world_text), SCHEMA), script, has_previous,
+                structure, w)
     if ev["status"] == "incomplete":
-        again = verify(j(evaluation_prompt(brief, plan, script, continuity, retry=True), SCHEMA), script, has_previous,
-                       structure)
+        again = verify(j(evaluation_prompt(brief, plan, script, continuity, retry=True, world_text=world_text), SCHEMA),
+                       script, has_previous, structure, w)
         again["retried"] = True
         if len(again["unverified"]) <= len(ev["unverified"]):
             ev = again
@@ -299,7 +304,7 @@ def check(j, brief: dict, plan: dict, script: str, continuity: str, has_previous
 
 
 def improve(j, brief: dict, plan: dict, script: str, ev: dict, continuity: str, has_previous: bool,
-            structure_fn, hook_rule: str) -> tuple[str, dict]:
+            structure_fn, hook_rule: str, world_text: str = "") -> tuple[str, dict]:
     """At most one targeted revision of a weak (complete) episode."""
     if ev["status"] != "needs_work":
         return script, ev
@@ -315,13 +320,14 @@ def improve(j, brief: dict, plan: dict, script: str, ev: dict, continuity: str, 
     numbers = target_scenes(script, weak) or list(range(1, len(sections(script)) + 1))
     record = {"attempted": True, "areas": targets, "scenes": numbers, "whole": numbers == list(range(1, len(sections(script)) + 1))}
     try:
-        out = j(revision_prompt(script, weak, numbers, continuity, hook_rule), REVISION_SCHEMA)
+        out = j(revision_prompt(script, weak, numbers, world_text + continuity, hook_rule), REVISION_SCHEMA)
         reps = {int(s["number"]): s["text"] for s in (out or {}).get("scenes") or []
                 if isinstance(s, dict) and isinstance(s.get("number"), int) and s["number"] in numbers}
         new = splice(script, reps) if reps else None
         if not new:
             return script, {**ev, "revision": {**record, "kept": False, "why": "The rewrite didn't return proper scenes."}}
-        ev2 = verify(j(evaluation_prompt(brief, plan, new, continuity), SCHEMA), new, has_previous, structure_fn(new))
+        ev2 = verify(j(evaluation_prompt(brief, plan, new, continuity, world_text=world_text), SCHEMA), new, has_previous,
+                     structure_fn(new), bool(world_text))
         ok, why = improved(ev, ev2, targets)
         if not ok:
             return script, {**ev, "revision": {**record, "kept": False, "why": f"Not kept: {why}."}}

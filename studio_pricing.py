@@ -279,3 +279,24 @@ def estimate_inspection(images: int = 5) -> Cost:
 def estimate_shotplan(scene_chars: int = 1500) -> Cost:
     """The director planning one scene's shots (one text call, capped thinking)."""
     return text_cost(2200 + scene_chars // 3, THINKING_BUDGET + 1400)
+
+
+SEARCH_USD = 0.035        # one Google Search grounded request (approximate, after the free allowance)
+
+
+def search_cost(searches: int) -> Cost:
+    """Web-search grounding used when a real place and period is researched (once per world)."""
+    return Cost("google", "search", {"searches": searches}, round(SEARCH_USD * searches, 5))
+
+
+def estimate_world(researched: bool = True) -> Cost:
+    """Building a story world: one research call with web search (real places), one structuring call."""
+    parts = [text_cost(2500, THINKING_BUDGET + 4000)]
+    if researched:
+        parts += [text_cost(1500, THINKING_BUDGET + 3500), search_cost(1)]
+    return combine(parts)
+
+
+def estimate_saga() -> Cost:
+    """Planning the larger story: one call, sent back at most once."""
+    return text_cost(2 * 5000, 2 * (THINKING_BUDGET + 5000))
