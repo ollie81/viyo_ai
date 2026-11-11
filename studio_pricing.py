@@ -303,6 +303,9 @@ def estimate_saga() -> Cost:
     return text_cost(2 * 5000, 2 * (THINKING_BUDGET + 5000))
 
 
-def estimate_listen(seconds: float = 15) -> Cost:
-    """The AI listening to one talking clip's sound (about 32 audio tokens a second) to check its dialogue."""
-    return text_cost(1500 + int(32 * max(1.0, seconds)), THINKING_BUDGET + 700)
+def estimate_listen(seconds: float = 15, video: bool = False) -> Cost:
+    """The AI listening to one talking clip's sound (about 32 audio tokens a second) to check its dialogue; with
+    the picture (about 300 tokens a second) it also watches the lip sync. Up to three short approved recordings
+    of the characters (about 600 tokens) are sent with it."""
+    per = 332 if video else 32
+    return text_cost(2100 + int(per * max(1.0, seconds)), THINKING_BUDGET + 900)

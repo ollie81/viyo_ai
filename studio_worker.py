@@ -33,6 +33,7 @@ import studio_world as wb
 import studio_saga as saga_mod
 import studio_voice as voice_mod
 import studio_fal as fal_mod
+import studio_voice_fix as voice_fix
 from studio_store import Files, Store, new_path
 
 NARRATOR_VOICE = "Charon"
@@ -103,10 +104,17 @@ class StudioWorker:
         t.start()
         try:
             output, cost = self.handle(job)
-            credits = min(cost.credits, int(job["estimated_credits"])) if job["kind"] not in ("script", "breakdown", "outfits") \
-                else cost.credits
+            # A handler may charge less than it spent (a voice fix that didn't work is not charged); the
+            # usage record keeps what was really spent.
+            billable = output.pop("_billable", None) if isinstance(output, dict) else None
+            billable = billable or cost
+            credits = min(billable.credits, int(job["estimated_credits"])) if job["kind"] not in ("script", "breakdown", "outfits") \
+                else billable.credits
+            usage = cost.usage()
+            if billable is not cost and isinstance(usage, dict):
+                usage = {**usage, "charged_usd": round(billable.total_usd, 5)}
             self.store.rpc("studio_complete_job", {"p_job_id": job["id"], "p_lease": job["lease"], "p_output": output,
-                                                   "p_credits": credits, "p_usage": cost.usage()})
+                                                   "p_credits": credits, "p_usage": usage})
         except JobFailed as e:
             print(f"[INFO] studio job {job['id']} ({job['kind']}) failed: {e.code}: {e.message}")
             self._fail(job, e.code, e.message, e.retry, e.absorbed)
@@ -292,11 +300,15 @@ class StudioWorker:
         return voice_mod.for_provider(provider, lines, voices, project.get("language") or "English",
                                       self._hides(project), is_narrator)
 
-    def _voice_check(self, project, data: bytes, lines: list, cast: list):
-        """Checks a talking clip's sound: ffmpeg (sound present, silent, clipping) and an AI that listens
-        (which lines were said, by whom, language, naturalness, clarity). Returns (verdict, cost or None)."""
+    LISTEN_VIDEO_BYTES = 18 * 1024 * 1024     # larger clips are listened to as sound only (Gemini's inline limit)
+
+    def _voice_check(self, project, data: bytes, lines: list, cast: list, refs: Optional[dict] = None):
+        """Checks a talking clip's voices. Viyo's own measurements (ffmpeg: sound present, silent, too quiet,
+        clipping, when speech is heard; the transcript's words against the script; each line's pitch against the
+        character's approved recordings) and an AI that listens to and watches the clip (who speaks, naturalness,
+        feeling, pronunciation, lip sync). Returns (verdict, cost or None, 16 kHz mono WAV bytes or None)."""
         tech = {"has_audio": False}
-        audio = None
+        audio, measures = None, {}
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "clip.mp4")
             with open(src, "wb") as f:
@@ -315,22 +327,128 @@ class StudioWorker:
                     tech["silent"] = tech["mean_db"] is not None and tech["mean_db"] < -50
                     tech["clipping"] = tech["peak_db"] is not None and tech["peak_db"] >= -0.1
                     wav = os.path.join(tmp, "a.wav")
-                    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000", wav],
-                                   check=True, timeout=120)
+                    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000",
+                                    "-c:a", "pcm_s16le", wav], check=True, timeout=120)
                     with open(wav, "rb") as f:
                         audio = f.read()
+                    measures.update(voice_fix.speech_spans(wav))
+                    measures["expected_seconds"] = round(speech_seconds(lines), 2) if lines else None
             except Exception as e:
                 print(f"[INFO] studio voice check: couldn't read the clip's sound: {str(e)[:120]}")
-        heard, cost = None, None
-        if audio and not tech.get("silent") and getattr(self.ai, "listen", None) is not None:
-            try:
-                raw, cost = self.ai.listen(voice_mod.listen_prompt(lines, self.story_voices(project, cast),
-                                                                    project.get("language") or "English"), audio)
-                heard = voice_mod.clean_listen(raw, len(lines))
-            except Exception as e:
-                self._rollback()
-                print(f"[INFO] studio voice check: listening failed: {str(e)[:120]}")
-        return voice_mod.verdict(tech, heard, lines), cost
+            heard, cost = None, None
+            if audio and not tech.get("silent") and getattr(self.ai, "listen", None) is not None:
+                watch = len(data) <= self.LISTEN_VIDEO_BYTES
+                refs = refs or {}
+                try:
+                    raw, cost = self.ai.listen(voice_mod.listen_prompt(lines, self.story_voices(project, cast),
+                                                                        project.get("language") or "English",
+                                                                        refs.get("labels"), with_video=watch),
+                                               audio, video=data if watch else None, references=refs.get("audio"))
+                    heard = voice_mod.clean_listen(raw, len(lines))
+                    measures["watched"] = watch
+                except Exception as e:
+                    self._rollback()
+                    print(f"[INFO] studio voice check: listening failed: {str(e)[:120]}")
+            if heard is not None and audio:
+                try:
+                    samples, rate = voice_fix.read_wav(os.path.join(tmp, "a.wav"))
+                    lp = {}
+                    for x in heard["lines"]:
+                        if x.get("end"):
+                            hz = voice_fix.pitch_hz(samples[int(x["start"] * rate):int(x["end"] * rate)], rate)
+                            if hz:
+                                lp[x["index"]] = round(hz, 1)
+                    measures["line_pitch"] = lp
+                except Exception as e:
+                    print(f"[INFO] studio voice check: couldn't measure pitch: {str(e)[:120]}")
+                measures["ref_pitch"] = (refs or {}).get("pitch") or {}
+        check = voice_fix.evaluate(tech, heard, lines, measures)
+        if heard is not None:
+            check["times"] = {str(x["index"]): [x["start"], x["end"]] for x in heard["lines"] if x.get("end")}
+        return check, cost, audio
+
+    # ------------------------------------------------------------ approved voice recordings
+
+    def voice_refs(self, project) -> dict:
+        """Each character's approved recordings, this episode's first, then earlier episodes' (by name)."""
+        out: dict = {}
+        for sb in [project.get("story_bible") or {}] + list(reversed(self.earlier_episodes(project))):
+            for k, rows in (sb.get("voice_refs") or {}).items():
+                if isinstance(rows, list):
+                    out.setdefault(k, [])
+                    out[k] += [r for r in rows if isinstance(r, dict) and r.get("path")]
+        return out
+
+    def _ref_audio(self, project, lines) -> dict:
+        """The recordings sent with a check (one per speaking character, at most three) and each one's pitch."""
+        refs = self.voice_refs(project)
+        labels, audio, pitch = [], [], {}
+        for k, rows in refs.items():          # every character's pitch, so the wrong speaker can be recognised
+            calm = [r for r in rows if not r.get("emotive")] or rows
+            hz = [r["pitch_hz"] for r in calm if r.get("pitch_hz")]
+            if hz:
+                pitch[k] = round(sorted(hz)[len(hz) // 2], 1)
+        for k in dict.fromkeys(voice_mod.key(d.get("character") or "") for d in lines):
+            rows = refs.get(k) or []
+            calm = [r for r in rows if not r.get("emotive")] or rows
+            if calm and len(audio) < 3:
+                try:
+                    audio.append((calm[0].get("character") or k, self.files.get(calm[0]["path"])))
+                    labels.append(f"reference {len(audio)}: {(calm[0].get('character') or k).upper()}")
+                except Exception:
+                    self._rollback()
+        return {"labels": labels, "audio": audio, "pitch": pitch}
+
+    def save_voice_refs(self, owner_id, project, wav: Optional[bytes], lines: list, check: dict, source: str,
+                        scene_id: Optional[str] = None) -> int:
+        """Keeps short recordings of each character from a clip whose voices passed (or the creator approved):
+        at most 3 per character, one per scene. Returns how many were added."""
+        if not wav or not (check or {}).get("times"):
+            return 0
+        bible = dict(project.get("story_bible") or {})
+        refs = {k: list(v) for k, v in (bible.get("voice_refs") or {}).items()}
+        added = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "a.wav")
+            with open(src, "wb") as f:
+                f.write(wav)
+            samples, rate = voice_fix.read_wav(src)
+            for i, d in enumerate(lines):
+                t = check["times"].get(str(i))
+                k = voice_mod.key(d.get("character") or "")
+                have = refs.get(k, [])
+                if not t or not k or is_narrator(d.get("character") or "") or len(have) >= 3 or \
+                        any(r.get("scene_id") == scene_id and scene_id for r in have):
+                    continue
+                if any(p["kind"] in voice_fix.HARD and i in p.get("lines", []) for p in check.get("problems") or []):
+                    continue
+                a, b = float(t[0]), min(float(t[1]), float(t[0]) + 6.0)
+                if b - a < 0.8:
+                    continue
+                seg = samples[int(a * rate):int(b * rate)]
+                hz = voice_fix.pitch_hz(seg, rate)
+                if not hz:
+                    continue
+                import io
+                import wave
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(seg.tobytes())
+                path = new_path(owner_id, project["id"], "voice_ref", "wav")
+                self.files.put(path, buf.getvalue(), "audio/wav")
+                have.append({"character": d.get("character"), "path": path, "seconds": round(b - a, 2),
+                             "pitch_hz": round(hz, 1), "emotion": d.get("emotion") or "", "emotive": voice_fix.emotive(d),
+                             "scene_id": scene_id, "source": source, "at": _now()})
+                refs[k] = have
+                added += 1
+        if added:
+            bible["voice_refs"] = refs
+            self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
+            project["story_bible"] = bible
+        return added
 
     def _w(self, project, purpose: str) -> str:
         """The world text for one department (cached for this job)."""
@@ -1069,14 +1187,9 @@ class StudioWorker:
         rec, cost = self._inspect_scene(project, scene, cast)
         return {"overall": rec["result"]["scores"].get("overall"), "problems": len(inspect_mod.errors(rec["result"]))}, cost
 
-    def do_voice(self, job, project):
-        scene = self._scene(job, project)
-        if scene_speech(scene, project) == "video_model":
-            raise JobFailed("spoken_in_video", "The characters speak this scene's lines inside the video, so no separate "
-                                               "voice recording is needed. Your credits were returned.")
-        lines = [d for d in scene["dialogue"] if (d.get("text") or "").strip()]
-        if not lines:
-            raise JobFailed("no_dialogue", "This scene has no lines to voice.")
+    def _speak_lines(self, job, project, lines):
+        """Every line in its character's saved voice, joined. Returns (m4a bytes, seconds, line timings,
+        [(voice, character or None, style)], cost)."""
         cast = {c["name"].strip().lower(): c for c in self.store.select("studio_characters", {"project_id": project["id"]})}
         # Work out every line's voice before spending anything. A character
         # keeps its saved voice; a bad or missing one stops the job (credits
@@ -1121,7 +1234,17 @@ class StudioWorker:
                 t += secs + 0.25
             with open(out, "rb") as f:
                 data = f.read()
-        total = pricing.voice_cost(seconds_total)
+        return data, dur, timings, voices, pricing.voice_cost(seconds_total)
+
+    def do_voice(self, job, project):
+        scene = self._scene(job, project)
+        if scene_speech(scene, project) == "video_model":
+            raise JobFailed("spoken_in_video", "The characters speak this scene's lines inside the video, so no separate "
+                                               "voice recording is needed. Your credits were returned.")
+        lines = [d for d in scene["dialogue"] if (d.get("text") or "").strip()]
+        if not lines:
+            raise JobFailed("no_dialogue", "This scene has no lines to voice.")
+        data, dur, timings, voices, total = self._speak_lines(job, project, lines)
         path = self._save(job, project, "audio", "m4a", data, "audio/mp4", scene_id=scene["id"], duration_seconds=round(dur, 2))
         self.store.update("studio_scenes", {"id": scene["id"]}, {"audio_path": path, "audio_seconds": round(dur, 2),
                                                                  "updated_at": _now()})
@@ -1147,21 +1270,29 @@ class StudioWorker:
                 frame = None
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         data, cost, references, backup_used, entries = self._clip(job, project, scene, frame, cast)
+        data, cost, billable, voice, backup_used = self._finish_talking(job, project, scene, data, cost, cast, frame,
+                                                                        backup_used)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
-                          duration_seconds=cost.units.get("video_seconds"))
+                          duration_seconds=self._kept_seconds(data, cost, voice))
         self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
         if scene.get("lipsync_path"):   # a new clip needs new lip sync (the old file is kept)
             self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
         labels = [label for label, _d in references or []] or (["the scene picture"] if frame else [])
         if backup_used:
             labels = ["the scene picture"]
-        voice = self._after_talking(project, scene, data, cast)
         if voice:
-            cost = pricing.combine([cost, voice.pop("_cost")]) if voice.get("_cost") else cost
-            voice.pop("_cost", None)
             scene = dict(scene, made_with={**(scene.get("made_with") or {}), "_voice": voice})
+            if voice.get("status") == "passed" or voice.get("status") == "fixed":
+                self.save_voice_refs(job["owner_id"], project, voice.pop("_wav", None), self._spoken(scene),
+                                     voice["check"], "auto", scene["id"])
+            voice.pop("_wav", None)
         self._made_with(scene, entries, labels)
-        return {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}, cost
+        out = {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}
+        if voice:
+            out["voice"] = voice.get("status")
+            if voice.get("recovery"):
+                out["voice_recovery"] = voice["recovery"]
+        return {**out, "_billable": billable}, cost
 
 
     def _clip(self, job, project, scene, frame, cast, direction=None, seconds=None):
@@ -1193,10 +1324,11 @@ class StudioWorker:
             scene_text = f"{scene['visual'] or scene['heading']}. {notes} {style}{direction}"
             tail = " No subtitles, captions, text or watermarks. Do not add music."
 
-            def talking_prompt(provider):
+            def talking_prompt(provider, fixes=""):
+                # Corrections from a failed voice check go beside the dialogue; the lines themselves never change.
                 d = self._dialogue(provider, project, lines, cast)
                 self._last_voice = {"provider": provider, "limitations": d["limitations"], "speakers": d["speakers"]}
-                return voice_mod.video_prompt(provider, scene_text, d["text"] + tail)
+                return voice_mod.video_prompt(provider, scene_text, d["text"] + (" " + fixes if fixes else "") + tail)
             prompt = talking_prompt("omni")
             self._talking_prompt = talking_prompt
             references = self._references(scene, entries, frame, camera, expressions, (location, props))
@@ -1225,6 +1357,7 @@ class StudioWorker:
         talking = bool(lines) and scene_speech(scene, project) == "video_model"
         if not talking:
             self._talking_prompt, self._last_voice = None, None
+        self._clip_args = (seconds, references)
         backup_used = None
         try:
             data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
@@ -1532,19 +1665,23 @@ class StudioWorker:
                                         "plan or split the scene. Your credits were returned.")
         data, cost, refs, backup, _e = self._clip(job, project, shot_scene, frame, cast, direction=direction,
                                                   seconds=seconds)
+        data, cost, billable, voice, backup = self._finish_talking(job, project, shot_scene, data, cost, cast, frame,
+                                                                   backup)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
-                          duration_seconds=cost.units.get("video_seconds"))
+                          duration_seconds=self._kept_seconds(data, cost, voice))
         self.store.update("studio_shots", {"id": shot["id"]}, {"video_path": path, "status": "ready", "updated_at": _now()})
-        voice = self._after_talking(project, shot_scene, data, cast)
         out = {"path": path, **({"model": backup} if backup else {})}
         if voice:
-            if voice.get("_cost"):
-                cost = pricing.combine([cost, voice["_cost"]])
-            voice.pop("_cost", None)
+            if voice.get("status") in ("passed", "fixed"):
+                self.save_voice_refs(job["owner_id"], project, voice.pop("_wav", None), self._spoken(shot_scene),
+                                     voice["check"], "auto", scene["id"])
+            voice.pop("_wav", None)
             self._optional_update("studio_shots", {"id": shot["id"]}, {"made_with": {**(shot.get("made_with") or {}),
                                                                                   "_voice": voice}})
-            out["voice"] = (voice.get("check") or {}).get("status")
-        return out, cost
+            out["voice"] = voice.get("status")
+            if voice.get("recovery"):
+                out["voice_recovery"] = voice["recovery"]
+        return {**out, "_billable": billable}, cost
 
     @staticmethod
     def _film_edit(scene, scenes, spoken_in_clip) -> dict:
@@ -1601,19 +1738,169 @@ class StudioWorker:
             lines=(), video_audio=talking or not has_lines,
             sfx=tuple(x for x in (scene.get("sfx") or []) if isinstance(x, str)))
 
-    def _after_talking(self, project, scene_like, data, cast) -> Optional[dict]:
-        """The voice record of a talking clip: which provider spoke it, its limits, and its sound check."""
+    @staticmethod
+    def _kept_seconds(data, cost, voice):
+        if voice and voice.get("recovery"):          # several clips were made: the kept one's own length
+            return ai_mod._probe_seconds(data) or cost.units.get("video_seconds")
+        return cost.units.get("video_seconds")
+
+    @staticmethod
+    def _spoken(scene_like) -> list:
+        return [d for d in scene_like.get("dialogue") or [] if (d.get("text") or "").strip()]
+
+    def _finish_talking(self, job, project, scene_like, data, cost, cast, frame, backup_used):
+        """A talking clip's voices: checked, and when they're wrong, fixed automatically with the cheapest fix
+        that can work (see studio_voice_fix), within a limit of tries and money. Only the clip being fixed is
+        made again, never the rest of the episode. Returns (clip, actual cost, cost to charge, voice record or
+        None, backup model or None). The creator is charged for the first clip and its check, and for a fix only
+        when it worked (STUDIO_VOICE_FIX_BILLING=all: every fix), never above the price they were shown."""
         lv = getattr(self, "_last_voice", None)
-        if not lv:
-            return None
-        lines = [d for d in scene_like.get("dialogue") or [] if (d.get("text") or "").strip()]
-        rec = {**lv, "at": _now()}
-        if project.get("auto_inspect") is not False:
-            check, c = self._voice_check(project, data, lines, cast)
-            rec["check"] = check
-            rec["_cost"] = c
         self._last_voice = None
-        return rec
+        if not lv:
+            return data, cost, cost, None, backup_used
+        lines = self._spoken(scene_like)
+        rec = {**lv, "at": _now()}
+        self._fix_costs = []
+        if project.get("auto_inspect") is False:
+            return data, cost, cost, rec, backup_used
+        refs = self._ref_audio(project, lines)
+        check, c, wav = self._voice_check(project, data, lines, cast, refs)
+        first_cost = pricing.combine([cost, c])
+        kept = {"data": data, "check": check, "wav": wav, "provider": lv["provider"], "cost": None}
+        attempts, spent, stopped, made = [], 0.0, "", 0
+        lang = project.get("language") or "English"
+        seconds, references = getattr(self, "_clip_args", (None, None))
+        seconds = seconds or 8
+        talking_prompt = getattr(self, "_talking_prompt", None)
+        if not voice_fix.needs_fix(check):
+            stopped = "" if check.get("status") in ("passed", "unchecked") else \
+                "This kind of problem isn't fixed automatically, because a new clip rarely helps."
+        elif not voice_fix.enabled():
+            stopped = "Automatic voice fixes are switched off."
+        elif (job.get("input") or {}).get("voice_fix") is False:
+            stopped = "There weren't enough credits for an automatic fix."
+        else:
+            backups = [b for b in fal_mod.models() if fal_mod.usable(b, True, lang)]
+            steps = voice_fix.ladder(check, lv["provider"], backups, self.lipsync is not None, frame is not None)
+            text = " ".join(d.get("text") or "" for d in lines)
+            listen_usd = pricing.estimate_listen(seconds, video=True).total_usd
+            for step in steps:
+                if kept["check"].get("status") == "passed":
+                    break
+                paid = step["step"] != "clean"
+                est = voice_fix.step_cost(step, seconds, lang, text)
+                if paid and made >= voice_fix.max_attempts():
+                    stopped = "The limit of automatic fixes was reached."
+                    break
+                if paid and spent + (est.total_usd if est else 0) + listen_usd > voice_fix.max_usd():
+                    attempts.append({"step": step["step"], "provider": step["provider"], "ran": False,
+                                     "skipped": "over the cost limit",
+                                     "estimate_usd": round(est.total_usd, 4) if est else 0})
+                    stopped = "The next fix would cost more than the limit for one clip."
+                    continue
+                made += paid
+                try:
+                    new, new_cost = self._voice_fix_step(step, job, project, kept, lines, frame, seconds, references,
+                                                         talking_prompt,
+                                                         voice_fix.corrections(kept["check"], lines,
+                                                                               self.story_voices(project, cast), lang))
+                except (ai_mod.PolicyBlocked, ai_mod.ProviderError, ai_mod.ProviderBusy, fal_mod.BackupFailed,
+                        JobFailed) as e:
+                    self._rollback()
+                    attempts.append({"step": step["step"], "provider": step["provider"], "ran": True,
+                                     "status": "error", "error": str(e)[:160], "cost_usd": 0})
+                    continue
+                chk, c2, wav2 = self._voice_check(project, new, lines, cast, refs)
+                if c2 is not None:
+                    self._fix_costs.append(c2)
+                a_cost = pricing.combine([new_cost, c2])
+                spent += a_cost.total_usd
+                a = {"step": step["step"], "provider": step["provider"], "ran": True, "status": chk["status"],
+                     "problems": [p["kind"] for p in chk["problems"]], "cost_usd": round(a_cost.total_usd, 4)}
+                attempts.append(a)
+                print(f"[INFO] studio job {job['id']}: voice fix {step['step']} ({step['provider']}): {chk['status']}")
+                if voice_fix.rank(chk) > voice_fix.rank(kept["check"]):
+                    kept = {"data": new, "check": chk, "wav": wav2, "cost": a_cost, "attempt": a,
+                            "provider": step["provider"] if step["step"] in ("retry", "switch") else kept["provider"]}
+            if not stopped and kept["check"].get("status") != "passed":
+                stopped = "No other automatic fix is available for this clip."
+        costs = [first_cost] + [x for x in getattr(self, "_fix_costs", [])]
+        self._fix_costs = []
+        actual = pricing.combine(costs)
+        if voice_fix.charge_all():
+            billable = actual
+        elif kept.get("cost") is not None and kept["check"].get("status") == "passed":
+            billable = pricing.combine([first_cost, kept["cost"]])
+        else:
+            billable = first_cost
+        rec.update(voice_fix.outcome(check, kept["check"], attempts, stopped))
+        rec["check"] = kept["check"]
+        rec["provider"] = kept["provider"]
+        if attempts:
+            rec["first_check"] = {"status": check["status"], "problems": check["problems"]}
+            rec["recovery"] = {"attempts": attempts, "original_usd": round(first_cost.total_usd, 4),
+                               "recovery_usd": round(actual.total_usd - first_cost.total_usd, 4),
+                               "charged_usd": round(billable.total_usd, 4),
+                               "absorbed_usd": round(max(0.0, actual.total_usd - billable.total_usd), 4)}
+            if (kept.get("attempt") or {}).get("step") == "saved":
+                rec["limitation"] = ("The clip's own voices couldn't be fixed, so the saved character voices were "
+                                     "used and the mouths re-synced. The clip's background sound was replaced too.")
+        if kept["provider"] not in ("omni", "tts", None) and kept["provider"] in fal_mod.MODELS:
+            backup_used = kept["provider"]
+        rec["_wav"] = kept.get("wav")
+        self._last_voice = None
+        return kept["data"], actual, billable, rec, backup_used
+
+    def _voice_fix_step(self, step, job, project, kept, lines, frame, seconds, references, talking_prompt, fixes):
+        """One automatic fix. Returns (new clip bytes, cost or None). Every cost is also kept in _fix_costs so the
+        actual spend is recorded even for a fix that is thrown away."""
+        self._fix_costs = getattr(self, "_fix_costs", [])
+        kind = step["step"]
+        if kind == "clean":
+            with tempfile.TemporaryDirectory() as tmp:
+                src, out = os.path.join(tmp, "in.mp4"), os.path.join(tmp, "out.mp4")
+                with open(src, "wb") as f:
+                    f.write(kept["data"])
+                render._run(["ffmpeg", "-y", "-v", "error", "-i", src, "-c:v", "copy", "-af",
+                             "afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", out],
+                            "cleaning up the voices")
+                return open(out, "rb").read(), None
+        if kind in ("retry", "switch"):
+            if talking_prompt is None:
+                raise JobFailed("no_prompt", "This clip can't be made again automatically.")
+            prompt = talking_prompt(step["provider"], fixes)
+            if step["provider"] in fal_mod.MODELS:
+                if not frame:
+                    raise JobFailed("no_picture", "Another video model needs the scene picture.")
+                data, cost = fal_mod.generate(step["provider"], prompt, frame, project["aspect_ratio"], seconds, True)
+            else:
+                data, cost = self.ai.video(prompt, frame, project["aspect_ratio"], seconds, references) if references \
+                    else self.ai.video(prompt, frame, project["aspect_ratio"], seconds)
+            self._fix_costs.append(cost)
+            return data, cost
+        if self.lipsync is None:
+            raise JobFailed("not_ready", "Lip sync isn't switched on.")
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = new_path(job["owner_id"], project["id"], "voicefix", "mp4")
+            self.files.put(clip, kept["data"], "video/mp4")
+            parts = []
+            if kind == "saved":
+                audio, _dur, _t, _v, tts_cost = self._speak_lines(job, project, lines)
+                self._fix_costs.append(tts_cost)
+                parts.append(tts_cost)
+            else:                                   # resync: the clip's own sound, mouths re-synced
+                src, out = os.path.join(tmp, "in.mp4"), os.path.join(tmp, "a.m4a")
+                with open(src, "wb") as f:
+                    f.write(kept["data"])
+                render._run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-c:a", "aac", out], "taking the sound")
+                audio = open(out, "rb").read()
+            sound = new_path(job["owner_id"], project["id"], "voicefix", "m4a")
+            self.files.put(sound, audio, "audio/mp4")
+            urls = self.files.sign([clip, sound], 3600)
+            data, ls_cost, _gid = self.lipsync.run("video", urls[clip], urls[sound])
+            self._fix_costs.append(ls_cost)
+            parts.append(ls_cost)
+            return data, pricing.combine(parts)
 
     def _video_backup(self, job, project, prompt, frame, seconds, talking, audio, refused, prompt_for=None):
         """Google refused the video: try the backup models (fal.ai) from the

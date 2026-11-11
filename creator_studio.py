@@ -1954,6 +1954,48 @@ async def accept_shot_continuity(shot_id: str, body: AcceptContinuity, user_id: 
     return {"ok": True, "continuity_check": studio_shot_continuity.report(ins, sh["image_path"])}
 
 
+def _approve_voice(row: dict, table: str, user_id: str, lines: list, scene_id: str) -> dict:
+    """The creator keeps a talking clip's voices as they are. Its lines become approved recordings of each
+    character (later clips are compared with them)."""
+    import subprocess
+    import tempfile
+    from studio_worker import StudioWorker
+    rec = dict((row.get("made_with") or {}).get("_voice") or {})
+    if not rec or not row.get("video_path"):
+        raise HTTPException(status_code=409, detail="This clip's voices haven't been checked yet.")
+    p = _project(row["project_id"], user_id)
+    added = 0
+    if (rec.get("check") or {}).get("times"):
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                src, wav = os.path.join(tmp, "c.mp4"), os.path.join(tmp, "a.wav")
+                get_files().get_to(row["video_path"], src)
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-ac", "1", "-ar", "16000",
+                                "-c:a", "pcm_s16le", wav], check=True, timeout=120)
+                added = StudioWorker(get_store(), get_files(), None, "generation").save_voice_refs(
+                    user_id, p, open(wav, "rb").read(), lines, rec["check"], "creator", scene_id)
+        except Exception as e:
+            print(f"[WARN] approving voices: couldn't keep the recordings: {str(e)[:160]}")
+    rec.update(status="approved", needs_approval=False, approved_at=_now_iso(),
+               message="You approved these voices." + (" They're now the reference for later clips." if added else ""))
+    get_store().update(table, {"id": row["id"]}, {"made_with": {**(row.get("made_with") or {}), "_voice": rec}})
+    return {"ok": True, "voice_check": rec, "references_added": added}
+
+
+@router.post("/scenes/{scene_id}/voice/approve")
+async def approve_scene_voice(scene_id: str, user_id: str = Depends(creator)):
+    s = _owned("studio_scenes", scene_id, user_id)
+    lines = [d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
+    return _approve_voice(s, "studio_scenes", user_id, lines, s["id"])
+
+
+@router.post("/shots/{shot_id}/voice/approve")
+async def approve_shot_voice(shot_id: str, user_id: str = Depends(creator)):
+    sh = _owned_shot(shot_id, user_id)
+    lines = [d for d in sh.get("dialogue") or [] if (d.get("text") or "").strip()]
+    return _approve_voice(sh, "studio_shots", user_id, lines, sh["scene_id"])
+
+
 @router.get("/projects/{project_id}/continuity-memory")
 async def continuity_memory(project_id: str, user_id: str = Depends(creator)):
     """The production's structured continuity memory: characters, places, props,
@@ -2155,9 +2197,11 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
                 return pricing.estimate_video(15), ("This scene has too much dialogue for one video clip "
                                                     "(15 seconds at most). Split it into two scenes.")
             main = with_backup(secs, True)
-            # The talking clip's sound is listened to after it's made (included here; only what runs is charged).
-            return (pricing.combine([main, pricing.estimate_listen(secs)]) if p.get("auto_inspect") is not False
-                    else main), None
+            # The talking clip is listened to and watched after it's made, with room for one automatic voice fix
+            # (included here; only what runs and works is charged).
+            return (pricing.combine([main, pricing.estimate_listen(secs, video=True),
+                                     _voice_reserve(p, target, secs, bool(target.get("image_path")))])
+                    if p.get("auto_inspect") is not False else main), None
         return with_backup(target.get("duration_seconds") or 8.0, False), None
     if kind == "lipsync":
         from studio_worker import needs_lipsync, speech_seconds
@@ -2208,7 +2252,8 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
             cost = pricing.estimate_video(secs)
             from studio_worker import scene_speech
             if target.get("dialogue") and scene_speech(scene, p) == "video_model" and p.get("auto_inspect") is not False:
-                cost = pricing.combine([cost, pricing.estimate_listen(secs)])
+                cost = pricing.combine([cost, pricing.estimate_listen(secs, video=True),
+                                        _voice_reserve(p, target, secs, True)])
         if not scene.get("shot_plan_approved"):
             return cost, "Approve the scene's shot plan first."
         if target.get("approved_at"):
@@ -2290,6 +2335,33 @@ def _portrait_opts(views: list[str], outfit_id: Optional[str], user_id: str) -> 
     return {"views": ident.view_order(views)} if views else {}
 
 
+def _voice_reserve(p: dict, target: dict, secs: float, has_frame: bool):
+    """Room for one automatic voice fix of a talking clip (None when fixes are off)."""
+    import studio_voice_fix
+    text = " ".join(d.get("text") or "" for d in target.get("dialogue") or [])
+    return studio_voice_fix.reserve(secs, p.get("language") or "English", text, has_frame)
+
+
+def _voice_reserve_credits(kind: str, p: dict, t: dict) -> int:
+    """How many of an item's credits are the voice-fix room (so a creator short of it can still start the clip)."""
+    if kind not in ("video", "shot_video") or p.get("auto_inspect") is False or not (t.get("dialogue") or []):
+        return 0
+    from studio_worker import scene_speech, speech_clip_seconds, talks_in_video
+    if kind == "video":
+        if not talks_in_video(dict(t, mode="video"), p):
+            return 0
+        secs, frame = speech_clip_seconds(t), bool(t.get("image_path"))
+    else:
+        scene = get_store().one("studio_scenes", {"id": t["scene_id"]}) or {}
+        if scene_speech(scene, p) != "video_model":
+            return 0
+        secs, frame = studio_shots.clip_seconds(t), True
+    if secs is None:
+        return 0
+    r = _voice_reserve(p, t, secs, frame)
+    return r.credits if r else 0
+
+
 def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = None) -> list[dict]:
     cast = get_store().select("studio_characters", {"project_id": p["id"]}) if kind in ("image", "voice") else []
     items = []
@@ -2298,7 +2370,7 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
         items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover", "elements") else t["id"],
                       **({"scene_id": t.get("scene_id")} if kind in ("shot_image", "shot_video", "shot_inspect") else {}),
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
-                      "blocked": reason})
+                      "blocked": reason, **({"voice_fix_credits": vr} if (vr := _voice_reserve_credits(kind, p, t)) else {})})
     if kind == "inspect":
         ready = 0
         for it in items:
@@ -2316,7 +2388,11 @@ async def estimate(project_id: str, body: EstimateRequest, user_id: str = Depend
         {"auto_fix": body.auto_fix} if body.kind == "shot_image" else None
     items = _quote(body.kind, p, body.target_ids, opts)
     ready = [i for i in items if not i["blocked"]]
+    fix = sum(i.get("voice_fix_credits", 0) for i in ready)
     note = "Text steps hold a little extra and return what isn't used." if body.kind in ("script", "breakdown", "outfits") \
+        else (f"Includes room for one automatic voice fix ({fix} credits) if a talking clip's voices come out wrong. "
+              "It's only charged if a fix is needed and works; unused credits are returned straight away."
+              if fix else None) if body.kind in ("video", "shot_video") \
         else ("Each picture is checked against the shot before it and the approved references. The price includes "
               "one corrected picture if the check finds a real mistake; you're only charged for what is made."
               if body.kind == "shot_image" and p.get("auto_inspect") is not False and body.auto_fix else None)
@@ -2380,6 +2456,11 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
             "p_max_open": 30 + MAX_AUDIT if body.kind in ("inspect", "shot_inspect") else 30}
         try:
             r = st.rpc("studio_create_job", args)
+            if r and not r.get("ok") and r.get("error") == "insufficient_credits" and item.get("voice_fix_credits"):
+                # Not enough for the voice-fix room: make the clip anyway, without automatic fixes.
+                args = {**args, "p_credits": item["credits"] - item["voice_fix_credits"],
+                        "p_input": {**(args["p_input"] or {}), "voice_fix": False}}
+                r = st.rpc("studio_create_job", args)
         except Exception as e:
             if args["p_lane"] != "inspect":
                 raise

@@ -242,6 +242,8 @@ Voices (you are the voice director):
 - VOICE CHECK lines report clips whose sound failed (lines missing, wrong voice, wrong language, extra speech) or
   need work. Name the exact line, then offer: remake that clip only (remake_video / remake_shot_video), or switch
   that scene to saved voices. To change a voice, propose edit_voice (data.character, data.field, data.value).
+  Viyo already tries automatic voice fixes (voice fix lines say what was tried); don't propose the same remake again
+  unless the creator wants another try, and never promise that a fix will make the voice identical.
 
 Changes of mind and approved decisions:
 - MEMORY items are listed oldest first. When the creator changes the story, the newer statement wins: work from it,
@@ -605,9 +607,11 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
             for i, sc in enumerate(scenes[:120], start=1):
                 v = (sc.get("made_with") or {}).get("_voice") or {}
                 chk = v.get("check") or {}
-                if chk.get("status") in ("failed", "needs_work"):
+                if chk.get("status") in ("failed", "needs_work") and v.get("status") != "approved":
                     lines.append(f"VOICE CHECK scene {i} ({(v.get('provider') or '').upper()}): {chk['status'].upper()} – "
                                  + "; ".join(x["problem"] for x in chk.get("problems") or [])[:300])
+                if v.get("recovery"):
+                    lines.append(f"  voice fix scene {i}: {v.get('message', '')[:240]}")
                 for lim in (v.get("limitations") or [])[:1]:
                     lines.append(f"  voice limit scene {i}: {lim}")
         if world[0] and scenes:

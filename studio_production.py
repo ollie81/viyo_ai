@@ -97,8 +97,14 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
                                  "kind": "shot_image", "input": {}})
         if scene.get("mode") == "video":
             secs = max(3, min(15, int(float(scene.get("duration_seconds") or 6) / k + 0.999) + 2))
+            clip = pricing.estimate_video(secs)
+            if any((d.get("text") or "").strip() for d in scene.get("dialogue") or []) and \
+                    scene_speech(scene, p) == "video_model" and p.get("auto_inspect") is not False:
+                # Talking shots: their voice check and room for one automatic voice fix (only used if needed).
+                clip = pricing.combine([clip, pricing.estimate_listen(secs, video=True),
+                                        cs._voice_reserve(p, scene, secs, True)])
             stages["videos"].append({"target_id": f"reserve-{scene['id']}", "label": f"Scene {i}: up to {k} shot clips",
-                                     "credits": k * pricing.estimate_video(secs).credits, "reserve_only": True,
+                                     "credits": k * clip.credits, "reserve_only": True,
                                      "kind": "shot_video", "input": {}})
     shots_by: dict = {}
     for sh in cs._project_shots(p["id"]):

@@ -285,45 +285,79 @@ LISTEN_SCHEMA = {
     "properties": {
         "lines": {"type": "array", "items": {"type": "object", "properties": {
             "index": {"type": "integer"}, "heard": {"type": "boolean"},
-            "heard_text": {"type": "string", "description": "What you actually hear for this line (empty if not said)."},
+            "heard_text": {"type": "string", "description": "Word for word what you actually hear for this line (empty if not said)."},
+            "start": {"type": "number", "description": "Seconds from the start of the clip when this line begins."},
+            "end": {"type": "number", "description": "Seconds when it ends."},
             "speaker_ok": {"type": "boolean", "description": "Does it sound like the voice described for this character?"},
-            "emotion_ok": {"type": "boolean"}, "pronunciation_ok": {"type": "boolean"}},
+            "same_person": {"type": "boolean", "description": "Only when a reference recording of this character was "
+                                                            "given: is it the same person (ignore emotion, volume, whispering, crying)?"},
+            "emotion_ok": {"type": "boolean"}, "pronunciation_ok": {"type": "boolean"},
+            "lip_sync_ok": {"type": "boolean", "description": "Video only: do the speaker's visible mouth movements match "
+                                                            "these words in time? true if the mouth can't be seen."}},
             "required": ["index", "heard", "heard_text", "speaker_ok"]}},
         "language_ok": {"type": "boolean"}, "natural": {"type": "integer", "description": "1-10"},
         "clarity": {"type": "integer", "description": "1-10: can every word be understood over the background?"},
         "extra_speech": {"type": "boolean", "description": "Someone says words that are not in the script."},
         "voices_distinct": {"type": "boolean", "description": "Different characters sound like different people."},
+        "mouths_visible": {"type": "boolean", "description": "Video only: are the speakers' mouths visible while they talk?"},
+        "background_noise": {"type": "boolean", "description": "Hiss, hum, crackle or noise that gets in the way of the words."},
+        "overacted": {"type": "boolean", "description": "The delivery is more exaggerated than the lines and feelings call for."},
         "notes": _S,
     },
     "required": ["lines", "language_ok", "natural", "clarity", "extra_speech"],
 }
 
 
-def listen_prompt(lines: list[dict], voices: dict, language: str) -> str:
+def listen_prompt(lines: list[dict], voices: dict, language: str, references: Optional[list[str]] = None,
+                  with_video: bool = False) -> str:
     rows = "\n".join(f"{i}. {d.get('character')}: \"{d.get('text')}\" — expected voice: "
                      f"{profile_text(voices.get(key(d.get('character') or ''), {}), short=True) or 'any'}"
-                     f"; feeling: {d.get('emotion') or 'neutral'}" for i, d in enumerate(lines))
+                     f"; feeling: {d.get('emotion') or 'neutral'}" + (f" ({d['delivery']})" if d.get("delivery") else "")
+                     for i, d in enumerate(lines))
+    refs = ""
+    if references:
+        refs = ("\n\nREFERENCE RECORDINGS (approved earlier; they come first, in this order): " + "; ".join(references) +
+                ".\nFor each line whose character has a reference, say whether it is the SAME PERSON (same_person). "
+                "A different feeling is not a different person: whispering, shouting, crying or fear change how a voice "
+                "sounds, not who it is. Only say false when the voice itself (age, sex, timbre, accent) has changed.")
+    video = ("\n\nYou also get the picture: say whether the speakers' mouths are visible (mouths_visible) and, for each "
+             "line, whether the mouth movements match the words in time (lip_sync_ok; true when the mouth can't be seen)."
+             if with_video else "")
     return f"""Listen to this clip's audio. It should contain exactly these lines in {language}, in order:
-{rows}
+{rows}{refs}{video}
 
-For each line: was it said (heard), what you actually hear, whether it sounds like the expected voice, whether the
-feeling fits, and whether the words are pronounced correctly. Then: is the language right, how natural (1-10) and
-clear (1-10) is the speech, does anyone say words that aren't in the script, and do different characters sound
-like different people. Only report what you can hear; if unsure, say so in notes."""
+For each line: was it said (heard), exactly what you hear, word for word (heard_text, in the language spoken), when it
+starts and ends (seconds), whether it sounds like the expected voice, whether the feeling fits, and whether the words
+are pronounced correctly. Then: is the language right, how natural (1-10) and clear (1-10) is the speech, does anyone
+say words that aren't in the script, do different characters sound like different people, is there noise in the way of
+the words, and is the delivery more exaggerated than the script calls for. Only report what you can hear; if unsure,
+say so in notes."""
 
 
 def clean_listen(raw, n_lines: int) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     lines = []
+
+    def secs(v):
+        return round(float(v), 2) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 600 else None
+
     for x in raw.get("lines") or []:
         if isinstance(x, dict) and isinstance(x.get("index"), int) and 0 <= x["index"] < n_lines:
-            lines.append({"index": x["index"], "heard": bool(x.get("heard")), "heard_text": _t(x.get("heard_text"), 200),
-                          "speaker_ok": x.get("speaker_ok") is not False, "emotion_ok": x.get("emotion_ok") is not False,
-                          "pronunciation_ok": x.get("pronunciation_ok") is not False})
+            row = {"index": x["index"], "heard": bool(x.get("heard")), "heard_text": _t(x.get("heard_text"), 200),
+                   "speaker_ok": x.get("speaker_ok") is not False, "emotion_ok": x.get("emotion_ok") is not False,
+                   "pronunciation_ok": x.get("pronunciation_ok") is not False,
+                   "lip_sync_ok": x.get("lip_sync_ok") is not False,
+                   "same_person": x.get("same_person") if isinstance(x.get("same_person"), bool) else None}
+            a, b = secs(x.get("start")), secs(x.get("end"))
+            if a is not None and b is not None and b > a:
+                row["start"], row["end"] = a, b
+            lines.append(row)
     num = lambda k: max(1, min(10, int(raw[k]))) if isinstance(raw.get(k), (int, float)) and not isinstance(raw.get(k), bool) else None
     return {"lines": lines, "language_ok": raw.get("language_ok") is not False, "natural": num("natural"),
             "clarity": num("clarity"), "extra_speech": bool(raw.get("extra_speech")),
-            "voices_distinct": raw.get("voices_distinct") is not False, "notes": _t(raw.get("notes"), 300)}
+            "voices_distinct": raw.get("voices_distinct") is not False,
+            "mouths_visible": raw.get("mouths_visible") is not False, "background_noise": bool(raw.get("background_noise")),
+            "overacted": bool(raw.get("overacted")), "notes": _t(raw.get("notes"), 300)}
 
 
 def verdict(tech: dict, heard: Optional[dict], lines: list[dict]) -> dict:
@@ -357,9 +391,9 @@ def verdict(tech: dict, heard: Optional[dict], lines: list[dict]) -> dict:
         problems.append({"kind": "clarity", "problem": f"Hard to understand (clarity {heard['clarity']}/10).", "lines": []})
     if (heard.get("natural") or 10) < 5:
         problems.append({"kind": "unnatural", "problem": f"Sounds unnatural ({heard['natural']}/10).", "lines": []})
-    soft = [i for i, x in by.items() if x["heard"] and (not x["emotion_ok"] or not x["pronunciation_ok"])]
+    soft = [i for i, x in by.items() if x["heard"] and not x["emotion_ok"]]
     if soft:
-        problems.append({"kind": "performance", "problem": "Feeling or pronunciation off on line(s) " +
+        problems.append({"kind": "performance", "problem": "The feeling is off on line(s) " +
                          ", ".join(str(i + 1) for i in soft), "lines": soft})
     hard = {"no_audio", "silent", "missing_lines", "wrong_voice", "language", "extra_speech"}
     status = "failed" if any(p["kind"] in hard for p in problems) else "needs_work" if problems else "passed"

@@ -92,7 +92,10 @@ def test_google_refuses_and_the_backup_makes_the_scene(env, monkeypatch):
     run(gen)
     job = client.get(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u)).json()["jobs"][0]
     assert job["status"] == "succeeded", job
-    assert tried == [("kling", True, True)], "talking scene: with sound and the lines"
+    assert tried[0] == ("kling", True, True), "talking scene: with sound and the lines"
+    # The fake backup clip has no sound at all, so the voice check sends it back to the same model once
+    # (Google refuses this scene, so the backup is the model that made it); never more than the limit.
+    assert tried == [("kling", True, True)] * 2
     assert job["charged_credits"] <= est["total_credits"], "never more than the price shown"
     assert detail(client, u, pid)["scenes"][0]["has_video"]
 
