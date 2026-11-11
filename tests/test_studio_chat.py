@@ -67,7 +67,7 @@ def test_the_assistant_sees_the_real_project_and_never_the_system_prompt_in_repl
     prompt = ai.chat_prompts[-1]
     assert "PROJECT (saved facts):" in prompt and "- Maya:" in prompt and "1. EXT. ROOFTOP - NIGHT" in prompt
     assert "Change Maya's outfit in the next scene" in prompt and "Never say something \"was saved\"" in prompt
-    assert "BE SHORT" in prompt and "under 80 words" in prompt
+    assert "Fit the length to the question" in prompt and "2-4 sentences" in prompt
     h = history(client, u, pid)
     assert all("Truth rules" not in m["content"] for m in h["messages"])
 
@@ -83,7 +83,7 @@ def test_memory_uses_a_summary_and_recent_messages_not_the_whole_history(chat, m
     last = ai.chat_prompts[-1]
     assert "Summary: the creator is developing" in last, "older messages folded into the summary"
     assert "message number 0" not in last.split("RECENT MESSAGES:")[1], "not resent word for word"
-    assert "- Make it an action movie" in last.split("DECISIONS the creator made earlier:")[1].split("EARLIER CONVERSATION")[0]
+    assert "- Make it an action movie" in last.split("MEMORY (this production")[1].split("EARLIER CONVERSATION")[0]
     assert ("summarize",) in ai.calls
 
 

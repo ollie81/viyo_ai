@@ -34,6 +34,7 @@ import studio_sfx
 import studio_pricing as pricing
 import studio_music as music_mod
 import studio_continuity as continuity
+import studio_memory
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
@@ -1854,6 +1855,9 @@ async def download_render(render_id: str, user_id: str = Depends(creator)):
 # ---------------------------------------------------------------- assistant chat
 
 CHAT_HOLD = 6          # credits held while the assistant answers; only the real cost is kept
+# Held per message by how hard the assistant thinks (studio_chat.reasoning_mode):
+# quick chat, creative work, whole-production analysis. Only the real cost is kept.
+CHAT_HOLDS = {"quick": CHAT_HOLD, "story": 12, "deep": 30}
 _ai = None
 
 
@@ -1913,8 +1917,8 @@ def _messages(conv: dict, limit: int = 60) -> list:
     return rows[-limit:]
 
 
-def _chat_context(p: dict, message: str = "") -> str:
-    import studio_chat
+def _chat_state(p: dict) -> dict:
+    """Everything the assistant may know about this production (owner-checked by the caller)."""
     from studio_worker import characters_in_scene
     st = get_store()
     cast = sorted(st.select("studio_characters", {"project_id": p["id"]}), key=lambda c: c.get("position") or 0)
@@ -1922,27 +1926,79 @@ def _chat_context(p: dict, message: str = "") -> str:
     jobs = st.select("studio_jobs", {"project_id": p["id"]}, order="created_at", desc=True, limit=20)
     outfits, elements = _outfits(p["id"]), _elements(p["id"])
     resolved = ident.resolve_outfits(scenes, outfits, cast, characters_in_scene)
-    names = {c["id"]: c["name"] for c in cast}
+    renders = len(st.select("studio_renders", {"project_id": p["id"]}, limit=50))
+    return {"cast": cast, "scenes": scenes, "jobs": jobs, "outfits": outfits, "elements": elements,
+            "resolved": resolved, "renders": renders,
+            "issues": _continuity_issues(scenes, cast, outfits, resolved, elements)}
+
+
+def _episodes(p: dict) -> list:
+    """The other episodes of the same series, the creator's own only."""
+    if not p.get("series_id"):
+        return []
+    rows = sorted(get_store().select("studio_projects", {"series_id": p["series_id"], "owner_id": p["owner_id"]}),
+                  key=lambda r: str(r.get("created_at") or ""))
+    rows = [r for r in rows if r.get("status") != "archived"]
+    return [{"number": i, "title": r.get("title"), "logline": r.get("logline"), "current": r["id"] == p["id"]}
+            for i, r in enumerate(rows, start=1)] if len(rows) > 1 else []
+
+
+def _chat_context(p: dict, message: str = "", focus: Optional[dict] = None, state: Optional[dict] = None) -> str:
+    import studio_chat
+    s = state or _chat_state(p)
+    names = {c["id"]: c["name"] for c in s["cast"]}
     wearing = {sid: {names.get(cid, "?"): (o or {}).get("name") for cid, o in row.items() if o}
-               for sid, row in resolved.items()}
-    issues = _continuity_issues(scenes, cast, outfits, resolved, elements)
-    return studio_chat.project_context(p, cast, outfits, elements, scenes, _production_out(p), jobs,
-                                       wearing=wearing, issues=issues, focus=studio_chat.scenes_named(message))
+               for sid, row in s["resolved"].items()}
+    focus = focus or {"scenes": sorted(studio_chat.scenes_named(message)), "characters": []}
+    return studio_chat.project_context(p, s["cast"], s["outfits"], s["elements"], s["scenes"], _production_out(p),
+                                       s["jobs"], wearing=wearing, issues=s["issues"], focus=set(focus.get("scenes") or []),
+                                       question=message, focus_names=set(focus.get("characters") or []),
+                                       episodes=_episodes(p), renders=s["renders"])
+
+
+def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
+    """The project's memory. Decisions kept in a conversation before project
+    memory existed are brought in the first time."""
+    mem = studio_memory.clean(p.get("assistant_memory") or {})
+    if conv and not studio_memory.count(mem):
+        for d in (conv.get("memory") or {}).get("decisions") or []:
+            mem, _ = studio_memory.add(mem, "decisions", d, "creator")
+    return mem
+
+
+def _save_memory(p: dict, mem: dict) -> dict:
+    st = get_store()
+    try:
+        st.update("studio_projects", {"id": p["id"]}, {"assistant_memory": studio_memory.clean(mem)})
+    except Exception as e:      # creator_studio_assistant_memory.sql not run yet
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        print(f"[WARN] studio assistant memory not saved for {p['id']}: {str(e)[:160]}")
+    return mem
 
 
 def _proposal_targets(p: dict, props: list) -> list:
     """Paid suggestions for one scene carry that scene's id, so only it is remade."""
-    scenes = sorted(get_store().select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    st = get_store()
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
     for prop in props:
-        if prop.get("type") in ("remake_picture", "remake_video"):
+        d = prop.get("data") or {}
+        if prop.get("type") in ("remake_picture", "remake_video", "record_voices"):
             try:
-                n = int((prop.get("data") or {}).get("scene"))
+                n = int(d.get("scene"))
             except (TypeError, ValueError):
                 n = 0
             if 1 <= n <= len(scenes):
                 prop["targets"] = [scenes[n - 1]["id"]]
             else:
                 prop["status"], prop["error"] = "failed", "That scene number doesn't exist."
+        elif prop.get("type") in ("make_character_sheet", "make_place_object_picture"):
+            rows = st.select("studio_characters", {"project_id": p["id"]}) if prop["type"] == "make_character_sheet" \
+                else _elements(p["id"])
+            try:
+                prop["targets"] = [_find_by_name(rows, d.get("character") or d.get("name") or "", "it")["id"]]
+            except HTTPException:
+                prop["status"], prop["error"] = "failed", "That isn't in this production."
     return props
 
 
@@ -1954,13 +2010,20 @@ async def chat_history(project_id: str, conversation_id: Optional[str] = None, u
     if not _chat_tables_ready():
         raise HTTPException(status_code=503, detail="The assistant chat isn't ready yet. Run creator_studio_chat.sql.")
     conv = _conversation_for(p, user_id, conversation_id, create=False)
+    state = _chat_state(p)
     convs = [c for c in get_store().select("studio_conversations", {"project_id": p["id"]}, order="updated_at", desc=True,
                                            limit=20) if c["owner_id"] == user_id]
     return {"conversation": {"id": conv["id"], "title": conv.get("title") or ""} if conv else None,
             "conversations": [{"id": c["id"], "title": c.get("title") or "", "updated_at": c.get("updated_at")} for c in convs],
             "messages": [_message_out(m) for m in _messages(conv)] if conv else [],
-            "suggestions": studio_chat.SUGGESTIONS,
-            "price_note": f"Each message costs about 1-2 credits (at most {CHAT_HOLD}); you're never charged for a failed answer.",
+            "suggestions": studio_chat.suggestions(p, state["cast"], state["scenes"], state["issues"], state["jobs"],
+                                                   state["renders"]),
+            "status": studio_chat.status(state["scenes"], state["cast"], state["jobs"], state["issues"], state["renders"],
+                                         state["elements"]),
+            "memory_count": studio_memory.count(_memory_of(p, conv)),
+            "price_note": (f"Quick questions cost about 1-2 credits (at most {CHAT_HOLDS['quick']}); creative work up to "
+                           f"{CHAT_HOLDS['story']}; a review of the whole production up to {CHAT_HOLDS['deep']}. "
+                           "Only what's used is kept, and a failed answer is free."),
             "balance": _balance(user_id)}
 
 
@@ -1992,7 +2055,9 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
     mine = st.one("studio_messages", {"client_key": key})
     if mine and mine["conversation_id"] != conv["id"]:
         raise HTTPException(status_code=409, detail="That message belongs to another chat.")
-    hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": CHAT_HOLD})
+    mode = studio_chat.reasoning_mode(body.message)
+    limit = CHAT_HOLDS[mode]
+    hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": limit})
     if not hold or not hold.get("ok"):
         raise HTTPException(status_code=402, detail={"message": "Not enough credits for the assistant.", "balance": _balance(user_id)})
     try:
@@ -2013,19 +2078,32 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
                                  {"summary": summary[:4000], "summarized_count": summarized + len(fold)})[0]
         recent = earlier[max(int(conv.get("summarized_count") or 0), len(earlier) - studio_chat.RECENT):]
         memory = conv.get("memory") or {}
-        prompt = studio_chat.build_prompt(_chat_context(p, body.message), conv.get("summary") or "", memory.get("decisions") or [],
-                                          recent, body.message.strip())
-        data, c2 = _ai_call(lambda: get_ai().chat(prompt))
+        state = _chat_state(p)
+        focus = studio_chat.resolve_focus(body.message, memory.get("focus"), len(state["scenes"]),
+                                          [c["name"] for c in state["cast"]])
+        project_memory = _memory_of(p, conv)
+        prompt = studio_chat.build_prompt(_chat_context(p, body.message, focus, state), conv.get("summary") or "",
+                                          studio_memory.render(project_memory), recent, body.message.strip(),
+                                          studio_chat.focus_text(focus), mode)
+        data, c2 = _ai_call(lambda: get_ai().chat(prompt, mode=mode))
+        if not isinstance(data, dict) or not str(data.get("reply") or "").strip():
+            raise ValueError("incomplete answer")
         costs.append(c2)
         cost = pricing.combine(costs)
-        credits = min(CHAT_HOLD, max(1, cost.credits))
+        credits = min(limit, max(1, cost.credits))
         reply = st.insert("studio_messages", [{
             "conversation_id": conv["id"], "project_id": p["id"], "owner_id": user_id, "role": "assistant",
             "content": str(data.get("reply") or "").strip()[:20000], "proposals": _proposal_targets(p, studio_chat.clean_proposals(data.get("proposals"))),
             "credits": credits, "client_key": key + ":reply"}])[0]
         new_decisions = [str(d).strip()[:300] for d in data.get("decisions") or [] if str(d).strip()]
+        updates = [u for u in data.get("memory") or [] if isinstance(u, dict)] + \
+            [{"category": "decisions", "text": d, "from_creator": True} for d in new_decisions]
+        _save_memory(p, studio_memory.apply_updates(project_memory, updates))
+        said = data.get("focus") if isinstance(data.get("focus"), dict) else {}
+        next_focus = {"scenes": [n for n in (said.get("scenes") or focus["scenes"]) if isinstance(n, int)][:6],
+                      "characters": [str(c) for c in (said.get("characters") or focus["characters"])][:6]}
         st.update("studio_conversations", {"id": conv["id"]}, {
-            "memory": {**memory, "decisions": ((memory.get("decisions") or []) + new_decisions)[-60:]},
+            "memory": {**memory, "decisions": ((memory.get("decisions") or []) + new_decisions)[-60:], "focus": next_focus},
             "updated_at": _now_iso()})
         st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": credits})
     except HTTPException:
@@ -2039,7 +2117,59 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         raise HTTPException(status_code=502, detail={"code": "assistant_failed", "message":
                             "The assistant couldn't answer just now. Try again; you weren't charged."})
     return {"message": _message_out(mine), "reply": _message_out(reply), "conversation_id": conv["id"],
-            "balance": _balance(user_id)}
+            "mode": mode, "balance": _balance(user_id)}
+
+
+# ------------------------------------------------ assistant memory (the creator can see and correct it)
+
+class MemoryIn(BaseModel):
+    category: Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas"]
+    text: str = Field(..., min_length=1, max_length=300)
+
+
+class MemoryPatch(BaseModel):
+    text: Optional[str] = Field(None, min_length=1, max_length=300)
+    category: Optional[Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas"]] = None
+
+
+def _memory_out(mem: dict) -> dict:
+    return {"memory": studio_memory.clean(mem), "labels": studio_memory.CATEGORIES}
+
+
+@router.get("/projects/{project_id}/assistant/memory")
+async def get_memory(project_id: str, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    conv = _conversation_for(p, user_id, None, create=False) if _chat_tables_ready() else None
+    return _memory_out(_memory_of(p, conv))
+
+
+@router.post("/projects/{project_id}/assistant/memory")
+async def add_memory(project_id: str, body: MemoryIn, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    mem, item = studio_memory.add(_memory_of(p), body.category, body.text, "creator")
+    if item is None:
+        raise HTTPException(status_code=409, detail="That's already remembered.")
+    return _memory_out(_save_memory(p, mem))
+
+
+@router.patch("/projects/{project_id}/assistant/memory/{item_id}")
+async def edit_memory(project_id: str, item_id: str, body: MemoryPatch, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    try:
+        mem = studio_memory.edit(_memory_of(p), item_id, body.text, body.category)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return _memory_out(_save_memory(p, mem))
+
+
+@router.delete("/projects/{project_id}/assistant/memory/{item_id}")
+async def forget_memory(project_id: str, item_id: str, user_id: str = Depends(creator)):
+    p = _project(project_id, user_id)
+    try:
+        mem = studio_memory.remove(_memory_of(p), item_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return _memory_out(_save_memory(p, mem))
 
 
 def SUMMARY_WINDOW() -> int:
@@ -2107,6 +2237,12 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
             out = await add_character(p["id"], CharacterIn(name=d.get("name") or "", description=d.get("description") or ""), user_id)
             return f"{out['name']} added to the cast."
         cast = st.select("studio_characters", {"project_id": p["id"]})
+        if kind == "update_place_object":
+            e = _find_by_name(_elements(p["id"]), d.get("name"), "place or object")
+            if not (d.get("description") or "").strip():
+                raise HTTPException(status_code=409, detail="This suggestion has nothing to change.")
+            await update_element(e["id"], ElementPatch(description=d["description"][:800]), user_id)
+            return f"{e['name']} updated."
         if kind == "update_character":
             c = _find_by_name(cast, d.get("character") or d.get("name"), "character")
             await update_character(c["id"], CharacterPatch(description=d.get("description") or c["description"]), user_id)
@@ -2174,6 +2310,8 @@ async def apply_proposal(message_id: str, index: int, user_id: str = Depends(cre
     props[index] = {**prop, "status": "applied", "result": result, "applied_at": _now_iso(), "error": None}
     st = get_store()
     st.update("studio_messages", {"id": m["id"]}, {"proposals": props})
+    mem, _ = studio_memory.add(_memory_of(p), "decisions", f"Applied: {prop['title']}. {prop.get('summary') or ''}", "applied")
+    _save_memory(p, mem)
     conv = st.one("studio_conversations", {"id": m["conversation_id"]})
     if conv:
         memory = conv.get("memory") or {}
