@@ -1821,6 +1821,39 @@ async def approve_shot_plan(scene_id: str, body: Approve, user_id: str = Depends
     return {"ok": True, "shot_plan_approved": body.approved}
 
 
+class ShotOrder(BaseModel):
+    shot_ids: list[str] = Field(..., min_length=1, max_length=20)
+
+
+@router.post("/scenes/{scene_id}/shots/order")
+async def reorder_shots(scene_id: str, body: ShotOrder, user_id: str = Depends(creator)):
+    """The creator rearranges a scene's shots. Allowed while no shot is approved and only if every line is
+    still heard in the script's order; pictures made after a moved shot follow a different shot now, so the
+    shots whose neighbour changed are marked to be made again."""
+    s = _owned("studio_scenes", scene_id, user_id)
+    rows = sorted(_project_shots_of(s), key=lambda r: r["position"])
+    want = [_uuid(x) for x in body.shot_ids]
+    if sorted(want) != sorted(r["id"] for r in rows):
+        raise HTTPException(status_code=400, detail="List every shot of this scene once.")
+    if any(r.get("approved_at") for r in rows):
+        raise HTTPException(status_code=409, detail="A shot is approved. Unapprove it to rearrange.")
+    by = {r["id"]: r for r in rows}
+    spoken = [(d.get("character"), d.get("text")) for i in want for d in by[i].get("dialogue") or []]
+    script = [(d.get("character"), d.get("text")) for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
+    if spoken != script:
+        raise HTTPException(status_code=409, detail="That order would change the order of the lines. Move shots "
+                                                    "without lines, or edit the plan.")
+    st = get_store()
+    old = [r["id"] for r in rows]
+    for pos, sid in enumerate(want):
+        moved = old.index(sid) != pos or (pos and old.index(want[pos - 1]) != old.index(sid) - 1)
+        patch = {"position": pos}
+        if moved and by[sid].get("image_path"):
+            patch.update(image_path=None, video_path=None, status="planned")   # it follows a different shot now
+        st.update("studio_shots", {"id": sid}, patch)
+    return {"ok": True, "order": want}
+
+
 @router.post("/shots/{shot_id}/approve")
 async def approve_shot(shot_id: str, body: Approve, user_id: str = Depends(creator)):
     """An approved shot is never replaced or edited until unapproved."""
@@ -3118,6 +3151,8 @@ class ProductionQuoteIn(BaseModel):
     # Make a reference sheet for characters that have none (recommended),
     # instead of a single portrait.
     sheets: bool = True
+    # The AI director plans every scene's camera shots before anything is made (the default).
+    direct: bool = True
 
 
 class ProductionIn(ProductionQuoteIn):
@@ -3128,7 +3163,7 @@ class ProductionIn(ProductionQuoteIn):
 
 def _production_quote(p: dict, body: ProductionQuoteIn) -> dict:
     import studio_production
-    q = studio_production.plan(p, {"sheets": body.sheets})
+    q = studio_production.plan(p, {"sheets": body.sheets, "direct": body.direct})
     q["balance"] = _balance(p["owner_id"])
     q["note"] = ("Credits for the whole production are reserved when you start. Each step keeps only what it really "
                  "costs; failed steps are refunded and tried again once; what's left comes back at the end.")
@@ -3196,7 +3231,7 @@ async def start_production(project_id: str, body: ProductionIn, user_id: str = D
     try:
         r = get_store().rpc("studio_run_reserve", {
             "p_owner": user_id, "p_project": p["id"], "p_credits": q["total_credits"],
-            "p_key": f"{user_id}:{body.request_id}:production", "p_options": {"sheets": body.sheets, "round": 0},
+            "p_key": f"{user_id}:{body.request_id}:production", "p_options": {"sheets": body.sheets, "direct": body.direct, "round": 0},
             "p_plan": plan_})
     except Exception as e:
         if hasattr(get_store(), "conn"):

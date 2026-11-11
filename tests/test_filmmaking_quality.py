@@ -123,6 +123,6 @@ def test_the_production_quote_names_scenes_that_would_be_one_static_shot(env):
             "dialogue": [{"character": "Maya", "text": "Why?"}, {"character": "Daniel", "text": "Because."}]}
     quiet = {"heading": "EXT. ROOF", "visual": "Maya alone", "duration_seconds": 3, "dialogue": []}
     split(client, ai, gen, u, pid, [talk, quiet], characters=(MAYA, DAN))
-    q = client.post(f"/api/v1/studio/projects/{pid}/production/quote", headers=H(u), json={}).json()
+    q = client.post(f"/api/v1/studio/projects/{pid}/production/quote", headers=H(u), json={"direct": False}).json()
     assert q["single_shot_scenes"] == [detail(client, u, pid)["scenes"][0]["id"]]
     assert "1 scene (1) would be filmed as one shot each" in q["advice"][0]
