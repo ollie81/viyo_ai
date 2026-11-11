@@ -165,9 +165,33 @@ def clean_plan(raw, scene: dict, cast_names: list[str]) -> list[dict]:
     return shots
 
 
+def speech_seconds(lines: list) -> float:
+    """How long a shot's lines take to say. One rule everywhere for shots: the
+    plan gives each shot at least this, the shot's clip is requested at the
+    shot's length (so the model paces the lines to fit), and the render never
+    cuts a shot shorter than this. (A whole-scene clip keeps its own, roomier
+    estimate in studio_worker.speech_seconds.)"""
+    if not lines:
+        return 0.0
+    words = sum(len((d.get("text") or "").split()) for d in lines)
+    return words / 2.4 + 0.4 * len(lines) + 0.5
+
+
+def clip_seconds(shot: dict) -> Optional[int]:
+    """The clip length to ask the video model for: the shot's length (or its
+    lines' length if longer), within what the model accepts; None if it can't fit."""
+    import math
+    need = max(float(shot.get("duration_seconds") or 3), speech_seconds(shot.get("dialogue") or []))
+    if need > 15:
+        return None
+    return max(3, min(15, math.ceil(need)))
+
+
 def _fit_durations(shots: list[dict], total: float) -> None:
-    """Scale to the scene's length; every shot at least MIN_SHOT and long enough for its lines."""
-    need = [max(MIN_SHOT, 0.9 + sum(len((d.get("text") or "").split()) for d in s["dialogue"]) / 2.6) for s in shots]
+    """Scale to the scene's length; every shot at least MIN_SHOT and long enough
+    for its lines. Speech wins: if the lines need more time than the scene has,
+    the shots run longer rather than cut a line."""
+    need = [max(MIN_SHOT, speech_seconds(s["dialogue"])) for s in shots]
     given = [s["duration_seconds"] or n for s, n in zip(shots, need)]
     scale = total / sum(given) if sum(given) else 1
     durs = [max(n, g * scale) for g, n in zip(given, need)]

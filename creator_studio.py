@@ -571,7 +571,9 @@ def _speech(s: dict, project: Optional[dict]) -> str:
 
 
 def _job_out(j: dict) -> dict:
+    inp = j.get("input") if isinstance(j.get("input"), dict) else {}
     return {"id": j["id"], "kind": j["kind"], "status": j["status"], "scene_id": j.get("scene_id"),
+            "shot_id": inp.get("shot_id"),
             "character_id": j.get("character_id"), "estimated_credits": int(j.get("estimated_credits") or 0),
             "charged_credits": int(j.get("charged_credits") or 0), "error": j.get("error_message"),
             "created_at": j.get("created_at"), "finished_at": j.get("finished_at")}
@@ -1821,10 +1823,10 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         if kind == "shot_image":
             cost = pricing.image_cost(1, 400 + 1300 * min(len(target.get("characters") or []) + 1, 4), size)
         else:
-            from studio_worker import speech_clip_seconds
-            secs = float(target["duration_seconds"])
-            if target.get("dialogue"):
-                secs = max(secs, speech_clip_seconds({"dialogue": target["dialogue"], "duration_seconds": secs}) or secs)
+            secs = studio_shots.clip_seconds(target)        # the same length the worker asks for
+            if secs is None:
+                return pricing.estimate_video(15), ("This shot has too much dialogue for one clip (15 seconds at "
+                                                    "most). Edit the plan or split the scene.")
             cost = pricing.estimate_video(secs)
         if not scene.get("shot_plan_approved"):
             return cost, "Approve the scene's shot plan first."
