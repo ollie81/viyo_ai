@@ -247,6 +247,20 @@ def _classify(e: Exception) -> Exception:
     return ProviderError(str(e)[:300])
 
 
+CHAT_LEVELS = {"quick": ("low", 512), "story": ("medium", 4096), "deep": ("high", 12288)}
+
+
+def chat_thinking(mode: str) -> tuple[str, int]:
+    """(thinking_level, thinking_budget) for an assistant reply. Override with
+    STUDIO_CHAT_THINKING_QUICK / _STORY / _DEEP (minimal, low, medium, high)."""
+    level, budget = CHAT_LEVELS.get(mode, CHAT_LEVELS["quick"])
+    env = (os.environ.get(f"STUDIO_CHAT_THINKING_{mode.upper()}") or "").strip().lower()
+    if env in ("minimal", "low", "medium", "high"):
+        level = env
+        budget = {"minimal": 0, "low": 512, "medium": 4096, "high": 12288}[env]
+    return level.upper(), budget
+
+
 class GoogleStudioAI:
     def __init__(self, api_key: Optional[str] = None):
         from google import genai
@@ -317,15 +331,39 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
-    def chat(self, prompt: str):
-        """One assistant reply (studio_chat): {reply, proposals, decisions}."""
+    def chat(self, prompt: str, mode: str = "quick"):
+        """One assistant reply (studio_chat): {reply, proposals, memory, focus}.
+
+        The thinking depth follows the task (chat_thinking): the SDK's
+        thinking_level when the model takes it, otherwise the older
+        thinking_budget with a matching size."""
         import studio_chat
-        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=studio_chat.CHAT_SCHEMA)
+        from google.genai import types
+        level, budget = chat_thinking(mode)
+        model = os.environ.get("STUDIO_CHAT_MODEL") or pricing.TEXT_MODEL
+
+        def call(thinking):
+            return self.client.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=thinking, safety_settings=drama_safety(),
+                    response_mime_type="application/json", response_json_schema=studio_chat.CHAT_SCHEMA))
+        try:
+            try:
+                resp = call(types.ThinkingConfig(thinking_level=level))
+            except Exception as e:
+                if "thinking" not in str(e).lower():
+                    raise
+                resp = call(types.ThinkingConfig(thinking_budget=budget))   # this model only takes a budget
+        except Exception as e:
+            raise _classify(e)
+        if not (resp.text or "").strip():
+            raise PolicyBlocked("The AI returned nothing for this request (it may have been blocked).")
         try:
             data = json.loads(resp.text)
         except (TypeError, ValueError):
             raise ProviderError("The assistant's answer couldn't be read.")
-        if not (data.get("reply") or "").strip():
+        if not isinstance(data, dict) or not (data.get("reply") or "").strip():
             raise ProviderError("The assistant returned an empty answer.")
         i, o = self._text_usage(resp)
         return data, pricing.text_cost(i, o)
@@ -536,9 +574,10 @@ class FakeStudioAI:
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
 
-    def chat(self, prompt):
+    def chat(self, prompt, mode="quick"):
         self.calls.append(("chat",))
         self.chat_prompts = getattr(self, "chat_prompts", []) + [prompt]
+        self.chat_modes = getattr(self, "chat_modes", []) + [mode]
         self._maybe_fail("chat")
         if getattr(self, "chat_result", None) is not None:
             r = self.chat_result
