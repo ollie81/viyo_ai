@@ -178,9 +178,10 @@ class StudioWorker:
         if bible:
             self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
         ev = (bible or {}).get("evaluation") or {}
+        import studio_story_check as sc
         return {"chars": len(text), "scores": (bible or {}).get("scores"), "rewritten": (bible or {}).get("rewrite_used"),
-                "story_check": {k: v.get("score") for k, v in (ev.get("scores") or {}).items()},
-                "revised": ev.get("revised", False), "below_bar": ev.get("below_bar", [])}, cost
+                "story_check": ev.get("status"), "verified_scores": sc.scores(ev), "unverified": ev.get("unverified", []),
+                "below_bar": ev.get("below_bar", []), "revision": ev.get("revision")}, cost
 
     def earlier_episodes(self, project) -> list[dict]:
         """The story bibles of the episodes before this one in its series,

@@ -595,6 +595,9 @@ def _project_out(p: dict) -> dict:
     keys = ("id", "title", "logline", "kind", "aspect_ratio", "genre", "visual_style", "language", "target_seconds",
             "captions", "script", "created_at", "updated_at", "music_name", "series_id")
     out = {k: p.get(k) for k in keys}
+    import studio_story_check
+    out["story_check_outdated"] = studio_story_check.outdated((p.get("story_bible") or {}).get("evaluation") or {},
+                                                              p.get("script") or "")
     out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
                auto_music=p.get("auto_music") is not False,
                auto_inspect=p.get("auto_inspect") is not False,
@@ -1120,6 +1123,60 @@ async def creator_assistant_approve(project_id: str, body: AssistantApproveIn,
         raise HTTPException(status_code=503, detail="Story approval storage is not ready. Run creator_studio_story.sql.")
     return {"ok": True, "story_status": "approved", "story_approved_at": updated["_assistant_approval"]["approved_at"],
             "project": _project_out(p)}
+
+
+class StoryCheckIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+
+
+@router.get("/projects/{project_id}/story-check")
+async def story_check_price(project_id: str, user_id: str = Depends(creator)):
+    """The price of re-checking the current script, and whether the saved check is out of date."""
+    import studio_story_check as sc
+    p = _project(project_id, user_id)
+    ev = (p.get("story_bible") or {}).get("evaluation") or {}
+    return {"credits": pricing.estimate_story_check(len(p.get("script") or "")).credits,
+            "outdated": sc.outdated(ev, p.get("script") or ""), "status": ev.get("status"),
+            "ready": bool((p.get("script") or "").strip())}
+
+
+@router.post("/projects/{project_id}/story-check")
+async def story_check(project_id: str, body: StoryCheckIn, user_id: str = Depends(creator)):
+    """Checks the CURRENT script (with the creator's edits) strictly and saves the
+    result. Never rewrites the script. Charged like the assistant: a hold, then
+    only what was used; nothing if it fails."""
+    import studio_story_check as sc
+    from studio_worker import StudioWorker
+    p = _project(project_id, user_id)
+    script = (p.get("script") or "").strip()
+    if not script:
+        raise HTTPException(status_code=409, detail="Write or develop the script first.")
+    st = get_store()
+    _rate_limit(user_id)
+    limit = pricing.estimate_story_check(len(script)).credits
+    hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": limit})
+    if not hold or not hold.get("ok"):
+        raise HTTPException(status_code=402, detail={"message": "Not enough credits for the story check.",
+                                                     "balance": _balance(user_id)})
+    bible = dict(p.get("story_bible") or {})
+    brief = {k: p.get(k) for k in ("title", "logline", "genre", "kind", "aspect_ratio", "target_seconds", "language")}
+    try:
+        previous = StudioWorker(st, get_files(), None, "generation").earlier_episodes(p)
+        ev, cost = _ai_call(lambda: get_ai().story_check(brief, bible, script, previous))
+        ev = {**ev, "source": "recheck", "request_id": body.request_id}
+        bible["evaluation"] = ev
+        st.update("studio_projects", {"id": p["id"]}, {"story_bible": bible})
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": min(limit, max(1, cost.credits))})
+    except HTTPException:
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
+        raise
+    except Exception as e:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
+        print(f"[WARN] studio story check {p['id']}: {str(e)[:200]}")
+        raise HTTPException(status_code=502, detail="The story check couldn't run just now. You weren't charged.")
+    return {"evaluation": ev, "outdated": False, "balance": _balance(user_id)}
 
 
 @router.patch("/projects/{project_id}")
