@@ -26,6 +26,7 @@ import studio_pricing as pricing
 import studio_render as render
 import studio_music as music_mod
 import studio_continuity as continuity
+import studio_inspect as inspect_mod
 import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
@@ -777,6 +778,10 @@ class StudioWorker:
 
     def do_image(self, job, project):
         scene = self._scene(job, project)
+        if scene.get("image_approved_path") and scene.get("image_approved_path") == scene.get("image_path"):
+            raise JobFailed("approved", "This picture is approved. Unapprove it first to replace it. "
+                                        "Your credits were returned.")
+        correction = ((job.get("input") or {}).get("correction") or "").strip()[:600]
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
@@ -802,13 +807,82 @@ class StudioWorker:
                                     expressions=expressions, world=world_mod.world_block(location, props),
                                     continuity=continuity.image_block(before, scene),
                                     camera_text=continuity.of(scene).get("camera", "") if scene.get("camera") in (None, "", "auto") else "")
+        if correction:
+            prompt += ("\nCORRECTION (the last picture of this scene got this wrong; fix it and keep everything else "
+                       f"the same): {correction}")
         prompt += "\nNo text, captions, logos or watermarks in the image."
         data, mime, cost = self.ai.image(prompt, refs[:IMAGE_REFS], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
         self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
         self._made_with(scene, entries, [label for label, _d in labelled], previous=self._last_previous_shot)
-        return {"path": path, "references": [label for label, _d in labelled]}, cost
+        out = {"path": path, "references": [label for label, _d in labelled]}
+        if project.get("auto_inspect") is not False:
+            # Check the new picture straight away (its price was in the estimate).
+            # A failed check never fails the picture and isn't charged.
+            try:
+                rec, check_cost = self._inspect_scene(project, self.store.one("studio_scenes", {"id": scene["id"]}), cast)
+                cost = pricing.combine([cost, check_cost])
+                out["inspection"] = {"overall": rec["result"]["scores"].get("overall"),
+                                     "problems": len(inspect_mod.errors(rec["result"]))}
+            except Exception as e:
+                self._rollback()
+                print(f"[INFO] studio job {job['id']}: picture made, check skipped: {str(e)[:160]}")
+        return out, cost
+
+    # ------------------------------------------------------------ visual continuity check
+
+    def inspection_inputs(self, project, scene, cast=None):
+        """(previous scene, whether it carries over, entries, signature) for a check."""
+        cast = cast if cast is not None else self.store.select("studio_characters", {"project_id": project["id"]})
+        prev = self._scene_before(project, scene)
+        carries = continuity.carries_look(prev, scene)
+        entries = self._cast_for_scene(project, scene, cast)
+        sig = inspect_mod.signature(scene, prev if carries else None, [(o or {}).get("id") for _c, o in entries],
+                                    [f"{c['id']}:{c.get('identity_version') or 0}" for c, _o in entries])
+        return prev, carries, entries, sig
+
+    def _inspect_scene(self, project, scene, cast=None):
+        """Looks at the scene picture with a vision model and saves the result."""
+        if not scene or not scene.get("image_path"):
+            raise JobFailed("no_picture", "Make this scene's picture first. Your credits were returned.")
+        prev, carries, entries, sig = self.inspection_inputs(project, scene, cast)
+        images = [("this scene's picture (check this one)", self.files.get(scene["image_path"]))]
+        for c, outfit in entries[:2]:     # each character's best face reference
+            for label, path in ident.references_for(c, "front", outfit, 1):
+                try:
+                    images.append((f"reference: {label}", self.files.get(path)))
+                except Exception:
+                    pass
+        if carries and prev and prev.get("image_path"):
+            try:
+                images.append(("the previous scene's picture (this scene follows it)", self.files.get(prev["image_path"])))
+            except Exception:
+                pass
+        location, props = self._world(project, scene)
+        room = inspect_mod.MAX_IMAGES - len(images)
+        for label, data in self._world_files(location, props, room):
+            images.append((f"reference: {label}", data))
+        prev_seen = (((prev or {}).get("inspection") or {}).get("result") or {}).get("observed") if prev else None
+        text = inspect_mod.prompt(scene, prev, ident.cast_block(entries).splitlines(), world_mod.world_block(location, props),
+                                  [label for label, _d in images], prev_seen, continuity.transition(prev, scene))
+        result, cost = self.ai.inspect(text, images)
+        rec = inspect_mod.record(result, sig, scene["image_path"], cost.total_usd)
+        self._optional_update("studio_scenes", {"id": scene["id"]}, {"inspection": rec})
+        return rec, cost
+
+    def do_inspect(self, job, project):
+        """Checks an existing scene picture (reused for free if nothing changed)."""
+        scene = self._scene(job, project)
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        if scene.get("image_path"):
+            _prev, _c, _e, sig = self.inspection_inputs(project, scene, cast)
+            saved = inspect_mod.current(scene, sig)
+            if saved:
+                return {"reused": True, "overall": saved["result"]["scores"].get("overall")}, \
+                    pricing.Cost("viyo", "reused", {"reused": 1})
+        rec, cost = self._inspect_scene(project, scene, cast)
+        return {"overall": rec["result"]["scores"].get("overall"), "problems": len(inspect_mod.errors(rec["result"]))}, cost
 
     def do_voice(self, job, project):
         scene = self._scene(job, project)

@@ -247,6 +247,14 @@ def _classify(e: Exception) -> Exception:
     return ProviderError(str(e)[:300])
 
 
+def _mime(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 CHAT_LEVELS = {"quick": ("low", 512), "story": ("medium", 4096), "deep": ("high", 12288)}
 
 
@@ -367,6 +375,32 @@ class GoogleStudioAI:
             raise ProviderError("The assistant returned an empty answer.")
         i, o = self._text_usage(resp)
         return data, pricing.text_cost(i, o)
+
+    def inspect(self, prompt: str, images: list):
+        """The visual continuity check (studio_inspect): images are (label, bytes),
+        Image 1 is the scene picture. Returns (cleaned result, cost)."""
+        import studio_inspect
+        from google.genai import types
+        parts = []
+        for i, (label, data) in enumerate(images[:studio_inspect.MAX_IMAGES], start=1):
+            parts.append(types.Part.from_text(text=f"Image {i}: {label}"))
+            parts.append(types.Part.from_bytes(data=data, mime_type=_mime(data)))
+        parts.append(types.Part.from_text(text=prompt))
+        try:
+            resp = self.client.models.generate_content(
+                model=os.environ.get("STUDIO_INSPECT_MODEL") or pricing.TEXT_MODEL, contents=parts,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+                    safety_settings=drama_safety(), response_mime_type="application/json",
+                    response_json_schema=studio_inspect.SCHEMA))
+        except Exception as e:
+            raise _classify(e)
+        try:
+            result = studio_inspect.clean(json.loads(resp.text or ""))
+        except (TypeError, ValueError):
+            raise ProviderError("The picture check returned an unreadable answer.")
+        i, o = self._text_usage(resp)
+        return result, pricing.text_cost(i, o)
 
     def summarize(self, prompt: str):
         """A short plain-text summary (the assistant's memory of older messages)."""
@@ -588,6 +622,19 @@ class FakeStudioAI:
                                "data": {"title": "Hidden Heir", "logline": "An evicted courier learns he is a billionaire's son.",
                                         "genre": "Drama"}}],
                 "decisions": []}, pricing.text_cost(3000, 400)
+
+    def inspect(self, prompt, images):
+        """inspect_result: a dict or a function (prompt, labels) -> dict. Default: a clean picture."""
+        import studio_inspect
+        self.calls.append(("inspect",))
+        labels = [label for label, _d in images]
+        self.inspect_log = getattr(self, "inspect_log", []) + [{"prompt": prompt, "labels": labels}]
+        self._maybe_fail("inspect")
+        r = getattr(self, "inspect_result", None)
+        raw = (r(prompt, labels) if callable(r) else r) if r is not None else {
+            "scores": {"overall": 92, "character": 95, "outfit": 90, "location": 90, "props": 90},
+            "problems": [], "observed": {}, "summary": "Looks consistent."}
+        return studio_inspect.clean(raw), pricing.text_cost(2500 + 1300 * len(images), 900)
 
     def summarize(self, prompt):
         self.calls.append(("summarize",))

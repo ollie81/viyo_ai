@@ -55,11 +55,13 @@ ACTIONS = {
     "make_character_sheet": "paid",  # data: character: reference pictures of that character (job kind "portrait")
     "record_voices": "paid",     # data: scene: records that scene's lines with the saved voices (job kind "voice")
     "make_place_object_picture": "paid",  # data: name: the picture of one place/object (job kind "element")
+    "check_scenes": "paid",      # data: scenes [numbers] (empty = every scene with a picture): the picture check
+    "fix_scene_picture": "paid", # data: scene, correction: a new picture of that scene that fixes what the check found
 }
 PAID_JOB = {"develop_story": "script", "break_into_scenes": "breakdown", "find_places_objects": "elements",
             "make_cover": "cover", "make_film": "production", "remake_picture": "image", "remake_video": "video",
             "suggest_outfits": "outfits", "make_character_sheet": "portrait", "record_voices": "voice",
-            "make_place_object_picture": "element"}
+            "make_place_object_picture": "element", "check_scenes": "inspect", "fix_scene_picture": "image"}
 
 _STR = {"type": "string"}
 CHAT_SCHEMA = {
@@ -77,7 +79,8 @@ CHAT_SCHEMA = {
                 "target_seconds": {"type": "integer"}, "script": _STR, "name": _STR, "description": _STR,
                 "character": _STR, "owner": _STR, "clothing": _STR, "shoes": _STR, "accessories": _STR, "makeup": _STR,
                 "outfit": _STR, "scene": {"type": "integer"}, "heading": _STR, "visual": _STR,
-                "start_state": _STR, "end_state": _STR,
+                "start_state": _STR, "end_state": _STR, "correction": _STR,
+                "scenes": {"type": "array", "items": {"type": "integer"}},
                 "transition": {"type": "string", "enum": ["continuous", "same_place_cut", "new_place", "time_jump",
                                                           "flashback"]},
                 "dialogue": {"type": "array", "items": {"type": "object", "properties": {
@@ -106,7 +109,18 @@ short drama, series or movie. You are one assistant with five skills, used as th
 - Writer: premises, titles, loglines, characters, conflicts, twists, structure, screenplay, dialogue, episodes.
 - Director: scenes, visual storytelling, shot types, camera angles and movement, action, pacing.
 - Continuity supervisor: characters' faces, outfits, places, objects, timeline and story logic stay consistent.
-- Production manager: what has been made, what is missing, what happens next and what it costs.
+- Picture checks (visual continuity):
+- Scenes may have a PICTURE CHECK: a vision model compared the picture with the references, the record and the scene
+  before (scores 0-100, problems with severity and certainty, whether the script means the change, the fix, what the
+  picture shows). Use it to answer "why does she look different", "the room changed", "why is the letter missing".
+  It can be wrong: say "the check thinks" for uncertain findings. An "outdated" check is for an older picture.
+- To check pictures, propose check_scenes (data.scenes, or empty for all). It costs a little per scene; unchanged
+  pictures are not checked again. To fix one, propose fix_scene_picture with data.scene and data.correction (what
+  the new picture must change, e.g. "Maya's dress must stay red, as in scene 2"). Only that scene is remade.
+- An APPROVED picture is never replaced: ask the creator to unapprove it on the Scenes tab first.
+- Not fixed until a new picture has been made AND checked again, and the creator has seen it.
+
+Production manager: what has been made, what is missing, what happens next and what it costs.
 - Creative partner: brainstorm, give honest specific feedback, offer alternatives with pros and cons.
 
 How you talk:
@@ -172,6 +186,7 @@ Proposals (0 to 3, only when a concrete change would help now):
 - set_scene_outfit: data.scene, data.character, data.outfit (an existing outfit name).
 - update_place_object: data.name (an existing place or object), data.description.
 - make_character_sheet: data.character. make_place_object_picture: data.name. record_voices: data.scene.
+- check_scenes: data.scenes. fix_scene_picture: data.scene, data.correction.
 - develop_story, break_into_scenes, find_places_objects, suggest_outfits, make_cover, make_film: paid steps, data may
   be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -289,6 +304,23 @@ def screenplay_block(script: str, question: str = "", focus_numbers: Optional[se
               "say which and ask, don't guess.\n" + body)
 
 
+def _check_lines(r: dict, outdated: bool, approved: bool) -> list[str]:
+    sc = r.get("scores") or {}
+    head = " · ".join(f"{k} {v}" for k, v in sc.items())
+    out = [f"   PICTURE CHECK{' (outdated: for an older picture)' if outdated else ''}"
+           f"{' [picture APPROVED by the creator]' if approved else ''}: {head}. {_short(r.get('summary') or '', 200)}"]
+    for p in (r.get("problems") or [])[:6]:
+        tag = "intended" if p.get("intentional") else f"{p.get('severity')}, {p.get('certainty')}"
+        out.append(f"     - [{p.get('kind')}, {tag}] expected {_short(p.get('expected'), 120)}; seen {_short(p.get('seen'), 120)}."
+                   f" Fix: {_short(p.get('fix'), 160)}")
+    obs = r.get("observed") or {}
+    if obs.get("characters"):
+        out.append("     Picture shows: " + "; ".join(
+            f"{c.get('name')} ({', '.join(x for x in (c.get('outfit'), c.get('position'), ('holding ' + ', '.join(c['holding'])) if c.get('holding') else '') if x)})"
+            for c in obs["characters"][:4]))
+    return out
+
+
 def _bible_block(bible: dict) -> list[str]:
     if not bible:
         return []
@@ -331,8 +363,17 @@ def status(scenes: list[dict], cast: list[dict], jobs: list[dict], issues: Optio
         "running": sum(1 for j in jobs if j.get("status") in ("queued", "running")),
         "failed": sum(1 for j in jobs[:20] if j.get("status") == "failed"),
         "continuity_problems": sum(1 for i in issues or [] if i.get("severity") == "fix"),
+        "checked": sum(1 for s in scenes if (s.get("inspection") or {}).get("result")),
+        "picture_problems": sum(1 for s in scenes if _attention(s)),
         "films": renders,
     }
+
+
+def _attention(scene: dict) -> bool:
+    import studio_inspect
+    ins = scene.get("inspection") or {}
+    return bool(ins.get("result")) and ins.get("image_path") == scene.get("image_path") and \
+        studio_inspect.needs_attention(ins["result"])
 
 
 def _status_lines(st: dict) -> list[str]:
@@ -352,7 +393,8 @@ def _status_lines(st: dict) -> list[str]:
     return [f"PRODUCTION STATUS: {st['scenes']} scenes · {st['pictures']} pictures · {st['videos']} videos · "
             f"{st['voiced']}/{st['with_lines']} scenes with lines voiced · {st['characters']} characters "
             f"({st['sheets']} with reference pictures) · {st['films']} films made · {st['running']} steps running · "
-            f"{st['failed']} recent failures · {st['continuity_problems']} continuity problems",
+            f"{st['failed']} recent failures · {st['continuity_problems']} continuity problems · "
+            f"{st['checked']} pictures checked, {st['picture_problems']} need attention",
             "Still missing: " + ("; ".join(missing) if missing else "nothing obvious")]
 
 
@@ -414,6 +456,12 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
             full = len(scenes) <= DETAIL_ALL or i in near or (about and len(scenes) <= 60)
             lines.append(f"{i}. {s.get('heading') or ''}: {_short(s.get('visual') or '', 600 if full else 140)}"
                          f"{' Speakers: ' + ', '.join(who) if who else ''} [{made}]")
+            ins = (s.get("inspection") or {}).get("result")
+            if ins and (full or ins.get("problems")):
+                lines += _check_lines(ins, (s.get("inspection") or {}).get("image_path") != s.get("image_path"),
+                                      bool(s.get("image_approved_path")) and s.get("image_approved_path") == s.get("image_path"))
+            elif s.get("image_approved_path") and s.get("image_approved_path") == s.get("image_path"):
+                lines.append("   [picture APPROVED by the creator]")
             if full:
                 for d in (s.get("dialogue") or [])[:12]:
                     if (d.get("text") or "").strip():

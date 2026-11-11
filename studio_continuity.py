@@ -35,6 +35,7 @@ SCHEMA = {
         "transition_note": {"type": "string", "description": "For new_place, time_jump or flashback: what changed "
                                                              "(e.g. 'next morning', 'she has driven to the hospital')."},
         "time_of_day": {"type": "string", "description": "e.g. night, dawn, afternoon."},
+        "weather": {"type": "string", "description": "e.g. heavy rain, clear, fog."},
         "location": {"type": "string", "description": "The place, as named in the heading."},
         "objects": {"type": "array", "items": _S, "description": "Important objects visible or used."},
         "characters": {"type": "array", "items": {"type": "object", "properties": {
@@ -49,6 +50,9 @@ SCHEMA = {
             "outfit": {"type": "string", "description": "What they wear in this scene (same as before unless the "
                                                         "screenplay changes it)."},
             "emotion_start": _S, "emotion_end": _S,
+            "expression": {"type": "string", "description": "Facial expression at the start."},
+            "visible_state": {"type": "string", "description": "Story-relevant visible changes: injuries, blood, wet, "
+                                                               "dirt, torn clothes. They carry over until healed or changed."},
             "enters": {"type": "boolean"}, "leaves": {"type": "boolean"},
         }, "required": ["name", "in_frame"]}},
         "start_state": {"type": "string", "description": "The first moment: who is where, doing what, physical state "
@@ -81,7 +85,7 @@ def clean(raw) -> dict:
     if not isinstance(raw, dict):
         return {}
     out = {k: _t(raw.get(k), 600 if k in ("start_state", "action", "end_state") else 300)
-           for k in ("purpose", "transition_note", "time_of_day", "location", "start_state", "action", "end_state",
+           for k in ("purpose", "transition_note", "time_of_day", "weather", "location", "start_state", "action", "end_state",
                      "camera", "camera_movement", "lighting", "from_previous", "setup_next")}
     t = _t(raw.get("transition"), 30)
     out["transition"] = t if t in TRANSITIONS else ""
@@ -95,7 +99,8 @@ def clean(raw) -> dict:
                       "position": _t(c.get("position"), 200), "facing": _t(c.get("facing"), 80),
                       "holding": _list(c.get("holding"), 4, 80), "holding_at_end": _list(c.get("holding_at_end"), 4, 80),
                       "outfit": _t(c.get("outfit"), 200), "emotion_start": _t(c.get("emotion_start"), 60),
-                      "emotion_end": _t(c.get("emotion_end"), 60), "enters": bool(c.get("enters")),
+                      "emotion_end": _t(c.get("emotion_end"), 60), "expression": _t(c.get("expression"), 80),
+                      "visible_state": _t(c.get("visible_state"), 160), "enters": bool(c.get("enters")),
                       "leaves": bool(c.get("leaves"))})
     out["characters"] = chars
     return {k: v for k, v in out.items() if v not in ("", [], None)}
@@ -155,6 +160,10 @@ def _who(chars: list[dict], key: str) -> list[str]:
         emo = c.get("emotion_start" if key == "holding" else "emotion_end")
         if emo:
             bits.append(f"feeling {emo}")
+        if start and c.get("expression"):
+            bits.append(f"expression {c['expression']}")
+        if c.get("visible_state"):
+            bits.append(c["visible_state"])
         bits = [b for b in bits if b]
         if bits:
             out.append(f"{c['name']}: " + "; ".join(bits))
@@ -186,6 +195,16 @@ def image_block(prev: Optional[dict], scene: dict) -> str:
                      + ". Keep the same place, light, weather, clothes and what people hold unless listed as a change.")
         if end:
             lines.append(f"The previous scene ended with: {end}.")
+        seen = ((((prev or {}).get("inspection") or {}).get("result") or {}).get("observed") or {}) \
+            if (prev or {}).get("inspection", {}).get("image_path") == (prev or {}).get("image_path") else {}
+        shown = [f"{x.get('name')}: " + ", ".join(v for v in (x.get("outfit"), x.get("visible_state"),
+                                                              ("holding " + ", ".join(x["holding"])) if x.get("holding") else "")
+                                                   if v)
+                 for x in seen.get("characters") or [] if x.get("name")]
+        env = ", ".join(v for v in (seen.get("lighting"), seen.get("weather"), seen.get("time_of_day")) if v)
+        if shown or env:
+            lines.append("The previous picture actually shows (keep it unless listed as a change): "
+                         + " / ".join(shown + ([env] if env else [])) + ".")
     else:
         note = c.get("transition_note") or {"new_place": "a different place", "time_jump": "later in time",
                                             "flashback": "a flashback"}.get(t, "")
@@ -201,7 +220,7 @@ def image_block(prev: Optional[dict], scene: dict) -> str:
         lines.append(f"Only heard, NOT in the picture: {', '.join(heard)}.")
     if c.get("intentional_changes"):
         lines.append("Intended changes from the previous scene: " + "; ".join(c["intentional_changes"]) + ".")
-    look = ", ".join(x for x in (c.get("camera"), c.get("lighting"), c.get("time_of_day")) if x)
+    look = ", ".join(x for x in (c.get("camera"), c.get("lighting"), c.get("weather"), c.get("time_of_day")) if x)
     if look:
         lines.append(f"Camera and light: {look}.")
     return "CONTINUITY:\n" + "\n".join(f"- {x}" for x in lines) + "\n"
