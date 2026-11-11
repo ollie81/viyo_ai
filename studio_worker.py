@@ -962,7 +962,7 @@ class StudioWorker:
         return {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}, cost
 
 
-    def _clip(self, job, project, scene, frame, cast, direction=None):
+    def _clip(self, job, project, scene, frame, cast, direction=None, seconds=None):
         """One video clip for a scene, or for one shot passed as a scene-like
         dict (its own description, lines, length and continuity). Returns
         (data, cost, references, backup model or None, entries)."""
@@ -984,7 +984,7 @@ class StudioWorker:
             # The characters talk inside the clip. Omni takes no audio, so
             # each character gets their saved voice description, word for
             # word every time, plus their portrait so the face stays the same.
-            seconds = speech_clip_seconds(scene)
+            seconds = seconds or speech_clip_seconds(scene)     # a shot passes its own length
             if seconds is None:
                 raise JobFailed("too_long", "This scene has too much dialogue for one video clip (15 seconds at most). "
                                             "Split it into two scenes. Your credits were returned.")
@@ -1002,7 +1002,7 @@ class StudioWorker:
             prompt = (f"{scene['visual'] or scene['heading']}. {notes} {style}{direction}"
                       f"{'' if direction else 'Natural, subtle motion. '}{speech}No text, captions or watermarks. "
                       "Do not add music.")
-            seconds = pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
+            seconds = seconds or pricing.video_seconds_for(scene.get("duration_seconds") or 8.0)
             if has_lines and scene_speech(scene, project) == "lipsync":
                 need = max(float(scene.get("duration_seconds") or 5), float(scene.get("audio_seconds") or 0) + 0.5,
                            speech_seconds(lines) if not scene.get("audio_seconds") else 0)
@@ -1142,7 +1142,12 @@ class StudioWorker:
         shot_scene = dict(scene, visual=shot["video_prompt"] or shot["description"], dialogue=shot.get("dialogue") or [],
                           duration_seconds=float(shot["duration_seconds"]), continuity=c, image_path=shot["image_path"])
         direction = continuity.video_block(None, shot_scene) + (f" Sound: {shot['audio']}." if shot.get("audio") else "")
-        data, cost, refs, backup, _e = self._clip(job, project, shot_scene, frame, cast, direction=direction)
+        seconds = shots_mod.clip_seconds(shot)
+        if seconds is None:
+            raise JobFailed("too_long", "This shot has too much dialogue for one clip (15 seconds at most). Edit the "
+                                        "plan or split the scene. Your credits were returned.")
+        data, cost, refs, backup, _e = self._clip(job, project, shot_scene, frame, cast, direction=direction,
+                                                  seconds=seconds)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
                           duration_seconds=cost.units.get("video_seconds"))
         self.store.update("studio_shots", {"id": shot["id"]}, {"video_path": path, "status": "ready", "updated_at": _now()})
@@ -1159,8 +1164,11 @@ class StudioWorker:
         clips = []
         for k, sh in enumerate(shots):
             clip = os.path.join(tmp, f"s{n}_shot{k}.mp4")
+            spoken = [d for d in sh.get("dialogue") or [] if (d.get("text") or "").strip()]
             render.render_scene(render.SceneInput(
-                duration=float(sh["duration_seconds"]),
+                # A talking shot is never cut before its lines end.
+                duration=max(float(sh["duration_seconds"]),
+                             shots_mod.speech_seconds(spoken) if talking and spoken and sh.get("video_path") else 0),
                 image=None if sh.get("video_path") else fetch(sh["image_path"], f"s{n}_shot{k}.img"),
                 video=fetch(sh["video_path"], f"s{n}_shot{k}_v.mp4") if sh.get("video_path") else None,
                 lines=tuple(d["text"] for d in sh.get("dialogue") or [] if d.get("text")),
@@ -1175,7 +1183,7 @@ class StudioWorker:
                     f"joining the shots of scene {n + 1}")
         has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
         return render.SceneInput(
-            duration=sum(float(sh["duration_seconds"]) for sh in shots), video=joined,
+            duration=render.probe(joined)["duration"], video=joined,
             # Saved voices speak over the joined shots; talking shots carry their own speech.
             audio=None if talking else fetch(scene.get("audio_path"), f"aud{n}.m4a"),
             audio_seconds=float(scene["audio_seconds"]) if scene.get("audio_seconds") and not talking else None,

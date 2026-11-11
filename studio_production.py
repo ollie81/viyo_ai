@@ -34,7 +34,7 @@ STAGE_LABEL = {"places": "Places and objects", "sheets": "Character sheets", "im
                "lipsync": "Lip sync", "render": "Final film"}
 ATTEMPTS = 2          # each step: the first try and one automatic retry
 # Reasons a step can't run *yet* that an earlier stage of the run takes care of.
-LATER = ("has no picture yet", "isn't made yet", "Record this scene's voices first")
+LATER = ("has no picture yet", "isn't made yet", "Record this scene's voices first", "shot's picture first")
 LANE = {"render": "render"}
 
 
@@ -56,15 +56,17 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
     stages: dict[str, list] = {s: [] for s in STAGES}
     blocked: list[str] = []
 
-    def add(stage, target, label, opts=None):
-        cost, reason = cs._price(STAGE_KIND[stage], p, target, cast, opts)
+    def add(stage, target, label, opts=None, kind=None):
+        kind = kind or STAGE_KIND[stage]
+        cost, reason = cs._price(kind, p, target, cast, opts)
         if reason and any(m in reason for m in LATER):
             reason = None          # an earlier stage of this run makes it
         if reason:
             blocked.append(f"{label}: {reason}")
             return
-        stages[stage].append({"target_id": target["id"], "label": label, "credits": pricing.hold_credits(STAGE_KIND[stage], cost),
-                              "input": opts or {}})
+        stages[stage].append({"target_id": target["id"], "label": label, "credits": pricing.hold_credits(kind, cost),
+                              "input": opts or {}, "kind": kind, **({"scene_id": target["scene_id"]}
+                                                                      if kind in ("shot_image", "shot_video") else {})})
 
     try:
         elements = st.select("studio_elements", {"project_id": p["id"]})
@@ -81,7 +83,25 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
             add("sheets", c, f"{c['name']}'s reference sheet", {"views": list(ident.VIEWS)})
         elif not options["sheets"] and not c.get("reference_path") and (c.get("description") or "").strip():
             add("sheets", c, f"{c['name']}'s portrait")
+    import studio_shots
+    shots_by: dict = {}
+    for sh in cs._project_shots(p["id"]):
+        shots_by.setdefault(sh["scene_id"], []).append(sh)
     for i, s in enumerate(scenes, start=1):
+        shots = sorted(shots_by.get(s["id"], []), key=lambda r: r["position"])
+        if studio_shots.uses_shots(s, shots):
+            # A scene with an approved shot plan is made shot by shot (and its
+            # voices once, if saved voices speak it); never a single clip it won't use.
+            for sh in shots:
+                n = sh["position"] + 1
+                if not sh.get("image_path") and not sh.get("approved_at"):
+                    add("images", sh, f"Scene {i}, shot {n} picture", {"shot_id": sh["id"]}, "shot_image")
+                if s.get("mode") == "video" and not sh.get("video_path") and not sh.get("approved_at"):
+                    add("videos", sh, f"Scene {i}, shot {n} clip", {"shot_id": sh["id"]}, "shot_video")
+            lines = [d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
+            if lines and not s.get("audio_path") and scene_speech(s, p) != "video_model":
+                add("voices", s, f"Scene {i} voices")
+            continue
         if not s.get("image_path"):
             add("images", s, f"Scene {i} picture")
         lines = [d for d in s.get("dialogue") or [] if (d.get("text") or "").strip()]
@@ -164,11 +184,12 @@ def advance(st, run: dict) -> bool:
                 stuck.append(f"{item['label']}: {last.get('error_message') or 'it failed twice'}")
                 continue
             key = f"run:{run['id']}:{stage}:{item['target_id']}:{rnd}:{len(tries)}"
-            kind = STAGE_KIND[stage]
+            kind = item.get("kind") or STAGE_KIND[stage]
             r = st.rpc("studio_run_create_job", {
                 "p_run": run["id"], "p_kind": kind, "p_lane": LANE.get(stage, "generation"), "p_key": key,
                 "p_credits": item["credits"], "p_input": item["input"],
-                "p_scene": item["target_id"] if kind in ("image", "voice", "video", "lipsync") else None,
+                "p_scene": item["target_id"] if kind in ("image", "voice", "video", "lipsync")
+                else item.get("scene_id") if kind in ("shot_image", "shot_video") else None,
                 "p_character": item["target_id"] if kind == "portrait" else None,
                 # The first try of a step draws from the reservation; retries
                 # (in this round or after a resume) hold from the balance,

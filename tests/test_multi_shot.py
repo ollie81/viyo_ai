@@ -192,15 +192,19 @@ def test_a_failed_shot_is_refunded_and_remade_alone(prod):
     ids = [s["id"] for s in talk["shots"]]
     make(client, gen, u, pid, "shot_image", ids)
     make(client, gen, u, pid, "shot_video", ids)
-    before_paths = {s["id"]: s["video_url"] for s in scenes(client, u, pid)[0]["shots"]}
+    stored = lambda: {str(k): v for k, v in db.execute(
+        "select id, video_path from public.studio_shots where scene_id = %s", (talk["id"],)).fetchall()}
+    before_paths = stored()        # the stored files, not signed links (those carry a changing expiry)
     credits = balance(client, u)["available"]
     ai.fail["video"] = studio_ai.ProviderError("down")
     make(client, gen, u, pid, "shot_video", [ids[1]])
     assert balance(client, u)["available"] == credits, "a failed shot is free"
+    assert stored() == before_paths, "a failed shot changes nothing"
     ai.fail.pop("video")
     make(client, gen, u, pid, "shot_video", [ids[1]])
-    after = scenes(client, u, pid)[0]["shots"]
-    assert after[1]["has_video"] and after[0]["video_url"] == before_paths[ids[0]] and after[2]["video_url"] == before_paths[ids[2]]
+    after = stored()
+    assert after[ids[1]] != before_paths[ids[1]]
+    assert after[ids[0]] == before_paths[ids[0]] and after[ids[2]] == before_paths[ids[2]], "the others untouched"
 
 
 def test_the_same_request_never_makes_or_charges_twice(prod):
@@ -285,3 +289,110 @@ def test_the_assistant_explains_and_proposes_shot_changes(prod, monkeypatch):
     mid = r.json()["reply"]["id"]
     assert client.post(f"/api/v1/studio/assistant/messages/{mid}/proposals/0/apply", headers=H(u)).status_code == 200
     assert scenes(client, u, pid)[0]["shots"][2]["shot_type"] == "extreme_close_up"
+
+
+# ------------------------------------------------------------------ verification of the whole workflow
+
+LINES = [["Where were you last night?", "Out. Working late."], ["The hospital called about Dad."],
+         [], ["I know what you did with the money.", "Then you know why I did it.", "Tell me the truth."], [],
+         ["We have to leave tonight."], ["I'm not going anywhere."], []]
+
+
+def minute(env):
+    """A one-minute talking-video episode: 8 scenes of 7.5 seconds."""
+    client, db, store, files, ai, gen, ren = env
+    u = make_user(db)
+    grant(client, u, 200000)
+    pid = project(client, u, title="One Minute", target_seconds=60)["id"]
+    sc = []
+    for i, lines in enumerate(LINES):
+        who = ["Maya", "Daniel"]
+        sc.append({"heading": f"INT. FLAT {i + 1} - NIGHT", "visual": f"Maya and Daniel in the flat, moment {i + 1}",
+                   "duration_seconds": 7.5, "dialogue": [{"character": who[k % 2], "text": t} for k, t in enumerate(lines)],
+                   "continuity": {"transition": "continuous" if i else "new_place", "time_of_day": "night",
+                                  "characters": [{"name": "Maya", "in_frame": True, "position": "left"},
+                                                 {"name": "Daniel", "in_frame": True, "position": "right"}]}})
+    split(client, ai, gen, u, pid, sc, characters=(MAYA, DAN))
+    return client, db, ai, gen, ren, u, pid
+
+
+def test_a_one_minute_episode_is_planned_made_and_rendered_shot_by_shot(env):
+    client, db, ai, gen, ren, u, pid = minute(env)
+    sc = plan(client, gen, u, pid)
+    assert len(sc) == 8 and abs(sum(s["duration_seconds"] for s in sc) - 60) < 0.01
+    all_shots = [sh for s in sc for sh in s["shots"]]
+    assert 8 < len(all_shots) <= 32, "several shots where the story needs them"
+    assert [len(s["shots"]) for s in sc if not s["dialogue"]] == [1, 1, 1], "quiet scenes: one held shot"
+    for s, lines in zip(sc, LINES):
+        assert [d["text"] for sh in s["shots"] for d in sh["dialogue"]] == lines, "every line once, in order"
+        assert sum(sh["duration_seconds"] for sh in s["shots"]) >= 7.5 - 0.05
+        for sh in s["shots"]:
+            assert sh["duration_seconds"] >= studio_shots.speech_seconds(sh["dialogue"]) - 0.01, "time for every line"
+        approve(client, u, s["id"])
+    ids = [sh["id"] for sh in all_shots]
+    est = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u), json={"kind": "shot_image", "target_ids": ids}).json()
+    assert est["ready_count"] == len(ids)
+    assert make(client, gen, u, pid, "shot_image", ids).status_code == 200
+    run(gen, times=200)
+    assert make(client, gen, u, pid, "shot_video", ids).status_code == 200
+    run(gen, times=200)
+    assert all(sh["has_video"] for s in scenes(client, u, pid) for sh in s["shots"])
+    assert start(client, u, pid, "render").status_code == 200
+    run(ren)
+    dur = float(db.execute("select duration_seconds from public.studio_renders where project_id = %s", (pid,)).fetchone()[0])
+    planned = sum(max(7.5, sum(sh["duration_seconds"] for sh in s["shots"])) for s in scenes(client, u, pid))
+    assert planned - 0.5 <= dur <= planned + 1.5, (dur, planned)
+    assert 59 <= dur <= 75, "about a minute: a little longer only where lines need it"
+
+
+def test_one_click_production_makes_the_shots_not_a_single_clip(env):
+    from test_studio_production import drive, quote as pquote, start as pstart, status as pstatus
+    client, db, store, files, ai, gen, ren = env
+    u = make_user(db)
+    grant(client, u, 50000)
+    pid = project(client, u, title="Auto")["id"]
+    split(client, ai, gen, u, pid, [dict(TALK), dict(QUIET)], characters=(MAYA, DAN))
+    talk = plan(client, gen, u, pid, [scenes(client, u, pid)[0]["id"]])[0]
+    approve(client, u, talk["id"])
+    q = pquote(client, u, pid, sheets=False)
+    labels = [i["label"] for st in q["stages"] for i in st["items"]]
+    assert "Scene 1, shot 1 picture" in labels and "Scene 1, shot 3 clip" in labels
+    assert "Scene 1 picture" not in labels and "Scene 1 video" not in labels, "no single clip it won't use"
+    assert "Scene 2 picture" in labels, "a scene without a shot plan is made the old way"
+    assert q["blocked"] == []
+    r = pstart(client, u, pid, q["total_credits"], sheets=False)
+    assert r.status_code == 200, r.text
+    drive(gen, ren, rounds=20)
+    st = pstatus(client, u, pid)
+    assert st["status"] == "done", st
+    kinds = [k for (k,) in db.execute("select kind from public.studio_jobs where project_id = %s and scene_id = %s",
+                                       (pid, talk["id"])).fetchall()]
+    assert "image" not in kinds and "video" not in kinds and kinds.count("shot_video") == 3
+
+
+def test_a_busy_provider_is_retried_and_charged_once(prod):
+    client, db, store, ai, gen, ren, u, pid = prod
+    talk = plan(client, gen, u, pid)[0]
+    approve(client, u, talk["id"])
+    sid = talk["shots"][0]["id"]
+    make(client, gen, u, pid, "shot_image", [sid])
+    ai.fail["video"] = [studio_ai.ProviderBusy("busy")]
+    make(client, gen, u, pid, "shot_video", [sid])
+    run(gen)
+    jobs = [j for j in client.get(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u)).json()["jobs"] if j["kind"] == "shot_video"]
+    assert len(jobs) == 1 and jobs[0]["status"] == "succeeded" and jobs[0]["shot_id"] == sid
+    charged = db.execute("select count(*) from public.studio_usage u join public.studio_jobs j on j.id = u.job_id "
+                         "where j.kind = 'shot_video' and u.status = 'charged'").fetchone()[0]
+    assert charged == 1
+
+
+def test_too_much_dialogue_for_one_shot_is_refused_before_paying(prod):
+    client, db, store, ai, gen, ren, u, pid = prod
+    talk = plan(client, gen, u, pid)[0]
+    approve(client, u, talk["id"])
+    sid = talk["shots"][0]["id"]
+    make(client, gen, u, pid, "shot_image", [sid])
+    long = [{"character": "Maya", "text": " ".join(["word"] * 60)}]
+    db.execute("update public.studio_shots set dialogue = %s where id = %s", (__import__("json").dumps(long), sid))
+    est = client.post(f"/api/v1/studio/projects/{pid}/estimate", headers=H(u), json={"kind": "shot_video", "target_ids": [sid]}).json()
+    assert est["ready_count"] == 0 and "too much dialogue for one clip" in est["items"][0]["blocked"]
