@@ -234,7 +234,7 @@ def test_2_the_writers_room_keeps_the_idea_and_plans_hooks_for_60_seconds():
                 "ending_hook": "So who are you?", "episode_summary": "", "open_threads": []}, 10, 10
 
     script, bible, *_ = studio_story.develop(lambda p: (SCRIPT, 10, 10), json_fn, brief)
-    assert "BROKE THE RULE" in calls[1], "a plan without an opening hook is sent back"
+    assert "YOUR PREVIOUS PLAN HAS THESE PROBLEMS" in calls[1], "a plan without an opening hook is sent back"
     assert bible["hooks_planned"] is True and bible["opening_hook"] == "Kofi?"
 
 

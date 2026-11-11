@@ -19,6 +19,46 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+OPENINGS = ("shocking_discovery", "unexpected_arrival", "betrayal", "confrontation", "mysterious_event",
+            "dangerous_secret", "emotional_revelation", "unexpected_decision", "threat", "in_the_middle_of_action")
+ENDINGS = ("secret_exposed", "betrayal_discovered", "unexpected_person", "disturbing_news", "relationship_shift",
+           "dangerous_decision", "mystery_deepens", "reversal", "threat_arrives", "final_twist", "emotional_payoff")
+
+# What works where: the techniques a genre's audience responds to, and what to avoid.
+GENRES = {
+    "thriller": "Open on danger or a discovery that puts someone at risk. Tighten with a ticking clock, a hidden threat "
+                "and information the viewer has before the hero. End on a threat arriving, a dangerous decision or a reversal.",
+    "mystery": "Open on a mysterious event or clue. Answer one question per beat and raise a bigger one. Plant clues "
+               "fairly. End on a mystery deepening or a secret exposed, never on random shock.",
+    "romance": "Open on longing, an unexpected meeting or a relationship at a breaking point. Build with closeness that "
+               "is interrupted, a secret between them, a rival. End on a relationship shift, a confession or a betrayal discovered.",
+    "family": "Open on a family secret surfacing or a confrontation at home. Build with loyalty tested, old wounds and who "
+              "knows what. End on a secret exposed, a disturbing truth about a parent or sibling, or an unexpected person.",
+    "revenge": "Open on the wrong done or the avenger's first move. Build with a plan that tightens and a cost that grows. "
+               "End on a reversal, the target discovering the plan, or a dangerous decision.",
+    "horror": "Open on something wrong in an ordinary place. Build dread by showing less, not more. End on the threat "
+              "arriving or a disturbing discovery.",
+    "comedy": "Open on an embarrassing situation or a lie that will snowball. Build with escalating complications. End "
+              "on the worst person walking in, or a reversal that makes it worse.",
+    "drama": "Open on an emotional revelation or a decision that changes a life. Build with conflict between people who "
+             "want different things. End on a relationship shift, disturbing news or a decision the viewer fears.",
+}
+_GENRE_WORDS = {"thriller": ("thriller", "crime", "action", "suspense", "spy", "heist"),
+                "mystery": ("mystery", "detective", "whodunit", "investigation"),
+                "romance": ("romance", "romantic", "love", "dating"),
+                "family": ("family", "sibling", "mother", "father", "inheritance"),
+                "revenge": ("revenge", "vengeance", "betrayal"),
+                "horror": ("horror", "ghost", "supernatural", "scary"),
+                "comedy": ("comedy", "comic", "funny", "romcom", "rom-com")}
+
+
+def genre_craft(genre: str, logline: str = "") -> str:
+    """The storytelling techniques that fit this genre (and the idea's own words)."""
+    text = f"{genre} {logline}".lower()
+    picked = [g for g, words in _GENRE_WORDS.items() if any(w in text for w in words)][:2] or ["drama"]
+    return "GENRE CRAFT (" + ", ".join(picked) + "):\n" + "\n".join(f"- {GENRES[g]}" for g in picked)
+
+
 PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -49,8 +89,37 @@ PLAN_SCHEMA = {
         }, "required": ["purpose", "what_happens", "emotional_turn", "seconds"]}},
         "ending": {"type": "string", "description": "The final image and why it hits (or the cliffhanger question)."},
         "visual_motifs": {"type": "array", "items": {"type": "string"}},
+        "hook_plan": {"type": "object", "properties": {
+            "opening_technique": {"type": "string", "enum": list(OPENINGS)},
+            "opening_moment": {"type": "string", "description": "Exactly what we see and hear in the first 3-5 seconds."},
+            "opening_why": {"type": "string", "description": "Why a viewer can't scroll away, tied to THIS story."},
+            "ending_technique": {"type": "string", "enum": list(ENDINGS)},
+            "ending_moment": {"type": "string", "description": "The final moment, exactly."},
+            "viewer_question": {"type": "string", "description": "The question the viewer is left needing answered."},
+        }, "required": ["opening_technique", "opening_moment", "opening_why", "ending_technique", "ending_moment",
+                        "viewer_question"]},
+        "continues_from": {"type": "string", "description": "Series only: how the first beat picks up the previous "
+                                                            "episode's final moment. Empty for a first episode."},
+        "questions": {"type": "array", "description": "The questions this episode makes the viewer ask, in order.",
+                      "items": {"type": "object", "properties": {
+                          "question": {"type": "string"}, "raised_in_beat": {"type": "integer"},
+                          "answered_in_beat": {"type": "integer", "description": "0 if it stays open for later."}},
+                          "required": ["question", "raised_in_beat", "answered_in_beat"]}},
+        "knowledge": {"type": "array", "description": "At the END of this episode: who knows what, who hides what.",
+                      "items": {"type": "object", "properties": {
+                          "character": {"type": "string"}, "knows": {"type": "string"}, "hides": {"type": "string"},
+                          "does_not_know": {"type": "string"}}, "required": ["character", "knows"]}},
+        "relationships": {"type": "array", "items": {"type": "object", "properties": {
+            "between": {"type": "string"}, "state": {"type": "string", "description": "At the end of this episode."},
+            "change": {"type": "string", "description": "What changed in this episode, or empty."}},
+            "required": ["between", "state"]}},
+        "revelations": {"type": "array", "items": {"type": "string"},
+                        "description": "What the VIEWER learns in this episode (so later episodes never re-explain it)."},
+        "next_episode": {"type": "array", "items": {"type": "string"},
+                         "description": "Planned developments for the next episode (episodes and series)."},
     },
-    "required": ["title", "logline", "central_conflict", "stakes", "characters", "beats", "ending"],
+    "required": ["title", "logline", "central_conflict", "stakes", "characters", "beats", "ending", "hook_plan",
+                 "questions", "knowledge"],
 }
 
 DOCTOR_SCHEMA = {
@@ -100,15 +169,53 @@ def _format(b: dict) -> str:
     return "vertical 9:16 phone video" if b.get("aspect_ratio") == "9:16" else "landscape 16:9 film"
 
 
+def _record_of(ep: dict) -> dict:
+    """An earlier episode's continuity record (older bibles have none: built from what they kept)."""
+    rec = dict(ep.get("episode_record") or {})
+    rec.setdefault("ending", ep.get("ending_hook") or ep.get("ending") or "")
+    rec.setdefault("open_questions", ep.get("open_threads") or [])
+    rec.setdefault("end_technique", (ep.get("hook_plan") or {}).get("ending_technique") or "")
+    if ep.get("_screenplay_end"):
+        rec["final_scene"] = ep["_screenplay_end"]       # the script as it is now (the creator may have edited it)
+    return rec
+
+
 def _continuity(previous: list[dict]) -> str:
     if not previous:
         return ""
-    lines = ["THIS IS A SERIES. Earlier episodes (keep every established fact, name, relationship and personality;",
-             "never rename or change a character; pay off the open threads):"]
-    for ep in previous[-6:]:
-        lines.append(f"- {ep.get('title') or 'Episode'}: {ep.get('episode_summary') or ''}".strip())
-        if ep.get("open_threads"):
-            lines.append("  Open threads: " + "; ".join(ep["open_threads"][:6]))
+    lines = ["THIS IS A SERIES. Earlier episodes, oldest first (keep every established fact, name, relationship and",
+             "personality; never rename or change a character):"]
+    for n, ep in enumerate(previous[-6:], start=max(1, len(previous) - 5)):
+        rec = _record_of(ep)
+        lines.append(f"- Episode {n} \"{ep.get('title') or ''}\": {ep.get('episode_summary') or ''}".strip())
+        if rec.get("revelations"):
+            lines.append("  The viewer already learned: " + "; ".join(rec["revelations"][:6]))
+        if rec.get("end_technique"):
+            lines.append(f"  Its ending used: {rec['end_technique'].replace('_', ' ')}")
+    last = _record_of(previous[-1])
+    lines.append("")
+    lines.append("THE PREVIOUS EPISODE ENDED EXACTLY LIKE THIS (this episode starts from here):")
+    lines.append((last.get("final_scene") or last.get("ending") or "(not recorded)")[:1500])
+    if last.get("open_questions"):
+        lines.append("Questions the viewer is waiting to have answered: " + "; ".join(map(str, last["open_questions"][:8])))
+    knowledge = last.get("knowledge") or []
+    if knowledge:
+        lines.append("Who knows what at the end of the previous episode (a character only learns more ON SCREEN):")
+        for k in knowledge[:10]:
+            lines.append(f"- {k.get('character')}: knows {k.get('knows') or '-'}"
+                         + (f"; hides {k['hides']}" if k.get("hides") else "")
+                         + (f"; doesn't know {k['does_not_know']}" if k.get("does_not_know") else ""))
+    for r in (last.get("relationships") or [])[:8]:
+        lines.append(f"- Relationship {r.get('between')}: {r.get('state')}")
+    if last.get("next_episode"):
+        lines.append("Planned for this episode: " + "; ".join(map(str, last["next_episode"][:6])))
+    used = [(_record_of(e).get("end_technique") or "") for e in previous[-2:]]
+    used = [u for u in used if u]
+    lines.append("SERIES RULES: the first beat picks up that final moment (its consequence or the very next moment); "
+                 "don't re-explain what the viewer already saw or learned; pay off at least one waiting question and "
+                 "raise at least one new one; the larger story must move forward."
+                 + (f" Don't end this episode with the same kind of cliffhanger as before ({', '.join(u.replace('_', ' ') for u in used)})."
+                    if used else ""))
     cast = {}
     for ep in previous:
         for c in ep.get("characters") or []:
@@ -136,6 +243,19 @@ Language of the final dialogue: {b.get('language') or 'English'}.
 
 {CRAFT}
 
+{genre_craft(b.get('genre') or '', b.get('logline') or '')}
+
+HOOKS THAT FIT THIS STORY (don't force a random shock):
+- Opening: pick the technique that grows from THIS idea (a discovery, an arrival, a betrayal, a confrontation, a
+  mystery, a dangerous secret, an emotional revelation, a decision...). The first line or image already belongs to the
+  conflict. No greetings, no "my name is", no background explained, no calm before the trouble.
+- Suspense: every beat turns the feeling (emotional_turn) and either raises a question or answers one (questions:
+  raised_in_beat / answered_in_beat). Answer small questions to earn bigger ones. No two beats do the same job; no
+  filler conversation; each scene changes something.
+- Ending: the final moment grows out of what just happened and leaves one clear question the viewer needs answered
+  (viewer_question). It must feel inevitable, not bolted on.
+- knowledge: at the end, who knows what and who hides what (later episodes depend on it).
+
 Plan {scenes}-{scenes + 2} beats whose seconds add up to about {seconds}.
 The FIRST beat's purpose is "hook" and the LAST beat's purpose is "end_hook".
 {'The end hook is a cliffhanger.' if episode else 'The story resolves emotionally, and its final moment is still a hook: a last twist, revelation, line or image that hits hard.'}
@@ -159,10 +279,10 @@ Rules:
 - Return only the screenplay text."""
 
 
-def doctor_prompt(b: dict, plan: dict, draft: str) -> str:
+def doctor_prompt(b: dict, plan: dict, draft: str, previous: Optional[list[dict]] = None) -> str:
     return f"""You are a demanding script doctor. Here is a story plan and a first-draft screenplay.
 
-STORY PLAN:
+{_continuity(previous or [])}STORY PLAN:
 {json.dumps(plan, ensure_ascii=False, indent=1)}
 
 DRAFT:
@@ -185,42 +305,232 @@ def hooks_ok(plan: dict) -> bool:
     return bool(beats) and beats[0].get("purpose") == "hook" and beats[-1].get("purpose") in ("end_hook", "cliffhanger")
 
 
+def plan_problems(plan: dict, brief: dict, previous: list[dict]) -> list[str]:
+    """What the plan gets wrong that a writer would send back."""
+    out = []
+    if not hooks_ok(plan):
+        out.append("It must start with a 'hook' beat and end with an 'end_hook' beat.")
+    hp = plan.get("hook_plan") or {}
+    if not (hp.get("opening_moment") or "").strip() or not (hp.get("ending_moment") or "").strip():
+        out.append("hook_plan must say exactly what the opening and the final moment are.")
+    if previous:
+        if not (plan.get("continues_from") or "").strip():
+            out.append("continues_from must say how the first beat picks up the previous episode's final moment.")
+        last = (_record_of(previous[-1]).get("end_technique") or "")
+        if last and hp.get("ending_technique") == last:
+            out.append(f"The previous episode already ended with '{last.replace('_', ' ')}'. Choose a different kind "
+                       "of ending that still grows out of this story.")
+    if brief.get("kind") in ("episode", "series"):
+        if not any(not q.get("answered_in_beat") for q in plan.get("questions") or []):
+            out.append("An episode must leave at least one question open for the next episode (answered_in_beat 0).")
+    beats = plan.get("beats") or []
+    jobs = [(b.get("purpose"), (b.get("emotional_turn") or "").lower()) for b in beats]
+    if len(jobs) != len(set(jobs)) and len(beats) > 2:
+        out.append("Two beats do the same job with the same feeling: make every beat change something.")
+    return out
+
+
+CRITERIA = ("opening_hook", "progression", "emotion", "suspense", "dialogue", "scene_relevance", "ending_hook", "continuity")
+THRESHOLD = {"opening_hook": 8, "ending_hook": 8, "continuity": 8}      # the rest: 7
+EVAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {"type": "object", "properties": {k: {"type": "object", "properties": {
+            "score": {"type": "integer", "description": "1-10. Omit continuity for a first episode."},
+            "evidence": {"type": "string", "description": "Quote the exact line(s) or describe the exact moment judged."},
+            "reason": {"type": "string"}}, "required": ["score", "evidence", "reason"]} for k in CRITERIA}},
+        "weak": {"type": "array", "items": {"type": "object", "properties": {
+            "area": {"type": "string", "enum": list(CRITERIA)}, "problem": {"type": "string"},
+            "fix": {"type": "string", "description": "A concrete rewrite instruction."}},
+            "required": ["area", "problem", "fix"]}},
+        "viewer_questions": {"type": "array", "items": {"type": "string"},
+                             "description": "What a viewer wants to know after the last moment."},
+    },
+    "required": ["scores", "weak", "viewer_questions"],
+}
+
+def structure_checks(script: str, brief: dict, previous: list[dict]) -> list[dict]:
+    """Checks that need no AI: a slow opening, repeated lines, a flat last moment."""
+    import re
+    out = []
+    lines = screenplay_lines(script)
+    first = lines[0][1] if lines else ""
+    if re.match(r"^\W*(hi|hello|hey|good (morning|evening|afternoon)|my name is|welcome)\b", first, re.I):
+        out.append({"area": "opening_hook", "problem": f"The first line is a greeting: \"{first[:80]}\".",
+                    "fix": "Open inside the conflict: cut the greeting and start on the moment of trouble."})
+    seen = {}
+    for who, text in lines:
+        key = " ".join(_words(text))
+        if len(key.split()) >= 4:
+            seen[key] = seen.get(key, 0) + 1
+    rep = [k for k, n in seen.items() if n > 1]
+    if rep:
+        out.append({"area": "dialogue", "problem": f"A line is said more than once: \"{rep[0][:80]}\".",
+                    "fix": "Say it once; give the repeat a new line that moves the scene."})
+    tail = (script or "").strip().splitlines()[-1:] or [""]
+    if re.search(r"\b(the end|fade out|fades to black|to be continued)\b", tail[0], re.I) and brief.get("kind") in ("episode", "series"):
+        out.append({"area": "ending_hook", "problem": "It ends on a fade-out instead of a moment.",
+                    "fix": "End on the final image or line that leaves the viewer's question open."})
+    return out
+
+
+def evaluation_prompt(b: dict, plan: dict, script: str, previous: list[dict]) -> str:
+    return f"""You are the head of story at a short-drama studio deciding whether this episode is ready for
+viewers. Judge the FINAL screenplay below (not the plan). Be honest and specific: a 9 or 10 means a viewer could not
+stop watching; 5 means forgettable. Quote the exact line or moment for every score.
+
+{_continuity(previous)}WHAT THE WRITERS PLANNED:
+Opening ({(plan.get('hook_plan') or {}).get('opening_technique', '')}): {(plan.get('hook_plan') or {}).get('opening_moment', '')}
+Ending ({(plan.get('hook_plan') or {}).get('ending_technique', '')}): {(plan.get('hook_plan') or {}).get('ending_moment', '')}
+Format: {b.get('kind')} of about {int(b.get('target_seconds') or 90)} seconds; genre {b.get('genre') or 'drama'}.
+
+SCREENPLAY:
+{script}
+
+Score 1-10 with evidence: opening_hook (do the first 3-5 seconds make leaving impossible?), progression (does every
+scene change something?), emotion (do we feel for someone?), suspense (do questions build?), dialogue (natural, with
+subtext, no repetition?), scene_relevance (any filler?), ending_hook (does the last moment leave a question the
+viewer needs answered, grown from the story?), continuity ({'does it pick up the previous ending, keep who knows what, and not re-explain?' if previous else 'omit: first episode'}).
+List every weak area with a concrete fix. List the viewer's questions after the last moment."""
+
+
+def revision_prompt(b: dict, plan: dict, script: str, weak: list[dict], previous: list[dict]) -> str:
+    fixes = "\n".join(f"- {w['area']}: {w['problem']} FIX: {w['fix']}" for w in weak[:8])
+    return f"""Revise this screenplay. Fix ONLY these weaknesses and keep everything else (characters, names,
+events, length, format, language):
+{fixes}
+
+{_continuity(previous)}{HOOK_RULE}
+
+SCREENPLAY:
+{script}
+
+Return only the full revised screenplay."""
+
+
+def clean_evaluation(raw, has_previous: bool) -> dict:
+    """Only scores backed by evidence count; a score without a quote is dropped."""
+    raw = raw if isinstance(raw, dict) else {}
+    scores = {}
+    for k in CRITERIA:
+        v = (raw.get("scores") or {}).get(k) if isinstance(raw.get("scores"), dict) else None
+        if k == "continuity" and not has_previous:
+            continue
+        if isinstance(v, dict) and isinstance(v.get("score"), (int, float)) and str(v.get("evidence") or "").strip():
+            scores[k] = {"score": max(1, min(10, int(v["score"]))), "evidence": str(v["evidence"])[:300],
+                         "reason": str(v.get("reason") or "")[:300]}
+    weak = [{"area": w["area"], "problem": str(w.get("problem") or "")[:300], "fix": str(w.get("fix") or "")[:300]}
+            for w in raw.get("weak") or [] if isinstance(w, dict) and w.get("area") in CRITERIA]
+    return {"scores": scores, "weak": weak,
+            "viewer_questions": [str(q)[:200] for q in (raw.get("viewer_questions") or [])[:6] if str(q).strip()]}
+
+
+def below(ev: dict) -> list[str]:
+    """Areas under the bar (missing scores count as unknown, not as passed)."""
+    return [k for k, v in ev["scores"].items() if v["score"] < THRESHOLD.get(k, 7)]
+
+
+def total(ev: dict) -> int:
+    return sum(v["score"] for v in ev["scores"].values())
+
+
+def _last_section(script: str, n: int = 900) -> str:
+    parts = [p for p in __import__("re").split(r"\n(?=\s*(?:INT\.|EXT\.|INT/EXT|EXT/INT|I/E))", script or "") if p.strip()]
+    return (parts[-1] if parts else script or "").strip()[-n:]
+
+
+def episode_record(plan: dict, script: str, doc: dict, ev: dict) -> dict:
+    """What the next episode must know: how this one ended, what's still open,
+    who knows what, relationships, what the viewer learned, what's planned."""
+    hp = plan.get("hook_plan") or {}
+    open_q = [q["question"] for q in plan.get("questions") or [] if isinstance(q, dict) and not q.get("answered_in_beat")]
+    return {"ending": doc.get("ending_hook") or hp.get("ending_moment") or plan.get("ending") or "",
+            "final_scene": _last_section(script), "end_technique": hp.get("ending_technique") or "",
+            "open_questions": list(dict.fromkeys(open_q + list(doc.get("open_threads") or []) + ev.get("viewer_questions", [])))[:10],
+            "knowledge": plan.get("knowledge") or [], "relationships": plan.get("relationships") or [],
+            "revelations": plan.get("revelations") or [], "next_episode": plan.get("next_episode") or []}
+
+
 def develop(text_fn, json_fn, brief: dict, previous: Optional[list[dict]] = None):
-    """Runs the three steps. `text_fn(prompt) -> (text, in_tokens, out_tokens)`,
-    `json_fn(prompt, schema) -> (dict, in_tokens, out_tokens)`.
-    Returns (screenplay, bible, total_in, total_out)."""
+    """Plan -> draft -> script doctor -> evaluation (-> one targeted revision
+    and a second evaluation if it's weak). `text_fn(prompt) -> (text, in, out)`,
+    `json_fn(prompt, schema) -> (dict, in, out)`. Returns (screenplay, bible, in, out)."""
     previous = previous or []
-    plan, i1, o1 = json_fn(plan_prompt(brief, previous), PLAN_SCHEMA)
+    tin = tout = 0
+
+    def j(prompt, schema):
+        nonlocal tin, tout
+        d, i, o = json_fn(prompt, schema)
+        tin, tout = tin + i, tout + o
+        return d
+
+    def t(prompt):
+        nonlocal tin, tout
+        d, i, o = text_fn(prompt)
+        tin, tout = tin + i, tout + o
+        return (d or "").strip()
+
+    plan = j(plan_prompt(brief, previous), PLAN_SCHEMA)
     if not plan.get("beats") or not plan.get("characters"):
         raise ValueError("the story plan came back empty")
-    if not hooks_ok(plan):
-        # Every story starts and ends with a hook: send the plan back once.
-        fix = (plan_prompt(brief, previous) + "\n\nYOUR PREVIOUS PLAN BROKE THE RULE. It must start with a 'hook' beat "
-               "and end with an 'end_hook' beat. Here it is; return it fixed:\n" + json.dumps(plan, ensure_ascii=False))
-        fixed, i0, o0 = json_fn(fix, PLAN_SCHEMA)
-        i1, o1 = i1 + i0, o1 + o0
+    problems = plan_problems(plan, brief, previous)
+    if problems:
+        # Sent back once, with every problem named.
+        fix = (plan_prompt(brief, previous) + "\n\nYOUR PREVIOUS PLAN HAS THESE PROBLEMS:\n" +
+               "\n".join(f"- {x}" for x in problems) + "\nHere it is; return it fixed:\n" + json.dumps(plan, ensure_ascii=False))
+        fixed = j(fix, PLAN_SCHEMA)
         if fixed.get("beats") and fixed.get("characters"):
             plan = fixed
     plan["hooks_planned"] = hooks_ok(plan)
-    draft, i2, o2 = text_fn(draft_prompt(brief, plan, previous))
-    draft = (draft or "").strip()
+    plan["plan_problems"] = plan_problems(plan, brief, previous)
+    draft = t(draft_prompt(brief, plan, previous))
     if not draft:
         raise ValueError("the screenplay draft came back empty")
     try:
-        doc, i3, o3 = json_fn(doctor_prompt(brief, plan, draft), DOCTOR_SCHEMA)
+        doc = j(doctor_prompt(brief, plan, draft, previous), DOCTOR_SCHEMA)
     except Exception:
-        doc, i3, o3 = {}, 0, 0
+        doc = {}
     final = (doc.get("screenplay") or "").strip()
     # A rewrite much shorter than the draft has probably been cut off: keep the draft.
     if len(final) < 0.6 * len(draft):
         final, doc = draft, {**doc, "fixes": doc.get("fixes") or [], "rewrite_used": False}
     else:
         doc["rewrite_used"] = True
-    bible = {**plan, "scores": doc.get("scores") or {}, "fixes": doc.get("fixes") or [],
+
+    # The final screenplay is judged (not the draft), with quoted evidence and checks that need no AI.
+    evaluation = {"scores": {}, "weak": [], "viewer_questions": [], "evaluated": False}
+    try:
+        ev = clean_evaluation(j(evaluation_prompt(brief, plan, final, previous), EVAL_SCHEMA), bool(previous))
+        checks = structure_checks(final, brief, previous)
+        weak_areas = set(below(ev)) | {c["area"] for c in checks}
+        evaluation = {**ev, "checks": checks, "evaluated": bool(ev["scores"]), "revised": False}
+        if weak_areas:
+            weak = [w for w in ev["weak"] if w["area"] in weak_areas] + checks
+            weak += [{"area": a, "problem": ev["scores"][a]["reason"], "fix": f"Make the {a.replace('_', ' ')} stronger."}
+                     for a in weak_areas if a in ev["scores"] and not any(w["area"] == a for w in weak)]
+            revised = t(revision_prompt(brief, plan, final, weak, previous))
+            if len(revised) >= 0.6 * len(final):
+                ev2 = clean_evaluation(j(evaluation_prompt(brief, plan, revised, previous), EVAL_SCHEMA), bool(previous))
+                checks2 = structure_checks(revised, brief, previous)
+                if ev2["scores"] and total(ev2) - 3 * len(checks2) >= total(ev) - 3 * len(checks):
+                    evaluation = {**ev2, "checks": checks2, "evaluated": True, "revised": True,
+                                  "before": {k: v["score"] for k, v in ev["scores"].items()},
+                                  "fixed": [w["area"] for w in weak]}
+                    final = revised
+                else:
+                    evaluation["revision_rejected"] = "The revision wasn't better, so the original was kept."
+            else:
+                evaluation["revision_rejected"] = "The revision came back cut off, so the original was kept."
+        evaluation["below_bar"] = sorted(set(below(evaluation)) | {c["area"] for c in evaluation.get("checks", [])})
+    except Exception as e:
+        evaluation["error"] = f"The story check couldn't run ({str(e)[:120]}); the screenplay is unchanged."
+    bible = {**plan, "draft_scores": doc.get("scores") or {}, "scores": doc.get("scores") or {},
+             "fixes": doc.get("fixes") or [],
              "opening_hook": doc.get("opening_hook") or "", "ending_hook": doc.get("ending_hook") or "",
              "episode_summary": doc.get("episode_summary") or "", "open_threads": doc.get("open_threads") or [],
-             "rewrite_used": doc.get("rewrite_used", False)}
-    return final, bible, i1 + i2 + i3, o1 + o2 + o3
+             "rewrite_used": doc.get("rewrite_used", False), "evaluation": evaluation}
+    bible["episode_record"] = episode_record(plan, final, doc, evaluation)
+    return final, bible, tin, tout
 
 
 # ------------------------------------------------------------------ dialogue check
@@ -247,6 +557,9 @@ def screenplay_lines(script: str) -> list[tuple[str, str]]:
         elif m and not line.upper().startswith(_NOT_CUE) and any(ch.isalpha() for ch in m.group(1)):
             flush()
             speaker, buf = m.group(1).strip().title(), []
+        elif line.upper().startswith(_NOT_CUE[:5]):
+            flush()                                   # a scene heading ends the speech
+            speaker, buf = None, []
         elif speaker and not (line.startswith("(") and line.endswith(")")):
             buf.append(line)
     flush()

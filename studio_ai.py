@@ -590,6 +590,12 @@ class FakeStudioAI:
 
     def develop_script(self, brief, previous):
         self.last_story_previous = list(previous)
+        fns = getattr(self, "story_fns", None)
+        if fns:
+            # A scripted writers' room (tests): runs the real studio_story pipeline.
+            import studio_story
+            text, bible, i, o = studio_story.develop(fns[0], fns[1], brief, previous)
+            return text, bible, pricing.text_cost(i, o)
         text, cost = self.write_script(brief)
         bible = {"title": brief.get("title"), "logline": brief.get("logline") or "A story.",
                  "central_conflict": "Maya must face the brother she left behind.", "stakes": "Her family",
