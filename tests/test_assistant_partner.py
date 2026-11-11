@@ -193,7 +193,8 @@ def test_memory_rules_unit():
     m, _ = studio_memory.add({}, "questions", "Who raised Daniel?")
     m, _ = studio_memory.add(m, "story", "Who raised Daniel?")
     assert m["questions"] == [] and m["story"][0]["text"] == "Who raised Daniel?", "answered questions leave the list"
-    m = studio_memory.apply_updates(m, [{"category": "nonsense", "text": "x"}, "bad", {"category": "story", "text": ""}])
+    m, added = studio_memory.apply_updates(m, [{"category": "nonsense", "text": "x"}, "bad", {"category": "story", "text": ""}])
+    assert added == []
     assert studio_memory.count(m) == 1
 
 

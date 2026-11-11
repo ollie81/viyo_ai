@@ -258,3 +258,14 @@ def hold_credits(kind: str, cost: Cost) -> int:
     if kind in ("script", "breakdown", "outfits"):
         return credits_for(cost.total_usd * HOLD_FACTOR)
     return cost.credits
+
+
+def estimate_inspection(images: int = 5) -> Cost:
+    """One visual continuity check: the scene picture and its references read
+    by the text model (studio_inspect), with a capped thinking budget."""
+    return text_cost(2500 + SHEET_REF_TOKENS * max(1, images), THINKING_BUDGET + 900)
+
+
+def estimate_shotplan(scene_chars: int = 1500) -> Cost:
+    """The director planning one scene's shots (one text call, capped thinking)."""
+    return text_cost(2200 + scene_chars // 3, THINKING_BUDGET + 1400)

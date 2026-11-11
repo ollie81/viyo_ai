@@ -157,7 +157,8 @@ For each scene give:
 - visual: the scene's opening frame as one coherent shot (characters by name, positions, action, what they hold,
   setting, lighting, framing), matching its start_state;
 - the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over);
-- a duration in seconds (2-12; long enough for its lines);
+- a duration in seconds (2-12; long enough for its lines). Plan about one scene per 7-8 seconds of the target length
+  (a 60-second drama is about 8 scenes), fewer when scenes need room, and make the durations add up to the target;
 - continuity: purpose; transition from the scene before (continuous, same_place_cut, new_place, time_jump,
   flashback; the first scene is new_place) with a note for the last three; time of day; location; important objects;
   every character involved with in_frame (false if only heard), position and facing, what they hold at the start and
@@ -247,6 +248,14 @@ def _classify(e: Exception) -> Exception:
     return ProviderError(str(e)[:300])
 
 
+def _mime(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 CHAT_LEVELS = {"quick": ("low", 512), "story": ("medium", 4096), "deep": ("high", 12288)}
 
 
@@ -331,7 +340,7 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
-    def chat(self, prompt: str, mode: str = "quick"):
+    def chat(self, prompt: str, mode: str = "quick", images: Optional[list] = None):
         """One assistant reply (studio_chat): {reply, proposals, memory, focus}.
 
         The thinking depth follows the task (chat_thinking): the SDK's
@@ -342,9 +351,17 @@ class GoogleStudioAI:
         level, budget = chat_thinking(mode)
         model = os.environ.get("STUDIO_CHAT_MODEL") or pricing.TEXT_MODEL
 
+        contents = prompt
+        if images:   # real pictures from the production (studio_visual): labelled, then the text
+            contents = []
+            for i, (label, data) in enumerate(images, start=1):
+                contents.append(types.Part.from_text(text=f"Image {i}: {label}"))
+                contents.append(types.Part.from_bytes(data=data, mime_type=_mime(data)))
+            contents.append(types.Part.from_text(text=prompt))
+
         def call(thinking):
             return self.client.models.generate_content(
-                model=model, contents=prompt,
+                model=model, contents=contents,
                 config=types.GenerateContentConfig(
                     thinking_config=thinking, safety_settings=drama_safety(),
                     response_mime_type="application/json", response_json_schema=studio_chat.CHAT_SCHEMA))
@@ -365,6 +382,43 @@ class GoogleStudioAI:
             raise ProviderError("The assistant's answer couldn't be read.")
         if not isinstance(data, dict) or not (data.get("reply") or "").strip():
             raise ProviderError("The assistant returned an empty answer.")
+        i, o = self._text_usage(resp)
+        return data, pricing.text_cost(i, o)
+
+    def inspect(self, prompt: str, images: list):
+        """The visual continuity check (studio_inspect): images are (label, bytes),
+        Image 1 is the scene picture. Returns (cleaned result, cost)."""
+        import studio_inspect
+        from google.genai import types
+        parts = []
+        for i, (label, data) in enumerate(images[:studio_inspect.MAX_IMAGES], start=1):
+            parts.append(types.Part.from_text(text=f"Image {i}: {label}"))
+            parts.append(types.Part.from_bytes(data=data, mime_type=_mime(data)))
+        parts.append(types.Part.from_text(text=prompt))
+        try:
+            resp = self.client.models.generate_content(
+                model=os.environ.get("STUDIO_INSPECT_MODEL") or pricing.TEXT_MODEL, contents=parts,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+                    safety_settings=drama_safety(), response_mime_type="application/json",
+                    response_json_schema=studio_inspect.SCHEMA))
+        except Exception as e:
+            raise _classify(e)
+        try:
+            result = studio_inspect.clean(json.loads(resp.text or ""))
+        except (TypeError, ValueError):
+            raise ProviderError("The picture check returned an unreadable answer.")
+        i, o = self._text_usage(resp)
+        return result, pricing.text_cost(i, o)
+
+    def plan_shots(self, prompt: str, scene: Optional[dict] = None, cast_names: Optional[list] = None):
+        """The director's shot plan for one scene (studio_shots.SCHEMA). Returns (raw, cost)."""
+        import studio_shots
+        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=studio_shots.SCHEMA)
+        try:
+            data = json.loads(resp.text or "")
+        except (TypeError, ValueError):
+            raise ProviderError("The director returned an unreadable shot plan.")
         i, o = self._text_usage(resp)
         return data, pricing.text_cost(i, o)
 
@@ -574,10 +628,12 @@ class FakeStudioAI:
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
 
-    def chat(self, prompt, mode="quick"):
+    def chat(self, prompt, mode="quick", images=None):
         self.calls.append(("chat",))
         self.chat_prompts = getattr(self, "chat_prompts", []) + [prompt]
         self.chat_modes = getattr(self, "chat_modes", []) + [mode]
+        self.chat_images = getattr(self, "chat_images", []) + [[label for label, _d in images or []]]
+        self.chat_image_bytes = getattr(self, "chat_image_bytes", []) + [[data for _l, data in images or []]]
         self._maybe_fail("chat")
         if getattr(self, "chat_result", None) is not None:
             r = self.chat_result
@@ -588,6 +644,30 @@ class FakeStudioAI:
                                "data": {"title": "Hidden Heir", "logline": "An evicted courier learns he is a billionaire's son.",
                                         "genre": "Drama"}}],
                 "decisions": []}, pricing.text_cost(3000, 400)
+
+    def inspect(self, prompt, images):
+        """inspect_result: a dict or a function (prompt, labels) -> dict. Default: a clean picture."""
+        import studio_inspect
+        self.calls.append(("inspect",))
+        labels = [label for label, _d in images]
+        self.inspect_log = getattr(self, "inspect_log", []) + [{"prompt": prompt, "labels": labels}]
+        self._maybe_fail("inspect")
+        r = getattr(self, "inspect_result", None)
+        raw = (r(prompt, labels) if callable(r) else r) if r is not None else {
+            "scores": {"overall": 92, "character": 95, "outfit": 90, "location": 90, "props": 90},
+            "problems": [], "observed": {}, "summary": "Looks consistent."}
+        return studio_inspect.clean(raw), pricing.text_cost(2500 + 1300 * len(images), 900)
+
+    def plan_shots(self, prompt, scene=None, cast_names=None):
+        """shots_result: a dict, or a function (prompt, scene) -> dict. Default: studio_shots.default_plan."""
+        import studio_shots
+        self.calls.append(("plan_shots",))
+        self.shot_prompts = getattr(self, "shot_prompts", []) + [prompt]
+        self._maybe_fail("plan_shots")
+        r = getattr(self, "shots_result", None)
+        raw = (r(prompt, scene) if callable(r) else r) if r is not None else \
+            studio_shots.default_plan(scene or {}, list(cast_names or []))
+        return raw, pricing.text_cost(1800, 900)
 
     def summarize(self, prompt):
         self.calls.append(("summarize",))

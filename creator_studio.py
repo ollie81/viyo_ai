@@ -35,6 +35,9 @@ import studio_pricing as pricing
 import studio_music as music_mod
 import studio_continuity as continuity
 import studio_memory
+import studio_inspect
+import studio_visual
+import studio_shots
 from studio_store import Files, Store, SupabaseFiles, SupabaseStore
 
 router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
@@ -42,7 +45,8 @@ router = APIRouter(prefix="/api/v1/studio", tags=["creator_studio"])
 SIGN_SECONDS = 3600
 JOB_KINDS = ("script", "breakdown", "portrait", "image", "voice", "video", "render", "outfits", "cover", "elements",
              "element")
-LANE = {"render": "render"}
+LANE = {"render": "render", "inspect": "inspect"}
+MAX_AUDIT = 150        # scenes one picture audit can queue at once (each scene is its own small request)
 CREDIT_PACKS = [  # credits are worth $0.01 each to Viyo after payment fees
     {"id": "starter", "credits": 500, "label": "500 credits"},
     {"id": "creator", "credits": 1500, "label": "1,500 credits"},
@@ -185,6 +189,7 @@ class ProjectPatch(BaseModel):
     aspect_ratio: Optional[Literal["9:16", "16:9"]] = None
     music_volume: Optional[float] = Field(None, ge=0, le=1)
     auto_music: Optional[bool] = None
+    auto_inspect: Optional[bool] = None
     image_quality: Optional[Literal["standard", "high"]] = None
     production_style: Optional[Literal["video", "pictures"]] = None
 
@@ -262,8 +267,11 @@ class OrderIn(BaseModel):
 
 class JobRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
-                  "elements", "element"]
-    target_ids: list[str] = Field(default_factory=list, max_length=100)
+                  "elements", "element", "inspect", "shotplan", "shot_image",
+                  "shot_video"]
+    # Image only: what a new picture must fix (from the picture check), approved by the creator.
+    correction: Optional[str] = Field(None, max_length=600)
+    target_ids: list[str] = Field(default_factory=list, max_length=200)
     request_id: str = Field(..., min_length=8, max_length=80)
     # Portrait jobs only: which reference-sheet views to make, or one outfit's picture.
     views: list[str] = Field(default_factory=list, max_length=7)
@@ -278,8 +286,9 @@ class JobRequest(BaseModel):
 
 class EstimateRequest(BaseModel):
     kind: Literal["script", "breakdown", "portrait", "image", "voice", "video", "render", "lipsync", "outfits", "cover",
-                  "elements", "element"]
-    target_ids: list[str] = Field(default_factory=list, max_length=100)
+                  "elements", "element", "inspect", "shotplan", "shot_image",
+                  "shot_video"]
+    target_ids: list[str] = Field(default_factory=list, max_length=200)
     views: list[str] = Field(default_factory=list, max_length=7)
     outfit_id: Optional[str] = None
     # Cover jobs only: the creator's idea for the poster (optional).
@@ -538,8 +547,22 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "made_with_references": (s.get("made_with") or {}).get("_refs") or [],
             "location_id": s.get("location_id"), "props": s.get("props"),
             "continuity": s.get("continuity") or {},
+            "image_approved": bool(s.get("image_approved_path")) and s.get("image_approved_path") == s.get("image_path"),
+            "inspection": _inspection_out(s),
             **_scene_world(s, elements),
             "consistency": _consistency(s, cast, resolved)}
+
+
+def _inspection_out(s: dict) -> Optional[dict]:
+    """The latest picture check, for the app ('outdated' when the picture changed since)."""
+    ins = s.get("inspection") or {}
+    r = ins.get("result")
+    if not r:
+        return None
+    return {"scores": r.get("scores") or {}, "problems": r.get("problems") or [], "summary": r.get("summary") or "",
+            "observed": r.get("observed") or {}, "needs_attention": studio_inspect.needs_attention(r),
+            "correction": studio_inspect.correction_text(r), "at": ins.get("at"),
+            "outdated": ins.get("image_path") != s.get("image_path")}
 
 
 def _speech(s: dict, project: Optional[dict]) -> str:
@@ -567,6 +590,7 @@ def _project_out(p: dict) -> dict:
     out = {k: p.get(k) for k in keys}
     out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
                auto_music=p.get("auto_music") is not False,
+               auto_inspect=p.get("auto_inspect") is not False,
                image_quality=p.get("image_quality") or "standard",
                production_style=p.get("production_style") or "pictures",
                story_bible=p.get("story_bible") or None)
@@ -922,6 +946,10 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     libraries = {c["id"]: _outfit_library(c, [o for o in outfits if o["character_id"] == c["id"]])
                  for c in chars} if p.get("series_id") else {}
     urls.update(_sign([o.get("reference_path") for lib in libraries.values() for o in lib]))
+    shots_by: dict = {}
+    for sh in _project_shots(p["id"]):
+        shots_by.setdefault(sh["scene_id"], []).append(sh)
+    shot_urls = _sign([x for rows in shots_by.values() for sh in rows for x in (sh.get("image_path"), sh.get("video_path"))])
     project_out = _project_out(p)
     covers = _covers(p)
     curls = _sign([c["path"] for c in covers])
@@ -932,13 +960,21 @@ async def get_project(project_id: str, user_id: str = Depends(creator)):
     return {"project": project_out,
             "characters": [_character_out(c, urls, [o for o in outfits if o["character_id"] == c["id"]],
                                           libraries.get(c["id"])) for c in chars],
-            "scenes": [_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {}), elements)
+            "scenes": [dict(_scene_out(s, urls, {c["id"]: c for c in chars}, p, resolved.get(s["id"], {}), elements),
+                            shots=[_shot_out(sh, shot_urls) for sh in sorted(shots_by.get(s["id"], []), key=lambda r: r["position"])],
+                            shot_plan_approved=bool(s.get("shot_plan_approved")))
                        for s in scenes],
             "elements": [_element_out(e, eurls) for e in elements],
             "renders": [_render_out(r) for r in renders],
             "jobs": [_job_out(j) for j in jobs], "balance": _balance(user_id),
             "production": _production_out(p),
-            "continuity_issues": _continuity_issues(scenes, chars, outfits, resolved, elements)}
+            "continuity_issues": _continuity_issues(scenes, chars, outfits, resolved, elements),
+            "visual_audit": _audit_out(studio_inspect.audit(scenes, jobs))}
+
+
+def _audit_out(a: dict) -> dict:
+    return {k: a[k] for k in ("total", "with_pictures", "checked", "outdated", "queued", "failed", "unchecked",
+                              "no_picture", "complete", "average_score", "attention", "cost_usd", "lists")}
 
 
 def _continuity_issues(scenes, chars, outfits, resolved, elements) -> list:
@@ -959,6 +995,18 @@ def _project_continuity(p: dict) -> list:
     from studio_worker import characters_in_scene
     return _continuity_issues(scenes, chars, outfits, ident.resolve_outfits(scenes, outfits, chars, characters_in_scene),
                               _elements(p["id"]))
+
+
+@router.get("/projects/{project_id}/visual-audit")
+async def visual_audit(project_id: str, user_id: str = Depends(creator)):
+    """The whole-production picture audit: every scene's state (checked,
+    being checked, failed, outdated, never checked, no picture), every mistake
+    found, progress, and whether it is complete."""
+    p = _project(project_id, user_id)
+    st = get_store()
+    scenes = st.select("studio_scenes", {"project_id": p["id"]})
+    jobs = st.select("studio_jobs", {"project_id": p["id"], "kind": "inspect"}, order="created_at", desc=True, limit=1000)
+    return studio_inspect.audit(scenes, jobs)
 
 
 @router.get("/projects/{project_id}/continuity")
@@ -1476,6 +1524,136 @@ async def update_scene(scene_id: str, body: ScenePatch, user_id: str = Depends(c
     return _scene_out(s, _sign([s.get("image_path"), s.get("video_path"), s.get("audio_path")]))
 
 
+def _project_shots(project_id: str) -> list:
+    try:
+        return get_store().select("studio_shots", {"project_id": project_id})
+    except Exception:
+        st = get_store()
+        if hasattr(st, "conn"):
+            st.conn.rollback()      # creator_studio_shots.sql not run yet
+        return []
+
+
+def _shot_out(sh: dict, urls: dict) -> dict:
+    return {"id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
+            "camera_angle": sh.get("camera_angle") or "", "camera_movement": sh.get("camera_movement") or "static",
+            "duration_seconds": float(sh["duration_seconds"]), "description": sh.get("description") or "",
+            "characters": sh.get("characters") or [], "dialogue": sh.get("dialogue") or [], "audio": sh.get("audio") or "",
+            "frame_prompt": sh.get("frame_prompt") or "", "video_prompt": sh.get("video_prompt") or "",
+            "continuity": sh.get("continuity") or "", "reason": sh.get("reason") or "", "status": sh.get("status"),
+            "image_url": urls.get(sh.get("image_path") or ""), "video_url": urls.get(sh.get("video_path") or ""),
+            "has_image": bool(sh.get("image_path")), "has_video": bool(sh.get("video_path")),
+            "approved": bool(sh.get("approved_at"))}
+
+
+def _owned_shot(shot_id: str, user_id: str) -> dict:
+    sh = get_store().one("studio_shots", {"id": _uuid(shot_id)})
+    if not sh or sh["owner_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return sh
+
+
+class ShotPatch(BaseModel):
+    shot_type: Optional[Literal["establishing_wide", "wide_two_shot", "medium", "close_up", "extreme_close_up",
+                                "over_the_shoulder", "reaction", "pov", "insert"]] = None
+    camera_angle: Optional[str] = Field(None, max_length=80)
+    camera_movement: Optional[str] = Field(None, max_length=40)
+    duration_seconds: Optional[float] = Field(None, ge=1.5, le=15)
+    description: Optional[str] = Field(None, max_length=600)
+    frame_prompt: Optional[str] = Field(None, max_length=900)
+    video_prompt: Optional[str] = Field(None, max_length=900)
+    continuity: Optional[str] = Field(None, max_length=400)
+
+
+@router.patch("/shots/{shot_id}")
+async def update_shot(shot_id: str, body: ShotPatch, user_id: str = Depends(creator)):
+    """The creator edits one shot. An approved shot is locked until unapproved;
+    a changed framing means its picture and clip must be made again."""
+    sh = _owned_shot(shot_id, user_id)
+    if sh.get("approved_at"):
+        raise HTTPException(status_code=409, detail="This shot is approved. Unapprove it to change it.")
+    fields = {k: (v.strip() if isinstance(v, str) else v) for k, v in body.model_dump(exclude_none=True).items()}
+    if not fields:
+        return _shot_out(sh, {})
+    if any(k in fields for k in ("shot_type", "camera_angle", "description", "frame_prompt")):
+        fields.update(status="planned")        # the old picture/clip stay in the history but no longer match
+    fields["updated_at"] = _now_iso()
+    sh = get_store().update("studio_shots", {"id": sh["id"]}, fields)[0]
+    return _shot_out(sh, _sign([sh.get("image_path"), sh.get("video_path")]))
+
+
+class Approve(BaseModel):
+    approved: bool
+
+
+@router.post("/scenes/{scene_id}/shots/approve")
+async def approve_shot_plan(scene_id: str, body: Approve, user_id: str = Depends(creator)):
+    """Approving a scene's shot plan lets its shots be made, and the film then
+    uses them instead of the scene's single picture/clip."""
+    s = _owned("studio_scenes", scene_id, user_id)
+    if body.approved and not [x for x in _project_shots(s["project_id"]) if x["scene_id"] == s["id"]]:
+        raise HTTPException(status_code=409, detail="Plan the shots first.")
+    get_store().update("studio_scenes", {"id": s["id"]}, {"shot_plan_approved": body.approved})
+    return {"ok": True, "shot_plan_approved": body.approved}
+
+
+@router.post("/shots/{shot_id}/approve")
+async def approve_shot(shot_id: str, body: Approve, user_id: str = Depends(creator)):
+    """An approved shot is never replaced or edited until unapproved."""
+    sh = _owned_shot(shot_id, user_id)
+    if body.approved and not (sh.get("image_path") or sh.get("video_path")):
+        raise HTTPException(status_code=409, detail="Make this shot first.")
+    get_store().update("studio_shots", {"id": sh["id"]}, {"approved_at": _now_iso() if body.approved else None})
+    return {"ok": True, "approved": body.approved}
+
+
+class ApproveImage(BaseModel):
+    approved: bool
+
+
+@router.post("/scenes/{scene_id}/approve-image")
+async def approve_image(scene_id: str, body: ApproveImage, user_id: str = Depends(creator)):
+    """The creator approves (or unapproves) this exact picture. An approved
+    picture is never replaced by a new one or a restored version."""
+    s = _owned("studio_scenes", scene_id, user_id)
+    if body.approved and not s.get("image_path"):
+        raise HTTPException(status_code=409, detail="Make this scene's picture first.")
+    s = get_store().update("studio_scenes", {"id": s["id"]},
+                           {"image_approved_path": s.get("image_path") if body.approved else None})[0]
+    return {"ok": True, "image_approved": bool(body.approved)}
+
+
+@router.get("/scenes/{scene_id}/versions")
+async def scene_versions(scene_id: str, user_id: str = Depends(creator)):
+    """Every picture and video ever made for this scene (none are deleted)."""
+    s = _owned("studio_scenes", scene_id, user_id)
+    rows = [a for a in get_store().select("studio_assets", {"scene_id": s["id"]}, order="created_at", desc=True)
+            if a["owner_id"] == user_id and a["kind"] in ("image", "video")][:40]
+    urls = _sign([a["path"] for a in rows])
+    current = {s.get("image_path"), s.get("video_path"), s.get("lipsync_path")}
+    return {"versions": [{"id": a["id"], "kind": a["kind"], "url": urls.get(a["path"]), "created_at": a.get("created_at"),
+                          "current": a["path"] in current} for a in rows]}
+
+
+class RestoreIn(BaseModel):
+    asset_id: str
+
+
+@router.post("/scenes/{scene_id}/restore")
+async def restore_version(scene_id: str, body: RestoreIn, user_id: str = Depends(creator)):
+    """Puts an earlier picture or video back. The current one is kept too."""
+    s = _owned("studio_scenes", scene_id, user_id)
+    a = get_store().one("studio_assets", {"id": _uuid(body.asset_id)})
+    if not a or a["owner_id"] != user_id or a.get("scene_id") != s["id"] or a["kind"] not in ("image", "video"):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if a["kind"] == "image" and s.get("image_approved_path") and s.get("image_approved_path") == s.get("image_path"):
+        raise HTTPException(status_code=409, detail="This scene's picture is approved. Unapprove it first to restore another.")
+    field = "image_path" if a["kind"] == "image" else "video_path"
+    s = get_store().update("studio_scenes", {"id": s["id"]}, {field: a["path"], "updated_at": _now_iso()})[0]
+    _touch(s["project_id"])
+    return {"ok": True, "restored": a["kind"]}
+
+
 @router.delete("/scenes/{scene_id}")
 async def delete_scene(scene_id: str, user_id: str = Depends(creator)):
     s = _owned("studio_scenes", scene_id, user_id)
@@ -1509,6 +1687,16 @@ def _targets(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
     st = get_store()
     if kind in ("script", "breakdown", "render", "outfits", "cover", "elements"):
         return [p]
+    if kind in ("shot_image", "shot_video"):
+        # In film order (scene, then shot), so each shot can follow the one before it.
+        order = {sc["id"]: sc["position"] for sc in st.select("studio_scenes", {"project_id": p["id"]})}
+        rows = _project_shots(p["id"])
+        if target_ids:
+            wanted = {_uuid(t) for t in target_ids}
+            rows = [r for r in rows if r["id"] in wanted]
+            if len(rows) != len(wanted):
+                raise HTTPException(status_code=404, detail="Some of those shots don't exist.")
+        return sorted(rows, key=lambda r: (order.get(r["scene_id"], 0), r["position"]))
     table = {"portrait": "studio_characters", "element": "studio_elements"}.get(kind, "studio_scenes")
     rows = st.select(table, {"project_id": p["id"]})
     if target_ids:
@@ -1568,8 +1756,20 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
     if kind == "image":
         from studio_worker import characters_in_scene
         refs = sum(1 for c in characters_in_scene(target, cast) if c.get("reference_path"))
-        return pricing.image_cost(1, 400 + 1300 * min(refs, 4), size), \
-            (None if (target["visual"] or target["heading"]).strip() else "Describe what this scene shows first.")
+        cost = pricing.image_cost(1, 400 + 1300 * min(refs, 4), size)
+        if p.get("auto_inspect") is not False:     # every new picture is checked (studio_inspect)
+            cost = pricing.combine([cost, pricing.estimate_inspection()])
+        if target.get("image_approved_path") and target.get("image_approved_path") == target.get("image_path"):
+            return cost, "This picture is approved. Unapprove it first to replace it."
+        return cost, (None if (target["visual"] or target["heading"]).strip() else "Describe what this scene shows first.")
+    if kind == "inspect":
+        if not target.get("image_path"):
+            return pricing.estimate_inspection(), "Make this scene's picture first."
+        from studio_worker import StudioWorker
+        _prev, _c, _e, sig = StudioWorker(get_store(), get_files(), None, "generation").inspection_inputs(p, target)
+        if studio_inspect.current(target, sig):
+            return pricing.estimate_inspection(), "Already checked, and nothing has changed since."
+        return pricing.estimate_inspection(), None
     if kind == "voice":
         from studio_worker import scene_speech
         text = " ".join(d.get("text", "") for d in target.get("dialogue") or [])
@@ -1609,12 +1809,47 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         if not (target.get("image_path") or (target.get("mode") == "video" and target.get("video_path"))):
             return cost, "Make this scene's video or picture first."
         return cost, None
+    if kind == "shotplan":
+        if target.get("shot_plan_approved"):
+            return pricing.estimate_shotplan(), "The shot plan is approved. Unapprove it to plan again."
+        return pricing.estimate_shotplan(len(target.get("visual") or "") + sum(len(d.get("text") or "")
+                                                                              for d in target.get("dialogue") or [])), \
+            (None if (target.get("visual") or target.get("heading") or "").strip() else "Describe what this scene shows first.")
+    if kind in ("shot_image", "shot_video"):
+        size = "2K" if p.get("image_quality") == "high" else "1K"
+        scene = get_store().one("studio_scenes", {"id": target["scene_id"]}) or {}
+        if kind == "shot_image":
+            cost = pricing.image_cost(1, 400 + 1300 * min(len(target.get("characters") or []) + 1, 4), size)
+        else:
+            from studio_worker import speech_clip_seconds
+            secs = float(target["duration_seconds"])
+            if target.get("dialogue"):
+                secs = max(secs, speech_clip_seconds({"dialogue": target["dialogue"], "duration_seconds": secs}) or secs)
+            cost = pricing.estimate_video(secs)
+        if not scene.get("shot_plan_approved"):
+            return cost, "Approve the scene's shot plan first."
+        if target.get("approved_at"):
+            return cost, "This shot is approved. Unapprove it to remake it."
+        if kind == "shot_video" and not target.get("image_path"):
+            return cost, "Make this shot's picture first."
+        return cost, None
     if kind == "render":
         scenes = get_store().select("studio_scenes", {"project_id": p["id"]})
         secs = sum(max(float(s["duration_seconds"]), float(s.get("audio_seconds") or 0) + 0.5) for s in scenes)
+        by_scene = {}
+        for sh in _project_shots(p["id"]):
+            by_scene.setdefault(sh["scene_id"], []).append(sh)
+        from studio_worker import scene_speech
+        for sc in sorted(scenes, key=lambda x: x["position"]):
+            rows = sorted(by_scene.get(sc["id"], []), key=lambda r: r["position"])
+            if studio_shots.uses_shots(sc, rows):
+                problem = studio_shots.shot_problem(sc["position"] + 1, rows, scene_speech(sc, p) == "video_model")
+                if problem:
+                    return pricing.render_cost(secs, music_generated=music_mod.wanted(p)), problem
+        scenes = [sc for sc in scenes if not studio_shots.uses_shots(sc, by_scene.get(sc["id"], []))]
         missing = next((s["position"] + 1 for s in sorted(scenes, key=lambda s: s["position"])
                         if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))), None)
-        reason = "Add scenes first." if not scenes else (f"Scene {missing} has no picture yet." if missing else None)
+        reason = "Add scenes first." if not scenes and not by_scene else (f"Scene {missing} has no picture yet." if missing else None)
         from studio_worker import talks_in_video
         unspoken = next((s["position"] + 1 for s in sorted(scenes, key=lambda s: s["position"])
                          if talks_in_video(s, p) and not s.get("video_path")), None)
@@ -1676,8 +1911,16 @@ def _quote(kind: str, p: dict, target_ids: list[str], opts: Optional[dict] = Non
     for t in _targets(kind, p, target_ids):
         cost, reason = _price(kind, p, t, cast, opts)
         items.append({"target_id": None if kind in ("script", "breakdown", "render", "outfits", "cover", "elements") else t["id"],
+                      **({"scene_id": t.get("scene_id")} if kind in ("shot_image", "shot_video") else {}),
                       "credits": pricing.hold_credits(kind, cost), "cost_usd": round(cost.total_usd, 5),
                       "blocked": reason})
+    if kind == "inspect":
+        ready = 0
+        for it in items:
+            if not it["blocked"]:
+                ready += 1
+                if ready > MAX_AUDIT:
+                    it["blocked"] = f"Next batch: at most {MAX_AUDIT} scenes are checked at a time. Start again when these finish."
     return items
 
 
@@ -1723,17 +1966,33 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
     job_input = {k: v for k, v in (opts or {}).items() if k in ("views", "outfit_id")}
     if body.kind == "cover" and (body.cover_note or "").strip():
         job_input = {"note": body.cover_note.strip()}
+    if body.kind == "image" and (body.correction or "").strip():
+        job_input = {"correction": body.correction.strip()[:600]}     # a fix from the picture check
     for item in _quote(body.kind, p, body.target_ids, opts):
         if item["blocked"]:
             problems.append({"target_id": item["target_id"], "error": item["blocked"]})
             continue
         key = f"{user_id}:{body.request_id}:{body.kind}:{item['target_id'] or p['id']}"
-        r = st.rpc("studio_create_job", {
+        shot_kind = body.kind in ("shot_image", "shot_video")
+        args = {
             "p_owner": user_id, "p_project": p["id"], "p_kind": body.kind, "p_lane": LANE.get(body.kind, "generation"),
             "p_key": key, "p_credits": item["credits"],
-            "p_input": {"element_id": item["target_id"]} if body.kind == "element" else job_input,
-            "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync") else None,
-            "p_character": item["target_id"] if body.kind == "portrait" else None, "p_max_open": 30})
+            "p_input": {"element_id": item["target_id"]} if body.kind == "element"
+            else {"shot_id": item["target_id"]} if shot_kind else job_input,
+            "p_scene": item["target_id"] if body.kind in ("image", "voice", "video", "lipsync", "inspect", "shotplan")
+            else item.get("scene_id") if shot_kind else None,
+            "p_character": item["target_id"] if body.kind == "portrait" else None,
+            # A picture audit queues one small job per scene; it may queue a whole film at once.
+            "p_max_open": 30 + MAX_AUDIT if body.kind == "inspect" else 30}
+        try:
+            r = st.rpc("studio_create_job", args)
+        except Exception as e:
+            if args["p_lane"] != "inspect":
+                raise
+            if hasattr(st, "conn"):
+                st.conn.rollback()
+            print(f"[WARN] inspect lane unavailable (run creator_studio_visual_audit.sql): {str(e)[:120]}")
+            r = st.rpc("studio_create_job", {**args, "p_lane": "generation"})
         if r and r.get("ok"):
             created.append(r["job_id"])
         else:
@@ -1926,9 +2185,15 @@ def _chat_state(p: dict) -> dict:
     jobs = st.select("studio_jobs", {"project_id": p["id"]}, order="created_at", desc=True, limit=20)
     outfits, elements = _outfits(p["id"]), _elements(p["id"])
     resolved = ident.resolve_outfits(scenes, outfits, cast, characters_in_scene)
+    shots_by: dict = {}
+    for sh in _project_shots(p["id"]):
+        shots_by.setdefault(sh["scene_id"], []).append(sh)
+    for sc in scenes:          # each scene's shots, in order, for the assistant
+        sc["_shots"] = sorted(shots_by.get(sc["id"], []), key=lambda r: r["position"])
     renders = len(st.select("studio_renders", {"project_id": p["id"]}, limit=50))
+    checks = st.select("studio_jobs", {"project_id": p["id"], "kind": "inspect"}, order="created_at", desc=True, limit=1000)
     return {"cast": cast, "scenes": scenes, "jobs": jobs, "outfits": outfits, "elements": elements,
-            "resolved": resolved, "renders": renders,
+            "resolved": resolved, "renders": renders, "audit": studio_inspect.audit(scenes, checks),
             "issues": _continuity_issues(scenes, cast, outfits, resolved, elements)}
 
 
@@ -1953,7 +2218,7 @@ def _chat_context(p: dict, message: str = "", focus: Optional[dict] = None, stat
     return studio_chat.project_context(p, s["cast"], s["outfits"], s["elements"], s["scenes"], _production_out(p),
                                        s["jobs"], wearing=wearing, issues=s["issues"], focus=set(focus.get("scenes") or []),
                                        question=message, focus_names=set(focus.get("characters") or []),
-                                       episodes=_episodes(p), renders=s["renders"])
+                                       episodes=_episodes(p), renders=s["renders"], audit=s.get("audit"))
 
 
 def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
@@ -1966,19 +2231,39 @@ def _memory_of(p: dict, conv: Optional[dict] = None) -> dict:
     return mem
 
 
-def _save_memory(p: dict, mem: dict) -> dict:
+def _save_memory(p: dict, mem: dict) -> bool:
+    """True only if the memory was really saved."""
     st = get_store()
     try:
         st.update("studio_projects", {"id": p["id"]}, {"assistant_memory": studio_memory.clean(mem)})
-    except Exception as e:      # creator_studio_assistant_memory.sql not run yet
+        return True
+    except Exception as e:      # e.g. creator_studio_assistant_memory.sql not run yet, or the database is down
         if hasattr(st, "conn"):
             st.conn.rollback()
         print(f"[WARN] studio assistant memory not saved for {p['id']}: {str(e)[:160]}")
-    return mem
+        return False
+
+
+def _saved_or_503(p: dict, mem: dict) -> dict:
+    if not _save_memory(p, mem):
+        raise HTTPException(status_code=503, detail="Viyo couldn't save the memory just now. Nothing was changed; try again.")
+    return _memory_out(mem)
+
+
+def _shot_by_numbers(scenes: list, scene_no, shot_no) -> Optional[dict]:
+    try:
+        sc, n = scenes[int(scene_no) - 1], int(shot_no)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if int(scene_no) < 1:
+        return None
+    rows = sorted([x for x in _project_shots(sc["project_id"]) if x["scene_id"] == sc["id"]], key=lambda r: r["position"])
+    return rows[n - 1] if 1 <= n <= len(rows) else None
 
 
 def _proposal_targets(p: dict, props: list) -> list:
-    """Paid suggestions for one scene carry that scene's id, so only it is remade."""
+    """Paid suggestions carry the ids they apply to (and a picture fix its
+    correction), so only those are made."""
     st = get_store()
     scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
     for prop in props:
@@ -1992,6 +2277,38 @@ def _proposal_targets(p: dict, props: list) -> list:
                 prop["targets"] = [scenes[n - 1]["id"]]
             else:
                 prop["status"], prop["error"] = "failed", "That scene number doesn't exist."
+        elif prop.get("type") == "fix_scene_picture":
+            try:
+                n = int(d.get("scene"))
+            except (TypeError, ValueError):
+                n = 0
+            if not 1 <= n <= len(scenes):
+                prop["status"], prop["error"] = "failed", "That scene number doesn't exist."
+            elif scenes[n - 1].get("image_approved_path") and scenes[n - 1]["image_approved_path"] == scenes[n - 1].get("image_path"):
+                prop["status"], prop["error"] = "failed", f"Scene {n}'s picture is approved. Unapprove it first."
+            else:
+                prop["targets"] = [scenes[n - 1]["id"]]
+                prop["extra"] = {"correction": str(d.get("correction") or "")[:600]}
+        elif prop.get("type") == "plan_shots":
+            nums = [n for n in (d.get("scenes") or []) if isinstance(n, int) and 1 <= n <= len(scenes)]
+            picked = [scenes[n - 1] for n in nums] if nums else scenes
+            prop["targets"] = [x["id"] for x in picked if not x.get("shot_plan_approved")]
+            if not prop["targets"]:
+                prop["status"], prop["error"] = "failed", "Those scenes' shot plans are approved. Unapprove them first."
+        elif prop.get("type") in ("remake_shot_picture", "remake_shot_video", "edit_shot"):
+            shot = _shot_by_numbers(scenes, d.get("scene"), d.get("shot"))
+            if not shot:
+                prop["status"], prop["error"] = "failed", "That shot doesn't exist."
+            elif shot.get("approved_at"):
+                prop["status"], prop["error"] = "failed", "That shot is approved. Unapprove it first."
+            elif prop["type"] != "edit_shot":
+                prop["targets"] = [shot["id"]]
+        elif prop.get("type") == "check_scenes":
+            nums = [n for n in (d.get("scenes") or []) if isinstance(n, int) and 1 <= n <= len(scenes)]
+            picked = [scenes[n - 1] for n in nums] if nums else scenes
+            prop["targets"] = [x["id"] for x in picked if x.get("image_path")]
+            if not prop["targets"]:
+                prop["status"], prop["error"] = "failed", "None of those scenes has a picture yet."
         elif prop.get("type") in ("make_character_sheet", "make_place_object_picture"):
             rows = st.select("studio_characters", {"project_id": p["id"]}) if prop["type"] == "make_character_sheet" \
                 else _elements(p["id"])
@@ -2056,7 +2373,10 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
     if mine and mine["conversation_id"] != conv["id"]:
         raise HTTPException(status_code=409, detail="That message belongs to another chat.")
     mode = studio_chat.reasoning_mode(body.message)
-    limit = CHAT_HOLDS[mode]
+    visual = studio_visual.wants_visual(body.message)
+    if visual and mode == "quick":
+        mode = "story"
+    limit = CHAT_HOLDS["deep"] if visual else CHAT_HOLDS[mode]     # images cost a little more
     hold = st.rpc("studio_hold_credits", {"p_owner": user_id, "p_credits": limit})
     if not hold or not hold.get("ok"):
         raise HTTPException(status_code=402, detail={"message": "Not enough credits for the assistant.", "balance": _balance(user_id)})
@@ -2082,29 +2402,37 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         focus = studio_chat.resolve_focus(body.message, memory.get("focus"), len(state["scenes"]),
                                           [c["name"] for c in state["cast"]])
         project_memory = _memory_of(p, conv)
+        images, seen, unseen = [], [], []
+        if visual:   # real pictures from this (owner-checked) production
+            ep = next((e["number"] for e in _episodes(p) if e.get("current")), None)
+            where = f"{p.get('title') or 'Production'}{f' · Episode {ep}' if ep else ''}"
+            images, seen, unseen = studio_visual.gather(get_files(), state["scenes"], state["cast"], state["elements"],
+                                                        focus, body.message, where=where, owner=user_id)
         prompt = studio_chat.build_prompt(_chat_context(p, body.message, focus, state), conv.get("summary") or "",
                                           studio_memory.render(project_memory), recent, body.message.strip(),
-                                          studio_chat.focus_text(focus), mode)
-        data, c2 = _ai_call(lambda: get_ai().chat(prompt, mode=mode))
-        if not isinstance(data, dict) or not str(data.get("reply") or "").strip():
-            raise ValueError("incomplete answer")
+                                          studio_chat.focus_text(focus), mode,
+                                          visual=studio_visual.manifest(seen, unseen, visual))
+        raw, c2 = _ai_call(lambda: get_ai().chat(prompt, mode=mode, images=images or None))
+        data = studio_chat.validate_reply(raw)        # malformed parts are dropped, never executed
+        if data["dropped"]:
+            print(f"[INFO] studio chat {p['id']}: dropped malformed {', '.join(data['dropped'])}")
         costs.append(c2)
         cost = pricing.combine(costs)
         credits = min(limit, max(1, cost.credits))
+        new_memory, added = studio_memory.apply_updates(project_memory, data["memory"], body.message)
+        memory_saved = _save_memory(p, new_memory) if added else True
+        text = data["reply"]
+        if not memory_saved and any(it["source"] == "creator" for it in added):
+            text += ("\n\n(I couldn't save this to the production's memory just now, so I may not remember it in "
+                     "another chat. Please tell me again later.)")
         reply = st.insert("studio_messages", [{
             "conversation_id": conv["id"], "project_id": p["id"], "owner_id": user_id, "role": "assistant",
-            "content": str(data.get("reply") or "").strip()[:20000], "proposals": _proposal_targets(p, studio_chat.clean_proposals(data.get("proposals"))),
+            "content": text[:20000], "proposals": _proposal_targets(p, studio_chat.clean_proposals(data["proposals"])),
             "credits": credits, "client_key": key + ":reply"}])[0]
-        new_decisions = [str(d).strip()[:300] for d in data.get("decisions") or [] if str(d).strip()]
-        updates = [u for u in data.get("memory") or [] if isinstance(u, dict)] + \
-            [{"category": "decisions", "text": d, "from_creator": True} for d in new_decisions]
-        _save_memory(p, studio_memory.apply_updates(project_memory, updates))
-        said = data.get("focus") if isinstance(data.get("focus"), dict) else {}
-        next_focus = {"scenes": [n for n in (said.get("scenes") or focus["scenes"]) if isinstance(n, int)][:6],
-                      "characters": [str(c) for c in (said.get("characters") or focus["characters"])][:6]}
+        said = data["focus"]
+        next_focus = {"scenes": said["scenes"] or focus["scenes"], "characters": said["characters"] or focus["characters"]}
         st.update("studio_conversations", {"id": conv["id"]}, {
-            "memory": {**memory, "decisions": ((memory.get("decisions") or []) + new_decisions)[-60:], "focus": next_focus},
-            "updated_at": _now_iso()})
+            "memory": {**memory, "focus": next_focus}, "updated_at": _now_iso()})
         st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": credits})
     except HTTPException:
         st.rpc("studio_settle_credits", {"p_hold": hold["hold_id"], "p_used": 0})
@@ -2117,19 +2445,20 @@ async def chat_send(project_id: str, body: ChatIn, user_id: str = Depends(creato
         raise HTTPException(status_code=502, detail={"code": "assistant_failed", "message":
                             "The assistant couldn't answer just now. Try again; you weren't charged."})
     return {"message": _message_out(mine), "reply": _message_out(reply), "conversation_id": conv["id"],
-            "mode": mode, "balance": _balance(user_id)}
+            "mode": mode, "seen": seen, "not_seen": unseen, "memory_saved": memory_saved, "balance": _balance(user_id)}
 
 
 # ------------------------------------------------ assistant memory (the creator can see and correct it)
 
 class MemoryIn(BaseModel):
-    category: Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas"]
+    category: Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas", "assumptions"]
     text: str = Field(..., min_length=1, max_length=300)
 
 
 class MemoryPatch(BaseModel):
     text: Optional[str] = Field(None, min_length=1, max_length=300)
-    category: Optional[Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas"]] = None
+    category: Optional[Literal["story", "characters", "preferences", "decisions", "production", "questions", "ideas",
+                               "assumptions"]] = None
 
 
 def _memory_out(mem: dict) -> dict:
@@ -2149,7 +2478,7 @@ async def add_memory(project_id: str, body: MemoryIn, user_id: str = Depends(cre
     mem, item = studio_memory.add(_memory_of(p), body.category, body.text, "creator")
     if item is None:
         raise HTTPException(status_code=409, detail="That's already remembered.")
-    return _memory_out(_save_memory(p, mem))
+    return _saved_or_503(p, mem)
 
 
 @router.patch("/projects/{project_id}/assistant/memory/{item_id}")
@@ -2159,7 +2488,7 @@ async def edit_memory(project_id: str, item_id: str, body: MemoryPatch, user_id:
         mem = studio_memory.edit(_memory_of(p), item_id, body.text, body.category)
     except KeyError:
         raise HTTPException(status_code=404, detail="Not found.")
-    return _memory_out(_save_memory(p, mem))
+    return _saved_or_503(p, mem)
 
 
 @router.delete("/projects/{project_id}/assistant/memory/{item_id}")
@@ -2169,7 +2498,7 @@ async def forget_memory(project_id: str, item_id: str, user_id: str = Depends(cr
         mem = studio_memory.remove(_memory_of(p), item_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Not found.")
-    return _memory_out(_save_memory(p, mem))
+    return _saved_or_503(p, mem)
 
 
 def SUMMARY_WINDOW() -> int:
@@ -2237,6 +2566,17 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
             out = await add_character(p["id"], CharacterIn(name=d.get("name") or "", description=d.get("description") or ""), user_id)
             return f"{out['name']} added to the cast."
         cast = st.select("studio_characters", {"project_id": p["id"]})
+        if kind == "edit_shot":
+            scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda r: r["position"])
+            shot = _shot_by_numbers(scenes, d.get("scene"), d.get("shot"))
+            if not shot:
+                raise HTTPException(status_code=409, detail="That shot doesn't exist any more.")
+            patch = {k: d[k] for k in ("shot_type", "camera_angle", "camera_movement", "duration_seconds", "description")
+                     if d.get(k) not in (None, "")}
+            if not patch:
+                raise HTTPException(status_code=409, detail="This suggestion has nothing to change.")
+            await update_shot(shot["id"], ShotPatch(**patch), user_id)
+            return f"Scene {d.get('scene')}, shot {d.get('shot')} changed. Make its picture again to see it."
         if kind == "update_place_object":
             e = _find_by_name(_elements(p["id"]), d.get("name"), "place or object")
             if not (d.get("description") or "").strip():
@@ -2284,6 +2624,29 @@ async def _apply(p: dict, prop: dict, user_id: str) -> str:
     raise HTTPException(status_code=409, detail="This kind of suggestion can't be applied here.")
 
 
+_claims = __import__("threading").Lock()
+
+
+def _claim_proposal(m: dict, index: int, user_id: str) -> bool:
+    """Marks the suggestion as being applied, once: two taps at the same moment
+    can't both apply it (creator_studio_assistant_safety.sql)."""
+    st = get_store()
+    try:
+        return bool(st.rpc("studio_claim_proposal", {"p_message": m["id"], "p_owner": user_id, "p_index": index}))
+    except Exception as e:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        print(f"[WARN] studio_claim_proposal unavailable ({str(e)[:120]}); using a local lock")
+    with _claims:          # one server process: re-read and mark under a lock
+        fresh = _owned_message(m["id"], user_id)
+        props = list(fresh.get("proposals") or [])
+        if not 0 <= index < len(props) or props[index].get("status") != "proposed":
+            return False
+        props[index] = {**props[index], "status": "applying"}
+        st.update("studio_messages", {"id": m["id"]}, {"proposals": props})
+        return True
+
+
 @router.post("/assistant/messages/{message_id}/proposals/{index}/apply")
 async def apply_proposal(message_id: str, index: int, user_id: str = Depends(creator)):
     """The creator applies one suggestion. Free changes are saved now through
@@ -2300,6 +2663,8 @@ async def apply_proposal(message_id: str, index: int, user_id: str = Depends(cre
         raise HTTPException(status_code=409, detail={"code": "needs_price", "job": prop.get("job"),
                                                      "message": "This step costs credits: check the price first."})
     p = _project(m["project_id"], user_id)
+    if not _claim_proposal(m, index, user_id):
+        raise HTTPException(status_code=409, detail="This suggestion is already being applied or was already used.")
     try:
         result = await _apply(p, prop, user_id)
     except HTTPException as e:

@@ -55,11 +55,18 @@ ACTIONS = {
     "make_character_sheet": "paid",  # data: character: reference pictures of that character (job kind "portrait")
     "record_voices": "paid",     # data: scene: records that scene's lines with the saved voices (job kind "voice")
     "make_place_object_picture": "paid",  # data: name: the picture of one place/object (job kind "element")
+    "check_scenes": "paid",      # data: scenes [numbers] (empty = every scene with a picture): the picture check
+    "fix_scene_picture": "paid", # data: scene, correction: a new picture of that scene that fixes what the check found
+    "plan_shots": "paid",        # data: scenes [numbers]: the director plans each scene's camera shots (job "shotplan")
+    "edit_shot": "free",         # data: scene, shot, and shot_type / camera_angle / camera_movement / duration_seconds / description
+    "remake_shot_picture": "paid",   # data: scene, shot: a new opening picture of that one shot
+    "remake_shot_video": "paid",     # data: scene, shot: a new clip of that one shot
 }
 PAID_JOB = {"develop_story": "script", "break_into_scenes": "breakdown", "find_places_objects": "elements",
             "make_cover": "cover", "make_film": "production", "remake_picture": "image", "remake_video": "video",
             "suggest_outfits": "outfits", "make_character_sheet": "portrait", "record_voices": "voice",
-            "make_place_object_picture": "element"}
+            "make_place_object_picture": "element", "check_scenes": "inspect", "fix_scene_picture": "image",
+            "plan_shots": "shotplan", "remake_shot_picture": "shot_image", "remake_shot_video": "shot_video"}
 
 _STR = {"type": "string"}
 CHAT_SCHEMA = {
@@ -77,7 +84,11 @@ CHAT_SCHEMA = {
                 "target_seconds": {"type": "integer"}, "script": _STR, "name": _STR, "description": _STR,
                 "character": _STR, "owner": _STR, "clothing": _STR, "shoes": _STR, "accessories": _STR, "makeup": _STR,
                 "outfit": _STR, "scene": {"type": "integer"}, "heading": _STR, "visual": _STR,
-                "start_state": _STR, "end_state": _STR,
+                "start_state": _STR, "end_state": _STR, "correction": _STR,
+                "scenes": {"type": "array", "items": {"type": "integer"}}, "shot": {"type": "integer"},
+                "shot_type": {"type": "string", "enum": ["establishing_wide", "wide_two_shot", "medium", "close_up",
+                                                         "extreme_close_up", "over_the_shoulder", "reaction", "pov", "insert"]},
+                "camera_angle": _STR, "camera_movement": _STR, "duration_seconds": {"type": "number"},
                 "transition": {"type": "string", "enum": ["continuous", "same_place_cut", "new_place", "time_jump",
                                                           "flashback"]},
                 "dialogue": {"type": "array", "items": {"type": "object", "properties": {
@@ -86,10 +97,11 @@ CHAT_SCHEMA = {
         }, "required": ["type", "title", "summary", "data"]}},
         "memory": {"type": "array", "description": "What to remember from the creator's LATEST message: facts, "
                                                   "preferences, decisions, open questions. Your own suggestions go in "
-                                                  "category 'ideas' with from_creator false.",
+                                                  "category 'ideas', things you inferred in 'assumptions', both with "
+                                                  "from_creator false. Never mark your own idea as from_creator.",
                    "items": {"type": "object", "properties": {
                        "category": {"type": "string", "enum": ["story", "characters", "preferences", "decisions",
-                                                               "production", "questions", "ideas"]},
+                                                               "production", "questions", "ideas", "assumptions"]},
                        "text": {"type": "string"},
                        "from_creator": {"type": "boolean", "description": "true only if the creator said or decided it"}},
                        "required": ["category", "text", "from_creator"]}},
@@ -106,7 +118,42 @@ short drama, series or movie. You are one assistant with five skills, used as th
 - Writer: premises, titles, loglines, characters, conflicts, twists, structure, screenplay, dialogue, episodes.
 - Director: scenes, visual storytelling, shot types, camera angles and movement, action, pacing.
 - Continuity supervisor: characters' faces, outfits, places, objects, timeline and story logic stay consistent.
-- Production manager: what has been made, what is missing, what happens next and what it costs.
+- Picture checks (visual continuity):
+- Scenes may have a PICTURE CHECK: a vision model compared the picture with the references, the record and the scene
+  before (scores 0-100, problems with severity and certainty, whether the script means the change, the fix, what the
+  picture shows). Use it to answer "why does she look different", "the room changed", "why is the letter missing".
+  It can be wrong: say "the check thinks" for uncertain findings. An "outdated" check is for an older picture.
+- To check pictures, propose check_scenes (data.scenes, or empty for all). It costs a little per scene; unchanged
+  pictures are not checked again. To fix one, propose fix_scene_picture with data.scene and data.correction (what
+  the new picture must change, e.g. "Maya's dress must stay red, as in scene 2"). Only that scene is remade.
+- An APPROVED picture is never replaced: ask the creator to unapprove it on the Scenes tab first.
+- Not fixed until a new picture has been made AND checked again, and the creator has seen it.
+
+Seeing and auditing:
+- You only see a picture if it is listed under VISUAL MATERIAL for this message. Never describe a picture you
+  weren't given; if none are attached, say you haven't seen it and use the PICTURE CHECK results or offer to look.
+- An audit of the whole production must cover every scene. VISUAL AUDIT lists every scene's state from the
+  per-scene picture checks (each one compared that scene with the characters' references and the scene before). If
+  it isn't complete, say "X of Y checked", name what's missing, and offer check_scenes for the rest (it runs one
+  scene at a time and reports progress). Never say "all scenes" unless VISUAL AUDIT says complete. While checks are
+  queued or running, say they're in progress.
+- Looking at images and checking pictures never changes the production. Changes are proposals the creator applies.
+- Story continuity too: dialogue that contradicts saved facts or MEMORY, events out of order, characters acting
+  against their established motivation. Call these "possible" problems and ask whether they're intended.
+- When something might be intended (a wardrobe change, a new place), explain why it might be and ask; give a
+  concrete fix if it isn't, e.g. "Scene 4 seems to show Maya in a different outfit from the end of scene 3. I'd keep
+  the previous outfit unless there's a wardrobe change in the story."
+
+Camera shots (the director):
+- A scene can be filmed as several shots (wide two-shot, medium, over-the-shoulder, close-up, reaction, insert...).
+  Each scene below lists its shots with type, length, why it was chosen and whether it's made. Explain the choices in
+  plain words when asked ("a close-up on Daniel so we see the lie land").
+- plan_shots (data.scenes) has the director plan shots (paid, small). The creator approves the plan in the app, then
+  each shot's picture and clip are made. edit_shot changes one shot (free, the creator applies it); remake_shot_picture
+  / remake_shot_video remake one shot only. An approved shot or plan is never replaced: ask the creator to unapprove.
+- Coverage depends on the moment: a conversation, an emotional beat, action or a quiet moment need different shots.
+
+Production manager: what has been made, what is missing, what happens next and what it costs.
 - Creative partner: brainstorm, give honest specific feedback, offer alternatives with pros and cons.
 
 How you talk:
@@ -133,8 +180,9 @@ Truth rules (very important):
   taps Apply. Never say something "was saved", "was changed", "is generated" or "was approved" because of you.
 - Paid steps (developing the full story, breaking it into scenes, finding places and objects, covers, making the
   film) cost credits: propose them and say the price will be shown before anything is charged.
-- Ideas in the conversation summary, earlier messages or MEMORY "Ideas not approved yet" are only ideas unless they
-  appear in PROJECT facts or as approved decisions in MEMORY.
+- Ideas in the conversation summary, earlier messages or MEMORY "Ideas not approved yet" / "assumptions" are only
+  ideas unless they appear in PROJECT facts or as approved decisions in MEMORY. Only say you'll remember something
+  when it's the creator's own fact or decision; your own ideas are noted as ideas.
 - Something is done only when the project shows it (a saved field, a finished step). A step you proposed is not
   done until the creator applied it and the project or the recent steps show it succeeded. If a step failed, say so
   and say why (from Recent steps).
@@ -172,6 +220,8 @@ Proposals (0 to 3, only when a concrete change would help now):
 - set_scene_outfit: data.scene, data.character, data.outfit (an existing outfit name).
 - update_place_object: data.name (an existing place or object), data.description.
 - make_character_sheet: data.character. make_place_object_picture: data.name. record_voices: data.scene.
+- check_scenes: data.scenes. fix_scene_picture: data.scene, data.correction.
+- plan_shots: data.scenes. edit_shot / remake_shot_picture / remake_shot_video: data.scene and data.shot (numbers).
 - develop_story, break_into_scenes, find_places_objects, suggest_outfits, make_cover, make_film: paid steps, data may
   be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -289,6 +339,23 @@ def screenplay_block(script: str, question: str = "", focus_numbers: Optional[se
               "say which and ask, don't guess.\n" + body)
 
 
+def _check_lines(r: dict, outdated: bool, approved: bool) -> list[str]:
+    sc = r.get("scores") or {}
+    head = " · ".join(f"{k} {v}" for k, v in sc.items())
+    out = [f"   PICTURE CHECK{' (outdated: for an older picture)' if outdated else ''}"
+           f"{' [picture APPROVED by the creator]' if approved else ''}: {head}. {_short(r.get('summary') or '', 200)}"]
+    for p in (r.get("problems") or [])[:6]:
+        tag = "intended" if p.get("intentional") else f"{p.get('severity')}, {p.get('certainty')}"
+        out.append(f"     - [{p.get('kind')}, {tag}] expected {_short(p.get('expected'), 120)}; seen {_short(p.get('seen'), 120)}."
+                   f" Fix: {_short(p.get('fix'), 160)}")
+    obs = r.get("observed") or {}
+    if obs.get("characters"):
+        out.append("     Picture shows: " + "; ".join(
+            f"{c.get('name')} ({', '.join(x for x in (c.get('outfit'), c.get('position'), ('holding ' + ', '.join(c['holding'])) if c.get('holding') else '') if x)})"
+            for c in obs["characters"][:4]))
+    return out
+
+
 def _bible_block(bible: dict) -> list[str]:
     if not bible:
         return []
@@ -331,8 +398,21 @@ def status(scenes: list[dict], cast: list[dict], jobs: list[dict], issues: Optio
         "running": sum(1 for j in jobs if j.get("status") in ("queued", "running")),
         "failed": sum(1 for j in jobs[:20] if j.get("status") == "failed"),
         "continuity_problems": sum(1 for i in issues or [] if i.get("severity") == "fix"),
+        "checked": sum(1 for s in scenes if (s.get("inspection") or {}).get("result")),
+        "checked_current": sum(1 for s in scenes if s.get("image_path") and (s.get("inspection") or {}).get("result")
+                               and (s.get("inspection") or {}).get("image_path") == s.get("image_path")),
+        "checked_outdated": sum(1 for s in scenes if s.get("image_path") and (s.get("inspection") or {}).get("result")
+                                and (s.get("inspection") or {}).get("image_path") != s.get("image_path")),
+        "picture_problems": sum(1 for s in scenes if _attention(s)),
         "films": renders,
     }
+
+
+def _attention(scene: dict) -> bool:
+    import studio_inspect
+    ins = scene.get("inspection") or {}
+    return bool(ins.get("result")) and ins.get("image_path") == scene.get("image_path") and \
+        studio_inspect.needs_attention(ins["result"])
 
 
 def _status_lines(st: dict) -> list[str]:
@@ -349,17 +429,25 @@ def _status_lines(st: dict) -> list[str]:
         missing.append(f"pictures for {st['places_objects'] - st['place_object_pictures']} places/objects")
     if st["scenes"] and not st["films"]:
         missing.append("the final film")
-    return [f"PRODUCTION STATUS: {st['scenes']} scenes · {st['pictures']} pictures · {st['videos']} videos · "
+    cover = (f"AUDIT COVERAGE: plan-level continuity review covers all {st['scenes']} scenes; picture checks are "
+             f"current for {st['checked_current']} of {st['pictures']} scene pictures ({st['checked_outdated']} outdated, "
+             f"{st['pictures'] - st['checked_current'] - st['checked_outdated']} never checked; "
+             f"{st['scenes'] - st['pictures']} scenes have no picture). "
+             + ("Every picture has a current check." if st['pictures'] and st['checked_current'] == st['pictures']
+                else "A visual audit of the whole production is NOT complete: say how many were checked."))
+    return [cover, f"PRODUCTION STATUS: {st['scenes']} scenes · {st['pictures']} pictures · {st['videos']} videos · "
             f"{st['voiced']}/{st['with_lines']} scenes with lines voiced · {st['characters']} characters "
             f"({st['sheets']} with reference pictures) · {st['films']} films made · {st['running']} steps running · "
-            f"{st['failed']} recent failures · {st['continuity_problems']} continuity problems",
+            f"{st['failed']} recent failures · {st['continuity_problems']} continuity problems · "
+            f"{st['checked']} pictures checked, {st['picture_problems']} need attention",
             "Still missing: " + ("; ".join(missing) if missing else "nothing obvious")]
 
 
 def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: list[dict], scenes: list[dict],
                     production: Optional[dict], jobs: list[dict], wearing: Optional[dict] = None,
                     issues: Optional[list] = None, focus: Optional[set] = None, question: str = "",
-                    focus_names: Optional[set] = None, episodes: Optional[list] = None, renders: int = 0) -> str:
+                    focus_names: Optional[set] = None, episodes: Optional[list] = None, renders: int = 0,
+                    audit: Optional[dict] = None) -> str:
     """What the assistant knows as fact: only what is saved, retrieved for the question."""
     import studio_identity as ident
     focus = set(focus or set())
@@ -414,6 +502,19 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
             full = len(scenes) <= DETAIL_ALL or i in near or (about and len(scenes) <= 60)
             lines.append(f"{i}. {s.get('heading') or ''}: {_short(s.get('visual') or '', 600 if full else 140)}"
                          f"{' Speakers: ' + ', '.join(who) if who else ''} [{made}]")
+            shots = s.get("_shots") or []
+            if shots and (full or len(scenes) <= 60):
+                lines.append(f"   SHOTS ({len(shots)}, plan {'APPROVED' if s.get('shot_plan_approved') else 'not approved'}): " + " | ".join(
+                    f"{k + 1}. {sh['shot_type'].replace('_', ' ')} {float(sh['duration_seconds']):g}s"
+                    f"{' [made]' if sh.get('video_path') else ' [picture]' if sh.get('image_path') else ''}"
+                    f"{' [approved]' if sh.get('approved_at') else ''}" + (f" – {_short(sh.get('reason'), 90)}" if full else "")
+                    for k, sh in enumerate(shots)))
+            ins = (s.get("inspection") or {}).get("result")
+            if ins and (full or ins.get("problems")):
+                lines += _check_lines(ins, (s.get("inspection") or {}).get("image_path") != s.get("image_path"),
+                                      bool(s.get("image_approved_path")) and s.get("image_approved_path") == s.get("image_path"))
+            elif s.get("image_approved_path") and s.get("image_approved_path") == s.get("image_path"):
+                lines.append("   [picture APPROVED by the creator]")
             if full:
                 for d in (s.get("dialogue") or [])[:12]:
                     if (d.get("text") or "").strip():
@@ -429,6 +530,9 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
     else:
         lines.append("Scenes: (not broken into scenes yet)")
     lines += _status_lines(status(scenes, cast, jobs, issues, renders, elements))
+    if audit:
+        import studio_inspect
+        lines += studio_inspect.audit_lines(audit)
     if production:
         lines.append(f"One-click production: {production.get('status')} ({production.get('percent', 0)}%)"
                      f"{' – ' + production['problem'] if production.get('problem') else ''}")
@@ -525,7 +629,7 @@ def suggestions(p: dict, cast: list, scenes: list, issues: list, jobs: list, ren
 
 
 def build_prompt(context: str, summary: str, memory, history: list[dict], message: str,
-                 focus: str = "", mode: str = "quick") -> str:
+                 focus: str = "", mode: str = "quick", visual: str = "") -> str:
     """memory: the project memory rendered (str), or a list of decisions (older callers)."""
     convo = "\n".join(f"{'CREATOR' if m['role'] == 'user' else 'VIYO'}: {_short(m['content'], 1800)}" for m in history)
     mem = memory if isinstance(memory, str) else ("Approved decisions:\n" + "\n".join(f"- {d}" for d in memory[-30:])
@@ -546,6 +650,8 @@ EARLIER CONVERSATION (summary, ideas only):
 {summary or '(none)'}
 
 {focus or 'CURRENT FOCUS: nothing specific yet'}
+
+{visual or 'VISUAL MATERIAL: none attached to this message. You have NOT seen the pictures.'}
 
 RECENT MESSAGES:
 {convo or '(this is the first message)'}
@@ -569,6 +675,46 @@ CURRENT SUMMARY:
 
 NEW MESSAGES:
 {convo}"""
+
+
+MEMORY_CATEGORIES = ("story", "characters", "preferences", "decisions", "production", "questions", "ideas", "assumptions")
+
+
+def validate_reply(data) -> dict:
+    """Checks the model's answer against CHAT_SCHEMA before anything is used.
+    Raises ValueError without a usable reply; drops malformed parts (they are
+    never executed or saved) and lists what was dropped."""
+    if not isinstance(data, dict):
+        raise ValueError("the answer isn't an object")
+    reply = data.get("reply")
+    if not isinstance(reply, str) or not reply.strip():
+        raise ValueError("the answer has no reply text")
+    dropped = []
+    props = data.get("proposals")
+    if not isinstance(props, list):
+        if props is not None:
+            dropped.append("proposals")
+        props = []
+    good = []
+    for p in props:
+        if isinstance(p, dict) and p.get("type") in ACTIONS and isinstance(p.get("title", ""), str) \
+                and isinstance(p.get("data", {}), dict):
+            good.append(p)
+        else:
+            dropped.append("a proposal")
+    mem = data.get("memory")
+    if not isinstance(mem, list):
+        if mem is not None:
+            dropped.append("memory")
+        mem = []
+    memory = [m for m in mem if isinstance(m, dict) and m.get("category") in MEMORY_CATEGORIES
+              and isinstance(m.get("text"), str) and m["text"].strip()]
+    if len(memory) != len(mem):
+        dropped.append("a memory note")
+    focus = data.get("focus") if isinstance(data.get("focus"), dict) else {}
+    focus = {"scenes": [n for n in focus.get("scenes") or [] if isinstance(n, int) and not isinstance(n, bool)][:6],
+             "characters": [c for c in focus.get("characters") or [] if isinstance(c, str)][:6]}
+    return {"reply": reply.strip(), "proposals": good, "memory": memory, "focus": focus, "dropped": dropped}
 
 
 def clean_proposals(raw) -> list[dict]:

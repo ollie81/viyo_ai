@@ -27,4 +27,4 @@ alter table public.studio_scenes add column if not exists lipsync_path text;
 alter table public.studio_jobs drop constraint if exists studio_jobs_kind_check;
 alter table public.studio_jobs add constraint studio_jobs_kind_check  -- every job type, so re-running this file never narrows it
   check (kind in ('script', 'breakdown', 'portrait', 'image', 'voice', 'video', 'render', 'lipsync', 'outfits', 'cover',
-                  'elements', 'element'));
+                  'elements', 'element', 'inspect', 'shotplan', 'shot_image', 'shot_video'));

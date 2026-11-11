@@ -26,6 +26,8 @@ import studio_pricing as pricing
 import studio_render as render
 import studio_music as music_mod
 import studio_continuity as continuity
+import studio_inspect as inspect_mod
+import studio_shots as shots_mod
 import studio_fal as fal_mod
 from studio_store import Files, Store, new_path
 
@@ -777,6 +779,10 @@ class StudioWorker:
 
     def do_image(self, job, project):
         scene = self._scene(job, project)
+        if scene.get("image_approved_path") and scene.get("image_approved_path") == scene.get("image_path"):
+            raise JobFailed("approved", "This picture is approved. Unapprove it first to replace it. "
+                                        "Your credits were returned.")
+        correction = ((job.get("input") or {}).get("correction") or "").strip()[:600]
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
@@ -802,13 +808,82 @@ class StudioWorker:
                                     expressions=expressions, world=world_mod.world_block(location, props),
                                     continuity=continuity.image_block(before, scene),
                                     camera_text=continuity.of(scene).get("camera", "") if scene.get("camera") in (None, "", "auto") else "")
+        if correction:
+            prompt += ("\nCORRECTION (the last picture of this scene got this wrong; fix it and keep everything else "
+                       f"the same): {correction}")
         prompt += "\nNo text, captions, logos or watermarks in the image."
         data, mime, cost = self.ai.image(prompt, refs[:IMAGE_REFS], project["aspect_ratio"], _size(project))
         ext = "png" if "png" in mime else "jpg"
         path = self._save(job, project, "image", ext, data, mime, scene_id=scene["id"])
         self.store.update("studio_scenes", {"id": scene["id"]}, {"image_path": path, "updated_at": _now()})
         self._made_with(scene, entries, [label for label, _d in labelled], previous=self._last_previous_shot)
-        return {"path": path, "references": [label for label, _d in labelled]}, cost
+        out = {"path": path, "references": [label for label, _d in labelled]}
+        if project.get("auto_inspect") is not False:
+            # Check the new picture straight away (its price was in the estimate).
+            # A failed check never fails the picture and isn't charged.
+            try:
+                rec, check_cost = self._inspect_scene(project, self.store.one("studio_scenes", {"id": scene["id"]}), cast)
+                cost = pricing.combine([cost, check_cost])
+                out["inspection"] = {"overall": rec["result"]["scores"].get("overall"),
+                                     "problems": len(inspect_mod.errors(rec["result"]))}
+            except Exception as e:
+                self._rollback()
+                print(f"[INFO] studio job {job['id']}: picture made, check skipped: {str(e)[:160]}")
+        return out, cost
+
+    # ------------------------------------------------------------ visual continuity check
+
+    def inspection_inputs(self, project, scene, cast=None):
+        """(previous scene, whether it carries over, entries, signature) for a check."""
+        cast = cast if cast is not None else self.store.select("studio_characters", {"project_id": project["id"]})
+        prev = self._scene_before(project, scene)
+        carries = continuity.carries_look(prev, scene)
+        entries = self._cast_for_scene(project, scene, cast)
+        sig = inspect_mod.signature(scene, prev if carries else None, [(o or {}).get("id") for _c, o in entries],
+                                    [f"{c['id']}:{c.get('identity_version') or 0}" for c, _o in entries])
+        return prev, carries, entries, sig
+
+    def _inspect_scene(self, project, scene, cast=None):
+        """Looks at the scene picture with a vision model and saves the result."""
+        if not scene or not scene.get("image_path"):
+            raise JobFailed("no_picture", "Make this scene's picture first. Your credits were returned.")
+        prev, carries, entries, sig = self.inspection_inputs(project, scene, cast)
+        images = [("this scene's picture (check this one)", self.files.get(scene["image_path"]))]
+        for c, outfit in entries[:2]:     # each character's best face reference
+            for label, path in ident.references_for(c, "front", outfit, 1):
+                try:
+                    images.append((f"reference: {label}", self.files.get(path)))
+                except Exception:
+                    pass
+        if carries and prev and prev.get("image_path"):
+            try:
+                images.append(("the previous scene's picture (this scene follows it)", self.files.get(prev["image_path"])))
+            except Exception:
+                pass
+        location, props = self._world(project, scene)
+        room = inspect_mod.MAX_IMAGES - len(images)
+        for label, data in self._world_files(location, props, room):
+            images.append((f"reference: {label}", data))
+        prev_seen = (((prev or {}).get("inspection") or {}).get("result") or {}).get("observed") if prev else None
+        text = inspect_mod.prompt(scene, prev, ident.cast_block(entries).splitlines(), world_mod.world_block(location, props),
+                                  [label for label, _d in images], prev_seen, continuity.transition(prev, scene))
+        result, cost = self.ai.inspect(text, images)
+        rec = inspect_mod.record(result, sig, scene["image_path"], cost.total_usd)
+        self._optional_update("studio_scenes", {"id": scene["id"]}, {"inspection": rec})
+        return rec, cost
+
+    def do_inspect(self, job, project):
+        """Checks an existing scene picture (reused for free if nothing changed)."""
+        scene = self._scene(job, project)
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        if scene.get("image_path"):
+            _prev, _c, _e, sig = self.inspection_inputs(project, scene, cast)
+            saved = inspect_mod.current(scene, sig)
+            if saved:
+                return {"reused": True, "overall": saved["result"]["scores"].get("overall")}, \
+                    pricing.Cost("viyo", "reused", {"reused": 1})
+        rec, cost = self._inspect_scene(project, scene, cast)
+        return {"overall": rec["result"]["scores"].get("overall"), "problems": len(inspect_mod.errors(rec["result"]))}, cost
 
     def do_voice(self, job, project):
         scene = self._scene(job, project)
@@ -874,6 +949,23 @@ class StudioWorker:
             except Exception:
                 frame = None
         cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        data, cost, references, backup_used, entries = self._clip(job, project, scene, frame, cast)
+        path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
+                          duration_seconds=cost.units.get("video_seconds"))
+        self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
+        if scene.get("lipsync_path"):   # a new clip needs new lip sync (the old file is kept)
+            self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
+        labels = [label for label, _d in references or []] or (["the scene picture"] if frame else [])
+        if backup_used:
+            labels = ["the scene picture"]
+        self._made_with(scene, entries, labels)
+        return {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}, cost
+
+
+    def _clip(self, job, project, scene, frame, cast, direction=None):
+        """One video clip for a scene, or for one shot passed as a scene-like
+        dict (its own description, lines, length and continuity). Returns
+        (data, cost, references, backup model or None, entries)."""
         entries = self._cast_for_scene(project, scene, cast)
         camera = ident.scene_camera(scene)
         expressions = self._expressions(scene, entries)
@@ -884,7 +976,8 @@ class StudioWorker:
         lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
         style = f"Style: {project['visual_style'] or 'cinematic'}. "
         # Beginning, during and end of the clip, the camera, and what must not change.
-        direction = continuity.video_block(self._scene_before(project, scene), scene)
+        if direction is None:
+            direction = continuity.video_block(self._scene_before(project, scene), scene)
         direction = (direction + " ") if direction else ""
         references = None
         if lines and scene_speech(scene, project) == "video_model":
@@ -929,16 +1022,165 @@ class StudioWorker:
         except ai_mod.PolicyBlocked as refused:
             data, cost, backup_used = self._video_backup(job, project, prompt, frame, seconds, talking,
                                                          audio=talking or not lines, refused=refused)
+        return data, cost, references, backup_used, entries
+
+    # ------------------------------------------------------------ multi-shot scenes
+
+    def _shots(self, scene_id) -> list:
+        try:
+            return sorted(self.store.select("studio_shots", {"scene_id": scene_id}), key=lambda r: r["position"])
+        except Exception:
+            self._rollback()       # creator_studio_shots.sql not run yet: no shots
+            return []
+
+    def do_shotplan(self, job, project):
+        """The director plans one scene's shots. Replaces an unapproved plan."""
+        scene = self._scene(job, project)
+        if scene.get("shot_plan_approved"):
+            raise JobFailed("approved", "This scene's shot plan is approved. Unapprove it to plan again. "
+                                        "Your credits were returned.")
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
+        prev = self._scene_before(project, scene)
+        prev_shots = self._shots(prev["id"]) if prev else []
+        names = [c["name"] for c in cast]
+        prompt = shots_mod.planner_prompt(project, scene, scene["position"] + 1, len(scenes), prev,
+                                          prev_shots[-1] if prev_shots else None,
+                                          ident.cast_block(self._cast_for_scene(project, scene, cast)).splitlines())
+        raw, cost = self.ai.plan_shots(prompt, scene=scene, cast_names=names)
+        try:
+            plan = shots_mod.clean_plan(raw, scene, names)
+        except ValueError as e:
+            raise JobFailed("bad_plan", f"The director couldn't plan this scene ({e}). Your credits were returned.",
+                            absorbed=cost)
+        for old in self._shots(scene["id"]):
+            if old.get("approved_at"):
+                raise JobFailed("approved", "A shot in this scene is approved. Unapprove it to plan again. "
+                                            "Your credits were returned.", absorbed=cost)
+        self.store.delete("studio_shots", {"scene_id": scene["id"]})   # their pictures/clips stay in the asset history
+        rows = [{"scene_id": scene["id"], "project_id": project["id"], "owner_id": project["owner_id"], "position": i,
+                 **{k: sh[k] for k in ("shot_type", "camera_angle", "camera_movement", "duration_seconds", "description",
+                                      "characters", "line_indices", "dialogue", "audio", "frame_prompt", "video_prompt",
+                                      "continuity", "reason")}} for i, sh in enumerate(plan)]
+        self.store.insert("studio_shots", rows)
+        return {"shots": len(rows), "types": [r["shot_type"] for r in rows]}, cost
+
+    def _shot_job(self, job, project):
+        sid = (job.get("input") or {}).get("shot_id")
+        shot = self.store.one("studio_shots", {"id": sid}) if sid else None
+        if not shot or shot["owner_id"] != job["owner_id"] or shot["project_id"] != project["id"]:
+            raise JobFailed("not_found", "This shot no longer exists. Your credits were returned.")
+        scene = self.store.one("studio_scenes", {"id": shot["scene_id"]})
+        if not scene or not scene.get("shot_plan_approved"):
+            raise JobFailed("not_approved", "Approve the scene's shot plan first. Your credits were returned.")
+        if shot.get("approved_at"):
+            raise JobFailed("approved", "This shot is approved. Unapprove it to remake it. Your credits were returned.")
+        return shot, scene, self._shots(scene["id"])
+
+    def _shot_entries(self, project, scene, shot, cast):
+        names = [c["name"] for c in shot.get("characters") or []]
+        entries = self._cast_for_scene(project, scene, cast)
+        return [(c, o) for c, o in entries if c["name"] in names] or \
+            [(c, o) for c, o in self._cast_for_scene(project, dict(scene, continuity={}, visual=" ".join(names)), cast)
+             if c["name"] in names]
+
+    def do_shot_image(self, job, project):
+        """The opening picture of one shot: its own framing, the scene's
+        continuity, and the previous shot's picture so it all matches."""
+        shot, scene, shots = self._shot_job(job, project)
+        idx = next(i for i, x in enumerate(shots) if x["id"] == shot["id"])
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        entries = self._shot_entries(project, scene, shot, cast)
+        camera = shots_mod.reference_camera(shot)
+        location, props = self._world(project, scene)
+        prev_pic, prev_label = None, None
+        if idx > 0 and shots[idx - 1].get("image_path"):
+            prev_pic, prev_label = shots[idx - 1]["image_path"], "the previous shot of this scene"
+        elif idx == 0:
+            before = self._scene_before(project, scene)
+            if before and continuity.carries_look(before, scene):
+                last = (self._shots(before["id"]) or [None])[-1]
+                prev_pic = (last or {}).get("image_path") or before.get("image_path")
+                prev_label = "the last shot of the previous scene"
+        labelled = self._reference_files(entries, camera, IMAGE_REFS - (2 if prev_pic else 1), )
+        if prev_pic:
+            try:
+                labelled.append((f"{prev_label} (same place, light and clothes; NOT its framing)", self.files.get(prev_pic)))
+            except Exception:
+                prev_pic = None
+        labelled += self._world_files(None if prev_pic else location, props, IMAGE_REFS - len(labelled))
+        roles = " ".join(f"Reference image {i}: {label}." for i, (label, _d) in enumerate(labelled, start=1))
+        before = self._scene_before(project, scene)
+        prompt = ident.scene_prompt(shot["frame_prompt"] or shot["description"], entries, camera, project["visual_style"],
+                                    project["aspect_ratio"], extra=(roles + "\n") if roles else "",
+                                    world=world_mod.world_block(location, props),
+                                    continuity=continuity.image_block(before, scene) + shots_mod.continuity_block(
+                                        scene, shots, idx, (before or {}).get("continuity", {}).get("end_state", "")),
+                                    camera_text=shots_mod.camera_text(shot))
+        prompt += "\nNo text, captions, logos or watermarks in the image."
+        data, mime, cost = self.ai.image(prompt, [d for _l, d in labelled][:IMAGE_REFS], project["aspect_ratio"], _size(project))
+        path = self._save(job, project, "image", "png" if "png" in mime else "jpg", data, mime, scene_id=scene["id"])
+        self.store.update("studio_shots", {"id": shot["id"]}, {
+            "image_path": path, "status": "picture", "video_path": None,   # a new picture needs a new clip "made_with": {"_refs": [label for label, _d in labelled][:8], "_previous": prev_pic},
+            "updated_at": _now()})
+        return {"path": path, "shot": idx + 1}, cost
+
+    def do_shot_video(self, job, project):
+        """One shot's clip, from its opening picture: the shot's movement and
+        lines, the scene's continuity, what must not change."""
+        shot, scene, shots = self._shot_job(job, project)
+        if not shot.get("image_path"):
+            raise JobFailed("no_picture", "Make this shot's picture first. Your credits were returned.")
+        frame = self.files.get(shot["image_path"])
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        names = [c["name"] for c in shot.get("characters") or []]
+        c = dict(scene.get("continuity") or {})
+        c.update(characters=[x for x in c.get("characters") or [] if x.get("name") in names] or
+                 [{"name": n, "in_frame": True} for n in names],
+                 start_state=shot["description"], action=shot["video_prompt"] or shot["description"],
+                 end_state="", camera=shots_mod.camera_text(shot), camera_movement=shot.get("camera_movement") or "")
+        shot_scene = dict(scene, visual=shot["video_prompt"] or shot["description"], dialogue=shot.get("dialogue") or [],
+                          duration_seconds=float(shot["duration_seconds"]), continuity=c, image_path=shot["image_path"])
+        direction = continuity.video_block(None, shot_scene) + (f" Sound: {shot['audio']}." if shot.get("audio") else "")
+        data, cost, refs, backup, _e = self._clip(job, project, shot_scene, frame, cast, direction=direction)
         path = self._save(job, project, "video", "mp4", data, "video/mp4", scene_id=scene["id"],
                           duration_seconds=cost.units.get("video_seconds"))
-        self.store.update("studio_scenes", {"id": scene["id"]}, {"video_path": path, "mode": "video", "updated_at": _now()})
-        if scene.get("lipsync_path"):   # a new clip needs new lip sync (the old file is kept)
-            self._optional_update("studio_scenes", {"id": scene["id"]}, {"lipsync_path": None})
-        labels = [label for label, _d in references or []] or (["the scene picture"] if frame else [])
-        if backup_used:
-            labels = ["the scene picture"]
-        self._made_with(scene, entries, labels)
-        return {"path": path, "references": labels, **({"model": backup_used} if backup_used else {})}, cost
+        self.store.update("studio_shots", {"id": shot["id"]}, {"video_path": path, "status": "ready", "updated_at": _now()})
+        return {"path": path, **({"model": backup} if backup else {})}, cost
+
+    def _shot_scene_input(self, project, scene, shots, fetch, tmp):
+        """A scene made of shots: each shot is rendered for its own length (its
+        clip, or its picture with a slow push-in), then joined in order into
+        one scene clip that goes through the normal film render."""
+        n = scene["position"]
+        w, h = render.canvas(project["aspect_ratio"])
+        talking = scene_speech(scene, project) == "video_model"
+        captions = bool(project.get("captions", True))
+        clips = []
+        for k, sh in enumerate(shots):
+            clip = os.path.join(tmp, f"s{n}_shot{k}.mp4")
+            render.render_scene(render.SceneInput(
+                duration=float(sh["duration_seconds"]),
+                image=None if sh.get("video_path") else fetch(sh["image_path"], f"s{n}_shot{k}.img"),
+                video=fetch(sh["video_path"], f"s{n}_shot{k}_v.mp4") if sh.get("video_path") else None,
+                lines=tuple(d["text"] for d in sh.get("dialogue") or [] if d.get("text")),
+                video_audio=bool(sh.get("video_path")) and (talking or not (sh.get("dialogue") or []))),
+                w, h, clip, tmp, n * 10 + k, captions)
+            clips.append(clip)
+        listing = os.path.join(tmp, f"s{n}_shots.txt")
+        with open(listing, "w") as f:
+            f.writelines(f"file '{c}'\n" for c in clips)
+        joined = os.path.join(tmp, f"s{n}_shots.mp4")
+        render._run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined],
+                    f"joining the shots of scene {n + 1}")
+        has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
+        return render.SceneInput(
+            duration=sum(float(sh["duration_seconds"]) for sh in shots), video=joined,
+            # Saved voices speak over the joined shots; talking shots carry their own speech.
+            audio=None if talking else fetch(scene.get("audio_path"), f"aud{n}.m4a"),
+            audio_seconds=float(scene["audio_seconds"]) if scene.get("audio_seconds") and not talking else None,
+            lines=(), video_audio=talking or not has_lines,
+            sfx=tuple(x for x in (scene.get("sfx") or []) if isinstance(x, str)))
 
     def _video_backup(self, job, project, prompt, frame, seconds, talking, audio, refused):
         """Google refused the video: try the backup models (fal.ai) from the
@@ -1007,11 +1249,21 @@ class StudioWorker:
         scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
         if not scenes:
             raise JobFailed("no_scenes", "Add scenes before rendering.")
-        missing = [s["position"] + 1 for s in scenes if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))]
+        shot_rows = {s["id"]: self._shots(s["id"]) for s in scenes}
+        shot_based = {sid for sid, rows in shot_rows.items()
+                      if shots_mod.uses_shots(next(x for x in scenes if x["id"] == sid), rows)}
+        for s in scenes:
+            if s["id"] in shot_based:
+                problem = shots_mod.shot_problem(s["position"] + 1, shot_rows[s["id"]],
+                                                 scene_speech(s, project) == "video_model")
+                if problem:
+                    raise JobFailed("not_ready", problem + " Make it first.")
+        single = [s for s in scenes if s["id"] not in shot_based]
+        missing = [s["position"] + 1 for s in single if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))]
         if missing:
             raise JobFailed("not_ready", f"Scene {missing[0]} has no picture yet. Generate it first.")
-        unspoken = [s["position"] + 1 for s in scenes if talks_in_video(s, project) and not s.get("video_path")]
-        unsynced = [s["position"] + 1 for s in scenes if needs_lipsync(s, project) and not s.get("lipsync_path")]
+        unspoken = [s["position"] + 1 for s in single if talks_in_video(s, project) and not s.get("video_path")]
+        unsynced = [s["position"] + 1 for s in single if needs_lipsync(s, project) and not s.get("lipsync_path")]
         if unsynced:
             raise JobFailed("not_ready", f"Scene {unsynced[0]}'s lip sync isn't made yet. Make it first, so the "
                                          "lips match the voices.")
@@ -1028,6 +1280,9 @@ class StudioWorker:
                     self.files.get_to(path, local)
                     return local
                 n = s["position"]
+                if s["id"] in shot_based:
+                    inputs.append(self._shot_scene_input(project, s, shot_rows[s["id"]], fetch, tmp))
+                    continue
                 synced = s.get("lipsync_path") if needs_lipsync(s, project) else None
                 use_video = synced or (s["mode"] == "video" and s.get("video_path"))
                 spoken_in_clip = bool(synced) or (bool(use_video) and talks_in_video(s, project))
@@ -1353,7 +1608,8 @@ def start_background(store: Store, files: Files, ai, bunny_upload=None) -> list[
     except Exception as e:
         print(f"[WARN] studio: lip sync not started: {str(e)[:120]}")
     workers = [StudioWorker(store, files, ai, "generation", lipsync=lipsync),
-               StudioWorker(store, files, ai, "render", bunny_upload=bunny_upload)]
+               StudioWorker(store, files, ai, "render", bunny_upload=bunny_upload),
+               StudioWorker(store, files, ai, "inspect")]      # picture checks, one scene per job
     for w in workers:
         threading.Thread(target=w.run_forever, name=f"studio-{w.lane}", daemon=True).start()
     return workers
