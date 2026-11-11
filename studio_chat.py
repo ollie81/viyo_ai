@@ -57,11 +57,16 @@ ACTIONS = {
     "make_place_object_picture": "paid",  # data: name: the picture of one place/object (job kind "element")
     "check_scenes": "paid",      # data: scenes [numbers] (empty = every scene with a picture): the picture check
     "fix_scene_picture": "paid", # data: scene, correction: a new picture of that scene that fixes what the check found
+    "plan_shots": "paid",        # data: scenes [numbers]: the director plans each scene's camera shots (job "shotplan")
+    "edit_shot": "free",         # data: scene, shot, and shot_type / camera_angle / camera_movement / duration_seconds / description
+    "remake_shot_picture": "paid",   # data: scene, shot: a new opening picture of that one shot
+    "remake_shot_video": "paid",     # data: scene, shot: a new clip of that one shot
 }
 PAID_JOB = {"develop_story": "script", "break_into_scenes": "breakdown", "find_places_objects": "elements",
             "make_cover": "cover", "make_film": "production", "remake_picture": "image", "remake_video": "video",
             "suggest_outfits": "outfits", "make_character_sheet": "portrait", "record_voices": "voice",
-            "make_place_object_picture": "element", "check_scenes": "inspect", "fix_scene_picture": "image"}
+            "make_place_object_picture": "element", "check_scenes": "inspect", "fix_scene_picture": "image",
+            "plan_shots": "shotplan", "remake_shot_picture": "shot_image", "remake_shot_video": "shot_video"}
 
 _STR = {"type": "string"}
 CHAT_SCHEMA = {
@@ -80,7 +85,10 @@ CHAT_SCHEMA = {
                 "character": _STR, "owner": _STR, "clothing": _STR, "shoes": _STR, "accessories": _STR, "makeup": _STR,
                 "outfit": _STR, "scene": {"type": "integer"}, "heading": _STR, "visual": _STR,
                 "start_state": _STR, "end_state": _STR, "correction": _STR,
-                "scenes": {"type": "array", "items": {"type": "integer"}},
+                "scenes": {"type": "array", "items": {"type": "integer"}}, "shot": {"type": "integer"},
+                "shot_type": {"type": "string", "enum": ["establishing_wide", "wide_two_shot", "medium", "close_up",
+                                                         "extreme_close_up", "over_the_shoulder", "reaction", "pov", "insert"]},
+                "camera_angle": _STR, "camera_movement": _STR, "duration_seconds": {"type": "number"},
                 "transition": {"type": "string", "enum": ["continuous", "same_place_cut", "new_place", "time_jump",
                                                           "flashback"]},
                 "dialogue": {"type": "array", "items": {"type": "object", "properties": {
@@ -135,6 +143,15 @@ Seeing and auditing:
 - When something might be intended (a wardrobe change, a new place), explain why it might be and ask; give a
   concrete fix if it isn't, e.g. "Scene 4 seems to show Maya in a different outfit from the end of scene 3. I'd keep
   the previous outfit unless there's a wardrobe change in the story."
+
+Camera shots (the director):
+- A scene can be filmed as several shots (wide two-shot, medium, over-the-shoulder, close-up, reaction, insert...).
+  Each scene below lists its shots with type, length, why it was chosen and whether it's made. Explain the choices in
+  plain words when asked ("a close-up on Daniel so we see the lie land").
+- plan_shots (data.scenes) has the director plan shots (paid, small). The creator approves the plan in the app, then
+  each shot's picture and clip are made. edit_shot changes one shot (free, the creator applies it); remake_shot_picture
+  / remake_shot_video remake one shot only. An approved shot or plan is never replaced: ask the creator to unapprove.
+- Coverage depends on the moment: a conversation, an emotional beat, action or a quiet moment need different shots.
 
 Production manager: what has been made, what is missing, what happens next and what it costs.
 - Creative partner: brainstorm, give honest specific feedback, offer alternatives with pros and cons.
@@ -204,6 +221,7 @@ Proposals (0 to 3, only when a concrete change would help now):
 - update_place_object: data.name (an existing place or object), data.description.
 - make_character_sheet: data.character. make_place_object_picture: data.name. record_voices: data.scene.
 - check_scenes: data.scenes. fix_scene_picture: data.scene, data.correction.
+- plan_shots: data.scenes. edit_shot / remake_shot_picture / remake_shot_video: data.scene and data.shot (numbers).
 - develop_story, break_into_scenes, find_places_objects, suggest_outfits, make_cover, make_film: paid steps, data may
   be empty.
 Use the exact names from the PROJECT facts for characters, outfits and scene numbers."""
@@ -484,6 +502,13 @@ def project_context(p: dict, cast: list[dict], outfits: list[dict], elements: li
             full = len(scenes) <= DETAIL_ALL or i in near or (about and len(scenes) <= 60)
             lines.append(f"{i}. {s.get('heading') or ''}: {_short(s.get('visual') or '', 600 if full else 140)}"
                          f"{' Speakers: ' + ', '.join(who) if who else ''} [{made}]")
+            shots = s.get("_shots") or []
+            if shots and (full or len(scenes) <= 60):
+                lines.append(f"   SHOTS ({len(shots)}, plan {'APPROVED' if s.get('shot_plan_approved') else 'not approved'}): " + " | ".join(
+                    f"{k + 1}. {sh['shot_type'].replace('_', ' ')} {float(sh['duration_seconds']):g}s"
+                    f"{' [made]' if sh.get('video_path') else ' [picture]' if sh.get('image_path') else ''}"
+                    f"{' [approved]' if sh.get('approved_at') else ''}" + (f" – {_short(sh.get('reason'), 90)}" if full else "")
+                    for k, sh in enumerate(shots)))
             ins = (s.get("inspection") or {}).get("result")
             if ins and (full or ins.get("problems")):
                 lines += _check_lines(ins, (s.get("inspection") or {}).get("image_path") != s.get("image_path"),

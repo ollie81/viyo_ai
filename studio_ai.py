@@ -157,7 +157,8 @@ For each scene give:
 - visual: the scene's opening frame as one coherent shot (characters by name, positions, action, what they hold,
   setting, lighting, framing), matching its start_state;
 - the spoken lines in order (character name exactly as in the character list; use "NARRATOR" for voice-over);
-- a duration in seconds (2-12; long enough for its lines);
+- a duration in seconds (2-12; long enough for its lines). Plan about one scene per 7-8 seconds of the target length
+  (a 60-second drama is about 8 scenes), fewer when scenes need room, and make the durations add up to the target;
 - continuity: purpose; transition from the scene before (continuous, same_place_cut, new_place, time_jump,
   flashback; the first scene is new_place) with a note for the last three; time of day; location; important objects;
   every character involved with in_frame (false if only heard), position and facing, what they hold at the start and
@@ -410,6 +411,17 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return result, pricing.text_cost(i, o)
 
+    def plan_shots(self, prompt: str, scene: Optional[dict] = None, cast_names: Optional[list] = None):
+        """The director's shot plan for one scene (studio_shots.SCHEMA). Returns (raw, cost)."""
+        import studio_shots
+        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=studio_shots.SCHEMA)
+        try:
+            data = json.loads(resp.text or "")
+        except (TypeError, ValueError):
+            raise ProviderError("The director returned an unreadable shot plan.")
+        i, o = self._text_usage(resp)
+        return data, pricing.text_cost(i, o)
+
     def summarize(self, prompt: str):
         """A short plain-text summary (the assistant's memory of older messages)."""
         resp = self._text(prompt)
@@ -645,6 +657,17 @@ class FakeStudioAI:
             "scores": {"overall": 92, "character": 95, "outfit": 90, "location": 90, "props": 90},
             "problems": [], "observed": {}, "summary": "Looks consistent."}
         return studio_inspect.clean(raw), pricing.text_cost(2500 + 1300 * len(images), 900)
+
+    def plan_shots(self, prompt, scene=None, cast_names=None):
+        """shots_result: a dict, or a function (prompt, scene) -> dict. Default: studio_shots.default_plan."""
+        import studio_shots
+        self.calls.append(("plan_shots",))
+        self.shot_prompts = getattr(self, "shot_prompts", []) + [prompt]
+        self._maybe_fail("plan_shots")
+        r = getattr(self, "shots_result", None)
+        raw = (r(prompt, scene) if callable(r) else r) if r is not None else \
+            studio_shots.default_plan(scene or {}, list(cast_names or []))
+        return raw, pricing.text_cost(1800, 900)
 
     def summarize(self, prompt):
         self.calls.append(("summarize",))
