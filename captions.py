@@ -175,7 +175,7 @@ def ts(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def hook_dialogue(hook: str, upper: bool, style: str = "Hook") -> Optional[str]:
+def hook_dialogue(hook: str, upper: bool, style: str = "Hook", seconds: float = HOOK_SECONDS) -> Optional[str]:
     text = escape(hook).strip()
     if not text:
         return None
@@ -183,7 +183,7 @@ def hook_dialogue(hook: str, upper: bool, style: str = "Hook") -> Optional[str]:
     parts = _wrap(text.split(), 24)
     words = text.split()
     wrapped = " ".join(words) if not parts else " ".join(words[:parts[0]]) + "\\N" + " ".join(words[parts[0]:])
-    return f"Dialogue: 1,{ts(0)},{ts(HOOK_SECONDS)},{style},,0,0,0,,{{\\fad(150,200)}}{wrapped}"
+    return f"Dialogue: 1,{ts(0)},{ts(seconds)},{style},,0,0,0,,{{\\fad(150,200)}}{wrapped}"
 
 
 def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFAULT_STYLE,
@@ -215,14 +215,15 @@ def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFA
         f"Style: Caption,{FONT},{st['size']},{WHITE},{WHITE},&H00000000,{st['back']},1,0,0,0,100,100,0,0,"
         f"{st['border']},{st['outline']},1,2,{left},{right},{bottom},1",
         f"Style: Hook,{FONT},56,{GOLD},{GOLD},&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,1,8,"
-        f"{left},{right},{top},1",
+        f"{left},{right},{top + int((layout or {}).get('hook_offset') or 0)},1",
         f"Style: Marker,{FONT},40,{WHITE},{WHITE},&H00000000,&H90000000,1,0,0,0,100,100,2,0,3,10,0,7,"
         f"{left},{right},{top + 150},1",
         "", "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     events: list[str] = []
-    hook_line = hook_dialogue(hook, st["upper"]) if hook else None
+    hook_line = hook_dialogue(hook, st["upper"], seconds=(layout or {}).get("hook_seconds") or HOOK_SECONDS) \
+        if hook else None
     if hook_line:
         events.append(hook_line)
 

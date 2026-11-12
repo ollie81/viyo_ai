@@ -249,6 +249,9 @@ def _analyse_media(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str
     timeline = run.visual(path, duration)
     if timeline.usable:
         amb.visual_quality = lambda s, e: video_analysis.visual_quality_score(video_analysis.window_visual(timeline, s, e))
+        broll = clip_render.cutaways(timeline)
+        facts["broll"] = {"cutaways": len(broll), "seconds": round(sum(b - a for a, b in broll), 1),
+                          "times": broll[:20], "inserted": False}
         facts["visual"] = {"samples": int(len(timeline.times)), "shots": len(timeline.shots),
                            "camera_cuts": int(timeline.cut_before.sum()), "detector": timeline.detector,
                            "bars": {k: round(v, 3) for k, v in timeline.bars.items()}}
@@ -335,8 +338,16 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     except clip_selection.SelectionUnavailable as e:
         raise TransientJobError("selection_unavailable", "Clip selection is temporarily unavailable.", str(e))
 
+    if result.clips and deps.analysis and amb.video_map and deps.review:
+        # Multi-moment stories across the whole video: thread partners joined to chosen clips (confirmed below).
+        import clip_story
+        facts["story_links"] = clip_story.link(result.clips + result.spares, sentences, run.punct(words, segments),
+                                               amb.video_map, duration)
     if result.clips and deps.analysis:
         facts["review"] = _review(ctx, deps, run, path, result, sentences, amb, work_dir, duration)
+    if "story_links" in facts:
+        import clip_story
+        facts["story_links"].update(clip_story.settle(result.clips + result.spares))
 
     if result.clips:
         ctx.stage("selecting", 0.59, "Writing the hooks")
@@ -382,165 +393,57 @@ def _clip_words(punct: list, start: float, end: float) -> list:
     return [w for w in punct if start <= (float(w["start"]) + float(w["end"])) / 2 < end]
 
 
-def _main_sentence_ids(clip: dict) -> list:
-    """The sentences of the clip's main moment (not a joined part, not dropped ones), or [] when unknown."""
-    if clip.get("start_sentence") is None or clip.get("end_sentence") is None:
-        return []
-    st = clip.get("structure") or {}
-    dropped = set(st.get("dropped") or [])
-    joined = st.get("joined")
-    hi = (joined[0] - 1) if joined else clip["end_sentence"]
-    return [i for i in range(int(clip["start_sentence"]), int(hi) + 1) if i not in dropped]
-
-
 def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str, work_dir: str, rank: int,
                 clip: dict, transcript: dict) -> dict:
-    import clip_edit
+    """Decides the clip's edits (clip_make.decide), makes it (clip_make.make), and saves the clip, its
+    caption-free master, the platform caption files and the edit decision list (so the creator can switch
+    edits off later)."""
+    import clip_make
     import platforms as pf
     import repurpose as r
     words, segments = transcript.get("words") or [], transcript.get("segments") or []
     punct = run.punct(words, segments)
-    # The clip is one or more source ranges (a digression dropped, a later part joined: see clip_edit).
-    parts = [tuple(p) for p in (clip.get("parts") or [])] or [(clip["start"], clip["end"])]
-    blocks, dead_air = [], 0.0
-    for a, b in parts:
-        pb = r._find_speech_blocks(segments, a, b)
-        dead_air += r._dead_air_removed_seconds(pb)
-        blocks += pb
-    dead_air = round(dead_air, 2)
-    kept_before = sum(e - s for s, e in blocks)
-    blocks, filler_count = r._remove_filler_words(blocks, words)
-    filler_seconds = round(kept_before - sum(e - s for s, e in blocks), 2)
-
-    overlay = clip.get("overlay_hook")
     smap = run.speaker_map
     speaker_at = smap.label_at if smap is not None and smap.reliable and smap.n_speakers >= 2 else None
-    # Retention: long pauses inside sentences shortened, abandoned restarts removed.
-    tight = {}
-    if deps.retention and run.mode == "speech":
-        blocks, tight = clip_edit.tighten(blocks, punct, speaker_at)
-    planned_main = sum(e - s for s, e in blocks)
-    structure = clip.get("structure") or {}
-    joined_at = structure.get("joined_at")
-    markers = [(captions.build_remap(blocks)(float(joined_at)), "LATER IN THE VIDEO")] if joined_at else []
-    # Hook: a slow opening gets a preview of the clip's own strongest line (verbatim, from later in the clip).
-    teaser = None
-    if deps.cold_open and run.mode == "speech":
-        ids = _main_sentence_ids(clip)
-        if ids:
-            teaser = clip_edit.choose_teaser(run.sentences(punct), ids, punct, blocks[0][0])
-
-    dims = run.dimensions(source)
     timeline = run.visual(source, ctx.job.get("checkpoint", {}).get("source", {}).get("duration") or 0.0) \
         if deps.analysis else None
-    out = os.path.join(work_dir, f"clip_{rank}.mp4")
-    master = os.path.join(work_dir, f"clip_{rank}_master.mp4")
-    plan = clip_render.plan_crop(timeline, blocks, dims["width"], dims["height"], source)
-    teaser_dur = 0.0
-
-    def render_master() -> dict:
-        nonlocal teaser_dur
-        zoom = clip_render.jump_zoom_windows(blocks, timeline, plan, (float(joined_at),) if joined_at else ()) \
-            if deps.zoom else []
-        main = os.path.join(work_dir, f"clip_{rank}_main.mp4") if teaser else master
-        facts = clip_render.render(source, main, blocks, plan, None, run.fps, has_audio=run.has_audio, zoom=zoom,
-                                   crf=clip_render.MASTER_CRF, preset=clip_render.MASTER_PRESET)
-        if teaser:
-            tb = [(teaser["start"], teaser["end"])]
-            tplan = clip_render.plan_crop(timeline, tb, dims["width"], dims["height"], source)
-            if plan.mode == "fit":
-                tplan = clip_render.CropPlan(mode="fit", src_w=dims["width"], src_h=dims["height"], bars=tplan.bars,
-                                             crop_w=tplan.crop_w, crop_h=tplan.crop_h,
-                                             pieces=[(0.0, 0.0, tb[0][1] - tb[0][0], 0.0)], facts=tplan.facts)
-            tpath = os.path.join(work_dir, f"clip_{rank}_teaser.mp4")
-            clip_render.render(source, tpath, tb, tplan, None, run.fps, has_audio=run.has_audio,
-                               crf=clip_render.MASTER_CRF, preset=clip_render.MASTER_PRESET)
-            teaser_dur = video_duration(tpath) or (tb[0][1] - tb[0][0])
-            clip_render.join_clips(tpath, main, master)
-            for f in (tpath, main):
-                os.remove(f)
-        return facts
-
-    def captions_for(layout: Optional[dict], shift: float = 0.0) -> tuple:
-        main_ass, facts = captions.build_ass(punct, blocks, hook="" if teaser else (overlay or ""),
-                                             style=deps.caption_style, speaker_at=speaker_at, shift=shift,
-                                             layout=layout, markers=markers)
-        if teaser:
-            t_ass, _f = captions.build_ass(punct, [(teaser["start"], teaser["end"])], hook=overlay or "",
-                                           style=deps.caption_style, speaker_at=speaker_at, shift=shift, layout=layout)
-            return captions.join_ass(t_ass, main_ass, teaser_dur), facts
-        return main_ass, facts
-
-    def write_ass(text: Optional[str], name: str) -> Optional[str]:
-        if not text:
-            return None
-        path = os.path.join(work_dir, name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-        return path
-
-    qa_dict: dict = {}
-    attempts = 0
-    render_facts = None
-    shift = 0.0
-    while True:
-        attempts += 1
-        try:
-            if render_facts is None:
-                render_facts = render_master()
-            ass_text, cap_facts = captions_for(None, shift)
-            if shift:
-                cap_facts["timing_shift_s"] = shift
-            ass_path = write_ass(ass_text, f"captions_{rank}.ass")
-            clip_render.burn_captions(master, out, ass_path)
-        except clip_render.RenderError as e:
-            raise RuntimeError(str(e))
-        planned = planned_main + teaser_dur
-        if not deps.qa:
-            break
-        c_words = (_clip_words(punct, teaser["start"], teaser["end"]) if teaser else []) + \
-            [w for w in punct if any(s <= (float(w["start"]) + float(w["end"])) / 2 < e for s, e in blocks)]
-        report = clip_qa.run_qa(out, planned, render_facts, ass_text, overlay, clip.get("transcript", ""),
-                                [str(w.get("text") or w.get("word")) for w in c_words], work_dir,
-                                mode=run.mode, has_audio=run.has_audio)
-        qa_dict = report.to_dict()
-        if report.passed:
-            break
-        # Caption timing: whisper's word times can sit a few hundred ms off the audio. QC measured the offset,
-        # so shift the captions by it and burn them again (the master is reused).
-        cs_fail = [f for f in report.failures if f.name == "caption_sync"]
-        if (attempts == 1 and ass_text and len(report.failures) == 1 and cs_fail
-                and 0.12 < abs(cs_fail[0].detail.get("offset_s", 0)) <= 0.7):
-            shift = float(cs_fail[0].detail["offset_s"])
-            continue
-        # One regeneration: a framing failure is fixed by keeping the whole frame instead of cropping it.
-        if attempts <= 2 and report.failures and all(f.name == "framing" for f in report.failures):
-            plan = clip_render.CropPlan(mode="fit", src_w=dims["width"], src_h=dims["height"], bars=plan.bars,
-                                        crop_w=plan.crop_w, crop_h=plan.crop_h,
-                                        pieces=[(0.0, 0.0, planned_main, 0.0)], facts={**plan.facts, "retry": "fit_after_framing"})
-            render_facts = None
-            continue
-        for f in (out, master):
-            if os.path.exists(f):
-                os.remove(f)
-        raise ClipRejected([f.name for f in report.failures], qa_dict)
+    edl = clip_make.decide(clip, punct, words, segments, run.sentences(punct) if run.mode == "speech" else [],
+                           mode=run.mode, retention=deps.retention, cold_open=deps.cold_open, timeline=timeline)
+    toggles = {**clip_make.DEFAULT_TOGGLES, "tighten": deps.retention, "retention_cuts": deps.retention,
+               "cold_open": deps.cold_open, "zoom": deps.zoom}
+    try:
+        made = clip_make.make(source, edl, toggles, work_dir, f"clip_{rank}", dims=run.dimensions(source), fps=run.fps,
+                              has_audio=run.has_audio, caption_style=deps.caption_style, timeline=timeline,
+                              speaker_at=speaker_at, qa=deps.qa, zoom=deps.zoom, transcript=clip.get("transcript", ""))
+    except clip_render.RenderError as e:
+        raise RuntimeError(str(e))
+    except clip_make.Rejected as e:
+        raise ClipRejected(e.failures, e.report)
+    out, master = made["out"], made["master"]
+    edits, qa_dict = made["edits"], made["qa"]
 
     user_id, job_id = ctx.job["user_id"], ctx.job_id
     base = f"{user_id}/{job_id}/clip_{rank}"
     video_url = deps.storage.upload(CLIPS_BUCKET, f"{base}.mp4", out, "video/mp4")
-    # Platform versions: the caption-free master plus captions placed for each platform's overlays.
+    # Platform versions: the caption-free master plus captions placed for each platform's overlays; and the edit
+    # decision list, so the creator can switch edits off and the clip is made again without new analysis.
     platform_ready = []
     if deps.platform_versions:
         try:
             deps.storage.upload(CLIPS_BUCKET, f"{base}_master.mp4", master, "video/mp4")
+            shift = (made["captions"] or {}).get("timing_shift_s", 0.0)
             for name in pf.PLATFORMS:
-                text, _f = captions_for(pf.layout(name), shift)
-                path = write_ass(text, f"captions_{rank}_{name}.ass")
+                text, _f = made["captions_for"](pf.layout(name), shift)
+                path = made["write"](text, f"captions_{rank}_{name}.ass")
                 if path:
                     deps.storage.upload(CLIPS_BUCKET, f"{base}_{name}.ass", path, "text/plain")
                 platform_ready.append(name)
+            clip_make.save_json(deps.storage, CLIPS_BUCKET, f"{base}_edl.json",
+                                {**edl, "dims": run.dimensions(source), "fps": run.fps, "has_audio": run.has_audio,
+                                 "caption_style": deps.caption_style, "transcript": clip.get("transcript", "")},
+                                work_dir)
         except Exception as e:
-            # Optional extras: the clip itself is saved; only the platform versions are unavailable.
+            # Optional extras: the clip itself is saved; only the platform versions and edit choices are unavailable.
             print(f"[WARN] platform versions unavailable for clip {rank}: {e}")
             platform_ready = []
 
@@ -563,26 +466,16 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str,
     except Exception as e:
         print(f"[WARN] quote card failed for clip {rank}: {e}")
 
-    edits = {
-        "parts": [[round(a, 2), round(b, 2)] for a, b in parts],
-        "joined": bool(joined_at), "joined_at": joined_at,
-        "dropped_sentences": len(structure.get("dropped") or []),
-        "trimmed_ending": bool(structure.get("trimmed_ending")),
-        "cold_open": {"text": teaser["text"], "source_time": teaser["start"], "seconds": round(teaser_dur, 2)}
-        if teaser else None,
-        "pauses_tightened": tight.get("pauses_tightened", 0), "pause_seconds_removed": tight.get("pause_seconds_removed", 0.0),
-        "repeats_removed": tight.get("repeats_removed", []),
-        "zoom_cuts": (render_facts or {}).get("zoom_windows", 0),
-    }
+    edits["dropped_sentences"] = len((clip.get("structure") or {}).get("dropped") or [])
+    edits["trimmed_ending"] = bool((clip.get("structure") or {}).get("trimmed_ending"))
+    edits["editable"] = bool(platform_ready)
     quality = clip_qa.summary(qa_dict, clip.get("review"), edits, clip.get("components"), run.mode) if deps.qa else \
         {"status": "unchecked", "items": []}
-    render_meta = {"dead_air_removed_seconds": dead_air,
-                   "filler_words_removed_seconds": filler_seconds,
-                   "filler_words_removed_count": filler_count,
-                   "render": render_facts, "captions": cap_facts, "qa": qa_dict,
-                   "overlay_hook": overlay, "overlay_status": clip.get("overlay_status"),
+    render_meta = {**made["trim"],
+                   "render": made["render"], "captions": made["captions"], "qa": qa_dict,
+                   "overlay_hook": clip.get("overlay_hook"), "overlay_status": clip.get("overlay_status"),
                    "review": clip.get("review") or {}, "edits": edits, "quality": quality,
-                   "platforms": platform_ready}
+                   "retention": edl.get("retention"), "platforms": platform_ready}
     ctx.save_clip({
         "rank": rank, "status": "rendered", "start_time": clip["start"], "end_time": clip["end"],
         "score": clip["score"], "score_breakdown": clip.get("breakdown"), "category": clip.get("category"),
@@ -647,6 +540,7 @@ def _legacy_clip(clip: dict, rendered: dict) -> dict:
         "thumbnail_url": rendered.get("thumbnail_url"),
         # What the editor did, the creator's quality checklist, and which platform versions can be exported.
         "edits": rendered.get("edits") or {},
+        "retention": rendered.get("retention") or {},
         "quality": rendered.get("quality") or {},
         "platforms": rendered.get("platforms") or [],
     }

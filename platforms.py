@@ -10,6 +10,10 @@ caption and title, in pixels of a 1080x1920 frame. They are approximate
 (the apps change their layouts, and differ between phones); the "universal"
 layout, used for the default clip, stays clear of all three at once.
 Re-check against the apps' current layouts when they change.
+
+Hook timings are an editorial choice (TikTok's feed is swiped fastest, so its hook text is shortest), not a
+measured platform rule. Pacing is deliberately the same everywhere: there's no reliable evidence that one app
+needs a different cut of the same moment, so the platforms differ in layout, hook, encoding and packaging.
 """
 from __future__ import annotations
 
@@ -24,6 +28,11 @@ PLATFORMS = {
         "caption_chars": 150,       # what shows before "more" (the hard limit is far higher)
         "hashtags": (3, 5),
         "notes": "Caption and hashtags in one text box; the first line is what people see.",
+        # Hook text on screen for the opening seconds, and where (pixels below the top safe edge).
+        "hook_seconds": 2.2, "hook_offset": 0,
+        # Upload-friendly encoding: 30 fps, a 2-second keyframe interval, a capped bitrate the app won't need to
+        # squeeze hard, 44.1 kHz AAC.
+        "export": {"fps": 30, "maxrate": "8M", "bufsize": "16M", "keyint": 60, "audio_rate": 44100},
     },
     "shorts": {
         "label": "YouTube Shorts",
@@ -35,6 +44,9 @@ PLATFORMS = {
         "caption_chars": 300,
         "hashtags": (2, 3),         # YouTube shows the first three above the title
         "notes": "A title (up to 100 characters) plus a description; the first hashtags show above the title.",
+        "hook_seconds": 2.6, "hook_offset": 0,
+        # YouTube's recommended upload settings: 48 kHz audio, closed GOPs about half the frame rate.
+        "export": {"fps": 30, "maxrate": "10M", "bufsize": "20M", "keyint": 15, "audio_rate": 48000},
     },
     "reels": {
         "label": "Instagram Reels",
@@ -46,6 +58,8 @@ PLATFORMS = {
         "caption_chars": 125,       # what shows before "more"
         "hashtags": (3, 5),
         "notes": "One caption; a few specific hashtags work better than many.",
+        "hook_seconds": 2.4, "hook_offset": 30,
+        "export": {"fps": 30, "maxrate": "8M", "bufsize": "16M", "keyint": 60, "audio_rate": 44100},
     },
 }
 
@@ -59,5 +73,6 @@ def layout(name: str | None) -> dict:
     """Caption layout for a platform, or the universal one."""
     if name in PLATFORMS:
         p = PLATFORMS[name]
-        return {"safe": dict(p["safe"]), "caption_size": p["caption_size"], "platform": name}
+        return {"safe": dict(p["safe"]), "caption_size": p["caption_size"], "platform": name,
+                "hook_seconds": p["hook_seconds"], "hook_offset": p["hook_offset"]}
     return {"safe": dict(UNIVERSAL["safe"]), "caption_size": None, "platform": "universal"}

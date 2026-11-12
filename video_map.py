@@ -21,6 +21,8 @@ import clip_selection as cs
 MAX_FULL_TRANSCRIPT_WORDS = 14000
 KINDS = {"story", "argument", "explanation", "qa", "banter", "intro", "outro", "ad", "housekeeping", "other"}
 AVOID_KINDS = {"intro", "outro", "ad", "housekeeping"}
+RELATIONS = {"setup_payoff", "question_answer", "claim_example", "problem_solution", "callback"}
+MAX_THREADS = 8
 FORMATS = {"podcast", "interview", "talk", "panel", "vlog", "tutorial", "other"}
 
 PROMPT = """You are analysing a long video so that a short-form editor can later pick its best moments.
@@ -32,7 +34,10 @@ Return ONLY a JSON object:
   "format": one of podcast, interview, talk, panel, vlog, tutorial, other,
   "speakers": [{{"label": "A", "role": "host|guest|presenter|narrator|unknown", "description": "who they are, only if the transcript says so"}}],
   "topics": [{{"start_sentence": int, "end_sentence": int, "kind": one of story, argument, explanation, qa, banter, intro, outro, ad, housekeeping, other, "title": "short title"}}],
-  "avoid": [{{"start_sentence": int, "end_sentence": int, "kind": "intro|outro|ad|housekeeping"}}]
+  "avoid": [{{"start_sentence": int, "end_sentence": int, "kind": "intro|outro|ad|housekeeping"}}],
+  "threads": [{{"relation": one of setup_payoff, question_answer, claim_example, problem_solution, callback,
+               "parts": [{{"start_sentence": int, "end_sentence": int}}, {{"start_sentence": int, "end_sentence": int}}],
+               "why": "one sentence: how the parts belong together"}}]
 }}
 
 Rules:
@@ -40,6 +45,10 @@ Rules:
 - "avoid" lists ONLY stretches that are greetings/introductions, sign-offs, sponsor reads or ads,
   channel housekeeping ("subscribe", "link in the description"), or technical set-up chatter.
   Do not list ordinary content, even if it is dull.
+- "threads" (at most 8) link two moments in DIFFERENT parts of the video that tell one story together: a
+  setup and its payoff, a question and its answer, a claim and the example that proves it, a problem and its
+  solution, or a callback. Each part is a few complete sentences (about 5-25 seconds), in the order they happen.
+  Only when the second part, heard right after the first, keeps exactly what the speaker meant. [] if none.
 - Only state facts the transcript supports. Use "unknown" when you can't tell.
 
 TRANSCRIPT
@@ -109,9 +118,21 @@ def _validate(data: dict, n: int, labels: Optional[list]) -> dict:
         if isinstance(sp, dict) and (not allowed or str(sp.get("label")) in allowed):
             speakers.append({"label": str(sp.get("label"))[:2], "role": str(sp.get("role", "unknown"))[:20],
                              "description": str(sp.get("description", ""))[:120]})
+    threads = []
+    for th in (data.get("threads") or [])[:MAX_THREADS]:
+        if not isinstance(th, dict):
+            continue
+        parts = [rng(p) for p in (th.get("parts") or []) if isinstance(p, dict)]
+        rel = str(th.get("relation", "")).lower()
+        if len(parts) != 2 or None in parts or rel not in RELATIONS:
+            continue
+        (a0, a1), (b0, b1) = parts
+        if b0 <= a1 or (a1 - a0) > 12 or (b1 - b0) > 12:      # in order, apart, and each a short moment
+            continue
+        threads.append({"relation": rel, "parts": [[a0, a1], [b0, b1]], "why": str(th.get("why", ""))[:200]})
     fmt = str(data.get("format", "other")).lower()
     summary = str(data.get("summary", "")).strip()[:500]
     if not summary:
         raise ValueError("empty summary")
     return {"summary": summary, "format": fmt if fmt in FORMATS else "other", "speakers": speakers,
-            "topics": topics, "avoid": avoid}
+            "topics": topics, "avoid": avoid, "threads": threads}

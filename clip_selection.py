@@ -765,21 +765,60 @@ def _apply_structure(cand: Candidate, st: dict, sentences: list, words: list, fi
     the main moment, so a joined part never inflates the score."""
     ranges = st["ranges"]
     cand.structure = {k: v for k, v in st.items() if k != "ranges" and v}
+    main = [r for r in ranges if r != st.get("joined")]
+    cand.structure["main"] = [main[0][0], main[-1][1]]
     if len(ranges) == 1:
         cand.parts = [[cand.start, cand.end]]
+        cand.structure["ranges"] = [list(r) for r in ranges]
         return
-    parts = [list(_range_span(words, sentences, a, b, first if k == 0 else None, video_seconds))
-             for k, (a, b) in enumerate(ranges)]
-    ws = [w for a, b in ranges for w in words[(first if (a, b) == ranges[0] else sentences[a].first_word):
-                                               sentences[b].last_word + 1]]
+    if st.get("joined"):
+        cand.structure["unjoined"] = snapshot(cand)
+    set_ranges(cand, ranges, sentences, words, video_seconds, first)
+    if st.get("joined"):
+        cand.structure["joined_at"] = cand.parts[[tuple(r) for r in ranges].index(tuple(st["joined"]))][0]
+
+
+def snapshot(cand: Candidate) -> dict:
+    """The clip as it was before a join, so the join can be undone exactly."""
+    return {k: getattr(cand, k) for k in ("parts", "transcript", "duration", "speech_duration", "start", "end",
+                                          "start_sentence", "end_sentence")} | {"parts": [list(p) for p in cand.parts]
+                                                                                  or [[cand.start, cand.end]]}
+
+
+def set_ranges(cand: Candidate, ranges: list, sentences: list, words: list, video_seconds: float,
+               first: Optional[int] = None) -> None:
+    """Sets the clip's parts, text and length from sentence ranges (in order). `first` is the main moment's
+    first word when it was trimmed of leading fillers."""
+    ranges = [tuple(r) for r in sorted(ranges)]
+    main_start = (cand.structure or {}).get("main", [ranges[0][0]])[0]
+    parts, ws = [], []
+    for a, b in ranges:
+        fw = first if (first is not None and a == main_start) else sentences[a].first_word
+        parts.append(list(_range_span(words, sentences, a, b, fw, video_seconds)))
+        ws += words[fw: sentences[b].last_word + 1]
     cand.parts = parts
     cand.transcript = " ".join(w["text"] for w in ws)
     cand.duration = round(sum(b - a for a, b in parts), 3)
     cand.speech_duration = round(speech_seconds(ws), 3)
-    cand.end = parts[-1][1]
-    cand.end_sentence = ranges[-1][1]
-    if st.get("joined"):
-        cand.structure["joined_at"] = parts[-1][0]
+    cand.start, cand.end = parts[0][0], parts[-1][1]
+    cand.start_sentence, cand.end_sentence = ranges[0][0], ranges[-1][1]
+    cand.structure["ranges"] = [list(r) for r in ranges]
+
+
+def unjoin(cand: Candidate) -> bool:
+    """Undoes a join (the review found it changes the meaning, or couldn't confirm it). True if undone."""
+    st = cand.structure or {}
+    snap = st.get("unjoined")
+    if not st.get("joined") or not snap:
+        return False
+    for k, v in snap.items():
+        setattr(cand, k, v)
+    joined = tuple(st["joined"])
+    cand.structure = {k: v for k, v in st.items() if k not in ("joined", "joined_at", "unjoined", "relation", "why",
+                                                             "link", "needs_confirmation")}
+    cand.structure["ranges"] = [r for r in st.get("ranges") or [] if tuple(r) != joined]
+    cand.structure["join_undone"] = True
+    return True
 
 
 def _mostly_boilerplate(video_map: dict, s0: int, s1: int) -> bool:

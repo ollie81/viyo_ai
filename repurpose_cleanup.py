@@ -34,9 +34,14 @@ def _extras(assets: list) -> list:
         if not path.endswith(".mp4") or "_" not in path.rsplit("/", 1)[-1]:
             continue
         base = path[:-4]
-        out += [f"{base}_master.mp4", f"{base}_viyo.mp4"]
-        for p in platforms.PLATFORMS:
-            out += [f"{base}_{p}.ass", f"{base}_{p}.mp4", f"{base}_{p}_viyo.mp4"]
+        out += [f"{base}_edl.json"]
+        # The clip itself and every version a creator made by switching edits (5 switches: 32 combinations).
+        for stem in [base] + [f"{base}_e{n:05b}" for n in range(32)]:
+            out += [f"{stem}_master.mp4", f"{stem}_viyo.mp4", f"{stem}_info.json"]
+            if stem != base:
+                out.append(f"{stem}.mp4")
+            for p in platforms.PLATFORMS:
+                out += [f"{stem}_{p}.ass", f"{stem}_{p}.mp4", f"{stem}_{p}_viyo.mp4"]
     return out
 
 
@@ -65,7 +70,8 @@ def run_maintenance(store: JobStore, storage) -> dict:
         to_remove = [a["path"] for a in assets if not a.get("referenced")] + _extras(assets)
         kept_files += sum(1 for a in assets if a.get("referenced"))
         try:
-            storage.remove(CLIPS_BUCKET, to_remove)
+            for k in range(0, len(to_remove), 400):         # storage APIs cap how many paths one call may remove
+                storage.remove(CLIPS_BUCKET, to_remove[k:k + 400])
         except Exception as e:
             print(f"[WARN] cleanup: could not remove clips of job {entry['job_id']}: {e}")
             continue
