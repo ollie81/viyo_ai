@@ -63,3 +63,61 @@ def test_reasoning_model_gets_effort_and_no_temperature(monkeypatch):
     client = FakeClient()
     r.selection_llm(client)([{"role": "user", "content": "x"}])
     assert client.calls[0]["reasoning_effort"] == "low" and "temperature" not in client.calls[0]
+
+
+def _err(kind, status, msg):
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    return kind(msg, response=httpx.Response(status, request=req), body=None)
+
+
+class UnavailableModel(FakeClient):
+    """An account without access to `missing`: every call with it fails, other models work."""
+
+    def __init__(self, missing, error):
+        super().__init__()
+        self.missing, self.error = missing, error
+
+    def create(self, **kw):
+        if kw["model"] == self.missing:
+            self.calls.append(kw)
+            raise self.error
+        return super().create(**kw)
+
+
+@pytest.mark.parametrize("error", [
+    _err(openai.NotFoundError, 404, "The model `gpt-6-luna` does not exist or you do not have access to it."),
+    _err(openai.PermissionDeniedError, 403, "You are not allowed to use this model."),
+    _err(openai.BadRequestError, 400, "Invalid model: gpt-6-luna"),
+])
+def test_a_model_the_account_cant_use_falls_back_and_jobs_keep_working(monkeypatch, error):
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_MODEL", "gpt-6-luna")
+    monkeypatch.setattr(r, "REPURPOSE_FALLBACK_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "low")
+    client = UnavailableModel("gpt-6-luna", error)
+    llm = r.selection_llm(client)
+    assert llm([{"role": "user", "content": "x"}]) == '{"candidates": []}'
+    llm([{"role": "user", "content": "y"}])
+    assert [c["model"] for c in client.calls] == ["gpt-6-luna", "gpt-4o-mini", "gpt-4o-mini"], "tried once, then stuck"
+    assert "reasoning_effort" not in client.calls[1] and client.calls[1]["temperature"] == 0
+
+
+def test_a_model_that_only_rejects_the_reasoning_setting_is_kept(monkeypatch):
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_MODEL", "gpt-6-luna")
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "high")
+
+    class RejectsEffort(FakeClient):
+        def create(self, **kw):
+            if "reasoning_effort" in kw:
+                self.calls.append(kw)
+                raise bad_request("reasoning_effort is not supported with this model.")
+            return super().create(**kw)
+    client = RejectsEffort()
+    r.selection_llm(client)([{"role": "user", "content": "x"}])
+    assert [c["model"] for c in client.calls] == ["gpt-6-luna", "gpt-6-luna"]
+
+
+def test_the_working_model_is_used_as_configured(monkeypatch):
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_MODEL", "gpt-6-luna")
+    client = FakeClient()
+    r.selection_llm(client)([{"role": "user", "content": "x"}])
+    assert client.calls[0]["model"] == "gpt-6-luna"

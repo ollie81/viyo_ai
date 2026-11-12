@@ -143,6 +143,22 @@ def _llm_kwargs(temperature: float) -> dict:
 THUMBNAIL_CANDIDATE_COUNT = 5
 
 REPURPOSE_SELECTION_MODEL = os.environ.get("REPURPOSE_SELECTION_MODEL", REPURPOSE_TEXT_MODEL)
+# Used for clip selection when the selection model isn't available on this OpenAI account (a model name the
+# account can't use, e.g. a new model not yet enabled), so trying a new model can never stop jobs.
+REPURPOSE_FALLBACK_MODEL = os.environ.get("REPURPOSE_FALLBACK_MODEL", "gpt-4o-mini")
+
+
+def _model_unavailable(e: Exception) -> bool:
+    """The account can't use this model (it doesn't exist for it, or it has no access)."""
+    import openai
+    if isinstance(e, (openai.NotFoundError, openai.PermissionDeniedError)):
+        return True
+    text = str(e).lower()
+    if any(k in text for k in ("reasoning", "temperature", "parameter")):
+        return False        # the model exists; it only rejected a setting (handled by retrying without it)
+    return isinstance(e, openai.BadRequestError) and "model" in text and any(
+        k in text for k in ("does not exist", "not found", "model_not_found", "invalid model", "not supported",
+                            "do not have access", "unknown model"))
 
 job_config = JobConfig.from_env(cost=FEATURE_COSTS["repurpose"]["cost"])
 job_store: Optional[JobStore] = JobStore(supabase_rpc(supabase_admin), job_config) if supabase_admin else None
@@ -165,7 +181,7 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
     """
     import openai
 
-    state = {"reasoning": bool(REPURPOSE_SELECTION_REASONING_EFFORT)}
+    state = {"reasoning": bool(REPURPOSE_SELECTION_REASONING_EFFORT), "model": REPURPOSE_SELECTION_MODEL}
 
     def create(messages: list[dict]):
         # Reasoning models reject temperature and non-reasoning models
@@ -174,7 +190,7 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
         kwargs = ({"reasoning_effort": REPURPOSE_SELECTION_REASONING_EFFORT}
                   if state["reasoning"] else {"temperature": 0})
         return client.chat.completions.create(
-            model=REPURPOSE_SELECTION_MODEL,
+            model=state["model"],
             messages=messages,
             max_completion_tokens=8000,
             **kwargs,
@@ -183,20 +199,36 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
     def call(messages: list[dict]) -> str:
         try:
             response = create(messages)
-        except openai.BadRequestError as e:
+        except openai.APIError as e:
+            if not (_model_unavailable(e) and state["model"] != REPURPOSE_FALLBACK_MODEL):
+                return _rejected(messages, e)
+            # The configured model isn't available on this account: use the fallback for the rest of the process.
+            print(f"[WARN] selection model {state['model']!r} is not available ({str(e)[:160]}); "
+                  f"using {REPURPOSE_FALLBACK_MODEL!r} instead. Check REPURPOSE_SELECTION_MODEL.")
+            state["model"], state["reasoning"] = REPURPOSE_FALLBACK_MODEL, False
+            try:
+                response = create(messages)
+            except openai.APIError as e2:
+                raise TransientJobError("selection_unavailable",
+                                        "Clip selection is temporarily unavailable.", f"LLM error: {e2}")
+        return _text(response)
+
+    def _rejected(messages: list[dict], e: Exception) -> str:
+        if isinstance(e, openai.BadRequestError):
             if not state["reasoning"]:
                 raise TransientJobError("selection_unavailable",
                                         "Clip selection is temporarily unavailable.", f"LLM rejected request: {e}")
             print(f"[WARN] selection model rejected reasoning_effort ({e}); retrying without it")
             state["reasoning"] = False
             try:
-                response = create(messages)
+                return _text(create(messages))
             except openai.APIError as e2:
                 raise TransientJobError("selection_unavailable",
                                         "Clip selection is temporarily unavailable.", f"LLM error: {e2}")
-        except openai.APIError as e:
-            raise TransientJobError("selection_unavailable",
-                                    "Clip selection is temporarily unavailable.", f"LLM error: {e}")
+        raise TransientJobError("selection_unavailable",
+                                "Clip selection is temporarily unavailable.", f"LLM error: {e}")
+
+    def _text(response) -> str:
         content = response.choices[0].message.content or ""
         if not content.strip():
             print(f"[WARN] selection model returned no text "
