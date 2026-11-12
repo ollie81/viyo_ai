@@ -129,7 +129,10 @@ REPURPOSE_TEXT_MODEL = os.environ.get(
 # sent, which non-reasoning models like gpt-4o-mini require. Kept separate
 # from the other calls in this file on purpose: those run on
 # REPURPOSE_TEXT_MODEL, which can be a different model that would reject it.
-REPURPOSE_SELECTION_REASONING_EFFORT = os.environ.get("REPURPOSE_SELECTION_REASONING_EFFORT", "")
+# gpt-6-luna is a reasoning model: "low" keeps its (billed) thinking short. Set to "" for a non-reasoning model.
+REPURPOSE_SELECTION_REASONING_EFFORT = os.environ.get(
+    "REPURPOSE_SELECTION_REASONING_EFFORT",
+    "low" if os.environ.get("REPURPOSE_SELECTION_MODEL", "gpt-6-luna").startswith(("gpt-6", "gpt-5")) else "")
 
 
 def _llm_kwargs(temperature: float) -> dict:
@@ -142,7 +145,10 @@ def _llm_kwargs(temperature: float) -> dict:
 # block in the same request.
 THUMBNAIL_CANDIDATE_COUNT = 5
 
-REPURPOSE_SELECTION_MODEL = os.environ.get("REPURPOSE_SELECTION_MODEL", REPURPOSE_TEXT_MODEL)
+# Clip selection (the step where the model's judgement matters most) runs on gpt-6-luna: newer, and cheaper per
+# token than gpt-4o-mini (see repurpose_benchmark.PRICES). If the account can't use it, selection falls back to
+# REPURPOSE_FALLBACK_MODEL automatically. Override with REPURPOSE_SELECTION_MODEL.
+REPURPOSE_SELECTION_MODEL = os.environ.get("REPURPOSE_SELECTION_MODEL", "gpt-6-luna")
 # Used for clip selection when the selection model isn't available on this OpenAI account (a model name the
 # account can't use, e.g. a new model not yet enabled), so trying a new model can never stop jobs.
 REPURPOSE_FALLBACK_MODEL = os.environ.get("REPURPOSE_FALLBACK_MODEL", "gpt-4o-mini")
@@ -181,14 +187,15 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
     """
     import openai
 
-    state = {"reasoning": bool(REPURPOSE_SELECTION_REASONING_EFFORT), "model": REPURPOSE_SELECTION_MODEL}
+    state = {"reasoning": bool(REPURPOSE_SELECTION_REASONING_EFFORT), "model": REPURPOSE_SELECTION_MODEL,
+             "temperature": True}
 
     def create(messages: list[dict]):
         # Reasoning models reject temperature and non-reasoning models
         # reject reasoning_effort, so send exactly one. Temperature 0 so
         # the same video gets the same picks.
-        kwargs = ({"reasoning_effort": REPURPOSE_SELECTION_REASONING_EFFORT}
-                  if state["reasoning"] else {"temperature": 0})
+        kwargs = ({"reasoning_effort": REPURPOSE_SELECTION_REASONING_EFFORT} if state["reasoning"]
+                  else {"temperature": 0} if state["temperature"] else {})
         return client.chat.completions.create(
             model=state["model"],
             messages=messages,
@@ -205,7 +212,7 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
             # The configured model isn't available on this account: use the fallback for the rest of the process.
             print(f"[WARN] selection model {state['model']!r} is not available ({str(e)[:160]}); "
                   f"using {REPURPOSE_FALLBACK_MODEL!r} instead. Check REPURPOSE_SELECTION_MODEL.")
-            state["model"], state["reasoning"] = REPURPOSE_FALLBACK_MODEL, False
+            state["model"], state["reasoning"], state["temperature"] = REPURPOSE_FALLBACK_MODEL, False, True
             try:
                 response = create(messages)
             except openai.APIError as e2:
@@ -215,6 +222,15 @@ def selection_llm(client: OpenAI) -> clip_selection.LLMFn:
 
     def _rejected(messages: list[dict], e: Exception) -> str:
         if isinstance(e, openai.BadRequestError):
+            if not state["reasoning"] and state["temperature"] and "temperature" in str(e).lower():
+                # A reasoning model used without a reasoning level rejects temperature: send neither.
+                print(f"[WARN] selection model rejected temperature ({e}); retrying without it")
+                state["temperature"] = False
+                try:
+                    return _text(create(messages))
+                except openai.APIError as e2:
+                    raise TransientJobError("selection_unavailable",
+                                            "Clip selection is temporarily unavailable.", f"LLM error: {e2}")
             if not state["reasoning"]:
                 raise TransientJobError("selection_unavailable",
                                         "Clip selection is temporarily unavailable.", f"LLM rejected request: {e}")

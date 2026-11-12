@@ -121,3 +121,35 @@ def test_the_working_model_is_used_as_configured(monkeypatch):
     client = FakeClient()
     r.selection_llm(client)([{"role": "user", "content": "x"}])
     assert client.calls[0]["model"] == "gpt-6-luna"
+
+
+def test_gpt_6_luna_is_the_default_selection_model_with_a_short_reasoning_level():
+    import importlib
+    import os
+    saved = {k: os.environ.pop(k) for k in ("REPURPOSE_SELECTION_MODEL", "REPURPOSE_SELECTION_REASONING_EFFORT")
+             if k in os.environ}
+    try:
+        m = importlib.reload(r)
+        assert m.REPURPOSE_SELECTION_MODEL == "gpt-6-luna" and m.REPURPOSE_SELECTION_REASONING_EFFORT == "low"
+        assert m.REPURPOSE_FALLBACK_MODEL == "gpt-4o-mini"
+    finally:
+        os.environ.update(saved)
+        importlib.reload(r)
+
+
+def test_a_model_that_rejects_temperature_is_retried_without_it(monkeypatch):
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_MODEL", "gpt-6-luna")
+    monkeypatch.setattr(r, "REPURPOSE_SELECTION_REASONING_EFFORT", "")
+
+    class RejectsTemperature(FakeClient):
+        def create(self, **kw):
+            if "temperature" in kw:
+                self.calls.append(kw)
+                raise bad_request("Unsupported value: 'temperature' does not support 0 with this model.")
+            return super().create(**kw)
+    client = RejectsTemperature()
+    llm = r.selection_llm(client)
+    llm([{"role": "user", "content": "x"}])
+    llm([{"role": "user", "content": "y"}])
+    assert [("temperature" in c, c["model"]) for c in client.calls] == [
+        (True, "gpt-6-luna"), (False, "gpt-6-luna"), (False, "gpt-6-luna")]
