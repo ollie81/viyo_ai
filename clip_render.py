@@ -22,6 +22,7 @@ sampled faces would be cut off) so QC can verify it instead of trusting it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -254,7 +255,45 @@ def x_expression(plan: CropPlan) -> str:
 
 # ------------------------------------------------------------------ rendering
 
-def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[float]) -> str:
+ZOOM = 1.08            # a cut inside one shot alternates between the normal frame and this gentle punch-in
+MIN_ZOOM_BLOCK = 1.2   # a piece shorter than this keeps the previous framing (no flicker)
+
+
+def jump_zoom_windows(blocks: list, timeline: Optional[va.VisualTimeline], plan: CropPlan,
+                      joins: tuple = ()) -> list:
+    """Output-time windows to show punched in. A cut that removed a pause, a restart or a filler INSIDE one
+    camera shot is a visible jump; alternating the framing makes it look intentional, as editors do. A camera
+    cut, a joined part, a short piece, or a picture without a person resets to the normal frame."""
+    if plan.mode not in ("track", "center") or len(blocks) < 2 or not (plan.facts.get("face_ratio") or 0) >= 0.5:
+        return []
+    out, cum = [], 0.0
+    zoomed = False
+    starts = []
+    for b0, b1 in blocks:
+        starts.append(cum)
+        cum += b1 - b0
+    for i in range(1, len(blocks)):
+        prev_end, nxt = blocks[i - 1][1], blocks[i][0]
+        camera_cut = timeline is not None and timeline.usable and bool(timeline.cuts_between(prev_end - 0.05, nxt + 0.05))
+        if camera_cut or any(abs(nxt - j) < 0.01 for j in joins) or (blocks[i][1] - blocks[i][0]) < MIN_ZOOM_BLOCK:
+            zoomed = False
+            continue
+        zoomed = not zoomed
+        if zoomed:
+            out.append((round(starts[i], 3), round(starts[i] + blocks[i][1] - blocks[i][0], 3)))
+    return out
+
+
+def _zoom_filter(zoom: list) -> str:
+    """Punch in on the 1080x1920 output during the given windows (centred across, kept high so faces stay in)."""
+    on = "+".join(f"between(t,{a:.3f},{b - 0.001:.3f})" for a, b in zoom)
+    zw, zh = int(round(OUT_W * ZOOM / 2) * 2), int(round(OUT_H * ZOOM / 2) * 2)
+    return (f"scale=w='if({on},{zw},{OUT_W})':h='if({on},{zh},{OUT_H})':eval=frame:flags=bicubic,"
+            f"crop={OUT_W}:{OUT_H}:x='(iw-{OUT_W})/2':y='(ih-{OUT_H})*0.35'")
+
+
+def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[float],
+                  zoom: Optional[list] = None) -> str:
     parts = []
     if out_fps:
         parts.append(f"fps={out_fps:g}")
@@ -273,7 +312,10 @@ def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[flo
             crop = f"crop={plan.crop_w}:{plan.crop_h}:x='{x_expression(plan)}':y=0"
         else:
             crop = f"crop={plan.crop_w}:{plan.crop_h}:(iw-{plan.crop_w})/2:0"
-        parts += [crop, f"scale={OUT_W}:{OUT_H}:flags=lanczos", "setsar=1"]
+        parts += [crop, f"scale={OUT_W}:{OUT_H}:flags=lanczos"]
+        if zoom:
+            parts.append(_zoom_filter(zoom))
+        parts.append("setsar=1")
         graph = "[vcat]" + ",".join(parts)
     if ass_path:
         safe = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
@@ -344,9 +386,10 @@ def measure_loudness(inputs: list, filter_parts: list, concat_label: str, pre: s
 
 
 def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Optional[str] = None,
-           src_fps: Optional[float] = None, timeout: float = 900, has_audio: bool = True) -> dict:
+           src_fps: Optional[float] = None, timeout: float = 900, has_audio: bool = True,
+           zoom: Optional[list] = None, crf: int = 20, preset: str = "fast") -> dict:
     if not has_audio:
-        return _render_silent(source, out, blocks, plan, ass_path, src_fps, timeout)
+        return _render_silent(source, out, blocks, plan, ass_path, src_fps, timeout, zoom, crf, preset)
     inputs: list = []
     for b0, b1 in blocks:
         inputs += ["-ss", f"{b0:.3f}", "-t", f"{b1 - b0:.3f}", "-i", source]
@@ -372,20 +415,21 @@ def render(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Option
         ln = f"loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11"
     graph = ";".join(vparts + aparts + [
         "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vcat][acat0]",
-        _video_filter(plan, ass_path, out_fps) + "[vout]",
+        _video_filter(plan, ass_path, out_fps, zoom) + "[vout]",
         f"[acat0]{pre}highpass=f=70,{ln},{PEAK_LIMITER}[aout]"])
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
-           "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
+           "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-profile:v", "high", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart", out]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RenderError(r.stderr[-600:])
     return {"loudness_two_pass": bool(measured), "mono_channel_copied": bool(pre), "measured_lufs_before": measured["input_i"] if measured else None,
-            "target_lufs": TARGET_LUFS, "crop_mode": plan.mode, **plan.facts}
+            "target_lufs": TARGET_LUFS, "crop_mode": plan.mode, "zoom_windows": len(zoom or []), **plan.facts}
 
 
 def _render_silent(source: str, out: str, blocks: list, plan: CropPlan, ass_path: Optional[str],
-                   src_fps: Optional[float], timeout: float) -> dict:
+                   src_fps: Optional[float], timeout: float, zoom: Optional[list] = None, crf: int = 20,
+                   preset: str = "fast") -> dict:
     """Source without an audio track: render the picture and add a silent
     stereo track, so every clip plays the same way in players and apps."""
     inputs: list = []
@@ -397,12 +441,47 @@ def _render_silent(source: str, out: str, blocks: list, plan: CropPlan, ass_path
     vparts = [f"[{i}:v]setpts=PTS-STARTPTS[v{i}]" for i in range(n)]
     out_fps = 30 if (src_fps and src_fps > 31) else None
     graph = ";".join(vparts + ["".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vcat]",
-                               _video_filter(plan, ass_path, out_fps) + "[vout]"])
+                               _video_filter(plan, ass_path, out_fps, zoom) + "[vout]"])
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", f"{n}:a",
-           "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
+           "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-profile:v", "high", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-shortest", "-movflags", "+faststart", out]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RenderError(r.stderr[-600:])
     return {"loudness_two_pass": False, "measured_lufs_before": None, "target_lufs": None,
             "silent_source": True, "crop_mode": plan.mode, **plan.facts}
+
+
+# ------------------------------------------------------------------ masters, captions, joining
+
+MASTER_CRF = 17     # the caption-free master is encoded once more when captions are burned on: keep it near-lossless
+# Two encodes per clip instead of one: both use the faster x264 preset, so the pair costs about what the old
+# single "fast" encode did (measured: a 44 s clip, 71 s CPU before; see the PR notes).
+MASTER_PRESET = "veryfast"
+BURN_PRESET, BURN_CRF = "veryfast", 19
+
+
+def burn_captions(master: str, out: str, ass_path: Optional[str], timeout: float = 600) -> None:
+    """Captions burned onto a caption-free master; the sound is copied untouched."""
+    vf = "setsar=1"
+    if ass_path:
+        safe = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        vf = f"subtitles='{safe}'"
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", master, "-vf", vf, "-c:v", "libx264", "-preset", BURN_PRESET,
+           "-crf", str(BURN_CRF),
+           "-profile:v", "high", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RenderError(r.stderr[-600:])
+
+
+def join_clips(first: str, second: str, out: str, timeout: float = 300) -> None:
+    """Two pieces rendered with the same settings, played back to back (no re-encode)."""
+    listing = out + ".txt"
+    with open(listing, "w") as f:
+        f.write(f"file '{first}'\nfile '{second}'\n")
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy",
+                        "-movflags", "+faststart", out], capture_output=True, text=True, timeout=timeout)
+    os.remove(listing)
+    if r.returncode != 0:
+        raise RenderError(r.stderr[-600:])

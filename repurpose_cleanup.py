@@ -24,6 +24,22 @@ from repurpose_jobs import JobStore
 from repurpose_storage import CLIPS_BUCKET
 
 
+def _extras(assets: list) -> list:
+    """Files made next to each clip that the clip rows don't list: the caption-free master, the platform caption
+    files and versions, and the "Made with Viyo" copies. None of them is ever a post's media."""
+    import platforms
+    out = []
+    for a in assets:
+        path = a.get("path") or ""
+        if not path.endswith(".mp4") or "_" not in path.rsplit("/", 1)[-1]:
+            continue
+        base = path[:-4]
+        out += [f"{base}_master.mp4", f"{base}_viyo.mp4"]
+        for p in platforms.PLATFORMS:
+            out += [f"{base}_{p}.ass", f"{base}_{p}.mp4", f"{base}_{p}_viyo.mp4"]
+    return out
+
+
 def run_maintenance(store: JobStore, storage) -> dict:
     report = {"sweep": store.sweep()}
 
@@ -46,7 +62,7 @@ def run_maintenance(store: JobStore, storage) -> dict:
     kept_files = 0
     for entry in store.expired_jobs():
         assets = entry.get("assets") or []
-        to_remove = [a["path"] for a in assets if not a.get("referenced")]
+        to_remove = [a["path"] for a in assets if not a.get("referenced")] + _extras(assets)
         kept_files += sum(1 for a in assets if a.get("referenced"))
         try:
             storage.remove(CLIPS_BUCKET, to_remove)

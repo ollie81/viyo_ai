@@ -313,6 +313,12 @@ class RepurposeClipResult(BaseModel):
     # None if thumbnail extraction/selection/upload failed — same
     # never-fail-the-request reasoning as quote_card_url.
     thumbnail_url: Optional[str] = None
+    # The editor's work on this clip (source parts, cold open, pauses and restarts removed, zoom cuts), the
+    # creator's quality checklist, the platforms a version can be exported for, and ready-to-post packaging.
+    edits: dict = {}
+    quality: dict = {}
+    platforms: list[str] = []
+    packaging: dict = {}
 
 
 class RepurposeResponse(BaseModel):
@@ -1683,6 +1689,77 @@ async def branded_clip(job_id: str, rank: int, user_id: str = Depends(_get_curre
         print(f"[WARN] branded clip {job_id}/{rank}: {e}")
         raise HTTPException(status_code=502, detail="Couldn't add the Viyo tag right now. Try again.")
     return BrandedClipResponse(url=url)
+
+
+class PlatformClipResponse(BaseModel):
+    platform: str
+    url: str
+    packaging: dict = {}
+    specs: dict = {}
+
+
+@router.post("/repurpose/{job_id}/clips/{rank}/platform/{platform}", response_model=PlatformClipResponse)
+async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False,
+                        user_id: str = Depends(_get_current_user_id)):
+    """A version of one finished clip for TikTok, YouTube Shorts or Instagram Reels: captions placed clear of
+    that app's buttons and text (burned onto the clip's caption-free master), plus the packaging written for
+    it. Made once per platform, then reused. `tag` adds the "Made with Viyo" tag."""
+    import asyncio
+    import tempfile
+    import clip_brand
+    import clip_render
+    import platforms as pf
+
+    if platform not in pf.PLATFORMS:
+        raise HTTPException(status_code=404, detail="Unknown platform.")
+    store = _require_jobs()
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    job = store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    if str(job.get("user_id")) != user_id:
+        raise HTTPException(status_code=403, detail="Not your clip.")
+    row = next((c for c in job.get("clips") or [] if c.get("rank") == rank and c.get("video_url")), None)
+    if row is None or storage is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    result_clips = (job.get("result") or {}).get("clips") or []
+    result = result_clips[rank - 1] if 0 < rank <= len(result_clips) else {}
+    packaging = ((result.get("packaging") or {}).get("platforms") or {}).get(platform, {})
+    specs = {k: v for k, v in pf.PLATFORMS[platform].items() if k in ("label", "max_seconds", "title_chars",
+                                                                       "caption_chars", "hashtags", "notes")}
+    base = f"{user_id}/{job_id}/clip_{rank}"
+    if platform not in ((row.get("render_meta") or {}).get("platforms") or []) or \
+            not storage.object_size(CLIPS_BUCKET, f"{base}_master.mp4"):
+        raise HTTPException(status_code=409, detail="This clip was made before platform versions existed. "
+                                                    "Use the standard clip; it fits all three apps.")
+    out_path = f"{base}_{platform}{'_viyo' if tag else ''}.mp4"
+    if storage.object_size(CLIPS_BUCKET, out_path):
+        return PlatformClipResponse(platform=platform, url=storage.public_url(CLIPS_BUCKET, out_path),
+                                    packaging=packaging, specs=specs)
+
+    def make() -> str:
+        with tempfile.TemporaryDirectory(prefix="platform_") as work:
+            master, ass, out = (os.path.join(work, n) for n in ("master.mp4", "c.ass", "out.mp4"))
+            storage.download(CLIPS_BUCKET, f"{base}_master.mp4", master, 300 * 1024 * 1024)
+            has_ass = bool(storage.object_size(CLIPS_BUCKET, f"{base}_{platform}.ass"))
+            if has_ass:
+                storage.download(CLIPS_BUCKET, f"{base}_{platform}.ass", ass, 5 * 1024 * 1024)
+            clip_render.burn_captions(master, out, ass if has_ass else None)
+            if tag:
+                tagged = os.path.join(work, "tagged.mp4")
+                clip_brand.brand_clip(out, tagged)
+                out = tagged
+            return storage.upload(CLIPS_BUCKET, out_path, out, "video/mp4")
+
+    try:
+        url = await asyncio.to_thread(make)
+    except Exception as e:
+        print(f"[WARN] platform clip {job_id}/{rank}/{platform}: {e}")
+        raise HTTPException(status_code=502, detail="Couldn't make this version right now. Try again.")
+    return PlatformClipResponse(platform=platform, url=url, packaging=packaging, specs=specs)
 
 
 @router.get("/repurpose/free-trial")

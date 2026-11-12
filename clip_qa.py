@@ -264,6 +264,93 @@ def check_hook(hook: Optional[str], clip_text_: str, clip_words: list) -> Check:
     return Check("hook", text is not None, detail={"reason": why})
 
 
+AV_SYNC_WARN, AV_SYNC_FAIL = 0.12, 0.35
+
+
+def check_av_sync(path: str) -> Check:
+    """Picture and sound streams start together and last as long as each other (a drift between them shows as
+    lips out of step with the words, or a frozen end)."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time,duration",
+                            "-of", "json", path], capture_output=True, text=True, timeout=60)
+        streams = json.loads(r.stdout or "{}").get("streams", [])
+        v = next(s for s in streams if s.get("codec_type") == "video")
+        a = next(s for s in streams if s.get("codec_type") == "audio")
+        start = abs(float(v.get("start_time") or 0) - float(a.get("start_time") or 0))
+        length = abs(float(v.get("duration") or 0) - float(a.get("duration") or 0))
+    except Exception as e:
+        return Check("av_sync", False, "warn", {"error": str(e)[:120]})
+    worst = max(start, length)
+    return Check("av_sync", worst <= AV_SYNC_WARN, "fail" if worst > AV_SYNC_FAIL else "warn",
+                 {"start_offset_s": round(start, 3), "length_difference_s": round(length, 3)})
+
+
+def summary(qa: dict, review: Optional[dict], edits: Optional[dict] = None, components: Optional[dict] = None,
+            mode: str = "speech") -> dict:
+    """The creator's checklist for one delivered clip. Every item is passed / warning / failed / unchecked;
+    an item nobody could check is "unchecked", never "passed"."""
+    checks = (qa or {}).get("checks") or {}
+    rv = review or {}
+    reviewed = rv.get("status") == "reviewed"
+    edits = edits or {}
+    items = []
+
+    def add(key, label, status, note=""):
+        items.append({"key": key, "label": label, "status": status, "note": note})
+
+    def qa_item(key, label, name, note_ok="", note_bad=""):
+        c = checks.get(name)
+        if c is None:
+            add(key, label, "unchecked", "Not measured for this clip.")
+        else:
+            failed = name in (qa or {}).get("failed", [])
+            add(key, label, "passed" if c.get("ok") else ("failed" if failed else "warning"),
+                note_ok if c.get("ok") else note_bad)
+
+    if mode == "visual":
+        add("stands_alone", "Makes sense on its own", "unchecked", "Chosen from what's on screen; there's no speech.")
+    elif reviewed and rv.get("standalone") is not None:
+        add("stands_alone", "Makes sense on its own", "passed" if rv["standalone"] else "failed")
+    else:
+        add("stands_alone", "Makes sense on its own", "unchecked", "The editorial review didn't run for this clip.")
+    opening = rv.get("opening") if reviewed else None
+    if edits.get("cold_open"):
+        add("opening", "Strong opening", "passed",
+            f"Opens with a preview of a line from later in the clip: \"{edits['cold_open']['text'][:80]}\"")
+    elif opening is not None:
+        add("opening", "Strong opening", "passed" if opening >= 6 else "warning", f"Rated {opening}/10 by the review.")
+    else:
+        add("opening", "Strong opening", "unchecked")
+    ending = rv.get("ending") if reviewed else None
+    add("ending", "Satisfying ending", "unchecked" if ending is None else ("passed" if ending >= 6 else "warning"),
+        "" if ending is None else f"Rated {ending}/10 by the review.")
+    if mode == "visual":
+        add("captions", "Captions accurate", "unchecked", "No speech to caption.")
+    else:
+        cs = checks.get("caption_sync")
+        if cs is None:
+            add("captions", "Captions accurate", "unchecked")
+        else:
+            add("captions", "Captions accurate", "passed" if cs.get("ok") else "warning",
+                "Words come from the transcript and are timed to the voice. The transcript itself isn't "
+                "checked against a second listener.")
+    audio = (components or {}).get("audio")
+    if mode == "visual" or audio is None:
+        add("speech", "Speech understandable", "unchecked")
+    else:
+        lo = checks.get("loudness") or {}
+        add("speech", "Speech understandable", "passed" if audio >= 5 and lo.get("ok", True) else "warning",
+            f"Sound quality {audio}/10.")
+    qa_item("framing", "Framing", "framing", "", "A face may be cut off by the crop.")
+    qa_item("pauses", "No dead air", "silence", "", "There is a long silent stretch.")
+    qa_item("sync", "Sound and picture in sync", "av_sync")
+    qa_item("technical", "Meets the platforms' requirements (1080x1920, H.264/AAC, length)", "format")
+    status = "failed" if any(i["status"] == "failed" for i in items) else \
+        "warning" if any(i["status"] == "warning" for i in items) else \
+        "passed" if all(i["status"] == "passed" for i in items) else "partly_checked"
+    return {"status": status, "items": items}
+
+
 def run_qa(path: str, planned_seconds: float, render_facts: dict, ass_text: Optional[str],
            hook: Optional[str], transcript: str, clip_words: list, work_dir: str,
            mode: str = "speech", has_audio: bool = True) -> QAReport:
@@ -275,6 +362,7 @@ def run_qa(path: str, planned_seconds: float, render_facts: dict, ass_text: Opti
     duration = float(fmt.detail.get("duration") or planned_seconds)
     rep.checks.append(check_black_bars(path, duration, work_dir, render_facts.get("crop_mode", "")))
     rep.checks.append(check_framing(render_facts))
+    rep.checks.append(check_av_sync(path))
     if has_audio:
         rep.checks.append(check_loudness(path))
     if mode == "visual":
