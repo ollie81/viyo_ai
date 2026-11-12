@@ -60,6 +60,8 @@ class CropPlan:
     crop_h: int = 0
     pieces: list = field(default_factory=list)   # (t0, x0, t1, x1) in OUTPUT time, source px of the bar-cropped frame
     facts: dict = field(default_factory=dict)
+    # "stack" mode: two (x, y, w, h) windows of the bar-cropped frame, top speaker then bottom speaker
+    stack: list = field(default_factory=list)
 
     def x_at(self, t: float) -> float:
         for t0, x0, t1, x1 in self.pieces:
@@ -195,6 +197,19 @@ def plan_crop(timeline: Optional[va.VisualTimeline], blocks: list, src_w: int, s
             cx = f.cx * src_w - bx
         samples.append((o, cx, f))
 
+    if samples:
+        tops = sorted(((f.cy - f.h / 2) * src_h - by) / max(1, bh) for _o, _cx, f in samples)
+        plan.facts["face_top"] = round(tops[len(tops) // 10], 3)            # a low percentile: the highest heads
+        plan.facts["face_height"] = round(float(np.median([f.h for _o, _cx, f in samples])), 3)
+    stacked = _two_apart(timeline, start, end, src_w, src_h, bx, by, bw, bh, crop_w,
+                         len(timeline.cuts_between(start, end)) + 1, to_out)
+    if stacked:
+        plan.mode, plan.stack = "stack", stacked["windows"]
+        plan.pieces = [(0.0, centre, total, centre)]
+        plan.facts.update({"stack": True, "stack_share": stacked["share"], "faces_cut_off": 0,
+                           "faces_cut_off_share": 0.0, "face_samples": len(samples)})
+        return plan
+
     pieces: list = []
     tracked = 0.0
     last_x = centre
@@ -238,6 +253,47 @@ def plan_crop(timeline: Optional[va.VisualTimeline], blocks: list, src_w: int, s
     return plan
 
 
+STACK_MIN_SHARE = 0.6     # two people apart in at least this share of the sampled frames
+
+
+def _two_apart(timeline, start, end, src_w, src_h, bx, by, bw, bh, crop_w, segments, to_out) -> Optional[dict]:
+    """Two people side by side who don't both fit in one vertical crop, in one continuous wide shot: frame each
+    in their own half (top and bottom) instead of cutting one of them out. None unless that's clearly the case."""
+    import os
+    if os.environ.get("REPURPOSE_STACK", "on").lower() in ("off", "false", "0") or segments > 1:
+        return None
+    lo, hi = np.searchsorted(timeline.times, [start, end])
+    pairs, n_faces = [], 0
+    for k in range(int(lo), int(hi)):
+        if to_out(float(timeline.times[k])) is None:
+            continue
+        faces = sorted(timeline.faces[k], key=lambda f: -f.w * f.h)
+        if not faces:
+            continue
+        n_faces += 1
+        if len(faces) < 2 or faces[1].w * faces[1].h < 0.4 * faces[0].w * faces[0].h:
+            continue
+        a, b = sorted(faces[:2], key=lambda f: f.cx)
+        span = (b.cx + b.w / 2 - (a.cx - a.w / 2)) * src_w
+        if span > crop_w * 0.92:
+            pairs.append((a, b))
+    if not n_faces or len(pairs) < STACK_MIN_SHARE * n_faces or len(pairs) < 3:
+        return None
+    windows = []
+    for side in (0, 1):
+        cx = float(np.median([p[side].cx for p in pairs])) * src_w - bx
+        cy = float(np.median([p[side].cy for p in pairs])) * src_h - by
+        fh = float(np.median([p[side].h for p in pairs])) * src_h
+        h = float(np.clip(fh * 4.0, 0.45 * bh, bh))
+        w = h * OUT_W / (OUT_H / 2)                     # each half is 1080x960
+        if w > bw:
+            w, h = float(bw), bw * (OUT_H / 2) / OUT_W
+        x = float(np.clip(cx - w / 2, 0, bw - w))
+        y = float(np.clip(cy - 0.42 * h, 0, bh - h))    # the face a little above the middle: head room kept
+        windows.append(tuple(int(round(v / 2) * 2) for v in (x, y, w, h)))
+    return {"windows": windows, "share": round(len(pairs) / n_faces, 2)}
+
+
 def x_expression(plan: CropPlan) -> str:
     """ffmpeg expression for crop x as a function of t (output time)."""
     pieces = plan.pieces
@@ -277,6 +333,9 @@ def zoom_windows(blocks: list, timeline: Optional[va.VisualTimeline], plan: Crop
     (windows, facts)."""
     facts = {"jump_cuts": 0, "pacing_reframes": 0}
     if plan.mode not in ("track", "center") or not (plan.facts.get("face_ratio") or 0) >= 0.5:
+        return [], facts
+    if (plan.facts.get("face_height") or 0) > 0.42:
+        facts["skipped"] = "close_up"        # already a close-up: zooming further would crop the face
         return [], facts
     to_out, cum, total = _output_map(blocks)
     events = []                                   # (time, kind)
@@ -368,12 +427,17 @@ def cutaways(timeline: Optional[va.VisualTimeline], min_seconds: float = 1.5) ->
     return out
 
 
-def _zoom_filter(zoom: list) -> str:
-    """Punch in on the 1080x1920 output during the given windows (centred across, kept high so faces stay in)."""
+def _zoom_filter(zoom: list, face_top: Optional[float] = None) -> str:
+    """Punch in on the 1080x1920 output during the given windows, centred across. The vertical offset keeps the
+    highest head in frame with a margin (`face_top`: the top of the faces as a share of the frame height)."""
     on = "+".join(f"between(t,{a:.3f},{b - 0.001:.3f})" for a, b in zoom)
     zw, zh = int(round(OUT_W * ZOOM / 2) * 2), int(round(OUT_H * ZOOM / 2) * 2)
+    extra = zh - OUT_H
+    y = 0.35 * extra
+    if face_top is not None:
+        y = max(0.0, min(y, face_top * zh - 0.04 * OUT_H))   # never crop above the top of the highest head
     return (f"scale=w='if({on},{zw},{OUT_W})':h='if({on},{zh},{OUT_H})':eval=frame:flags=bicubic,"
-            f"crop={OUT_W}:{OUT_H}:x='(iw-{OUT_W})/2':y='(ih-{OUT_H})*0.35'")
+            f"crop={OUT_W}:{OUT_H}:x='(iw-{OUT_W})/2':y='if({on},{int(y)},0)'")
 
 
 def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[float],
@@ -384,6 +448,16 @@ def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[flo
     if plan.bars:
         x, y, w, h = plan.bars
         parts.append(f"crop={w}:{h}:{x}:{y}")
+    if plan.mode == "stack" and len(plan.stack) == 2:
+        chain = ",".join(parts) + "," if parts else ""
+        halves = []
+        for k, (x, y, w, h) in enumerate(plan.stack):
+            halves.append(f"[st{k}]crop={w}:{h}:{x}:{y},scale={OUT_W}:{OUT_H // 2}:flags=lanczos[sh{k}]")
+        graph = f"[vcat]{chain}split[st0][st1];" + ";".join(halves) + ";[sh0][sh1]vstack,setsar=1"
+        if ass_path:
+            safe = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+            graph += f",subtitles='{safe}'"
+        return graph
     if plan.mode == "fit":
         chain = ",".join(parts) + "," if parts else ""
         graph = (f"[vcat]{chain}split[bgsrc][fgsrc];"
@@ -398,7 +472,7 @@ def _video_filter(plan: CropPlan, ass_path: Optional[str], out_fps: Optional[flo
             crop = f"crop={plan.crop_w}:{plan.crop_h}:(iw-{plan.crop_w})/2:0"
         parts += [crop, f"scale={OUT_W}:{OUT_H}:flags=lanczos"]
         if zoom:
-            parts.append(_zoom_filter(zoom))
+            parts.append(_zoom_filter(zoom, plan.facts.get("face_top")))
         parts.append("setsar=1")
         graph = "[vcat]" + ",".join(parts)
     if ass_path:

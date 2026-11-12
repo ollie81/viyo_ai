@@ -38,6 +38,7 @@ def migrated():
         conn.execute((ROOT / "tests/sql/supabase_stub.sql").read_text())
         conn.execute((ROOT / "repurpose_jobs_schema.sql").read_text())
         conn.execute((ROOT / "repurpose_clip_count.sql").read_text())
+        conn.execute((ROOT / "repurpose_shorts_quality.sql").read_text())
     return DB_URL
 
 
@@ -46,7 +47,7 @@ def db(migrated):
     conn = connect()
     conn.execute(
         "truncate public.repurpose_clips, public.repurpose_uploads, public.repurpose_jobs, "
-        "public.repurpose_transcripts, public.transactions, public.profiles, public.posts cascade; "
+        "public.repurpose_transcripts, public.repurpose_feedback, public.transactions, public.profiles, public.posts cascade; "
         "delete from auth.users;"
     )
     yield conn

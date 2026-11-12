@@ -172,7 +172,7 @@ def blocks_for(edl: dict, toggles: dict, speaker_at=None, timeline=None, source:
 
 def make(source: str, edl: dict, toggles: dict, work_dir: str, tag: str, *, dims: dict, fps: Optional[float],
          has_audio: bool, caption_style: str, timeline: Optional[va.VisualTimeline] = None, speaker_at=None,
-         qa: bool = True, zoom: bool = True, transcript: str = "") -> dict:
+         qa: bool = True, zoom: bool = True, transcript: str = "", inspector: Optional[Callable] = None) -> dict:
     """Renders the EDL: returns {"out", "master", "captions_for", "render", "captions", "qa", "edits", "planned"}.
     Raises Rejected when quality control fails after its bounded corrections."""
     toggles = {**DEFAULT_TOGGLES, **(toggles or {})}
@@ -250,6 +250,24 @@ def make(source: str, edl: dict, toggles: dict, work_dir: str, tag: str, *, dims
                                 [str(w["text"]) for w in c_words], work_dir, mode=edl["mode"], has_audio=has_audio)
         qa_dict = report.to_dict()
         if report.passed:
+            if inspector is None:
+                break
+            # The final inspection of the finished clip (clip_inspect): one bounded re-frame, or a rejection.
+            insp = inspector(out, planned, words, blocks, ass_text, render_facts)
+            state["inspection"] = insp
+            if insp["action"] == "reframe" and plan.mode != "fit" and not state.get("reframed"):
+                state["reframed"] = True
+                plan = clip_render.CropPlan(mode="fit", src_w=dims["width"], src_h=dims["height"], bars=plan.bars,
+                                            crop_w=plan.crop_w, crop_h=plan.crop_h,
+                                            pieces=[(0.0, 0.0, planned_main, 0.0)],
+                                            facts={**plan.facts, "retry": "fit_after_inspection"})
+                render_facts = None
+                continue
+            if insp["action"] == "reject":
+                for f in (out, master):
+                    if os.path.exists(f):
+                        os.remove(f)
+                raise Rejected(["final_inspection"], {**qa_dict, "inspection": insp})
             break
         cs_fail = [f for f in report.failures if f.name == "caption_sync"]
         if (attempts == 1 and ass_text and len(report.failures) == 1 and cs_fail
@@ -283,6 +301,7 @@ def make(source: str, edl: dict, toggles: dict, work_dir: str, tag: str, *, dims
         "toggles": toggles,
     }
     return {"out": out, "master": master, "captions_for": captions_for, "write": write, "render": render_facts,
+            "inspection": state.get("inspection"), "inspection_costs": state.get("inspection_costs"),
             "captions": cap_facts, "qa": qa_dict, "edits": edits, "planned": planned,
             "trim": {k: bfacts[k] for k in ("dead_air_removed_seconds", "filler_words_removed_seconds",
                                             "filler_words_removed_count")}}

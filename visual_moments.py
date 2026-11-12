@@ -260,8 +260,11 @@ class VisualResult:
 
 def select(tl: va.VisualTimeline, duration: float, llm: Callable, frames_for: Callable,
            ff=None, guidance: str = "", refine_cut: Optional[Callable] = None,
-           min_score: int = MIN_SCORE) -> VisualResult:
+           min_score: int = MIN_SCORE, count: Optional[int] = None) -> VisualResult:
     target = target_count(duration)
+    if count:
+        # The creator's number, within what the footage can hold (one moment per ~45 s at most).
+        target = max(1, min(int(count), 10, max(1, int(duration // 45))))
     wins = build_windows(tl, duration)
     measure(wins, tl, ff)
     short = shortlist(wins)

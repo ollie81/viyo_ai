@@ -162,6 +162,32 @@ class JobStore:
             print(f"[WARN] clip count not saved (run repurpose_clip_count.sql?): {e}")
             return False
 
+    def set_moment_focus(self, job_id: str, user_id: str, focus: str) -> bool:
+        """The kind of moments the creator wants (repurpose_shorts_quality.sql). False without it."""
+        try:
+            return bool(self._rpc("repurpose_set_moment_focus", {"p_job_id": job_id, "p_user_id": user_id,
+                                                                 "p_focus": focus}))
+        except Exception as e:
+            print(f"[WARN] moment focus not saved (run repurpose_shorts_quality.sql?): {e}")
+            return False
+
+    def record_feedback(self, user_id: str, job_id: str, rank: int, event: str, category: Optional[str] = None,
+                        duration: Optional[float] = None, platform: Optional[str] = None) -> bool:
+        try:
+            return bool(self._rpc("repurpose_record_feedback", {
+                "p_user_id": user_id, "p_job_id": job_id, "p_rank": int(rank), "p_event": event,
+                "p_category": category, "p_duration": duration, "p_platform": platform}))
+        except Exception as e:
+            print(f"[WARN] feedback not recorded (run repurpose_shorts_quality.sql?): {e}")
+            return False
+
+    def feedback_events(self, user_id: str, limit: int = 500) -> list:
+        try:
+            return self._rpc("repurpose_feedback_events", {"p_user_id": user_id, "p_limit": limit}) or []
+        except Exception as e:
+            print(f"[INFO] creator feedback unavailable: {e}")
+            return []
+
     def free_trial_status(self, user_id: str) -> dict:
         """{'eligible', 'used', 'sold_out'}; never eligible when switched off
         or when the database doesn't have the free-trial functions yet."""

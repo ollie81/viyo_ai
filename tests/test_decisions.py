@@ -31,7 +31,9 @@ def answer_all(request_json, overrides=None):
             out.append({"type": "refusal", "name": q["name"]})
             continue
         if q["type"] == "predicate":
-            out.append({"type": "predicate", "name": q["name"], "probability": (o or {}).get("p", 0.9)})
+            # A normal clip: yes to the good things, no to "are there rendering defects?".
+            default = 0.05 if q["name"].endswith("defects") else 0.9
+            out.append({"type": "predicate", "name": q["name"], "probability": (o or {}).get("p", default)})
         elif q["type"] == "score":
             labels = [l["label"] for l in q["levels"]]
             s = min((o or {}).get("s", 2.4), len(labels) - 1)
@@ -207,7 +209,10 @@ def test_a_job_is_judged_by_decisions_and_records_its_usage_and_cost(env, monkey
     assert env["worker"].run_once()
     job = job_row(env, job_id)
     assert job["status"] == "succeeded", job.get("error_detail")
-    assert len(fake.requests) == 1 and "review" not in seen, "Decisions replaced the free-text review call"
+    judging = [r for r in fake.requests if any(q["name"].startswith("c0_") for q in r["json"]["questions"])]
+    inspecting = [r for r in fake.requests if r not in judging]
+    assert len(judging) == 1 and "review" not in seen, "one request judged every finalist; no free-text review call"
+    assert len(inspecting) == len(job["result"]["clips"]), "plus one small final inspection per delivered clip"
     rv = job["result"]["selection"]["analysis"]["review"]["decisions"]
     assert rv["requests"] == 1 and rv["cost_usd"] > 0 and rv["usage"]["input_tokens"] == 20000
     clip = job["result"]["clips"][0]

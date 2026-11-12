@@ -295,6 +295,10 @@ class RepurposeRequest(BaseModel):
     clip_length: Optional[Literal["auto", "short", "medium", "long"]] = None
     # How many shorts to make (1-10). None: as many as the video's length supports (up to 6).
     clip_count: Optional[int] = Field(None, ge=1, le=10)
+    # The kind of moments wanted (see clip_selection.FOCUS); describe it further in creative_prompt.
+    # "visual": the video has no talking that matters; moments are chosen from the picture, no transcription.
+    moment_focus: Optional[Literal["best", "funny", "emotional", "educational", "conversation", "story", "product",
+                                   "highlights", "visual"]] = None
 
 
 class HighlightSegment(BaseModel):
@@ -1691,6 +1695,8 @@ async def repurpose_video(
 
     if req.clip_count and outcome.get("created", True) is not False:
         store.set_clip_count(str(outcome["job_id"]), user_id, req.clip_count)
+    if req.moment_focus and req.moment_focus != "best" and outcome.get("created", True) is not False:
+        store.set_moment_focus(str(outcome["job_id"]), user_id, req.moment_focus)
     free = bool(outcome.get("free_trial"))
     if not free and outcome.get("created") is False:
         # A re-sent tap returns the existing job; report whether that job was free.
@@ -1797,6 +1803,7 @@ async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False
         raise HTTPException(status_code=409, detail="This clip was made before platform versions existed. "
                                                     "Use the standard clip; it fits all three apps.")
     out_path = f"{base}_{platform}{'_viyo' if tag else ''}.mp4"
+    store.record_feedback(user_id, job_id, rank, "exported", row.get("category"), _row_seconds(row), platform)
     if storage.object_size(CLIPS_BUCKET, out_path):
         return PlatformClipResponse(platform=platform, url=storage.public_url(CLIPS_BUCKET, out_path),
                                     packaging=packaging, specs=specs)
@@ -1922,6 +1929,7 @@ async def clip_edits(job_id: str, rank: int, body: ClipEditsRequest, user_id: st
             storage.upload(CLIPS_BUCKET, f"{base}_{version}_info.json", info, "application/json")
             return {"url": url, "edits": edits, "quality": quality}
 
+    store.record_feedback(user_id, job_id, rank, "regenerated", row.get("category"), _row_seconds(row))
     _EDITING.add(user_id)
     try:
         res = await asyncio.to_thread(make)
@@ -1937,6 +1945,37 @@ async def clip_edits(job_id: str, rank: int, body: ClipEditsRequest, user_id: st
     finally:
         _EDITING.discard(user_id)
     return ClipEditsResponse(version=version, **res)
+
+
+class ClipFeedbackRequest(BaseModel):
+    event: Literal["downloaded", "shared", "not_useful", "kept"]
+    platform: Optional[str] = Field(None, max_length=20)
+
+
+@router.post("/repurpose/{job_id}/clips/{rank}/feedback")
+async def clip_feedback(job_id: str, rank: int, body: ClipFeedbackRequest, user_id: str = Depends(_get_current_user_id)):
+    """What the creator did with a clip. Used only to tune this creator's own future selections."""
+    store = _require_jobs()
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    job = store.get_job(job_id)
+    if job is None or str(job.get("user_id")) != user_id:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    row = next((c for c in job.get("clips") or [] if c.get("rank") == rank), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    ok = store.record_feedback(user_id, job_id, rank, body.event, row.get("category"),
+                               _row_seconds(row), body.platform)
+    return {"ok": ok}
+
+
+def _row_seconds(row: dict) -> Optional[float]:
+    try:
+        return round(float(row["end_time"]) - float(row["start_time"]), 1)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 @router.get("/repurpose/free-trial")

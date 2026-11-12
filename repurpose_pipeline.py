@@ -69,6 +69,8 @@ class PipelineDeps:
     decisions: Optional[object] = None
     # user_id -> creator_prior callable or None (see creator_insights)
     creator_prior_for: Optional[Callable] = None
+    # user_id -> "short" / "medium" / "long" the creator keeps downloading, or None (used only when length is Auto)
+    creator_length_for: Optional[Callable] = None
 
 
 class JobContext:
@@ -314,7 +316,8 @@ def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, resul
                 pool, sentences, amb.speaker_labels, amb.video_map, frames, deps.decisions,
                 cache_key=(ctx.job.get("checkpoint") or {}).get("source", {}).get("sha256"),
                 second_opinion=lambda cands: clip_review.review_candidates(cands, sentences, amb.speaker_labels,
-                                                                           deps.llm, frames, summary_text))
+                                                                           deps.llm, frames, summary_text),
+                request=clip_selection.request_text(amb.request))
             pool, reviews = clip_decisions.rerank(pool, reviews)
         except dc.DecisionsUnavailable as e:
             print(f"[WARN] Decisions unavailable, using the editorial review: {e}")
@@ -354,7 +357,20 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
                                                ctx.job["user_id"])
     pref = ctx.job.get("clip_length")
     amb.length_pref = pref if pref in clip_selection.LENGTH_PREFS else None
+    if amb.length_pref is None and deps.creator_length_for is not None:
+        try:
+            learned = deps.creator_length_for(ctx.job["user_id"])
+        except Exception:
+            learned = None
+        if learned in clip_selection.LENGTH_PREFS:
+            amb.length_pref = learned
+            facts["clip_length_learned"] = learned
     facts["clip_length"] = amb.length_pref or "auto"
+    focus = ctx.job.get("moment_focus")
+    described = (ctx.job.get("creative_prompt") or "").strip()
+    amb.request = {"focus": focus if focus in clip_selection.FOCUS else None, "text": described} \
+        if (focus and focus != "best") or described else None
+    facts["request"] = clip_selection.request_text(amb.request) or "best moments overall"
     count = ctx.job.get("clip_count")
     amb.clip_count = int(count) if isinstance(count, int) and 1 <= count <= clip_selection.MAX_REQUESTED_CLIPS else None
     facts["clip_count"] = amb.clip_count or "auto"
@@ -365,6 +381,10 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     except clip_selection.SelectionUnavailable as e:
         raise TransientJobError("selection_unavailable", "Clip selection is temporarily unavailable.", str(e))
 
+    if amb.request and len(result.clips) < result.target:
+        n = len(result.clips)
+        result.note = (f"Only {n} moment{'s' if n != 1 else ''} in this video matched what you asked for, so you "
+                       f"get {n} instead of {result.target}. Nothing unrelated was added to make up the number.")
     if result.clips and deps.analysis and amb.video_map and deps.review:
         # Multi-moment stories across the whole video: thread partners joined to chosen clips (confirmed below).
         import clip_story
@@ -439,12 +459,23 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str,
     toggles = {**clip_make.DEFAULT_TOGGLES, "tighten": deps.retention, "retention_cuts": deps.retention,
                "cold_open": deps.cold_open, "zoom": deps.zoom}
     try:
+        import clip_inspect
+        spent = []
+
+        def inspector(path, seconds, words_, blocks_, ass_text, render_facts):
+            res = clip_inspect.inspect(path, seconds, words_, blocks_, ass_text, render_facts or {}, work_dir,
+                                       client=deps.decisions, mode=run.mode)
+            spent.append(res.get("cost_usd") or 0.0)
+            return res
         made = clip_make.make(source, edl, toggles, work_dir, f"clip_{rank}", dims=run.dimensions(source), fps=run.fps,
                               has_audio=run.has_audio, caption_style=deps.caption_style, timeline=timeline,
-                              speaker_at=speaker_at, qa=deps.qa, zoom=deps.zoom, transcript=clip.get("transcript", ""))
+                              speaker_at=speaker_at, qa=deps.qa, zoom=deps.zoom, transcript=clip.get("transcript", ""),
+                              inspector=inspector if deps.qa else None)
+        run.inspection_usd = getattr(run, "inspection_usd", 0.0) + sum(spent)
     except clip_render.RenderError as e:
         raise RuntimeError(str(e))
     except clip_make.Rejected as e:
+        run.inspection_usd = getattr(run, "inspection_usd", 0.0) + sum(spent)
         raise ClipRejected(e.failures, e.report)
     out, master = made["out"], made["master"]
     edits, qa_dict = made["edits"], made["qa"]
@@ -496,13 +527,14 @@ def _render_one(ctx: JobContext, deps: PipelineDeps, run: RunState, source: str,
     edits["dropped_sentences"] = len((clip.get("structure") or {}).get("dropped") or [])
     edits["trimmed_ending"] = bool((clip.get("structure") or {}).get("trimmed_ending"))
     edits["editable"] = bool(platform_ready)
-    quality = clip_qa.summary(qa_dict, clip.get("review"), edits, clip.get("components"), run.mode) if deps.qa else \
-        {"status": "unchecked", "items": []}
+    quality = clip_qa.summary(qa_dict, clip.get("review"), edits, clip.get("components"), run.mode,
+                              inspection=made.get("inspection")) if deps.qa else {"status": "unchecked", "items": []}
     render_meta = {**made["trim"],
                    "render": made["render"], "captions": made["captions"], "qa": qa_dict,
                    "overlay_hook": clip.get("overlay_hook"), "overlay_status": clip.get("overlay_status"),
                    "review": clip.get("review") or {}, "edits": edits, "quality": quality,
-                   "retention": edl.get("retention"), "platforms": platform_ready}
+                   "retention": edl.get("retention"), "platforms": platform_ready,
+                   "inspection": {k: v for k, v in (made.get("inspection") or {}).items() if k != "items"} or None}
     ctx.save_clip({
         "rank": rank, "status": "rendered", "start_time": clip["start"], "end_time": clip["end"],
         "score": clip["score"], "score_breakdown": clip.get("breakdown"), "category": clip.get("category"),
@@ -626,7 +658,8 @@ def _visual_select(ctx: JobContext, deps: PipelineDeps, run: "RunState", path: s
     try:
         result = visual_moments.select(timeline, duration, deps.llm, frames_for, ff=ff, guidance=guidance,
                                        refine_cut=lambda t: clip_render.refine_cut(path, t),
-                                       min_score=deps.min_clip_score)
+                                       min_score=deps.min_clip_score,
+                                       count=ctx.job.get("clip_count") if isinstance(ctx.job.get("clip_count"), int) else None)
     except clip_selection.SelectionUnavailable as e:
         raise TransientJobError("selection_unavailable", "Clip selection is temporarily unavailable.", str(e))
     summary = {"target": result.target, "selected": len(result.clips), "spares_kept": len(result.spares),
@@ -672,7 +705,10 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
             run.fps = None
 
         run.has_audio = has_audio
-        if has_audio:
+        if job.get("moment_focus") == "visual":
+            # The creator asked for visual moments (cooking, travel, gameplay...): no transcription is needed.
+            transcript = {"text": "", "segments": [], "words": []}
+        elif has_audio:
             ctx.stage("transcribing", 0.10, "Transcribing")
             transcript = _transcript(ctx, deps, source, sha, duration, work)
         else:
@@ -766,6 +802,7 @@ def process_job(ctx: JobContext, deps: PipelineDeps) -> dict:
                 summary["note"] = (summary.get("note") or
                                    "Some moments were dropped because they didn't pass our quality checks.")
         summary["delivered"] = len(results)
+        summary["final_inspection_usd"] = round(getattr(run, "inspection_usd", 0.0), 6)
         summary["packaging"] = pack_facts
         return {
             "status": "success",

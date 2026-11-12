@@ -60,6 +60,21 @@ def over_length_choice(c: "Candidate", length_pref: Optional[str]) -> bool:
     return bool(cap) and c.duration > cap and c.score < LENGTH_CAP_EXEMPT_SCORE
 TARGET_MAX_CLIPS = 6
 MAX_REQUESTED_CLIPS = 10      # the most a creator can ask for in one job
+
+# What creators can ask for. "best" (or nothing) keeps the normal judgement; "visual" is handled before selection
+# (no transcription; moments are chosen from the picture).
+FOCUS = {
+    "best": "the best moments overall",
+    "funny": "funny moments: jokes, banter, comic timing, absurd or unexpected reactions",
+    "emotional": "emotional moments: vulnerability, conviction, inspiration, tension, heartfelt stories",
+    "educational": "educational moments: clear explanations, useful advice, surprising facts, how-tos",
+    "conversation": "interesting conversations: lively exchanges, disagreements, sharp questions and answers",
+    "story": "storytelling: complete stories with a setup, a turn and a payoff",
+    "product": "product moments: where a product, service or offer is shown, explained or recommended",
+    "highlights": "the most important highlights: the key points, decisions or turning points of the video",
+    "visual": "visual moments chosen from the picture",
+}
+MIN_REQUEST_MATCH = 4         # a moment rated below this for the creator's request is left out (never padded in)
 # One clip per this much speech, at most. Keeps a 4-minute video from
 # being chopped into six thin slices just because six were asked for.
 SPEECH_SECONDS_PER_CLIP = 75.0
@@ -300,9 +315,21 @@ def _length_rule(length_pref: Optional[str]) -> str:
             "make it shorter.\n")
 
 
+def request_text(request: Optional[dict]) -> str:
+    """The creator's request as one plain sentence, or "" for the normal judgement."""
+    if not request:
+        return ""
+    focus = request.get("focus") if request.get("focus") in FOCUS and request.get("focus") not in ("best", "visual") else None
+    words = (request.get("text") or "").strip()[:400]
+    if not focus and not words:
+        return ""
+    return "THE CREATOR WANTS: " + "; ".join(x for x in (FOCUS[focus] if focus else "", f'"{words}"' if words else "") if x) + "."
+
+
 def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds: float,
                      max_candidates: int, speaker_labels: Optional[list] = None,
-                     video_map: Optional[dict] = None, length_pref: Optional[str] = None) -> str:
+                     video_map: Optional[dict] = None, length_pref: Optional[str] = None,
+                     request: Optional[dict] = None) -> str:
     lines = [
         f"S{s.id} {_speaker_prefix(speaker_labels[s.id] if speaker_labels else None)}"
         f"[{_fmt_time(s.start)}-{_fmt_time(s.end)}] {s.text}"
@@ -326,6 +353,11 @@ def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds:
             context = "VIDEO CONTEXT (from analysing the whole video):\n" + "\n".join(parts) + "\n\n"
     labelled = ("Letters before a time range (A, B...) are speakers identified from their voices; "
                 "a missing letter means unknown.\n" if speaker_labels and any(speaker_labels) else "")
+    want = request_text(request)
+    if want:
+        context += (want + " Prefer moments that match this request. Rate each moment's match in "
+                    "\"matches_request\" (0-10: 0 = unrelated, 5 = partly, 10 = exactly what was asked). Do not "
+                    "include a moment just to reach a count: fewer, matching moments are better.\n\n")
     return (
         f"The video is {video_seconds / 60:.1f} minutes long. {context}"
         f"Below is the transcript for {_fmt_time(sentences[lo].start)}-{_fmt_time(sentences[hi].end)} "
@@ -385,7 +417,8 @@ def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds:
         '"end_sentence": int, "category": str, "scores": {"hook": int, "curiosity": int, '
         '"emotional": int, "completeness": int, "standalone": int, "information": int}, '
         '"opens_mid_conversation": bool, "title": str, "reason": str, "overlay_hook": str, '
-        '"caption": str, "hashtags": [str], "topic": str, "drop_sentences": [int], "continues": null}]}\n\n'
+        '"caption": str, "hashtags": [str], "topic": str, "drop_sentences": [int], "continues": null'
+        + (', "matches_request": int' if want else '') + '}]}\n\n'
         "TRANSCRIPT\n" + "\n".join(lines)
     )
 
@@ -410,7 +443,8 @@ LLMFn = Callable[[list[dict]], str]
 
 def propose_candidates(sentences: list[Sentence], video_seconds: float, target: int,
                        llm: LLMFn, total_speech: float, speaker_labels: Optional[list] = None,
-                       video_map: Optional[dict] = None, length_pref: Optional[str] = None) -> list[dict]:
+                       video_map: Optional[dict] = None, length_pref: Optional[str] = None,
+                       request: Optional[dict] = None) -> list[dict]:
     """
     Raw candidate dicts (sentence ranges + rubric + packaging) from every
     window. Raises SelectionUnavailable if any window can't be read after
@@ -431,7 +465,7 @@ def propose_candidates(sentences: list[Sentence], video_seconds: float, target: 
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _proposal_prompt(
                 sentences, lo, hi, video_seconds, window_quota(lo, hi), speaker_labels, video_map,
-                length_pref)},
+                length_pref, request)},
         ]
         last_error: Optional[Exception] = None
         for _ in range(2):
@@ -477,6 +511,8 @@ class AnalysisContext:
     # How many shorts the creator asked for (1..MAX_REQUESTED_CLIPS); None lets the video's length decide. Fewer
     # are delivered when the video doesn't have that many strong moments.
     clip_count: Optional[int] = None
+    # What the creator asked for: {"focus": one of FOCUS, "text": their own words} or None (best overall).
+    request: Optional[dict] = None
 
 
 @dataclass
@@ -520,6 +556,7 @@ class Candidate:
     # part of the same topic was joined), and what the structure edit did (see clip_edit.plan_structure).
     parts: list = field(default_factory=list)
     structure: dict = field(default_factory=dict)
+    request_match: Optional[int] = None    # 0-10, how well it matches what the creator asked for (None: no request)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -669,6 +706,12 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     # Boilerplate (intro / outro / sponsor / housekeeping) from the video map.
     if ctx.video_map and _mostly_boilerplate(ctx.video_map, s0, s1):
         return None, "boilerplate"
+    # The creator asked for a kind of moment: one that clearly isn't it is left out, not used to fill the count.
+    match = None
+    if request_text(ctx.request):
+        match = _int_score(raw.get("matches_request")) if raw.get("matches_request") is not None else None
+        if match is not None and match < MIN_REQUEST_MATCH:
+            return None, "off_request"
 
     first_text = sentences[s0].text
     reply_opening = bool(raw.get("opens_mid_conversation")) or clip_text.opens_as_reply(first_text)
@@ -737,6 +780,7 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     if cand.breakdown.get("gate"):
         return None, cand.breakdown["gate"]
     _apply_structure(cand, structure, sentences, words, first, video_seconds)
+    cand.request_match = match
     return cand, None
 
 
@@ -1051,7 +1095,7 @@ def run_selection(words: list[dict], segments: list[dict], video_seconds: float,
         ctx.speaker_labels = None   # stale labels for a different sentence split: don't use
 
     raw = propose_candidates(sentences, video_seconds, target, llm, total_speech,
-                             ctx.speaker_labels, ctx.video_map, ctx.length_pref)
+                             ctx.speaker_labels, ctx.video_map, ctx.length_pref, ctx.request)
     rejected: list[dict] = []
     candidates: list[Candidate] = []
     seen_ranges: set = set()

@@ -205,7 +205,7 @@ def test_job_runs_end_to_end_and_produces_real_vertical_clips(env):
     assert env["worker"].run_once()
 
     job = job_row(env, job_id)
-    assert job["status"] == "succeeded" and job["progress"] == 1
+    assert job["status"] == "succeeded" and job["progress"] == 1, job.get("last_error")
     assert balance(env, uid) == 60, "charged exactly once"
 
     result = job["result"]

@@ -145,6 +145,8 @@ def check_black_bars(path: str, duration: float, work_dir: str, crop_mode: str) 
 
 
 def check_framing(render_facts: dict) -> Check:
+    if render_facts.get("crop_mode") == "stack":
+        return Check("framing", True, detail={"mode": "stack", "faces_checked": render_facts.get("face_samples", 0)})
     if render_facts.get("crop_mode") != "track":
         return Check("framing", True, detail={"mode": render_facts.get("crop_mode"), "faces_checked": 0})
     share = float(render_facts.get("faces_cut_off_share", 0.0))
@@ -286,7 +288,7 @@ def check_av_sync(path: str) -> Check:
 
 
 def summary(qa: dict, review: Optional[dict], edits: Optional[dict] = None, components: Optional[dict] = None,
-            mode: str = "speech") -> dict:
+            mode: str = "speech", inspection: Optional[dict] = None) -> dict:
     """The creator's checklist for one delivered clip. Every item is passed / warning / failed / unchecked;
     an item nobody could check is "unchecked", never "passed"."""
     checks = (qa or {}).get("checks") or {}
@@ -345,6 +347,11 @@ def summary(qa: dict, review: Optional[dict], edits: Optional[dict] = None, comp
     qa_item("pauses", "No dead air", "silence", "", "There is a long silent stretch.")
     qa_item("sync", "Sound and picture in sync", "av_sync")
     qa_item("technical", "Meets the platforms' requirements (1080x1920, H.264/AAC, length)", "format")
+    # The final inspection of the finished clip (clip_inspect): its items join the checklist.
+    have = {i["key"] for i in items}
+    for it in (inspection or {}).get("items") or []:
+        if it["key"] not in have:
+            items.append(dict(it))
     status = "failed" if any(i["status"] == "failed" for i in items) else \
         "warning" if any(i["status"] == "warning" for i in items) else \
         "passed" if all(i["status"] == "passed" for i in items) else "partly_checked"
