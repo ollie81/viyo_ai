@@ -88,3 +88,64 @@ def load_prior(admin, user_id: str) -> Optional[Callable]:
     except Exception as e:
         print(f"[INFO] creator history unavailable: {e}")
         return None
+
+
+# ------------------------------------------------------------------ what the creator did with their clips
+
+FEEDBACK_MIN_EVENTS = 5       # fewer than this and nothing changes
+FEEDBACK_MAX_POINTS = 3.0
+FEEDBACK_WEIGHTS = {"downloaded": 1.0, "shared": 1.0, "exported": 1.0, "kept": 1.0, "not_useful": -1.5,
+                    "regenerated": 0.0}   # changing the edits says nothing about the moment itself
+
+
+def build_feedback_prior(events: list) -> Optional[Callable]:
+    """A creator_prior from THIS creator's own actions on earlier clips: kinds and lengths of clip they keep and
+    download get a small nudge up, kinds they mark "not useful" a small nudge down (at most +-3 points on 0-100).
+    A download is treated as "they wanted it", never as "it was published" or "it performed"."""
+    rows = [e for e in events or [] if e.get("event") in FEEDBACK_WEIGHTS and FEEDBACK_WEIGHTS[e["event"]] != 0]
+    if len(rows) < FEEDBACK_MIN_EVENTS:
+        return None
+    cat: dict = {}
+    length: dict = {}
+    for e in rows:
+        w = FEEDBACK_WEIGHTS[e["event"]]
+        cat[e.get("category") or "other"] = cat.get(e.get("category") or "other", 0.0) + w
+        if e.get("duration"):
+            b = _bucket(float(e["duration"]))
+            length[b] = length.get(b, 0.0) + w
+    n = len(rows)
+
+    def prior(candidate) -> tuple:
+        c = cat.get(candidate.category, 0.0) / (n + SHRINK)
+        d = length.get(_bucket(candidate.duration), 0.0) / (n + SHRINK)
+        points = max(-FEEDBACK_MAX_POINTS, min(FEEDBACK_MAX_POINTS, (c + d) * FEEDBACK_MAX_POINTS * 2))
+        return round(points, 2), {"status": "applied", "source": "creator_feedback", "events": n}
+    return prior
+
+
+def combine(*priors) -> Optional[Callable]:
+    """Several priors added together (each already capped)."""
+    ps = [p for p in priors if p is not None]
+    if not ps:
+        return None
+    if len(ps) == 1:
+        return ps[0]
+
+    def prior(candidate) -> tuple:
+        total, info = 0.0, []
+        for p in ps:
+            pts, i = p(candidate)
+            total += pts
+            info.append(i)
+        return round(total, 2), {"status": "applied", "parts": info}
+    return prior
+
+
+def preferred_length(events: list) -> Optional[str]:
+    """The clip length this creator keeps choosing to download, once it's clear (60% of at least 8 downloads)."""
+    lens = [_bucket(float(e["duration"])) for e in events or []
+            if e.get("event") in ("downloaded", "shared", "exported", "kept") and e.get("duration")]
+    if len(lens) < 8:
+        return None
+    best = max(set(lens), key=lens.count)
+    return best if lens.count(best) >= 0.6 * len(lens) else None

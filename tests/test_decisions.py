@@ -31,7 +31,9 @@ def answer_all(request_json, overrides=None):
             out.append({"type": "refusal", "name": q["name"]})
             continue
         if q["type"] == "predicate":
-            out.append({"type": "predicate", "name": q["name"], "probability": (o or {}).get("p", 0.9)})
+            # A normal clip: yes to the good things, no to "are there rendering defects?".
+            default = 0.05 if q["name"].endswith("defects") else 0.9
+            out.append({"type": "predicate", "name": q["name"], "probability": (o or {}).get("p", default)})
         elif q["type"] == "score":
             labels = [l["label"] for l in q["levels"]]
             s = min((o or {}).get("s", 2.4), len(labels) - 1)

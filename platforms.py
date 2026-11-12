@@ -11,6 +11,11 @@ caption and title, in pixels of a 1080x1920 frame. They are approximate
 layout, used for the default clip, stays clear of all three at once.
 Re-check against the apps' current layouts when they change.
 
+Specs checked Nov 2026 (third-party guides; the apps' own help pages don't publish all of them and the guides
+partly disagree): all three take 1080x1920 9:16 H.264/AAC MP4 at 30 fps. Length caps: Shorts 3 min (since Oct
+2024), Reels 90 s to 3 min depending on the account, TikTok 10 min or more. Viyo's clips are at most 60 s, so
+they fit every app. Audio: YouTube recommends 48 kHz; guides for Reels split between 44.1 and 48 kHz.
+
 Hook timings are an editorial choice (TikTok's feed is swiped fastest, so its hook text is shortest), not a
 measured platform rule. Pacing is deliberately the same everywhere: there's no reliable evidence that one app
 needs a different cut of the same moment, so the platforms differ in layout, hook, encoding and packaging.

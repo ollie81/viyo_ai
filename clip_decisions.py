@@ -62,6 +62,7 @@ THRESHOLDS = {
     "standalone": 0.5,        # P(standalone) below this: the clip needs missing context
     "hook_true": 0.5,         # below: the on-screen hook is removed
     "join_true": 0.6,         # below: the joined part is undone
+    "matches": 0.4,           # below: not the kind of moment the creator asked for (left out, never padded in)
     "min_opening": 1.0,       # hook score below "Average" (index 1): weak opening
     "min_ending": 1.0,        # ending score below "Average": abrupt ending
     "min_visual": 0.75,       # visual score clearly "Poor"
@@ -102,7 +103,7 @@ def _clip_json(i: int, c: cs.Candidate, sentences: list) -> dict:
 
 
 def build_request(pool: list, sentences: list, labels: Optional[list], video_map: Optional[dict],
-                  frames: dict) -> tuple[list, list]:
+                  frames: dict, request: str = "") -> tuple[list, list]:
     """(shared input, questions) for the finalists in `pool` (list of (index, candidate))."""
     vm = video_map or {}
     shared = [
@@ -136,6 +137,9 @@ def build_request(pool: list, sentences: list, labels: Optional[list], video_map
         if c.overlay_hook:
             qs.append(dc.predicate(f"c{i}_hook_true", f"{ref} Does its on_screen_hook say only what the speaker "
                                    "actually says in the clip (no new facts, numbers or claims)?"))
+        if request:
+            qs.append(dc.predicate(f"c{i}_matches", f"{ref} {request} Is this clip the kind of moment the creator "
+                                   "asked for?"))
         if (c.structure or {}).get("joined"):
             qs.append(dc.predicate(f"c{i}_join_true", f"{ref} Heard back to back, do its joined_parts keep exactly "
                                    "what the speaker meant and belong to the same story?"))
@@ -156,7 +160,7 @@ def to_review(i: int, c: cs.Candidate, res: dc.Result) -> dict:
     """One clip's answers -> the pipeline's review record (+ scores, explanations, flags)."""
     T = THRESHOLDS
     a = {k: res.get(f"c{i}_{k}") for k in ("hook", "standalone", "story", "suitable", "ending", "visual",
-                                           "hook_true", "join_true")}
+                                           "hook_true", "join_true", "matches")}
     refused = [k for k, v in a.items() if v is not None and v.refused]
     scored = {k: v for k, v in a.items() if v is not None and not v.refused}
     core = ("hook", "standalone", "story", "suitable", "ending")
@@ -186,7 +190,11 @@ def to_review(i: int, c: cs.Candidate, res: dc.Result) -> dict:
         issues.append("The picture doesn't suit a vertical short.")
     hook_true = scored.get("hook_true")
     join_true = scored.get("join_true")
-    verdict = "reject" if (not standalone or scored["suitable"].score < 0.75) else \
+    matches = scored.get("matches")
+    off_request = matches is not None and matches.probability < T["matches"]
+    if off_request:
+        issues.append(f"Not the kind of moment you asked for (match {matches.probability:.0%}).")
+    verdict = "reject" if (not standalone or off_request or scored["suitable"].score < 0.75) else \
         ("fix" if issues else "publish")
     explanations = {k: e for k in ("hook", "story", "suitable", "ending", "visual") if (e := _explain(k, scored.get(k)))}
     explanations["standalone"] = f"{p_alone:.0%} chance a new viewer can follow it on its own."
@@ -207,7 +215,7 @@ def to_review(i: int, c: cs.Candidate, res: dc.Result) -> dict:
 
 def review(pool: list, sentences: list, labels: Optional[list], video_map: Optional[dict],
            frames_for: Optional[Callable], client: dc.Client, cache_key: Optional[str] = None,
-           second_opinion: Optional[Callable] = None) -> tuple[dict, dict]:
+           second_opinion: Optional[Callable] = None, request: str = "") -> tuple[dict, dict]:
     """Evaluates `pool` (finalists in rank order). Returns ({pool index: review}, facts). Raises
     decisions.DecisionsUnavailable when the API can't be used (the caller falls back)."""
     picked = list(enumerate(pool))[:MAX_CANDIDATES]
@@ -220,7 +228,7 @@ def review(pool: list, sentences: list, labels: Optional[list], video_map: Optio
                 f = []
             if f:
                 frames[i] = f[:3]
-    shared, questions = build_request(picked, sentences, labels, video_map, frames)
+    shared, questions = build_request(picked, sentences, labels, video_map, frames, request)
     res = client.decide(shared, questions, cache_key=cache_key)
     reviews = {i: to_review(i, c, res) for i, c in picked}
     facts = {"requests": 1, "questions": len(questions), "candidates": len(picked), "with_frames": len(frames),

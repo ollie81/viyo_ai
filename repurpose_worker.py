@@ -237,7 +237,11 @@ def build_production_worker() -> Worker:
         platform_versions=_on("REPURPOSE_PLATFORM_VERSIONS"), packaging=_on("REPURPOSE_PACKAGING"),
         # The OpenAI Decisions API judges clips (REPURPOSE_DECISIONS=off falls back to the editorial review).
         decisions=clip_decisions.make_client(),
-        creator_prior_for=lambda user_id: creator_insights.load_prior(r.supabase_admin, user_id),
+        # The creator's own history only: how their published clips did, and what they kept or skipped.
+        creator_prior_for=lambda user_id: creator_insights.combine(
+            creator_insights.load_prior(r.supabase_admin, user_id),
+            creator_insights.build_feedback_prior(store.feedback_events(user_id))),
+        creator_length_for=lambda user_id: creator_insights.preferred_length(store.feedback_events(user_id)),
     )
     def notifier(user_id: str, notif_type: str, message: str, job_id: str) -> None:
         from notify import notify
