@@ -187,9 +187,17 @@ def hook_dialogue(hook: str, upper: bool, style: str = "Hook") -> Optional[str]:
 
 
 def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFAULT_STYLE,
-              speaker_at=None, emphasis: bool = True, shift: float = 0.0) -> tuple[Optional[str], dict]:
-    """Returns (ASS text or None, facts). None means nothing to caption."""
-    st = STYLES.get(style) or STYLES[DEFAULT_STYLE]
+              speaker_at=None, emphasis: bool = True, shift: float = 0.0, layout: Optional[dict] = None,
+              markers: Optional[list] = None) -> tuple[Optional[str], dict]:
+    """Returns (ASS text or None, facts). None means nothing to caption. `layout` (platforms.layout) places the
+    captions for one platform's overlays; `markers` [(clip time, text)] shows a short label at the top, e.g.
+    "LATER" where a later part of the video was joined on."""
+    st = dict(STYLES.get(style) or STYLES[DEFAULT_STYLE])
+    safe = (layout or {}).get("safe") or {}
+    top, bottom = safe.get("top", SAFE_TOP), safe.get("bottom", SAFE_BOTTOM)
+    left, right = safe.get("left", SAFE_SIDE), safe.get("right", SAFE_RIGHT)
+    if (layout or {}).get("caption_size"):
+        st["size"] = int(layout["caption_size"])
     remap = build_remap(blocks)
     total = clip_total(blocks)
     cw = words_in_clip(words, blocks, speaker_at)
@@ -205,9 +213,11 @@ def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFA
         "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Caption,{FONT},{st['size']},{WHITE},{WHITE},&H00000000,{st['back']},1,0,0,0,100,100,0,0,"
-        f"{st['border']},{st['outline']},1,2,{SAFE_SIDE},{SAFE_RIGHT},{SAFE_BOTTOM},1",
+        f"{st['border']},{st['outline']},1,2,{left},{right},{bottom},1",
         f"Style: Hook,{FONT},56,{GOLD},{GOLD},&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,1,8,"
-        f"{SAFE_SIDE},{SAFE_RIGHT},{SAFE_TOP},1",
+        f"{left},{right},{top},1",
+        f"Style: Marker,{FONT},40,{WHITE},{WHITE},&H00000000,&H90000000,1,0,0,0,100,100,2,0,3,10,0,7,"
+        f"{left},{right},{top + 150},1",
         "", "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
@@ -215,6 +225,10 @@ def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFA
     hook_line = hook_dialogue(hook, st["upper"]) if hook else None
     if hook_line:
         events.append(hook_line)
+
+    for at, label in markers or []:
+        t = max(0.0, min(total, float(at)))
+        events.append(f"Dialogue: 1,{ts(t)},{ts(min(total, t + MARKER_SECONDS))},Marker,,0,0,0,,{escape(label)}")
 
     n_phrases = 0
     phrases = group_phrases(cw)
@@ -253,8 +267,38 @@ def build_ass(words: list[dict], blocks: list, hook: str = "", style: str = DEFA
     if not events:
         return None, {"words": 0, "phrases": 0}
     facts = {"words": len(cw), "phrases": n_phrases, "style": style if style in STYLES else DEFAULT_STYLE,
+             "layout": (layout or {}).get("platform", "default"), "markers": len(markers or []),
              "speaker_colours": multi, "hook_shown": bool(hook_line)}
     return "\n".join(header + events) + "\n", facts
+
+
+MARKER_SECONDS = 1.4
+
+
+def join_ass(first: Optional[str], second: Optional[str], offset: float) -> Optional[str]:
+    """One ASS file for two pieces played back to back (a cold open, then the clip): the second piece's events
+    move by `offset` seconds. The second piece's header (styles) is kept."""
+    if not first:
+        return _shift_events(second, offset) if second else None
+    if not second:
+        return first
+    head, _, events = second.partition("[Events]\n")
+    fmt, _, body = events.partition("\n")
+    first_events = [ln for ln in first.split("[Events]\n", 1)[1].split("\n")[1:] if ln.startswith("Dialogue:")]
+    return head + "[Events]\n" + fmt + "\n" + "\n".join(first_events) + "\n" + \
+        _shift_events(body, offset, events_only=True)
+
+
+def _shift_events(text: str, offset: float, events_only: bool = False) -> str:
+    out = []
+    for ln in text.split("\n"):
+        if ln.startswith("Dialogue:"):
+            head, rest = ln.split(":", 1)
+            f = rest.split(",", 9)
+            f[1], f[2] = ts(_parse_ts(f[1].strip()) + offset), ts(_parse_ts(f[2].strip()) + offset)
+            ln = head + ":" + ",".join(f)
+        out.append(ln)
+    return "\n".join(out)
 
 
 def caption_timeline(ass_text: str) -> list[tuple[float, float, str]]:

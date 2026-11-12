@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
+import clip_edit
 import clip_text
 
 MIN_CLIP_SECONDS = 12.0
@@ -372,12 +373,18 @@ def _proposal_prompt(sentences: list[Sentence], lo: int, hi: int, video_seconds:
         "caption. Use an empty string if nothing faithful and compelling fits.\n"
         "- caption: a ready-to-post caption, 1-2 short lines, no hashtags, no quotes\n"
         "- hashtags: 3-6 specific lowercase tags without #\n"
-        "- topic: 2-5 word label of what it is about\n\n"
+        "- topic: 2-5 word label of what it is about\n"
+        "- drop_sentences: optional S numbers INSIDE the moment (never its first or last) that are a "
+        "digression or a repeat and can be cut without changing what the speaker means; [] if none\n"
+        "- continues: optional {\"start_sentence\": int, \"end_sentence\": int} - ONE later range from this "
+        "list on the SAME topic that completes this moment (e.g. the answer to its question, the payoff of "
+        "its setup). Only when the two parts truly belong together and the later part makes sense right "
+        "after the first; the viewer is shown that it comes from later. null if none.\n\n"
         'Respond with ONLY a JSON object: {"candidates": [{"start_sentence": int, '
         '"end_sentence": int, "category": str, "scores": {"hook": int, "curiosity": int, '
         '"emotional": int, "completeness": int, "standalone": int, "information": int}, '
         '"opens_mid_conversation": bool, "title": str, "reason": str, "overlay_hook": str, '
-        '"caption": str, "hashtags": [str], "topic": str}]}\n\n'
+        '"caption": str, "hashtags": [str], "topic": str, "drop_sentences": [int], "continues": null}]}\n\n'
         "TRANSCRIPT\n" + "\n".join(lines)
     )
 
@@ -505,6 +512,10 @@ class Candidate:
     score: int = 0
     breakdown: dict = field(default_factory=dict)
     review: dict = field(default_factory=dict)            # filled by clip_review
+    # Source time ranges the clip is made of, in order (one range unless sentences were dropped or a later
+    # part of the same topic was joined), and what the structure edit did (see clip_edit.plan_structure).
+    parts: list = field(default_factory=list)
+    structure: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -667,6 +678,11 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     s1, adjustment = _fit_length(words, sentences, first, s0, s1, window[1])
     if s1 is None:
         return None, adjustment
+    # The editor's structure pass: digressions dropped, a weak sign-off trimmed, one later part joined.
+    structure = clip_edit.plan_structure(raw, sentences, s0, s1, _topic_lookup(ctx.video_map), video_seconds,
+                                         MAX_CLIP_SECONDS, window[1])
+    main = [r for r in structure["ranges"] if r != structure["joined"]]
+    s1 = main[-1][1]
     last = sentences[s1].last_word
     clip_words = words[first: last + 1]
     start = max(0.0, float(clip_words[0]["start"]) - 0.05)
@@ -716,7 +732,54 @@ def evaluate_candidate(raw: dict, sentences: list[Sentence], words: list[dict],
     score_candidate(cand, len(clip_words), ctx)
     if cand.breakdown.get("gate"):
         return None, cand.breakdown["gate"]
+    _apply_structure(cand, structure, sentences, words, first, video_seconds)
     return cand, None
+
+
+def _topic_lookup(video_map: Optional[dict]):
+    """sentence id -> topic index from the whole-video map (None when there's no map)."""
+    topics = (video_map or {}).get("topics") or []
+    if not topics:
+        return None
+
+    def topic_of(i: int):
+        for k, t in enumerate(topics):
+            if t["start_sentence"] <= i <= t["end_sentence"]:
+                return k
+        return None
+    return topic_of
+
+
+def _range_span(words: list, sentences: list, a: int, b: int, first_word: Optional[int], video_seconds: float):
+    fw = first_word if first_word is not None else sentences[a].first_word
+    lw = sentences[b].last_word
+    t0 = max(0.0, float(words[fw]["start"]) - 0.05)
+    t1 = float(words[lw]["end"]) + END_TAIL_SECONDS
+    if lw + 1 < len(words):
+        t1 = min(t1, float(words[lw + 1]["start"]) - 0.05)
+    return round(t0, 3), round(min(t1, video_seconds), 3)
+
+
+def _apply_structure(cand: Candidate, st: dict, sentences: list, words: list, first: int, video_seconds: float):
+    """Turns the structure plan into the clip's source time ranges and its spoken text. Scoring already ran on
+    the main moment, so a joined part never inflates the score."""
+    ranges = st["ranges"]
+    cand.structure = {k: v for k, v in st.items() if k != "ranges" and v}
+    if len(ranges) == 1:
+        cand.parts = [[cand.start, cand.end]]
+        return
+    parts = [list(_range_span(words, sentences, a, b, first if k == 0 else None, video_seconds))
+             for k, (a, b) in enumerate(ranges)]
+    ws = [w for a, b in ranges for w in words[(first if (a, b) == ranges[0] else sentences[a].first_word):
+                                               sentences[b].last_word + 1]]
+    cand.parts = parts
+    cand.transcript = " ".join(w["text"] for w in ws)
+    cand.duration = round(sum(b - a for a, b in parts), 3)
+    cand.speech_duration = round(speech_seconds(ws), 3)
+    cand.end = parts[-1][1]
+    cand.end_sentence = ranges[-1][1]
+    if st.get("joined"):
+        cand.structure["joined_at"] = parts[-1][0]
 
 
 def _mostly_boilerplate(video_map: dict, s0: int, s1: int) -> bool:
@@ -854,8 +917,13 @@ def _count_reasons(rejected: list[dict]) -> dict:
     return counts
 
 
+def _spans(c: Candidate) -> list:
+    return [tuple(p) for p in c.parts] if c.parts else [(c.start, c.end)]
+
+
 def _conflicts(c: Candidate, others: list[Candidate]) -> Optional[str]:
-    if any(min(c.end, a.end) - max(c.start, a.start) > OVERLAP_TOLERANCE_SECONDS for a in others):
+    if any(min(x1, y1) - max(x0, y0) > OVERLAP_TOLERANCE_SECONDS
+           for a in others for x0, x1 in _spans(c) for y0, y1 in _spans(a)):
         return "overlaps_better_clip"
     words = _content_words(c.transcript)
     if any(_jaccard(words, _content_words(a.transcript)) > DUPLICATE_TOPIC_SIMILARITY for a in others):

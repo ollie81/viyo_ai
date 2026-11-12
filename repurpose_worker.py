@@ -231,6 +231,9 @@ def build_production_worker() -> Worker:
         max_input_seconds=r.MAX_INPUT_DURATION_SECONDS,
         min_clip_score=int(os.environ.get("REPURPOSE_MIN_CLIP_SCORE", clip_selection.DEFAULT_MIN_SCORE)),
         caption_style=os.environ.get("REPURPOSE_CAPTION_STYLE", "bold"),
+        # The editor's passes; each is on unless switched off (REPURPOSE_<NAME>=off).
+        retention=_on("REPURPOSE_RETENTION"), cold_open=_on("REPURPOSE_COLD_OPEN"), zoom=_on("REPURPOSE_ZOOM"),
+        platform_versions=_on("REPURPOSE_PLATFORM_VERSIONS"), packaging=_on("REPURPOSE_PACKAGING"),
         creator_prior_for=lambda user_id: creator_insights.load_prior(r.supabase_admin, user_id),
     )
     def notifier(user_id: str, notif_type: str, message: str, job_id: str) -> None:
@@ -239,6 +242,10 @@ def build_production_worker() -> Worker:
         notify(user_id, notif_type, message, entity_id=job_id, push_title=title, admin=r.supabase_admin)
 
     return Worker(store, deps, config, maintenance=lambda: run_maintenance(store, storage), notifier=notifier)
+
+
+def _on(name: str) -> bool:
+    return os.environ.get(name, "on").strip().lower() not in ("off", "false", "0", "no")
 
 
 def main() -> None:

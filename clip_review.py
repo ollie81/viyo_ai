@@ -70,9 +70,17 @@ def _clip_block(c: cs.Candidate, idx: int, sentences: list, labels: Optional[lis
         who = f"[{labels[s.id]}] " if labels and labels[s.id] else ""
         return f"{who}{s.text}"
 
+    text = c.transcript
+    st = getattr(c, "structure", None) or {}
+    if st.get("joined"):
+        # Two parts of the video, joined; the viewer sees "Later in the video" between them.
+        a, b = st["joined"]
+        dropped = set(st.get("dropped") or [])
+        first = " ".join(s.text for s in sentences[c.start_sentence:a] if s.id not in dropped)
+        text = f"{first} [ON SCREEN: \"LATER IN THE VIDEO\"] {' '.join(s.text for s in sentences[a:b + 1])}"
     return (f"--- CLIP {idx} (title: {c.title})\n"
             f"BEFORE (not shown to viewer): {' / '.join(line(s) for s in before) or '(start of video)'}\n"
-            f"CLIP: {c.transcript}\n"
+            f"CLIP: {text}\n"
             f"AFTER: {' / '.join(line(s) for s in after) or '(end of video)'}\n"
             f"ON-SCREEN HOOK: {c.overlay_hook or '(none)'}\n")
 

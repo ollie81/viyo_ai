@@ -101,9 +101,22 @@ class Scripted:
                 "segments": SEGMENTS, "words": WORDS}
 
     def llm(self, messages):
-        self.llm_calls += 1
         content = messages[-1]["content"]
         prompt = content if isinstance(content, str) else content[0]["text"]
+        if "You package short vertical videos" in prompt:
+            # Packaging: one cheap call at the end of a job, counted on its own.
+            self.package_calls = getattr(self, "package_calls", 0) + 1
+            ids = [int(m.group(1)) for m in re.finditer(r"^--- CLIP (\d+)", prompt, re.M)]
+            return json.dumps({"clips": [{"id": i, "titles": ["Stop competing on price", "Go viral with pricing"],
+                                          "hooks": ["There is always someone cheaper"],
+                                          "description": "Why competing on price is a trap.",
+                                          "thumbnail": [{"moment": "Speaker explaining pricing", "text": "Stop competing"}],
+                                          "tiktok": {"caption": "Stop competing on price.", "hashtags": ["pricing", "fyp"]},
+                                          "shorts": {"title": "Stop competing on price", "description": "x",
+                                                     "hashtags": ["pricing"]},
+                                          "reels": {"caption": "Compete on being the expert.", "hashtags": ["pricing"]}}
+                                         for i in ids]})
+        self.llm_calls += 1
         if "NO talking" in prompt:
             ids = [int(m.group(1)) for m in re.finditer(r"--- CANDIDATE (\d+)", prompt)]
             return json.dumps({"reviews": [{"id": i, "appeal": 3 if self.weak else 8, "complete": 7,
@@ -421,6 +434,9 @@ def test_maintenance_deletes_old_sources_and_expired_results_but_keeps_posted_cl
     assert os.path.exists(local_path(posted["video_url"])), "posted clip is the post's media now"
     assert not os.path.exists(local_path(unposted["video_url"]))
     assert report["posted_files_kept"] == 1
+    folder = os.path.dirname(local_path(posted["video_url"]))
+    assert not [f for f in os.listdir(folder) if "_master" in f or f.endswith(".ass")], \
+        "masters and platform caption files go too, even next to a posted clip"
 
 
 def test_uploads_that_never_became_jobs_are_deleted(env):
