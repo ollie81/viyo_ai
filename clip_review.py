@@ -50,12 +50,16 @@ and caption, so the general topic is known:
   or there is distracting text. "visual_ok" is true/false (null if no frames).
 - verdict: "publish" if it is worth posting as it is, "fix" if it is usable only after a small change
   (say what), "reject" if it should not be posted.
+- join_faithful: ONLY for a clip that shows [ON SCREEN: "LATER IN THE VIDEO"] (parts from different moments
+  played back to back): true if, heard together, the parts keep exactly what the speaker meant and belong to
+  the same story; false if joining them changes the meaning, implies something not said, or they don't belong
+  together. null for every other clip.
 - issues: concrete problems, empty if none. If standalone is false you MUST say exactly what the viewer
   would be missing (e.g. "refers to 'the study' never introduced"). Be specific and honest; do not praise by default.
 
 Return ONLY JSON: {{"reviews": [{{"id": int, "standalone": bool, "opening": int, "ending": int,
 "hook_accurate": bool|null, "visual_ok": bool|null, "visual": "short note", "verdict": "publish|fix|reject",
-"issues": [str]}}]}}
+"join_faithful": bool|null, "issues": [str]}}]}}
 
 CLIPS
 {clips}
@@ -73,11 +77,17 @@ def _clip_block(c: cs.Candidate, idx: int, sentences: list, labels: Optional[lis
     text = c.transcript
     st = getattr(c, "structure", None) or {}
     if st.get("joined"):
-        # Two parts of the video, joined; the viewer sees "Later in the video" between them.
-        a, b = st["joined"]
-        dropped = set(st.get("dropped") or [])
-        first = " ".join(s.text for s in sentences[c.start_sentence:a] if s.id not in dropped)
-        text = f"{first} [ON SCREEN: \"LATER IN THE VIDEO\"] {' '.join(s.text for s in sentences[a:b + 1])}"
+        # Parts of the video played back to back; the viewer sees "Later in the video" where they meet.
+        joined = list(st["joined"])
+        ranges = st.get("ranges") or []
+        chunks = []
+        for k, (a, b) in enumerate(ranges):
+            if k and (list(ranges[k - 1]) == joined or list(ranges[k]) == joined):
+                chunks.append('[ON SCREEN: "LATER IN THE VIDEO"]')
+            chunks.append(" ".join(s.text for s in sentences[a:b + 1]))
+        text = " ".join(chunks)
+        if st.get("relation"):
+            text += f"\n(These parts were linked as {st['relation'].replace('_', ' ')}: {st.get('why', '')})"
     return (f"--- CLIP {idx} (title: {c.title})\n"
             f"BEFORE (not shown to viewer): {' / '.join(line(s) for s in before) or '(start of video)'}\n"
             f"CLIP: {text}\n"
@@ -153,6 +163,7 @@ def _clean(r: dict) -> dict:
     verdict = str(r.get("verdict", "")).lower()
     return {"standalone": b(r.get("standalone")), "opening": n(r.get("opening")), "ending": n(r.get("ending")),
             "hook_accurate": b(r.get("hook_accurate")), "visual_ok": b(r.get("visual_ok")),
+            "join_faithful": b(r.get("join_faithful")),
             "visual": str(r.get("visual", ""))[:200],
             "verdict": verdict if verdict in ("publish", "fix", "reject") else "unknown",
             "issues": [str(i)[:200] for i in (r.get("issues") or []) if i][:5]}

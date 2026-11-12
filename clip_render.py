@@ -261,26 +261,110 @@ MIN_ZOOM_BLOCK = 1.2   # a piece shorter than this keeps the previous framing (n
 
 def jump_zoom_windows(blocks: list, timeline: Optional[va.VisualTimeline], plan: CropPlan,
                       joins: tuple = ()) -> list:
-    """Output-time windows to show punched in. A cut that removed a pause, a restart or a filler INSIDE one
-    camera shot is a visible jump; alternating the framing makes it look intentional, as editors do. A camera
-    cut, a joined part, a short piece, or a picture without a person resets to the normal frame."""
-    if plan.mode not in ("track", "center") or len(blocks) < 2 or not (plan.facts.get("face_ratio") or 0) >= 0.5:
-        return []
-    out, cum = [], 0.0
-    zoomed = False
-    starts = []
-    for b0, b1 in blocks:
-        starts.append(cum)
-        cum += b1 - b0
+    """Zoom windows from jump cuts only (see zoom_windows)."""
+    return zoom_windows(blocks, timeline, plan, joins)[0]
+
+
+HOLD_MAX = 7.0          # one unchanging framing longer than this gets a gentle reframe at the next sentence
+MIN_GAP_AFTER = 2.5     # ...unless another framing change comes within this many seconds anyway
+
+
+def zoom_windows(blocks: list, timeline: Optional[va.VisualTimeline], plan: CropPlan, joins: tuple = (),
+                 sentence_starts: tuple = ()) -> tuple[list, dict]:
+    """Punch-in windows (output time) for a talking-head clip: alternated on cuts inside one shot (jump cuts)
+    and, when one framing holds for over HOLD_MAX seconds, at the start of the next sentence (visual pacing).
+    A camera cut or a joined part resets to the normal frame. `sentence_starts`: output times. Returns
+    (windows, facts)."""
+    facts = {"jump_cuts": 0, "pacing_reframes": 0}
+    if plan.mode not in ("track", "center") or not (plan.facts.get("face_ratio") or 0) >= 0.5:
+        return [], facts
+    to_out, cum, total = _output_map(blocks)
+    events = []                                   # (time, kind)
     for i in range(1, len(blocks)):
         prev_end, nxt = blocks[i - 1][1], blocks[i][0]
-        camera_cut = timeline is not None and timeline.usable and bool(timeline.cuts_between(prev_end - 0.05, nxt + 0.05))
-        if camera_cut or any(abs(nxt - j) < 0.01 for j in joins) or (blocks[i][1] - blocks[i][0]) < MIN_ZOOM_BLOCK:
-            zoomed = False
-            continue
-        zoomed = not zoomed
+        camera = timeline is not None and timeline.usable and bool(timeline.cuts_between(prev_end - 0.05, nxt + 0.05))
+        if camera or any(abs(nxt - j) < 0.01 for j in joins):
+            events.append((cum[i], "reset"))
+        elif blocks[i][1] - blocks[i][0] >= MIN_ZOOM_BLOCK:
+            events.append((cum[i], "jump"))
+    if timeline is not None and timeline.usable:
+        for b0, b1 in blocks:
+            for ct in timeline.cuts_between(b0, b1):
+                o = to_out(ct)
+                if o is not None:
+                    events.append((o, "reset"))
+    events.sort()
+    changes = sorted({t for t, _k in events} | {0.0})
+    zoomed, since, start = False, 0.0, None
+    out = []
+
+    def toggle(t):
+        nonlocal zoomed, start
         if zoomed:
-            out.append((round(starts[i], 3), round(starts[i] + blocks[i][1] - blocks[i][0], 3)))
+            out.append((round(start, 3), round(t, 3)))
+        else:
+            start = t
+        zoomed = not zoomed
+
+    queue = sorted(events + [(t, "sentence") for t in sentence_starts if 0 < t < total - 1.0])
+    for t, kind in queue:
+        if kind == "reset":
+            if zoomed:
+                toggle(t)
+            since = t
+        elif kind == "jump":
+            toggle(t)
+            since = t
+            facts["jump_cuts"] += 1
+        elif kind == "sentence" and t - since >= HOLD_MAX:
+            nxt_change = min([c for c in changes if c > t + 1e-6] or [total])
+            if nxt_change - t >= MIN_GAP_AFTER:
+                toggle(t)
+                since = t
+                facts["pacing_reframes"] += 1
+    if zoomed:
+        toggle(total)
+    return [w for w in out if w[1] - w[0] >= 0.5], facts
+
+
+def snap_to_cuts(blocks: list, timeline: Optional[va.VisualTimeline], words: list, path: Optional[str] = None,
+                 tolerance: float = 0.35) -> tuple[list, int]:
+    """A kept block that starts just before a camera cut, or ends just after one, would flash a few frames of the
+    other shot. Moves that edge onto the cut, only when no word is spoken in the sliver. Returns (blocks, moved)."""
+    if timeline is None or not timeline.usable:
+        return blocks, 0
+    mids = [(float(w["start"]) + float(w["end"])) / 2 for w in words]
+    out, moved = [], 0
+    for b0, b1 in blocks:
+        for ct in timeline.cuts_between(b0 - 0.01, b0 + tolerance):
+            c = refine_cut(path, ct) if path else ct
+            if b0 < c < b0 + tolerance and not any(b0 <= m < c for m in mids):
+                b0, moved = c, moved + 1
+                break
+        for ct in timeline.cuts_between(b1 - tolerance - 1.0, b1):
+            c = refine_cut(path, ct) if path else ct
+            if b1 - tolerance < c < b1 and not any(c <= m < b1 for m in mids):
+                b1, moved = c, moved + 1
+                break
+        if b1 - b0 >= 0.3:
+            out.append((b0, b1))
+    return out or blocks, moved
+
+
+def cutaways(timeline: Optional[va.VisualTimeline], min_seconds: float = 1.5) -> list:
+    """Shots in the source with no person on screen (product shots, screen shares, scenery): the B-roll the
+    video actually contains. [(start, end)] in source time; [] when there's no visual analysis."""
+    if timeline is None or not timeline.usable:
+        return []
+    out = []
+    for sh in timeline.shots:
+        if sh.end - sh.start < min_seconds:
+            continue
+        idx = range(sh.first, sh.last + 1)
+        faces = sum(1 for k in idx if k < len(timeline.faces) and timeline.faces[k])
+        sharp = float(np.median(timeline.sharpness[sh.first:sh.last + 1])) if sh.last >= sh.first else 0.0
+        if faces <= 0.2 * len(idx) and sharp > 0:
+            out.append((round(sh.start, 2), round(sh.end, 2)))
     return out
 
 
@@ -461,15 +545,27 @@ MASTER_PRESET = "veryfast"
 BURN_PRESET, BURN_CRF = "veryfast", 19
 
 
-def burn_captions(master: str, out: str, ass_path: Optional[str], timeout: float = 600) -> None:
-    """Captions burned onto a caption-free master; the sound is copied untouched."""
+def burn_captions(master: str, out: str, ass_path: Optional[str], timeout: float = 600,
+                  encode: Optional[dict] = None) -> None:
+    """Captions burned onto a caption-free master; the sound is copied untouched unless `encode` (a platform's
+    export settings, see platforms.PLATFORMS) asks for another sample rate."""
     vf = "setsar=1"
     if ass_path:
         safe = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
         vf = f"subtitles='{safe}'"
+    enc = encode or {}
+    extra = []
+    if enc.get("fps"):
+        vf = f"fps={enc['fps']}," + vf
+    if enc.get("maxrate"):
+        extra += ["-maxrate", enc["maxrate"], "-bufsize", enc.get("bufsize") or enc["maxrate"]]
+    if enc.get("keyint"):
+        extra += ["-g", str(enc["keyint"]), "-keyint_min", str(enc["keyint"]), "-sc_threshold", "0"]
+    audio = ["-c:a", "aac", "-b:a", "192k", "-ar", str(enc["audio_rate"])] \
+        if enc.get("audio_rate") and enc["audio_rate"] != 44100 else ["-c:a", "copy"]
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", master, "-vf", vf, "-c:v", "libx264", "-preset", BURN_PRESET,
-           "-crf", str(BURN_CRF),
-           "-profile:v", "high", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", out]
+           "-crf", str(BURN_CRF), *extra,
+           "-profile:v", "high", "-pix_fmt", "yuv420p", *audio, "-movflags", "+faststart", out]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RenderError(r.stderr[-600:])

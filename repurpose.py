@@ -59,6 +59,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
+import clip_qa
 import clip_selection
 from coins import FEATURE_COSTS
 from repurpose_jobs import JobConfig, JobStore, TransientJobError, supabase_rpc
@@ -316,6 +317,7 @@ class RepurposeClipResult(BaseModel):
     # The editor's work on this clip (source parts, cold open, pauses and restarts removed, zoom cuts), the
     # creator's quality checklist, the platforms a version can be exported for, and ready-to-post packaging.
     edits: dict = {}
+    retention: dict = {}
     quality: dict = {}
     platforms: list[str] = []
     packaging: dict = {}
@@ -1699,7 +1701,7 @@ class PlatformClipResponse(BaseModel):
 
 
 @router.post("/repurpose/{job_id}/clips/{rank}/platform/{platform}", response_model=PlatformClipResponse)
-async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False,
+async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False, version: Optional[str] = None,
                         user_id: str = Depends(_get_current_user_id)):
     """A version of one finished clip for TikTok, YouTube Shorts or Instagram Reels: captions placed clear of
     that app's buttons and text (burned onto the clip's caption-free master), plus the packaging written for
@@ -1729,8 +1731,14 @@ async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False
     result = result_clips[rank - 1] if 0 < rank <= len(result_clips) else {}
     packaging = ((result.get("packaging") or {}).get("platforms") or {}).get(platform, {})
     specs = {k: v for k, v in pf.PLATFORMS[platform].items() if k in ("label", "max_seconds", "title_chars",
-                                                                       "caption_chars", "hashtags", "notes")}
+                                                                       "caption_chars", "hashtags", "notes",
+                                                                       "hook_seconds", "export")}
     base = f"{user_id}/{job_id}/clip_{rank}"
+    if version:
+        # A version the creator made by switching edits (see clip_edits).
+        if not re.fullmatch(r"e[01]{5}", version):
+            raise HTTPException(status_code=404, detail="Version not found.")
+        base = f"{base}_{version}"
     if platform not in ((row.get("render_meta") or {}).get("platforms") or []) or \
             not storage.object_size(CLIPS_BUCKET, f"{base}_master.mp4"):
         raise HTTPException(status_code=409, detail="This clip was made before platform versions existed. "
@@ -1747,7 +1755,7 @@ async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False
             has_ass = bool(storage.object_size(CLIPS_BUCKET, f"{base}_{platform}.ass"))
             if has_ass:
                 storage.download(CLIPS_BUCKET, f"{base}_{platform}.ass", ass, 5 * 1024 * 1024)
-            clip_render.burn_captions(master, out, ass if has_ass else None)
+            clip_render.burn_captions(master, out, ass if has_ass else None, encode=pf.PLATFORMS[platform]["export"])
             if tag:
                 tagged = os.path.join(work, "tagged.mp4")
                 clip_brand.brand_clip(out, tagged)
@@ -1760,6 +1768,122 @@ async def platform_clip(job_id: str, rank: int, platform: str, tag: bool = False
         print(f"[WARN] platform clip {job_id}/{rank}/{platform}: {e}")
         raise HTTPException(status_code=502, detail="Couldn't make this version right now. Try again.")
     return PlatformClipResponse(platform=platform, url=url, packaging=packaging, specs=specs)
+
+
+class ClipEditsRequest(BaseModel):
+    join: bool = True            # keep the part joined from later in the video
+    cold_open: bool = True       # open with the preview line
+    retention_cuts: bool = True  # cut sentences that only repeat an earlier point
+    tighten: bool = True         # shorten long pauses, remove false starts
+    zoom: bool = True            # zoom on jump cuts and long static shots
+
+
+class ClipEditsResponse(BaseModel):
+    version: str
+    url: str
+    edits: dict = {}
+    quality: dict = {}
+
+
+_EDITING: set = set()
+
+
+@router.post("/repurpose/{job_id}/clips/{rank}/edits", response_model=ClipEditsResponse)
+async def clip_edits(job_id: str, rank: int, body: ClipEditsRequest, user_id: str = Depends(_get_current_user_id)):
+    """Makes the clip again with some of the editor's changes switched off (or back on), from the original video
+    and the clip's saved edit decisions: no new analysis and no AI calls. Possible while the original upload is
+    still stored (it's deleted after REPURPOSE_SOURCE_RETENTION_HOURS, 24 by default). Made once per
+    combination, then reused; the original clip is never replaced."""
+    import asyncio
+    import json as _json
+    import tempfile
+    import clip_make
+    import platforms as pf
+
+    store = _require_jobs()
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    job = store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    if str(job.get("user_id")) != user_id:
+        raise HTTPException(status_code=403, detail="Not your clip.")
+    row = next((c for c in job.get("clips") or [] if c.get("rank") == rank and c.get("video_url")), None)
+    if row is None or storage is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    toggles = {k: bool(getattr(body, k)) for k in clip_make.EDIT_KEYS}
+    version = "e" + "".join("1" if toggles[k] else "0" for k in clip_make.EDIT_KEYS)
+    meta = row.get("render_meta") or {}
+    original = (meta.get("edits") or {}).get("toggles") or {}
+    if all(bool(original.get(k, True)) == toggles[k] for k in clip_make.EDIT_KEYS):
+        return ClipEditsResponse(version="original", url=row["video_url"], edits=meta.get("edits") or {},
+                                 quality=meta.get("quality") or {})
+    base = f"{user_id}/{job_id}/clip_{rank}"
+    out_path = f"{base}_{version}.mp4"
+    if storage.object_size(CLIPS_BUCKET, out_path):
+        cached = {}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                storage.download(CLIPS_BUCKET, f"{out_path[:-4]}_info.json", os.path.join(tmp, "i.json"), 2 * 1024 * 1024)
+                cached = _json.load(open(os.path.join(tmp, "i.json")))
+        except Exception:
+            pass
+        return ClipEditsResponse(version=version, url=storage.public_url(CLIPS_BUCKET, out_path),
+                                 edits=cached.get("edits") or {}, quality=cached.get("quality") or {})
+    if not storage.object_size(CLIPS_BUCKET, f"{base}_edl.json"):
+        raise HTTPException(status_code=409, detail="This clip was made before edit choices existed.")
+    if job.get("source_deleted_at") or job.get("source_kind") != "private_upload":
+        raise HTTPException(status_code=409, detail="The original video is no longer stored, so this clip can't be "
+                                                    "made again. Originals are kept for a day after upload.")
+    if user_id in _EDITING:
+        raise HTTPException(status_code=429, detail="Another version of your clip is being made. Try again in a minute.")
+
+    def make() -> dict:
+        with tempfile.TemporaryDirectory(prefix="edits_") as work:
+            src, edl_path = os.path.join(work, "source"), os.path.join(work, "edl.json")
+            storage.download(CLIPS_BUCKET, f"{base}_edl.json", edl_path, 20 * 1024 * 1024)
+            edl = _json.load(open(edl_path))
+            try:
+                storage.download(job["source_bucket"], job["source_path"], src, MAX_INPUT_SIZE_BYTES)
+            except Exception as e:
+                raise LookupError(str(e))
+            made = clip_make.make(src, edl, toggles, work, f"v_{version}", dims=edl["dims"], fps=edl.get("fps"),
+                                  has_audio=edl.get("has_audio", True), caption_style=edl.get("caption_style", "bold"),
+                                  timeline=clip_make.timeline_from_json(edl.get("timeline")),
+                                  transcript=edl.get("transcript", ""))
+            url = storage.upload(CLIPS_BUCKET, out_path, made["out"], "video/mp4")
+            storage.upload(CLIPS_BUCKET, f"{base}_{version}_master.mp4", made["master"], "video/mp4")
+            shift = (made["captions"] or {}).get("timing_shift_s", 0.0)
+            for name in pf.PLATFORMS:
+                text, _f = made["captions_for"](pf.layout(name), shift)
+                path = made["write"](text, f"v_{name}.ass")
+                if path:
+                    storage.upload(CLIPS_BUCKET, f"{base}_{version}_{name}.ass", path, "text/plain")
+            edits = made["edits"]
+            quality = clip_qa.summary(made["qa"], meta.get("review"), edits, None, edl.get("mode", "speech"))
+            info = os.path.join(work, "info.json")
+            with open(info, "w") as f:
+                _json.dump({"edits": edits, "quality": quality}, f)
+            storage.upload(CLIPS_BUCKET, f"{base}_{version}_info.json", info, "application/json")
+            return {"url": url, "edits": edits, "quality": quality}
+
+    _EDITING.add(user_id)
+    try:
+        res = await asyncio.to_thread(make)
+    except LookupError:
+        raise HTTPException(status_code=409, detail="The original video is no longer stored, so this clip can't be "
+                                                    "made again. Originals are kept for a day after upload.")
+    except clip_make.Rejected as e:
+        raise HTTPException(status_code=422, detail="That combination didn't pass our quality checks "
+                                                    f"({', '.join(e.failures)}), so it wasn't kept.")
+    except Exception as e:
+        print(f"[WARN] clip edits {job_id}/{rank}/{version}: {e}")
+        raise HTTPException(status_code=502, detail="Couldn't make this version right now. Try again.")
+    finally:
+        _EDITING.discard(user_id)
+    return ClipEditsResponse(version=version, **res)
 
 
 @router.get("/repurpose/free-trial")
