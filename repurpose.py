@@ -245,6 +245,8 @@ class RepurposeRequest(BaseModel):
     # Preferred clip length. A target, not a cut-off: a moment that needs a
     # little longer to land its hook and payoff keeps it (60 s maximum).
     clip_length: Optional[Literal["auto", "short", "medium", "long"]] = None
+    # How many shorts to make (1-10). None: as many as the video's length supports (up to 6).
+    clip_count: Optional[int] = Field(None, ge=1, le=10)
 
 
 class HighlightSegment(BaseModel):
@@ -318,6 +320,7 @@ class RepurposeClipResult(BaseModel):
     # creator's quality checklist, the platforms a version can be exported for, and ready-to-post packaging.
     edits: dict = {}
     retention: dict = {}
+    scores: dict = {}
     quality: dict = {}
     platforms: list[str] = []
     packaging: dict = {}
@@ -1638,6 +1641,8 @@ async def repurpose_video(
         status, message = _CREATE_ERRORS.get(error, (400, "Could not start the job."))
         raise HTTPException(status_code=status, detail=message)
 
+    if req.clip_count and outcome.get("created", True) is not False:
+        store.set_clip_count(str(outcome["job_id"]), user_id, req.clip_count)
     free = bool(outcome.get("free_trial"))
     if not free and outcome.get("created") is False:
         # A re-sent tap returns the existing job; report whether that job was free.

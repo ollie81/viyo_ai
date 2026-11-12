@@ -59,6 +59,7 @@ def over_length_choice(c: "Candidate", length_pref: Optional[str]) -> bool:
     cap = LENGTH_SOFT_CAP.get(length_pref or "")
     return bool(cap) and c.duration > cap and c.score < LENGTH_CAP_EXEMPT_SCORE
 TARGET_MAX_CLIPS = 6
+MAX_REQUESTED_CLIPS = 10      # the most a creator can ask for in one job
 # One clip per this much speech, at most. Keeps a 4-minute video from
 # being chopped into six thin slices just because six were asked for.
 SPEECH_SECONDS_PER_CLIP = 75.0
@@ -473,6 +474,9 @@ class AnalysisContext:
     creator_prior: Optional[Callable] = None
     # "short" / "medium" / "long" (see LENGTH_PREFS); None lets the moment decide
     length_pref: Optional[str] = None
+    # How many shorts the creator asked for (1..MAX_REQUESTED_CLIPS); None lets the video's length decide. Fewer
+    # are delivered when the video doesn't have that many strong moments.
+    clip_count: Optional[int] = None
 
 
 @dataclass
@@ -1037,6 +1041,9 @@ def run_selection(words: list[dict], segments: list[dict], video_seconds: float,
     sentences = build_sentences(punctuated)
     total_speech = speech_seconds(punctuated)
     target = target_clip_count(total_speech)
+    if ctx.clip_count:
+        # The creator's choice, within what the speech can hold (about one clip per 30 s of speech at most).
+        target = max(1, min(int(ctx.clip_count), MAX_REQUESTED_CLIPS, max(1, int(total_speech // 30))))
     if total_speech < MIN_CLIP_SECONDS or not sentences:
         return SelectionResult([], target, min_score, total_speech, [],
                                "There isn't enough speech in this video to make a clip.")

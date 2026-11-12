@@ -350,3 +350,14 @@ def test_clip_length_choice_is_saved_on_the_job(api):
         row = api["db"].execute("select clip_length from repurpose_jobs where id=%s", (job,)).fetchone()
         assert row[0] == saved, choice
     assert client.post("/api/v1/repurpose", json={"source_path": "x", "clip_length": "huge"}).status_code == 422
+
+
+def test_the_creator_can_ask_for_a_number_of_shorts(api):
+    uid = make_user(api["db"], 100)
+    path = upload(api, uid)["source_path"]
+    client = api["as_user"](uid)
+    job = client.post("/api/v1/repurpose", json={"source_path": path, "client_request_id": "tap-count-1",
+                                                 "clip_count": 3}).json()["job_id"]
+    assert api["db"].execute("select clip_count from repurpose_jobs where id=%s", (job,)).fetchone()[0] == 3
+    for bad in (0, 11):
+        assert client.post("/api/v1/repurpose", json={"source_path": path, "clip_count": bad}).status_code == 422
