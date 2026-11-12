@@ -65,6 +65,8 @@ class PipelineDeps:
     zoom: bool = True
     platform_versions: bool = True
     packaging: bool = True
+    # The OpenAI Decisions API client (decisions.Client) for judging finalists, or None for the editorial review.
+    decisions: Optional[object] = None
     # user_id -> creator_prior callable or None (see creator_insights)
     creator_prior_for: Optional[Callable] = None
 
@@ -300,9 +302,28 @@ def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, resul
             return []
 
     summary_text = (amb.video_map or {}).get("summary")
-    reviews = clip_review.review_candidates(pool, sentences, amb.speaker_labels, deps.llm,
-                                            frames_for if run.timeline is not None and run.timeline.usable else None,
-                                            summary_text)
+    frames = frames_for if run.timeline is not None and run.timeline.usable else None
+    decided = None
+    if deps.decisions is not None:
+        # The OpenAI Decisions API judges the finalists with structured questions (one request); low-confidence
+        # clips get the editorial review as a second opinion. If Decisions is unavailable, the review runs alone.
+        import clip_decisions
+        import decisions as dc
+        try:
+            reviews, decided = clip_decisions.review(
+                pool, sentences, amb.speaker_labels, amb.video_map, frames, deps.decisions,
+                cache_key=(ctx.job.get("checkpoint") or {}).get("source", {}).get("sha256"),
+                second_opinion=lambda cands: clip_review.review_candidates(cands, sentences, amb.speaker_labels,
+                                                                           deps.llm, frames, summary_text))
+            pool, reviews = clip_decisions.rerank(pool, reviews)
+        except dc.DecisionsUnavailable as e:
+            print(f"[WARN] Decisions unavailable, using the editorial review: {e}")
+            decided = {"unavailable": str(e)[:200]}
+            reviews = None
+        if reviews is None:
+            reviews = clip_review.review_candidates(pool, sentences, amb.speaker_labels, deps.llm, frames, summary_text)
+    else:
+        reviews = clip_review.review_candidates(pool, sentences, amb.speaker_labels, deps.llm, frames, summary_text)
     before = len(result.clips)
     clip_review.apply_reviews(result, reviews, pool)
     recovery = clip_review.recover_with_context(
@@ -311,8 +332,11 @@ def _review(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, resul
     verdicts: dict = {}
     for rv in reviews.values():
         verdicts[rv["verdict"]] = verdicts.get(rv["verdict"], 0) + 1
-    return {"reviewed": True, "clips_reviewed": len(reviews), "unreviewed": len(pool) - len(reviews),
-            "verdicts": verdicts, "recovery": recovery, "changed_selection": before != len(result.clips) or bool(reviews)}
+    out = {"reviewed": True, "clips_reviewed": len(reviews), "unreviewed": len(pool) - len(reviews),
+           "verdicts": verdicts, "recovery": recovery, "changed_selection": before != len(result.clips) or bool(reviews)}
+    if decided is not None:
+        out["decisions"] = decided
+    return out
 
 
 def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, transcript: dict,
@@ -331,6 +355,9 @@ def _select(ctx: JobContext, deps: PipelineDeps, run: RunState, path: str, trans
     pref = ctx.job.get("clip_length")
     amb.length_pref = pref if pref in clip_selection.LENGTH_PREFS else None
     facts["clip_length"] = amb.length_pref or "auto"
+    count = ctx.job.get("clip_count")
+    amb.clip_count = int(count) if isinstance(count, int) and 1 <= count <= clip_selection.MAX_REQUESTED_CLIPS else None
+    facts["clip_count"] = amb.clip_count or "auto"
 
     ctx.stage("selecting", 0.53, "Finding the strongest moments")
     try:
@@ -520,6 +547,16 @@ def video_analysis_fps(path: str) -> Optional[float]:
     return float(num) / float(den) if den and float(den) else (float(num) if num else None)
 
 
+def _scores(review: dict) -> dict:
+    d = review.get("decisions") or {}
+    if not d:
+        return {"source": review.get("source") or ("editorial_review" if review.get("status") == "reviewed" else None),
+                "opening": review.get("opening"), "ending": review.get("ending"), "standalone": review.get("standalone")}
+    return {"source": "decisions", "scores": d.get("scores") or {}, "probabilities": d.get("probabilities") or {},
+            "explanations": d.get("explanations") or {}, "composite": d.get("composite"),
+            "needs_second_look": d.get("needs_second_look", False), "second_opinion": d.get("second_opinion")}
+
+
 def _legacy_clip(clip: dict, rendered: dict) -> dict:
     """The original RepurposeClipResult shape, plus additive fields."""
     return {
@@ -541,6 +578,8 @@ def _legacy_clip(clip: dict, rendered: dict) -> dict:
         # What the editor did, the creator's quality checklist, and which platform versions can be exported.
         "edits": rendered.get("edits") or {},
         "retention": rendered.get("retention") or {},
+        # How the clip was judged: Decisions scores, level labels and plain explanations (when Decisions ran).
+        "scores": _scores((rendered.get("review") or {})),
         "quality": rendered.get("quality") or {},
         "platforms": rendered.get("platforms") or [],
     }

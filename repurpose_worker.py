@@ -208,6 +208,7 @@ def build_production_worker() -> Worker:
     from repurpose_cleanup import run_maintenance
     from repurpose_storage import RoutingStorage, SupabaseStorage
     from transcription import local_chunk_transcriber, openai_chunk_transcriber, transcript_cache_key
+    import clip_decisions
     import clip_selection
     import creator_insights
 
@@ -234,6 +235,8 @@ def build_production_worker() -> Worker:
         # The editor's passes; each is on unless switched off (REPURPOSE_<NAME>=off).
         retention=_on("REPURPOSE_RETENTION"), cold_open=_on("REPURPOSE_COLD_OPEN"), zoom=_on("REPURPOSE_ZOOM"),
         platform_versions=_on("REPURPOSE_PLATFORM_VERSIONS"), packaging=_on("REPURPOSE_PACKAGING"),
+        # The OpenAI Decisions API judges clips (REPURPOSE_DECISIONS=off falls back to the editorial review).
+        decisions=clip_decisions.make_client(),
         creator_prior_for=lambda user_id: creator_insights.load_prior(r.supabase_admin, user_id),
     )
     def notifier(user_id: str, notif_type: str, message: str, job_id: str) -> None:

@@ -153,6 +153,15 @@ class JobStore:
             "p_client_request_id": client_request_id,
         }, clip_length)
 
+    def set_clip_count(self, job_id: str, user_id: str, count: int) -> bool:
+        """How many shorts the creator wants (repurpose_clip_count.sql). False on a database without it."""
+        try:
+            return bool(self._rpc("repurpose_set_clip_count", {"p_job_id": job_id, "p_user_id": user_id,
+                                                               "p_count": int(count)}))
+        except Exception as e:
+            print(f"[WARN] clip count not saved (run repurpose_clip_count.sql?): {e}")
+            return False
+
     def free_trial_status(self, user_id: str) -> dict:
         """{'eligible', 'used', 'sold_out'}; never eligible when switched off
         or when the database doesn't have the free-trial functions yet."""

@@ -37,6 +37,7 @@ def migrated():
         conn.execute("drop schema if exists auth cascade; drop schema if exists storage cascade;")
         conn.execute((ROOT / "tests/sql/supabase_stub.sql").read_text())
         conn.execute((ROOT / "repurpose_jobs_schema.sql").read_text())
+        conn.execute((ROOT / "repurpose_clip_count.sql").read_text())
     return DB_URL
 
 
