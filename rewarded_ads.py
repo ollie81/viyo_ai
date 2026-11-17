@@ -53,9 +53,12 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # How many coins one watched ad is worth, and how many times a day any one
-# viewer can claim it. Unchanged; a new value needs the owner's approval.
-REWARDED_AD_COINS = 10
-DAILY_AD_CAP = 30
+# viewer can claim it. Approved by the owner (Nov 2026), same in every country:
+# 5 coins per ad (a 30-coin episode is 6 ads), at most 20 ads (100 coins) a day.
+# Sized to what a rewarded ad actually earns, so watching stays a win for the
+# viewer and for Viyo. Changing them needs the owner's approval.
+REWARDED_AD_COINS = 5
+DAILY_AD_CAP = 20
 
 # Google's public keys for verifying reward callbacks. Google rotates them;
 # don't keep them longer than 24 hours.
