@@ -411,3 +411,72 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
                     )
 
     return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=total_cost, already_complete=False)
+
+
+# ---------------------------------------------------------------- unlocking with ads
+#
+# 2 Google-verified ads = 1 episode (ad_episode_unlocks.sql). Each verified ad is one
+# ticket (rewarded_ads.py, purpose "episode"); tickets the viewer doesn't use stay for
+# next time. No coins move and no creator earnings are created: those still come only
+# from coins bought on the web.
+
+
+class AdTicketsResponse(BaseModel):
+    tickets: int
+    ads_per_episode: int
+    ads_today: int
+    daily_cap: int
+
+
+@router.get("/episodes/ad-tickets", response_model=AdTicketsResponse)
+async def ad_tickets(user_id: str = Depends(_get_current_user_id_no_guest)):
+    from rewarded_ads import ADS_PER_EPISODE, EPISODE_AD_DAILY_CAP
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Episode unlocking is not configured.")
+    try:
+        tickets = supabase_admin.rpc("ad_episode_tickets_balance", {"p_user_id": user_id}).execute().data
+        today = supabase_admin.rpc("ad_episode_ads_today", {"p_user_id": user_id}).execute().data
+    except Exception:
+        tickets, today = 0, 0           # not migrated yet
+    return AdTicketsResponse(tickets=int(tickets or 0), ads_per_episode=ADS_PER_EPISODE,
+                             ads_today=int(today or 0), daily_cap=EPISODE_AD_DAILY_CAP)
+
+
+class AdUnlockResponse(BaseModel):
+    unlocked: bool
+    already_unlocked: bool = False
+    tickets: int
+
+
+@router.post("/episodes/{post_id}/unlock-with-ads", response_model=AdUnlockResponse)
+async def unlock_episode_with_ads(post_id: str, user_id: str = Depends(_get_current_user_id_no_guest)):
+    """Spends ADS_PER_EPISODE tickets on one locked episode. Free, own and Premium-covered
+    episodes never cost tickets; an episode already unlocked is never charged again."""
+    from rewarded_ads import ADS_PER_EPISODE
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Episode unlocking is not configured.")
+
+    episode = _get_episode(post_id)
+    if episode["user_id"] == user_id:
+        return AdUnlockResponse(unlocked=True, tickets=-1)
+    series = _get_series(episode["series_id"])
+    if _is_free_episode(series.get("content_type"), episode.get("episode_number") or 1, episode.get("is_free")):
+        return AdUnlockResponse(unlocked=True, tickets=-1)
+    if is_active_subscriber(supabase_admin, user_id):
+        return AdUnlockResponse(unlocked=True, tickets=-1)
+
+    try:
+        data = supabase_admin.rpc("ad_unlock_episode", {"p_user_id": user_id, "p_post_id": post_id,
+                                                        "p_cost": ADS_PER_EPISODE}).execute().data
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not unlock with ads: {e}")
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    data = data or {}
+    if not data.get("ok"):
+        if data.get("error") == "not_enough_tickets":
+            raise HTTPException(status_code=402, detail={"error": "not_enough_tickets",
+                                                         "tickets": data.get("tickets", 0), "needed": data.get("needed")})
+        raise HTTPException(status_code=500, detail=f"Could not unlock with ads: {data.get('error')}")
+    return AdUnlockResponse(unlocked=True, already_unlocked=bool(data.get("already_unlocked")),
+                            tickets=int(data.get("tickets") or 0))
