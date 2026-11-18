@@ -1122,7 +1122,7 @@ _STORAGE_BUCKETS_TO_PURGE = ["posts-media", "avatars", "processed-videos", "glow
                              "creator-studio"]
 
 
-def _purge_storage(user_id: str) -> list[str]:
+def _purge_storage(user_id: str, keep: Optional[set] = None) -> list[str]:
     """Removes every file under this user's prefix in each bucket above,
     including files in sub-folders (Viyo Studio keeps
     <user>/<project>/<kind>/<file>).
@@ -1131,10 +1131,11 @@ def _purge_storage(user_id: str) -> list[str]:
     and the caller doesn't fail the whole deletion over a storage
     cleanup issue — errors are collected and returned instead.
     """
-    errors = []
+    errors, keep = [], keep or set()
     for bucket in _STORAGE_BUCKETS_TO_PURGE:
         try:
-            paths = _list_files(supabase_admin.storage.from_(bucket), user_id)
+            # Files a kept drama still shows (its cover, thumbnails) stay.
+            paths = [p for p in _list_files(supabase_admin.storage.from_(bucket), user_id) if (bucket, p) not in keep]
             for i in range(0, len(paths), 500):
                 supabase_admin.storage.from_(bucket).remove(paths[i:i + 500])
         except Exception as e:
@@ -1158,9 +1159,9 @@ def _list_files(store, prefix: str, depth: int = 0) -> list[str]:
     return out
 
 
-def _purge_bunny(user_id: str) -> list[str]:
+def _purge_bunny(user_id: str, keep: Optional[set] = None) -> list[str]:
     """Deletes the user's videos from Bunny Stream: their posts' videos
-    and their Viyo Studio films."""
+    and their Viyo Studio films, except videos a kept drama still plays."""
     errors, video_ids = [], set()
     for table, column, field in (("posts", "user_id", "bunny_video_id"),
                                  ("studio_renders", "owner_id", "bunny_video_id")):
@@ -1169,6 +1170,7 @@ def _purge_bunny(user_id: str) -> list[str]:
             video_ids |= {r[field] for r in rows if r.get(field)}
         except Exception as e:
             errors.append(f"bunny list {table}: {e}")
+    video_ids -= keep or set()
     if video_ids:
         import bunny_stream
         for vid in video_ids:
@@ -1177,9 +1179,84 @@ def _purge_bunny(user_id: str) -> list[str]:
     return errors
 
 
+# ---------------------------------------------------------
+# Keeping dramas when a creator leaves
+#
+# A creator deleting their account can choose to keep their dramas (their
+# series and the episodes in them) on Viyo. Those move to one shared
+# "Former creator" account (account_keep_dramas.sql): their name and profile
+# are gone, viewers keep what they unlocked, and future unlock earnings no
+# longer go to anyone's payout. It only ever happens when the creator picks
+# it; the default deletes everything, as before.
+# ---------------------------------------------------------
+
+FORMER_CREATOR_EMAIL = "former-creator@viyo.site"
+_STORAGE_URL = re.compile(r"/storage/v1/object/(?:public|sign)/([^/]+)/([^?#\s\"']+)")
+
+
+def _former_creator_id() -> str:
+    """The shared Former creator account, created on first use."""
+    rows = (supabase_admin.table("viyo_system_accounts").select("user_id")
+            .eq("role", "former_creator").limit(1).execute().data or [])
+    if rows:
+        return rows[0]["user_id"]
+    import secrets
+    created = supabase_admin.auth.admin.create_user({
+        "email": FORMER_CREATOR_EMAIL, "password": secrets.token_urlsafe(32), "email_confirm": True,
+        "user_metadata": {"system_account": "former_creator"}})
+    user = getattr(created, "user", created)
+    uid = str(getattr(user, "id", None) or user["id"])
+    supabase_admin.table("profiles").upsert({"id": uid, "username": "former_creator",
+                                             "display_name": "Former creator"}).execute()
+    supabase_admin.table("viyo_system_accounts").insert({"role": "former_creator", "user_id": uid}).execute()
+    return uid
+
+
+def _rpc_data(name: str, params: dict) -> dict:
+    data = supabase_admin.rpc(name, params).execute().data
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return data or {}
+
+
+def _kept_media(series_ids: list) -> tuple[set, set]:
+    """Bunny video ids and Storage files the kept dramas still use, so the
+    clean-up after them doesn't remove a kept episode's video or cover."""
+    videos, files = set(), set()
+    if not series_ids:
+        return videos, files
+    rows = (supabase_admin.table("series").select("*").in_("id", series_ids).execute().data or [])
+    rows += (supabase_admin.table("posts").select("*").in_("series_id", series_ids).execute().data or [])
+    for r in rows:
+        if r.get("bunny_video_id"):
+            videos.add(r["bunny_video_id"])
+        for v in r.values():
+            if isinstance(v, str):
+                files |= {(b, p) for b, p in _STORAGE_URL.findall(v)}
+    return videos, files
+
+
+class DeletionSummary(BaseModel):
+    dramas: int
+    episodes: int
+
+
+@router.get("/account/deletion-summary", response_model=DeletionSummary)
+async def account_deletion_summary(user_id: str = Depends(_get_current_user_id)):
+    """How many dramas this account owns; the app offers to keep them when there are any."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Account service is not configured.")
+    try:
+        r = _rpc_data("viyo_account_dramas", {"p_user_id": user_id})
+    except Exception:
+        return DeletionSummary(dramas=0, episodes=0)     # not migrated yet: nothing to offer
+    return DeletionSummary(dramas=int(r.get("dramas") or 0), episodes=int(r.get("episodes") or 0))
+
+
 @router.delete("/account")
 async def delete_account(
     user_id: str = Depends(_get_current_user_id),
+    keep_dramas: bool = Query(False, description="Keep this creator's dramas on Viyo under 'Former creator'."),
 ):
     if supabase_admin is None:
         raise HTTPException(
@@ -1187,15 +1264,32 @@ async def delete_account(
             detail="Account service is not configured.",
         )
 
+    kept, keep_videos, keep_files = {}, set(), set()
+    if keep_dramas:
+        # Done first, and the deletion stops if it fails: a creator who asked to
+        # keep their dramas must never lose them to a half-finished keep.
+        try:
+            former = _former_creator_id()
+            kept = _rpc_data("viyo_keep_dramas", {"p_user_id": user_id, "p_former_id": former})
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Could not keep your dramas, nothing was deleted: {e}")
+        if not kept.get("ok"):
+            raise HTTPException(status_code=503,
+                                detail=f"Could not keep your dramas, nothing was deleted: {kept.get('error')}")
+        try:
+            keep_videos, keep_files = _kept_media(kept.get("series_ids") or [])
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Could not keep your dramas' videos, nothing else was deleted: {e}")
+
     # Videos on Bunny first: the rows that point at them are deleted next.
-    cleanup_errors = _purge_bunny(user_id)
+    cleanup_errors = _purge_bunny(user_id, keep=keep_videos)
     for table, column in _DELETE_TABLES.items():
         try:
             supabase_admin.table(table).delete().eq(column, user_id).execute()
         except Exception as e:
             cleanup_errors.append(f"{table}: {e}")
 
-    cleanup_errors += _purge_storage(user_id)
+    cleanup_errors += _purge_storage(user_id, keep=keep_files)
 
     try:
         supabase_admin.auth.admin.delete_user(user_id)
@@ -1210,7 +1304,8 @@ async def delete_account(
             ),
         )
 
-    return {"deleted": True, "partial_cleanup_errors": cleanup_errors}
+    return {"deleted": True, "partial_cleanup_errors": cleanup_errors,
+            "kept_dramas": int(kept.get("dramas") or 0), "kept_episodes": int(kept.get("episodes") or 0)}
 
 
 # ---------------------------------------------------------
