@@ -109,8 +109,11 @@ class FakeAdmin:
 
         self.storage = _Storage()
 
+    # Tables other test modules create for real (Studio, Glow Up, Coach) get test-only stand-ins here.
+    STAND_INS = {"studio_renders", "video_coach_messages", "glow_up_sessions", "glow_up_previews"}
+
     def table(self, name):
-        return _Query(self.conn, name)
+        return _Query(self.conn, f"kd_{name}" if name in self.STAND_INS else name)
 
     def rpc(self, name, params):
         conn = self.conn
@@ -132,10 +135,10 @@ def schema(migrated):
         user_id uuid references auth.users(id) on delete cascade, title text, cover_url text);
       alter table public.posts add column if not exists series_id uuid;
       alter table public.posts add column if not exists bunny_video_id text;
-      create table if not exists public.video_coach_messages (user_id uuid);
-      create table if not exists public.glow_up_sessions (user_id uuid);
-      create table if not exists public.glow_up_previews (user_id uuid);
-      create table if not exists public.studio_renders (owner_id uuid, bunny_video_id text);
+      create table if not exists public.kd_video_coach_messages (user_id uuid);
+      create table if not exists public.kd_glow_up_sessions (user_id uuid);
+      create table if not exists public.kd_glow_up_previews (user_id uuid);
+      create table if not exists public.kd_studio_renders (owner_id uuid, bunny_video_id text);
     """)
     conn.execute((ROOT / "account_keep_dramas.sql").read_text())
     conn.execute((ROOT / "account_keep_dramas.sql").read_text())          # safe to run twice
@@ -147,7 +150,7 @@ STORE = "https://x.supabase.co/storage/v1/object/public/posts-media"
 
 @pytest.fixture
 def env(schema, db, monkeypatch):
-    db.execute("truncate public.series, public.viyo_system_accounts, public.studio_renders cascade")
+    db.execute("truncate public.series, public.viyo_system_accounts, public.kd_studio_renders cascade")
     admin = FakeAdmin(db)
     monkeypatch.setattr(coach, "supabase_admin", admin)
     deleted_videos = []
@@ -162,7 +165,7 @@ def env(schema, db, monkeypatch):
     db.execute("insert into public.posts (user_id, series_id, bunny_video_id) values (%s, %s, 'ep2')", (creator, series))
     db.execute("insert into public.posts (user_id, bunny_video_id) values (%s, 'selfie-vlog')", (creator,))
     db.execute("insert into public.posts (user_id, bunny_video_id) values (%s, 'others')", (other,))
-    db.execute("insert into public.studio_renders (owner_id, bunny_video_id) values (%s, 'ep1'), (%s, 'draft')",
+    db.execute("insert into public.kd_studio_renders (owner_id, bunny_video_id) values (%s, 'ep1'), (%s, 'draft')",
                (creator, creator))
     admin.files |= {("posts-media", f"{creator}/cover.jpg"), ("posts-media", f"{creator}/ep1.jpg"),
                     ("posts-media", f"{creator}/vlog.jpg"), ("avatars", f"{creator}/me.jpg")}
