@@ -59,6 +59,12 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 # viewer and for Viyo. Changing them needs the owner's approval.
 REWARDED_AD_COINS = 5
 DAILY_AD_CAP = 20
+# Unlocking episodes with ads (ad_episode_unlocks.sql): each verified ad is one ticket, ADS_PER_EPISODE
+# tickets unlock one episode. Episode ads have their own rolling limit: up to EPISODE_AD_CAP ads
+# (15 episodes) in any EPISODE_AD_WINDOW_HOURS (5), so after a batch the viewer comes back a few hours later.
+ADS_PER_EPISODE = 2
+EPISODE_AD_CAP = 30
+EPISODE_AD_WINDOW_HOURS = 5
 
 # Google's public keys for verifying reward callbacks. Google rotates them;
 # don't keep them longer than 24 hours.
@@ -162,12 +168,17 @@ class RewardedAdStartResponse(BaseModel):
     coins: int
     claims_today: int
     daily_cap: int
+    purpose: str = "coins"
+    tickets: Optional[int] = None     # episode tickets the viewer holds (purpose "episode")
 
 
 @router.post("/coins/rewarded-ad/start", response_model=RewardedAdStartResponse)
-async def start_rewarded_ad(user_id: str = Depends(_get_current_user_id_no_guest)):
-    """Call before showing an ad. With verification on, returns the session to attach to the ad."""
+async def start_rewarded_ad(purpose: str = "coins", user_id: str = Depends(_get_current_user_id_no_guest)):
+    """Call before showing an ad. With verification on, returns the session to attach to the ad.
+    purpose=episode: the ad earns an episode ticket instead of coins (Google-verified only)."""
     _admin()
+    if purpose == "episode":
+        return _start_episode_ad(user_id)
     if not ssv_on():
         return RewardedAdStartResponse(verification="client", coins=REWARDED_AD_COINS, claims_today=0,
                                        daily_cap=DAILY_AD_CAP)
@@ -185,6 +196,41 @@ async def start_rewarded_ad(user_id: str = Depends(_get_current_user_id_no_guest
     return RewardedAdStartResponse(verification="server", session=str(r["session"]), user_id=user_id,
                                    coins=REWARDED_AD_COINS, claims_today=int(r.get("claims_today") or 0),
                                    daily_cap=DAILY_AD_CAP)
+
+
+def _until(when) -> str:
+    """'in about 3 hours' / 'in about 40 minutes' until an ISO time; 'in a few hours' if unknown."""
+    try:
+        t = datetime.datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+        mins = max(1, int((t - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 60))
+    except Exception:
+        return "in a few hours"
+    return f"in about {round(mins / 60)} hour{'s' if round(mins / 60) != 1 else ''}" if mins >= 90 else f"in about {mins} minutes"
+
+
+def _start_episode_ad(user_id: str) -> RewardedAdStartResponse:
+    if not ssv_on():
+        # Tickets unlock content directly, so they're only ever given for an ad Google confirmed.
+        raise HTTPException(status_code=409, detail={"error": "unavailable",
+                                                     "message": "Unlocking episodes with ads isn't available right now."})
+    try:
+        r = _rpc("rewarded_ad_start_episode", {"p_user_id": user_id, "p_cap": EPISODE_AD_CAP,
+                                                "p_hours": EPISODE_AD_WINDOW_HOURS})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={"error": "unavailable",
+                                                     "message": f"Unlocking episodes with ads isn't available right now ({e})."})
+    if not r.get("ok"):
+        if r.get("error") == "daily_cap":
+            raise HTTPException(status_code=429, detail={
+                "error": "daily_ad_cap_reached", "daily_cap": EPISODE_AD_CAP, "claims_today": r.get("ads_today"),
+                "next_free_at": r.get("next_free_at"),
+                "message": f"You've unlocked {EPISODE_AD_CAP // ADS_PER_EPISODE} episodes with ads. "
+                           f"Come back {_until(r.get('next_free_at'))} to unlock more, or unlock with coins."})
+        raise HTTPException(status_code=429, detail={"error": r.get("error") or "unavailable",
+                                                     "message": "Too many ads started at once. Try again later."})
+    return RewardedAdStartResponse(verification="server", session=str(r["session"]), user_id=user_id, coins=0,
+                                   claims_today=int(r.get("ads_today") or 0), daily_cap=EPISODE_AD_CAP,
+                                   purpose="episode", tickets=int(r.get("tickets") or 0))
 
 
 class RewardedAdStatusResponse(BaseModel):
@@ -279,10 +325,17 @@ async def admob_ssv(request: Request):
         raise HTTPException(status_code=400, detail="Unknown ad unit.")
     if not session or not user_id or not params.get("transaction_id"):
         raise HTTPException(status_code=400, detail="Missing session, user or transaction.")
+    args = {"p_session": session, "p_user_id": user_id, "p_transaction_id": params["transaction_id"],
+            "p_coins": REWARDED_AD_COINS, "p_daily_cap": DAILY_AD_CAP}
     try:
-        r = _rpc("rewarded_ad_credit", {"p_session": session, "p_user_id": user_id,
-                                        "p_transaction_id": params["transaction_id"],
-                                        "p_coins": REWARDED_AD_COINS, "p_daily_cap": DAILY_AD_CAP})
+        try:
+            # Coins or an episode ticket, depending on what the session was opened for.
+            r = _rpc("rewarded_ad_redeem", {**args, "p_episode_cap": EPISODE_AD_CAP,
+                                            "p_episode_hours": EPISODE_AD_WINDOW_HOURS})
+        except Exception as e:
+            if "rewarded_ad_redeem" not in str(e):
+                raise
+            r = _rpc("rewarded_ad_credit", args)          # ad_episode_unlocks.sql not run yet: coins only
     except HTTPException:
         raise
     except Exception as e:
