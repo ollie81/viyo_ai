@@ -172,14 +172,32 @@ def test_google_retries_give_one_ticket(env):
     assert tickets(env) == 1
 
 
-def test_episode_ads_have_their_own_daily_cap(env, monkeypatch):
-    monkeypatch.setattr(ra, "EPISODE_AD_DAILY_CAP", 2)
+def test_episode_ads_have_their_own_limit(env, monkeypatch):
+    monkeypatch.setattr(ra, "EPISODE_AD_CAP", 2)
     watch(env, "t1")
     watch(env, "t2")
     r = env["c"].post("/api/v1/coins/rewarded-ad/start?purpose=episode")
     assert r.status_code == 429 and r.json()["detail"]["error"] == "daily_ad_cap_reached"
+    assert "Come back in about 4 hours" in r.json()["detail"]["message"]
     watch(env, "c1", purpose="coins")      # coin ads are counted separately
     assert coins(env) == ra.REWARDED_AD_COINS
+
+
+def test_more_episode_ads_after_a_few_hours(env, monkeypatch):
+    monkeypatch.setattr(ra, "EPISODE_AD_CAP", 2)
+    watch(env, "t1")
+    watch(env, "t2")
+    info = env["c"].get("/api/v1/episodes/ad-tickets").json()
+    assert info["ads_today"] == 2 and info["window_hours"] == 4 and info["next_free_at"] is not None
+    # Four hours later the earlier ads have dropped out of the window.
+    env["db"].execute("update public.ad_episode_tickets set created_at = now() - interval '4 hours 1 minute'")
+    watch(env, "t3")
+    assert tickets(env) == 3
+    assert env["c"].get("/api/v1/episodes/ad-tickets").json()["next_free_at"] is None
+
+
+def test_default_limit_is_15_episodes_per_4_hours():
+    assert ra.EPISODE_AD_CAP // ra.ADS_PER_EPISODE == 15 and ra.EPISODE_AD_WINDOW_HOURS == 4
 
 
 def test_needs_google_verification(env, monkeypatch):

@@ -424,22 +424,29 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
 class AdTicketsResponse(BaseModel):
     tickets: int
     ads_per_episode: int
-    ads_today: int
-    daily_cap: int
+    ads_today: int                       # episode ads in the current window
+    daily_cap: int                       # ads allowed per window (EPISODE_AD_CAP)
+    window_hours: int
+    next_free_at: Optional[str] = None   # when more ads free up, if at the limit
 
 
 @router.get("/episodes/ad-tickets", response_model=AdTicketsResponse)
 async def ad_tickets(user_id: str = Depends(_get_current_user_id_no_guest)):
-    from rewarded_ads import ADS_PER_EPISODE, EPISODE_AD_DAILY_CAP
+    from rewarded_ads import ADS_PER_EPISODE, EPISODE_AD_CAP, EPISODE_AD_WINDOW_HOURS
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Episode unlocking is not configured.")
+    next_at = None
     try:
         tickets = supabase_admin.rpc("ad_episode_tickets_balance", {"p_user_id": user_id}).execute().data
-        today = supabase_admin.rpc("ad_episode_ads_today", {"p_user_id": user_id}).execute().data
+        recent = supabase_admin.rpc("ad_episode_ads_recent", {"p_user_id": user_id,
+                                                              "p_hours": EPISODE_AD_WINDOW_HOURS}).execute().data
+        next_at = supabase_admin.rpc("ad_episode_next_free_at", {"p_user_id": user_id, "p_cap": EPISODE_AD_CAP,
+                                                                 "p_hours": EPISODE_AD_WINDOW_HOURS}).execute().data
     except Exception:
-        tickets, today = 0, 0           # not migrated yet
-    return AdTicketsResponse(tickets=int(tickets or 0), ads_per_episode=ADS_PER_EPISODE,
-                             ads_today=int(today or 0), daily_cap=EPISODE_AD_DAILY_CAP)
+        tickets, recent = 0, 0           # not migrated yet
+    return AdTicketsResponse(tickets=int(tickets or 0), ads_per_episode=ADS_PER_EPISODE, ads_today=int(recent or 0),
+                             daily_cap=EPISODE_AD_CAP, window_hours=EPISODE_AD_WINDOW_HOURS,
+                             next_free_at=str(next_at) if next_at else None)
 
 
 class AdUnlockResponse(BaseModel):

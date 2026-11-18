@@ -2,7 +2,8 @@
 --
 -- A viewer chooses how many episodes to unlock, watches the ads back to back,
 -- and each ad Google confirms adds one "ad ticket". Two tickets unlock one
--- episode. Tickets they don't use stay for next time. Separate from coins: the
+-- episode. Tickets they don't use stay for next time. Up to 15 episodes (30 ads)
+-- every 4 hours: after a batch, they come back a few hours later for more. Separate from coins: the
 -- coin price of episodes and creator earnings from bought coins don't change.
 --
 -- Needs rewarded_ads_ssv.sql (already run). Additive only, safe to run more than
@@ -28,24 +29,34 @@ returns int language sql stable security definer set search_path = public as $$
   select coalesce(sum(delta), 0)::int from public.ad_episode_tickets where user_id = p_user_id;
 $$;
 
--- Ads watched for episodes since midnight UTC (its own daily cap, separate from coin ads).
-create or replace function public.ad_episode_ads_today(p_user_id uuid)
+-- Episode ads in the last p_hours (a rolling limit, separate from coin ads): a viewer unlocks a batch,
+-- and a few hours later can unlock more.
+create or replace function public.ad_episode_ads_recent(p_user_id uuid, p_hours int)
 returns int language sql stable security definer set search_path = public as $$
   select count(*)::int from public.ad_episode_tickets
-   where user_id = p_user_id and reason = 'ad'
-     and created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc';
+   where user_id = p_user_id and reason = 'ad' and created_at > now() - make_interval(hours => p_hours);
+$$;
+
+-- When the next episode ad frees up (the oldest ad in the window drops out), or null if not at the limit.
+create or replace function public.ad_episode_next_free_at(p_user_id uuid, p_cap int, p_hours int)
+returns timestamptz language sql stable security definer set search_path = public as $$
+  select case when count(*) >= p_cap then min(created_at) + make_interval(hours => p_hours) end
+    from (select created_at from public.ad_episode_tickets
+           where user_id = p_user_id and reason = 'ad' and created_at > now() - make_interval(hours => p_hours)
+           order by created_at desc limit p_cap) w;
 $$;
 
 -- Opens an ad session for an episode ticket.
-create or replace function public.rewarded_ad_start_episode(p_user_id uuid, p_daily_cap int)
+create or replace function public.rewarded_ad_start_episode(p_user_id uuid, p_cap int, p_hours int)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
-  v_today int := public.ad_episode_ads_today(p_user_id);
+  v_today int := public.ad_episode_ads_recent(p_user_id, p_hours);
   v_open int;
   v_id uuid;
 begin
-  if v_today >= p_daily_cap then
-    return jsonb_build_object('ok', false, 'error', 'daily_cap', 'ads_today', v_today);
+  if v_today >= p_cap then
+    return jsonb_build_object('ok', false, 'error', 'daily_cap', 'ads_today', v_today,
+                              'next_free_at', public.ad_episode_next_free_at(p_user_id, p_cap, p_hours));
   end if;
   select count(*) into v_open from public.rewarded_ad_sessions
    where user_id = p_user_id and credited_at is null and created_at > now() - interval '1 hour';
@@ -60,9 +71,11 @@ $$;
 
 -- Google confirmed an ad: coins for a coin session (rewarded_ad_credit, unchanged), one ticket for an
 -- episode session. Same checks either way: the session's own user, once per session and per AdMob
--- transaction, recent, inside that kind's daily cap.
+-- transaction, recent, inside that kind's limit (coins: p_daily_cap a day; episodes: p_episode_cap
+-- per p_episode_hours).
 create or replace function public.rewarded_ad_redeem(p_session uuid, p_user_id uuid, p_transaction_id text,
-                                                     p_coins int, p_daily_cap int)
+                                                     p_coins int, p_daily_cap int,
+                                                     p_episode_cap int, p_episode_hours int)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   s public.rewarded_ad_sessions;
@@ -86,7 +99,7 @@ begin
   if s.created_at < now() - interval '2 hours' then
     return jsonb_build_object('ok', false, 'error', 'expired');
   end if;
-  if public.ad_episode_ads_today(p_user_id) >= p_daily_cap then
+  if public.ad_episode_ads_recent(p_user_id, p_episode_hours) >= p_episode_cap then
     return jsonb_build_object('ok', false, 'error', 'daily_cap');
   end if;
   begin
@@ -131,14 +144,16 @@ end;
 $$;
 
 revoke all on function public.ad_episode_tickets_balance(uuid) from public, anon, authenticated;
-revoke all on function public.ad_episode_ads_today(uuid) from public, anon, authenticated;
-revoke all on function public.rewarded_ad_start_episode(uuid, int) from public, anon, authenticated;
-revoke all on function public.rewarded_ad_redeem(uuid, uuid, text, int, int) from public, anon, authenticated;
+revoke all on function public.ad_episode_ads_recent(uuid, int) from public, anon, authenticated;
+revoke all on function public.ad_episode_next_free_at(uuid, int, int) from public, anon, authenticated;
+revoke all on function public.rewarded_ad_start_episode(uuid, int, int) from public, anon, authenticated;
+revoke all on function public.rewarded_ad_redeem(uuid, uuid, text, int, int, int, int) from public, anon, authenticated;
 revoke all on function public.ad_unlock_episode(uuid, uuid, int) from public, anon, authenticated;
 grant execute on function public.ad_episode_tickets_balance(uuid) to service_role;
-grant execute on function public.ad_episode_ads_today(uuid) to service_role;
-grant execute on function public.rewarded_ad_start_episode(uuid, int) to service_role;
-grant execute on function public.rewarded_ad_redeem(uuid, uuid, text, int, int) to service_role;
+grant execute on function public.ad_episode_ads_recent(uuid, int) to service_role;
+grant execute on function public.ad_episode_next_free_at(uuid, int, int) to service_role;
+grant execute on function public.rewarded_ad_start_episode(uuid, int, int) to service_role;
+grant execute on function public.rewarded_ad_redeem(uuid, uuid, text, int, int, int, int) to service_role;
 grant execute on function public.ad_unlock_episode(uuid, uuid, int) to service_role;
 
 -- Check (read-only):
