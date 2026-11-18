@@ -3,7 +3,7 @@
 -- A viewer chooses how many episodes to unlock, watches the ads back to back,
 -- and each ad Google confirms adds one "ad ticket". Two tickets unlock one
 -- episode. Tickets they don't use stay for next time. Up to 15 episodes (30 ads)
--- every 4 hours: after a batch, they come back a few hours later for more. Separate from coins: the
+-- every 5 hours: after a batch, they come back a few hours later for more. Separate from coins: the
 -- coin price of episodes and creator earnings from bought coins don't change.
 --
 -- Needs rewarded_ads_ssv.sql (already run). Additive only, safe to run more than

@@ -61,10 +61,10 @@ REWARDED_AD_COINS = 5
 DAILY_AD_CAP = 20
 # Unlocking episodes with ads (ad_episode_unlocks.sql): each verified ad is one ticket, ADS_PER_EPISODE
 # tickets unlock one episode. Episode ads have their own rolling limit: up to EPISODE_AD_CAP ads
-# (15 episodes) in any EPISODE_AD_WINDOW_HOURS, so after a batch the viewer comes back a few hours later.
+# (15 episodes) in any EPISODE_AD_WINDOW_HOURS (5), so after a batch the viewer comes back a few hours later.
 ADS_PER_EPISODE = 2
 EPISODE_AD_CAP = 30
-EPISODE_AD_WINDOW_HOURS = 4
+EPISODE_AD_WINDOW_HOURS = 5
 
 # Google's public keys for verifying reward callbacks. Google rotates them;
 # don't keep them longer than 24 hours.
