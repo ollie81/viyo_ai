@@ -213,6 +213,19 @@ class _Res:
         self.data = data
 
 
+def _match(have, want):
+    if isinstance(want, tuple) and len(want) == 2 and isinstance(want[0], str) and want[0].startswith("__"):
+        op, v = want
+        if op == "__in__":
+            return have in v
+        if op == "__neq__":
+            return have != v
+        if have is None:
+            return False
+        return str(have) >= str(v) if op == "__gte__" else str(have) < str(v)
+    return have == want
+
+
 class _Q:
     def __init__(self, db, table):
         self.db, self.table, self.filters, self.patch, self.row = db, table, [], None, None
@@ -225,6 +238,27 @@ class _Q:
         return self
 
     def order(self, *_a, **_k):
+        return self
+
+    # Filters used by the intelligence modules (in-memory versions of PostgREST's).
+    def in_(self, k, values):
+        values = list(values)
+        self.filters.append((k, ("__in__", values)))
+        return self
+
+    def gte(self, k, v):
+        self.filters.append((k, ("__gte__", v)))
+        return self
+
+    def lt(self, k, v):
+        self.filters.append((k, ("__lt__", v)))
+        return self
+
+    def neq(self, k, v):
+        self.filters.append((k, ("__neq__", v)))
+        return self
+
+    def range(self, *_a):
         return self
 
     def limit(self, *_a):
@@ -245,14 +279,14 @@ class _Q:
     def execute(self):
         rows = self.db.setdefault(self.table, [])
         if getattr(self, "deleting", False):
-            hit = [r for r in rows if all(r.get(k) == v for k, v in self.filters)]
+            hit = [r for r in rows if all(_match(r.get(k), v) for k, v in self.filters)]
             self.db[self.table] = [r for r in rows if r not in hit]
             return _Res(hit)
         if self.row is not None:
             r = {"id": str(uuid.uuid4()), **self.row}
             rows.append(r)
             return _Res([r])
-        hit = [r for r in rows if all(r.get(k) == v for k, v in self.filters)]
+        hit = [r for r in rows if all(_match(r.get(k), v) for k, v in self.filters)]
         if self.patch is not None:
             for r in hit:
                 r.update(self.patch)
