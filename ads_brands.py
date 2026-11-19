@@ -124,6 +124,7 @@ def _brand_out(b: dict, assets: Optional[list] = None, characters: Optional[list
                              for r in characters]
     if campaigns is not None:
         out["campaigns"] = [{"id": c["id"], "status": c.get("status") or "draft", "ad_style": c.get("ad_style") or "auto",
+                             "track": c.get("track") or "",
                              "aspect_ratio": c.get("aspect_ratio"), "thumbnail_url": core._resolve(c.get("thumbnail_url")),
                              "published_post_id": c.get("published_post_id"), "created_at": c.get("created_at")}
                             for c in campaigns]
@@ -312,6 +313,7 @@ class NewAdIn(BaseModel):
     aspect_ratio: str = "9:16"
     objective: str = Field("", max_length=300)
     use_character: bool = True        # false: a product-only ad even if the brand has a character
+    track: str = ""                   # Campaign Universe track (ads_ideas.TRACKS); empty: not set
 
 
 @router.post("/{brand_id}/campaigns")
@@ -344,6 +346,9 @@ async def new_ad_from_brand(brand_id: str, body: NewAdIn, user_id: str = Depends
         duration_seconds=body.duration_seconds, aspect_ratio=body.aspect_ratio), user_id)
     cid = created["id"]
     patch = {"brand_id": b["id"]}
+    from ads_ideas import TRACKS
+    if body.track in TRACKS:
+        patch["track"] = body.track
     if character:
         patch["character"] = character
     _db().table("ad_campaigns").update(patch).eq("id", cid).execute()
