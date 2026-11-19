@@ -4,6 +4,12 @@ or any other app/product/website — a second, complementary feature to
 Viyo Studio (studio.py)'s AI Drama Maker, sharing its Gemini/Veo/ffmpeg/
 Bunny pipeline rather than duplicating it.
 
+Production rules (see ad_brand.py, ad_compose.py, ad_qc.py): the advertiser's brand name, website and call
+to action are the only ones that ever appear (invented ones are corrected before rendering); captions, real
+assets, the brand mark and the end card each have their own area of the frame; and the finished file is
+checked (format, sound, black/blank pictures, cut-off text, overlaps, the website actually shown, the end
+card) before an ad is delivered. One that can't be fixed automatically is "needs_correction", with reasons.
+
 Workflow: create a campaign (what to promote) -> upload up to 8 reference
 images (or pull real VIYO screenshots from the shared library below) ->
 pick a format (or let Gemini recommend one) -> generate 5 hook candidates,
@@ -55,10 +61,17 @@ ready campaign simply reruns it from the already-saved script — nothing
 about retry needs a separate endpoint or any partial-stage checkpoint,
 since assets/hooks/script all live on rows /generate never touches.
 """
+import copy
 import datetime
 import os
+import re
+import shutil
 import uuid
 from typing import Optional
+
+import ad_brand
+import ad_compose
+import ad_qc
 
 import requests
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
@@ -172,6 +185,13 @@ AD_RESOLUTIONS = ("720p", "1080p")
 # before this distinction existed — those stay treated as creative-only
 # (the safe default when the asset's real nature isn't known), never
 # promoted to exact-reproduction automatically.
+# What is being advertised. Only changes how the prompts describe it; nothing in the pipeline is tied to
+# one advertiser. (viyo / ollie_ai are kept so existing campaigns stay valid; both are apps.)
+PRODUCT_KINDS: dict[str, str] = {
+    "viyo": "a mobile app", "ollie_ai": "a mobile app", "other_app": "a mobile app", "website": "a website",
+    "physical_product": "a physical product", "business": "a business or service", "film": "a film or show",
+    "creator_project": "a creator's project",
+}
 AD_ASSET_TYPES = ("screenshot", "product_photo", "logo", "other")
 EXACT_ASSET_TYPES = {"screenshot", "product_photo", "logo"}
 
@@ -283,7 +303,7 @@ async def list_veo_tiers():
 # ---------------------------------------------------------------------------
 class CreateCampaignRequest(BaseModel):
     user_id: str
-    promote_target: str = Field(..., pattern="^(viyo|ollie_ai|other_app|website)$")
+    promote_target: str = Field(..., pattern="^(viyo|ollie_ai|other_app|website|physical_product|business|film|creator_project)$")
     target_name: str = ""
     target_description: str = ""
     target_features: list[str] = []
@@ -330,6 +350,10 @@ class CampaignOut(BaseModel):
     cost_usd_cents: int
     error: Optional[str] = None
     created_at: str
+    # Post-render quality check of the finished file (ad_qc.inspect) and, when it needs correction, the
+    # video it produced (never presented as finished: video_url stays empty until the checks pass).
+    quality_report: Optional[dict] = None
+    preview_video_url: Optional[str] = None
 
 
 def _row_to_campaign(row: dict) -> CampaignOut:
@@ -363,6 +387,8 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         cost_usd_cents=row.get("cost_usd_cents") or 0,
         error=row.get("error"),
         created_at=row.get("created_at") or "",
+        quality_report=row.get("quality_report"),
+        preview_video_url=row.get("preview_video_url"),
     )
 
 
@@ -389,6 +415,8 @@ async def create_campaign(req: CreateCampaignRequest):
         raise HTTPException(status_code=400, detail=f"format must be one of {list(AD_FORMATS)} or omitted.")
     if req.veo_tier not in VEO_TIERS:
         raise HTTPException(status_code=400, detail=f"veo_tier must be one of {list(VEO_TIERS)}.")
+    if req.destination_link.strip() and not ad_brand.parse_url(req.destination_link)[0]:
+        raise HTTPException(status_code=400, detail=f'"{req.destination_link}" isn\'t a valid website address.')
     if req.use_veo and req.aspect_ratio == "1:1":
         raise HTTPException(
             status_code=400,
@@ -423,6 +451,7 @@ async def create_campaign(req: CreateCampaignRequest):
 
 
 class UpdateCampaignRequest(BaseModel):
+    promote_target: Optional[str] = Field(None, pattern="^(viyo|ollie_ai|other_app|website|physical_product|business|film|creator_project)$")
     target_name: Optional[str] = None
     target_description: Optional[str] = None
     target_features: Optional[list[str]] = None
@@ -452,6 +481,8 @@ async def update_campaign(campaign_id: str, req: UpdateCampaignRequest):
         raise HTTPException(status_code=400, detail=f"resolution must be one of {AD_RESOLUTIONS}.")
     if "veo_tier" in patch and patch["veo_tier"] not in VEO_TIERS:
         raise HTTPException(status_code=400, detail=f"veo_tier must be one of {list(VEO_TIERS)}.")
+    if (patch.get("destination_link") or "").strip() and not ad_brand.parse_url(patch["destination_link"])[0]:
+        raise HTTPException(status_code=400, detail=f'"{patch["destination_link"]}" isn\'t a valid website address.')
     if not patch:
         return _row_to_campaign(_get_campaign(campaign_id))
     try:
@@ -732,8 +763,8 @@ class HookGenerationSchema(BaseModel):
 _HOOK_PROMPT = """You are a short-form video creative strategist specializing in opening hooks — the single \
 biggest lever on whether a viewer keeps watching past the first 1-3 seconds.
 
-PRODUCT/APP TO PROMOTE: {target_name}
-DESCRIPTION: {target_description}
+WHAT IS ADVERTISED: {target_name} ({product_kind})
+{facts}DESCRIPTION: {target_description}
 REAL FEATURES (do not invent anything beyond these): {features}
 TARGET AUDIENCE: {audience}
 OBJECTIVE: {objective}
@@ -776,6 +807,8 @@ def _build_hook_prompt(campaign: dict, format_key: Optional[str]) -> str:
     features = "; ".join(campaign.get("target_features") or []) or "none specified"
     return _HOOK_PROMPT.format(
         target_name=campaign.get("target_name") or "this product",
+        product_kind=PRODUCT_KINDS.get(campaign.get("promote_target") or "", "a product"),
+        facts=ad_brand.prompt_facts(ad_brand.BrandFacts.from_campaign(campaign)),
         target_description=campaign.get("target_description") or "",
         features=features,
         audience=campaign.get("target_audience") or "general short-form video viewers",
@@ -996,19 +1029,24 @@ video, built around this already-chosen opening hook. Do not change the hook —
 
 CHOSEN HOOK (this must be scene 1's content): {hook_text}
 
-PRODUCT/APP: {target_name} — {target_description}
-REAL FEATURES (do not invent anything beyond these): {features}
+WHAT IS ADVERTISED: {target_name} ({product_kind}) — {target_description}
+{facts}REAL FEATURES (do not invent anything beyond these): {features}
 AUDIENCE: {audience}
 OBJECTIVE: {objective}
 FORMAT STYLE: {format_style}
-CALL TO ACTION (must be the final scene): {cta_text}
 {asset_block}
 Write exactly {scene_count} scenes totaling {duration} seconds. Apply this pacing:
 - Scene 1 (0-3s): the hook above, staged as an interesting visual/action/line — no logo, no intro, nothing wasted.
 - Early-middle scenes: continue the story/demonstration naturally, raising curiosity or stakes.
 - Later scenes: deliver the payoff and introduce the product where it fits naturally — never forced in before \
 the content has earned it.
-- Final scene: the call to action above, concise and relevant, not a hard sales pitch.
+- Final scene: the closing card. On screen it shows the logo, the exact brand name, the exact website and the \
+exact call to action given above (added automatically — don't describe text for it). Its voiceover is one short \
+line that says the brand name and, only if a website is given above, that exact website.
+- Every scene must be about this product: what it does, who it helps, the real problem it solves. No unrelated \
+stock scenes, no scenery that doesn't move the message forward.
+- Any scene that shows the app, the website or a screen must use one of the real screenshots (featured_asset_id) \
+when there is one; never describe an invented interface or a blank/black screen.
 
 For each scene give:
 - order: 1-based scene number
@@ -1016,8 +1054,7 @@ For each scene give:
 - visual_description: what's on screen
 - camera_shot: e.g. "close-up", "medium shot", "wide establishing shot"
 - dialogue_or_vo: the exact spoken line or voiceover for this scene (can be empty for a pure visual beat)
-- caption_text: the on-screen caption burned into the video for this scene (usually the same as dialogue_or_vo, \
-condensed if long)
+- caption_text: the on-screen caption for this scene: at most 8 words, the key phrase of the line (never a website)
 - is_cta: true only for the final scene
 - featured_asset_id: {asset_field_instruction}
 
@@ -1075,11 +1112,12 @@ def _build_script_prompt(campaign: dict, hook_text: str, assets: list[dict]) -> 
         format_style=format_info["style"],
         hook_text=hook_text,
         target_name=campaign.get("target_name") or "this product",
+        product_kind=PRODUCT_KINDS.get(campaign.get("promote_target") or "", "a product"),
+        facts=ad_brand.prompt_facts(ad_brand.BrandFacts.from_campaign(campaign)),
         target_description=campaign.get("target_description") or "",
         features=features,
         audience=campaign.get("target_audience") or "general short-form video viewers",
         objective=campaign.get("objective") or "drive interest and engagement",
-        cta_text=campaign.get("cta_text") or "Try it today",
         scene_count=_scene_count_for_duration(duration),
         asset_block=asset_block,
         asset_field_instruction=asset_field_instruction,
@@ -1169,8 +1207,9 @@ async def generate_script(campaign_id: str):
     scenes = sorted((s.model_dump() for s in parsed.scenes), key=lambda s: s["order"])
     scenes = _normalize_scene_durations(scenes, float(campaign.get("duration_seconds") or 15))
     scenes = _resolve_featured_asset_tokens(scenes, assets)
-    if scenes:
-        scenes[-1]["is_cta"] = True
+    # Brand facts are the advertiser's, never the model's: any invented website or brand-name variant in
+    # the captions, voiceover or visual descriptions is corrected now, before anyone reviews the script.
+    scenes, _brand_changes = ad_brand.sanitize_script(scenes, ad_brand.BrandFacts.from_campaign(campaign))
 
     try:
         supabase_admin.table("ad_campaigns").update({
@@ -1194,13 +1233,14 @@ async def save_script(campaign_id: str, req: SaveScriptRequest):
     generation — the script stays fully editable right up until
     /generate actually renders it."""
     _require_configured()
-    _get_campaign(campaign_id)
+    campaign = _get_campaign(campaign_id)
     if not req.scenes:
         raise HTTPException(status_code=400, detail="A script needs at least one scene.")
     for s in req.scenes:
         if s.seconds <= 0:
             raise HTTPException(status_code=400, detail=f"Scene {s.order} has a non-positive duration.")
     scenes = [s.model_dump() for s in sorted(req.scenes, key=lambda s: s.order)]
+    scenes, _brand_changes = ad_brand.sanitize_script(scenes, ad_brand.BrandFacts.from_campaign(campaign))
     try:
         updated = (
             supabase_admin.table("ad_campaigns")
@@ -1468,171 +1508,360 @@ def _update_job(job_id: str, **fields) -> None:
         print(f"[WARN] Could not update ad_generation_jobs {job_id}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Production pipeline: plan -> render -> check the finished file -> correct -> deliver.
+# ---------------------------------------------------------------------------
+_SCREEN_WORDS = re.compile(r"(?i)\b(app|apps|screen|phone|smartphone|website|web page|site|dashboard|interface|ui|"
+                           r"laptop|tablet|browser|scrolls?|taps?|swipes?|notification|inbox|chat)\b")
+MAX_IMAGE_REGENERATIONS = 2     # paid corrections per run (one image each)
+MIN_END_CARD_SECONDS = 3.0
+
+
+def _fetch_local(url: str, path: str) -> None:
+    """Downloads a URL (or copies a local file, used by tests and local renders)."""
+    if url.startswith("file://") or os.path.exists(url):
+        shutil.copyfile(url.removeprefix("file://"), path)
+    else:
+        _download_to_file(url, path)
+
+
+def _prepare_assets(assets: list[dict], tmp: str) -> tuple[dict, list[str]]:
+    """Downloads every campaign asset and checks it is a real, readable image. Returns ({asset id: local
+    path}, problems). A broken asset is reported and never shown, rather than failing silently."""
+    from PIL import Image
+    paths, issues = {}, []
+    for a in assets:
+        label = (a.get("label") or a.get("asset_type") or "asset").strip()
+        ext = os.path.splitext(a["url"].split("?")[0])[1] or ".png"
+        path = os.path.join(tmp, f"asset_{a['id']}{ext}")
+        try:
+            _fetch_local(a["url"], path)
+            with Image.open(path) as im:
+                im.verify()
+            with Image.open(path) as im:
+                if im.width < 64 or im.height < 64:
+                    raise ValueError("too small")
+            paths[a["id"]] = path
+        except Exception as e:
+            issues.append(f'The {a.get("asset_type") or "asset"} "{label}" couldn\'t be loaded ({str(e)[:80]}).')
+    return paths, issues
+
+
+def _assign_real_assets(scenes: list[dict], assets: list[dict], local: dict) -> list[dict]:
+    """Scenes about the app/website/screen show a real screenshot when the advertiser supplied one, instead
+    of an AI-drawn interface (or a blank phone). Screenshots are used in turn so they don't repeat."""
+    shots = [a["id"] for a in assets if a.get("asset_type") == "screenshot" and a["id"] in local]
+    if not shots:
+        return scenes
+    used = {s.get("featured_asset_id") for s in scenes}
+    queue = [a for a in shots if a not in used] + [a for a in shots if a in used]
+    k = 0
+    for s in scenes[:-1]:
+        if (s.get("featured_asset_id") or "") or not _SCREEN_WORDS.search(s.get("visual_description") or ""):
+            continue
+        s["featured_asset_id"] = queue[k % len(queue)]
+        s["asset_auto_assigned"] = True
+        k += 1
+    return scenes
+
+
+def _image_prompt(scene: dict, campaign: dict, aspect_ratio: str, stricter: bool = False) -> str:
+    kind = PRODUCT_KINDS.get(campaign.get("promote_target") or "", "a product")
+    prompt = (
+        f"Photorealistic scene for a short marketing video about {kind}. {aspect_ratio} framing. "
+        f"Camera shot: {scene.get('camera_shot') or 'medium'} shot. What's happening: "
+        f"{scene.get('visual_description') or ''}\n\n"
+        "Absolutely no text of any kind in the image: no letters, numbers, logos, brand names, signs, labels, "
+        "website addresses, captions or watermarks. If a phone, laptop or other screen is in the picture, show it "
+        "from the side or back or with the screen out of view: never a blank or black screen, never an invented "
+        "app interface."
+    )
+    if stricter:
+        prompt += " Keep every device screen completely out of view, and keep the scene bright and clearly lit."
+    return prompt
+
+
+def _clip_seconds(path: str) -> float:
+    return float(ad_qc.probe(path)["duration"])
+
+
+def _render_spec(spec: dict, w: int, h: int, tmp: str, scale: float = 1.0) -> None:
+    """(Re)renders one scene from its spec into spec["clip"], recording what was drawn where."""
+    pages = ad_compose.layout_caption(spec["caption"], w, h, scale)
+    timed = ad_compose.time_pages(pages, 0.0, spec["duration"])
+    out = os.path.join(tmp, f"scene_{spec['index']}_{spec.get('version', 0)}.mp4")
+    prefix = f"s{spec['index']}v{spec.get('version', 0)}"
+    if spec["kind"] == "video":
+        spec["drawn"] = ad_compose.render_video_scene(
+            spec["video"], w, h, timed, out, tmp, prefix,
+            duration=None if spec.get("native_audio") else spec["duration"],
+            audio=None if spec.get("native_audio") else spec["audio"])
+    else:
+        spec["drawn"] = ad_compose.render_image_scene(
+            spec["image"], "fit" if spec["kind"] == "asset" else "cover", w, h, spec["duration"], spec["audio"],
+            timed, out, tmp, prefix, logo=spec.get("logo"), pan=spec.get("pan", "center"))
+    spec["clip"] = out
+    spec["version"] = spec.get("version", 0) + 1
+
+
+def _voice_track(text: str, planned: float, voice: str, campaign_id: str, tmp: str, name: str,
+                 minimum: float = 0.0) -> tuple[str, float]:
+    """A scene's sound: the voiceover (padded with silence to the planned length, never cut mid-word) or
+    silence. Returns (path, seconds)."""
+    target = max(planned, minimum)
+    path = os.path.join(tmp, f"{name}.wav")
+    if not text:
+        ad_compose.silence(target, path)
+        return path, target
+    raw = os.path.join(tmp, f"{name}_raw.wav")
+    _fetch_local(_generate_ad_line_audio(text, voice, campaign_id), raw)
+    spoken = _ffprobe_duration(raw)
+    if spoken >= target:
+        return raw, spoken
+    pad = os.path.join(tmp, f"{name}_pad.wav")
+    _render_silence(target - spoken, pad)
+    _concat_audio([raw, pad], path)
+    return path, target
+
+
+def _plan_timeline(specs: list[dict], end_card: dict) -> dict:
+    t, scenes = 0.0, []
+    for sp in specs:
+        d = _clip_seconds(sp["clip"])
+        scenes.append({"index": sp["index"], "start": t, "end": t + d, "kind": sp["kind"],
+                       "has_voice": bool(sp.get("dialogue")), "drawn": sp.get("drawn", {})})
+        t += d
+    d = _clip_seconds(end_card["clip"])
+    return {"scenes": scenes, "end_card": {"start": t, "end": t + d, "drawn": end_card.get("drawn", {}),
+                                           "has_logo": bool(end_card.get("logo"))}}
+
+
+def _save_campaign(campaign_id: str, fields: dict) -> None:
+    """Updates the campaign; if the quality columns don't exist yet (ads_studio_quality.sql not run), saves
+    the rest and folds the report summary into the error text instead of losing it."""
+    try:
+        supabase_admin.table("ad_campaigns").update(fields).eq("id", campaign_id).execute()
+    except Exception as e:
+        if "quality_report" not in str(e) and "preview_video_url" not in str(e):
+            raise
+        rest = {k: v for k, v in fields.items() if k not in ("quality_report", "preview_video_url")}
+        if fields.get("preview_video_url"):
+            rest["error"] = ((rest.get("error") or "") + f" Preview: {fields['preview_video_url']}").strip()
+        supabase_admin.table("ad_campaigns").update(rest).eq("id", campaign_id).execute()
+
+
 def _run_ad_generation(campaign_id: str, job_id: str) -> None:
-    """The actual generation pipeline — runs in FastAPI's BackgroundTasks
-    thread (this is a plain `def`, not `async def`, specifically so
-    FastAPI dispatches it off the event loop into a worker thread; it's
-    full of blocking subprocess/requests calls that would otherwise stall
-    every other in-flight request). Any exception anywhere in here is
-    caught at the bottom and recorded on both the job and campaign rows
-    rather than propagating — there's no HTTP response left to raise
-    into once a background task is running."""
+    """Runs in a BackgroundTasks worker thread (plain def: it blocks on ffmpeg and network).
+
+    1. Facts: the brand name, website and call to action come only from the campaign; every caption,
+       voiceover line and visual description is checked against them (ad_brand) before rendering.
+    2. Assets: every uploaded asset is downloaded and verified; scenes about the app/site use real
+       screenshots; a broken asset is reported, never shown.
+    3. Render: each scene with the layout engine (ad_compose): captions only in their band, real assets
+       whole and above it, the brand mark in its corner; then an end card with the logo, exact name,
+       exact website and exact call to action.
+    4. Check the finished file (ad_qc) and correct what can be corrected automatically (smaller captions,
+       a real screenshot or a regenerated image instead of a black/blank or text-bearing scene, a plain end
+       card if the text isn't readable, a redone voiceover), then check again.
+    5. Deliver only if every check passes; otherwise the campaign is "needs_correction" with the reasons
+       and a preview, never presented as a finished ad."""
     try:
         campaign = _get_campaign(campaign_id)
-        scenes = campaign.get("script") or []
-        if not scenes:
+        script = campaign.get("script") or []
+        if not script:
             raise HTTPException(status_code=400, detail="No script to generate from.")
+        facts = ad_brand.BrandFacts.from_campaign(campaign)
+        scenes, brand_changes = ad_brand.sanitize_script(copy.deepcopy(script), facts)
         assets = _load_campaign_assets(campaign_id)
         assets_by_id = {a["id"]: a for a in assets}
-        # A screenshot as loose "style inspiration" for a generated
-        # creative scene produces nonsense (the model redraws random
-        # UI into an unrelated shot) — excluded from the generic
-        # conditioning pool. A product photo or logo is legitimate
-        # style/brand grounding for a generated scene even when that
-        # scene isn't showing the asset itself verbatim, so those stay.
-        creative_reference_urls = [a["url"] for a in assets if a.get("asset_type") != "screenshot"]
         aspect_ratio = campaign.get("aspect_ratio") or "9:16"
         resolution = campaign.get("resolution") or "720p"
         use_veo = bool(campaign.get("use_veo"))
         veo_tier = campaign.get("veo_tier") or DEFAULT_VEO_TIER
-        width, height = _ad_target_dimensions(aspect_ratio, resolution)
+        w, h = _ad_target_dimensions(aspect_ratio, resolution)
 
         voice_name = campaign.get("voice_name")
         if not voice_name:
             voice_name = _auto_assign_voice(campaign.get("voice_gender_preference") or "", "adult", set())
             supabase_admin.table("ad_campaigns").update({"voice_name": voice_name}).eq("id", campaign_id).execute()
-
         _update_job(job_id, status="running", progress_pct=1)
 
         import tempfile as _tempfile
         with _tempfile.TemporaryDirectory() as tmp:
-            clip_paths = []
-            total = len(scenes)
-            for i, scene in enumerate(scenes):
+            local, asset_issues = _prepare_assets(assets, tmp)
+            scenes = _assign_real_assets(scenes, assets, local)
+            logo_id = next((a["id"] for a in assets if a.get("asset_type") == "logo" and a["id"] in local), None)
+            logo_path = local.get(logo_id) if logo_id else None
+            # Generated scenes may borrow a product photo/logo as style grounding; never a screenshot.
+            creative_refs = [a["url"] for a in assets if a.get("asset_type") != "screenshot" and a["id"] in local]
+
+            body, closing = scenes[:-1], scenes[-1]
+            specs, total = [], len(scenes) + 1
+            for i, scene in enumerate(body):
                 dialogue = (scene.get("dialogue_or_vo") or "").strip()
-                planned_seconds = float(scene.get("seconds") or 3.0)
-                caption = (scene.get("caption_text") or dialogue).strip()
-                clip_path = os.path.join(tmp, f"scene_{i}_clip.mp4")
-
-                featured_asset = assets_by_id.get((scene.get("featured_asset_id") or "").strip())
-                use_exact_asset = bool(featured_asset) and featured_asset.get("asset_type") in EXACT_ASSET_TYPES
-
-                if use_exact_asset:
-                    # Deterministic compositing on the REAL uploaded
-                    # asset — never regenerated, never Veo-animated —
-                    # so its pixels are guaranteed to be exactly what
-                    # the user actually uploaded (the real app
-                    # screenshot, product photo, or logo), not an AI
-                    # model's reinterpretation of it. See section 2 of
-                    # the Ads Studio spec: "use deterministic video
-                    # compositing rather than asking an image or video
-                    # model to recreate their details from text."
-                    url_path = featured_asset["url"].split("?")[0]
-                    ext = os.path.splitext(url_path)[1] or ".jpg"
-                    image_path = os.path.join(tmp, f"scene_{i}_real_asset{ext}")
-                    _download_to_file(featured_asset["url"], image_path)
-                    audio_path, scene_duration, cues = _build_scene_audio_track(
-                        dialogue, planned_seconds, caption, voice_name, campaign_id, tmp, i
-                    )
-                    pan = "left_right" if i % 2 else "center"
-                    _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
+                planned = float(scene.get("seconds") or 3.0)
+                spec = {"index": i, "dialogue": dialogue, "caption": (scene.get("caption_text") or dialogue).strip(),
+                        "pan": "left_right" if i % 2 else "center", "scene": scene}
+                featured = assets_by_id.get((scene.get("featured_asset_id") or "").strip())
+                if featured and featured["id"] in local and featured.get("asset_type") in EXACT_ASSET_TYPES:
+                    spec.update(kind="asset", image=local[featured["id"]], asset_id=featured["id"])
+                    spec["audio"], spec["duration"] = _voice_track(dialogue, planned, voice_name, campaign_id, tmp, f"a{i}")
+                    # The brand mark stays off the hook and off a scene already showing the logo.
+                    spec["logo"] = logo_path if (i > 0 and featured["id"] != logo_id) else None
                 else:
-                    image_prompt = (
-                        f"Cinematic marketing video scene. {aspect_ratio} aspect ratio. "
-                        f"Camera shot: {scene.get('camera_shot') or 'medium'} shot. "
-                        f"What's happening: {scene.get('visual_description') or ''}\n\n"
-                        "No text, no watermark, no captions baked into the image."
-                    )
-                    image_url = _generate_ad_scene_image(image_prompt, creative_reference_urls, campaign_id)
-
-                    if use_veo and dialogue:
-                        # Veo generates the video AND voices the
-                        # dialogue itself — kept as-is (not layered
-                        # with a separate TTS track) for real lip-
-                        # adjacent sync. The clip's length follows
-                        # Veo's own fixed duration, not the script's
-                        # planned seconds — see
-                        # _render_ad_scene_clip_veo_native_audio's
-                        # docstring for why looping/trimming generated
-                        # speech would be worse than a little total-
-                        # runtime drift.
-                        video_url, veo_duration = _generate_ad_scene_video(
+                    image_url = _generate_ad_scene_image(_image_prompt(scene, campaign, aspect_ratio), creative_refs, campaign_id)
+                    image_path = os.path.join(tmp, f"gen_{i}.png")
+                    _fetch_local(image_url, image_path)
+                    spec.update(kind="generated", image=image_path, logo=logo_path if i > 0 else None)
+                    if use_veo:
+                        video_url, veo_seconds = _generate_ad_scene_video(
                             image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
-                            aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue, target_seconds=planned_seconds,
-                        )
-                        video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
-                        _download_to_file(video_url, video_path)
-                        scene_duration = float(veo_duration)
-                        cues = _scene_cues([caption], [scene_duration]) if caption else []
-                        _render_ad_scene_clip_veo_native_audio(video_path, cues, width, height, clip_path)
-                    else:
-                        audio_path, scene_duration, cues = _build_scene_audio_track(
-                            dialogue, planned_seconds, caption, voice_name, campaign_id, tmp, i
-                        )
-                        if use_veo:
-                            # No dialogue — a pure visual/establishing
-                            # beat. Veo's own ambient audio is kept (no
-                            # speech to protect from looping), so the
-                            # silence track above is unused here; it
-                            # still gets rendered for simplicity/
-                            # symmetry with the Ken Burns path.
-                            video_url, _ = _generate_ad_scene_video(
-                                image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
-                                aspect_ratio, campaign_id, veo_tier=veo_tier,
-                            )
-                            video_path = os.path.join(tmp, f"scene_{i}_veo.mp4")
-                            _download_to_file(video_url, video_path)
-                            _render_ad_scene_clip_from_video(video_path, audio_path, cues, scene_duration, width, height, clip_path)
+                            aspect_ratio, campaign_id, veo_tier=veo_tier, dialogue=dialogue or None, target_seconds=planned)
+                        spec["video"] = os.path.join(tmp, f"veo_{i}.mp4")
+                        _fetch_local(video_url, spec["video"])
+                        spec["kind"] = "video"
+                        if dialogue:
+                            spec["native_audio"], spec["duration"] = True, float(veo_seconds)
+                            spec["audio"] = None
                         else:
-                            image_path = os.path.join(tmp, f"scene_{i}.png")
-                            _download_to_file(image_url, image_path)
-                            pan = "left_right" if i % 2 else "center"
-                            _render_ad_scene_clip(image_path, audio_path, cues, scene_duration, pan, width, height, clip_path)
+                            spec["audio"], spec["duration"] = _voice_track("", planned, voice_name, campaign_id, tmp, f"a{i}")
+                    else:
+                        spec["audio"], spec["duration"] = _voice_track(dialogue, planned, voice_name, campaign_id, tmp, f"a{i}")
+                _render_spec(spec, w, h, tmp)
+                specs.append(spec)
+                _update_job(job_id, progress_pct=int((i + 1) / total * 80))
 
-                _validate_clip(clip_path, f"Scene {i + 1}")
-                clip_paths.append(clip_path)
-                _update_job(job_id, progress_pct=int((i + 1) / total * 85))
+            # Closing card: only the advertiser's own facts.
+            closing_line = (closing.get("dialogue_or_vo") or "").strip()
+            audio, seconds = _voice_track(closing_line, float(closing.get("seconds") or 3.0), voice_name, campaign_id,
+                                          tmp, "end", minimum=MIN_END_CARD_SECONDS)
+            background = next((sp["image"] for sp in reversed(specs) if sp["kind"] in ("generated", "video")), None)
+            end_card = {"audio": audio, "duration": seconds, "logo": logo_path, "background": background,
+                        "dialogue": closing_line, "plain": False}
 
-            assembled_path = os.path.join(tmp, "assembled.mp4")
-            labels = [f"Scene {i + 1}" for i in range(len(scenes))]
-            _concat_clips(clip_paths, assembled_path, labels=labels)
+            def render_end(version: int) -> None:
+                end_card["clip"] = os.path.join(tmp, f"end_{version}.mp4")
+                end_card["drawn"] = ad_compose.render_end_card(
+                    facts.name, facts.display_url, facts.cta, w, h, end_card["duration"], end_card["audio"],
+                    end_card["clip"], tmp, logo=end_card["logo"], background=end_card["background"], plain=end_card["plain"])
 
-            final_path = assembled_path
-            music_url = campaign.get("music_url")
-            if music_url:
-                music_path = os.path.join(tmp, "music_src")
-                _download_to_file(music_url, music_path)
-                mixed_path = os.path.join(tmp, "with_music.mp4")
-                _mix_background_music(assembled_path, music_path, _ffprobe_duration(assembled_path), mixed_path)
-                final_path = mixed_path
-            _update_job(job_id, progress_pct=90)
+            render_end(0)
+            _update_job(job_id, progress_pct=84)
+
+            def assemble(tag: str) -> str:
+                assembled = os.path.join(tmp, f"assembled_{tag}.mp4")
+                ad_compose.concat([sp["clip"] for sp in specs] + [end_card["clip"]], assembled)
+                music_url = campaign.get("music_url")
+                if not music_url:
+                    return assembled
+                music = os.path.join(tmp, "music_src")
+                if not os.path.exists(music):
+                    _fetch_local(music_url, music)
+                mixed = os.path.join(tmp, f"with_music_{tag}.mp4")
+                _mix_background_music(assembled, music, _ffprobe_duration(assembled), mixed)
+                return mixed
+
+            final_path = assemble("0")
+            # A missing name/website is simply left out; a website that was given but isn't valid must be fixed.
+            blocking = asset_issues + ([i for i in facts.issues if "valid web address" in i])
+            plan = _plan_timeline(specs, end_card)
+            plan["asset_issues"] = blocking
+            report = ad_qc.inspect(final_path, plan, facts, w, h, tmp)
+            corrections: list[str] = []
+            if not report["passed"]:
+                corrections = _auto_correct(report, specs, end_card, render_end, assets, local, campaign,
+                                            campaign_id, aspect_ratio, voice_name, w, h, tmp)
+                if corrections:
+                    final_path = assemble("1")
+                    plan = _plan_timeline(specs, end_card)
+                    plan["asset_issues"] = blocking
+                    report = ad_qc.inspect(final_path, plan, facts, w, h, tmp)
+            report["corrections"] = corrections
+            report["brand_corrections"] = brand_changes
+            report["notes"] = list(facts.issues)
+            _update_job(job_id, progress_pct=92)
 
             duration_actual = int(round(_ffprobe_duration(final_path)))
             thumb_path = os.path.join(tmp, "thumb.jpg")
             _extract_thumbnail(final_path, thumb_path)
             with open(thumb_path, "rb") as f:
-                thumb_bytes = f.read()
-            thumbnail_url = _upload_image(thumb_bytes, "image/jpeg", f"ads/{campaign_id}/thumb_{uuid.uuid4().hex}.jpg")
-
+                thumbnail_url = _upload_image(f.read(), "image/jpeg", f"ads/{campaign_id}/thumb_{uuid.uuid4().hex}.jpg")
             video_id = _upload_finished_video_to_bunny(final_path, campaign.get("target_name") or "Viyo Ad")
-            video_url = _bunny_playback_url(video_id)
+            playback = _bunny_playback_url(video_id)
             _update_job(job_id, progress_pct=97)
 
-        supabase_admin.table("ad_campaigns").update({
-            "video_url": video_url,
-            "bunny_video_id": video_id,
-            "thumbnail_url": thumbnail_url,
-            "duration_actual_seconds": duration_actual,
-            "status": "ready",
-            "error": None,
-        }).eq("id", campaign_id).execute()
-        _update_job(job_id, status="succeeded", progress_pct=100)
+        if report["passed"]:
+            _save_campaign(campaign_id, {
+                "video_url": playback, "bunny_video_id": video_id, "thumbnail_url": thumbnail_url,
+                "duration_actual_seconds": duration_actual, "status": "ready", "error": None,
+                "quality_report": report, "preview_video_url": None})
+            _update_job(job_id, status="succeeded", progress_pct=100)
+        else:
+            reason = ad_qc.explain(report)
+            _save_campaign(campaign_id, {
+                "video_url": None, "bunny_video_id": video_id, "thumbnail_url": thumbnail_url,
+                "duration_actual_seconds": duration_actual, "status": "needs_correction", "error": reason,
+                "quality_report": report, "preview_video_url": playback})
+            _update_job(job_id, status="needs_correction", progress_pct=100, error=reason[:1000])
     except HTTPException as e:
         supabase_admin.table("ad_campaigns").update({"status": "failed", "error": e.detail}).eq("id", campaign_id).execute()
         _update_job(job_id, status="failed", error=str(e.detail))
     except Exception as e:
         supabase_admin.table("ad_campaigns").update({"status": "failed", "error": str(e)}).eq("id", campaign_id).execute()
         _update_job(job_id, status="failed", error=str(e))
+
+
+def _auto_correct(report: dict, specs: list[dict], end_card: dict, render_end, assets: list[dict], local: dict,
+                  campaign: dict, campaign_id: str, aspect_ratio: str, voice_name: str, w: int, h: int,
+                  tmp: str) -> list[str]:
+    """One round of fixes for what the check found, scene by scene. Returns what was done."""
+    done, regenerations = [], 0
+    photos = [a["id"] for a in assets if a.get("asset_type") in ("screenshot", "product_photo") and a["id"] in local]
+    used = {sp.get("asset_id") for sp in specs}
+    spare = [a for a in photos if a not in used] + [a for a in photos if a in used]
+    by_index = {sp["index"]: sp for sp in specs}
+    for key, problems in report.get("failing_scenes", {}).items():
+        if key == "end":
+            end_card["plain"] = True
+            render_end(1)
+            done.append("End card re-rendered on a plain background so the logo, website and call to action read clearly.")
+            continue
+        sp = by_index.get(int(key))
+        if not sp:
+            continue
+        n = sp["index"] + 1
+        if any(p in problems for p in ("black", "screen", "website")) and sp["kind"] in ("generated", "video"):
+            if spare:
+                aid = spare.pop(0)
+                sp.update(kind="asset", image=local[aid], asset_id=aid, native_audio=False)
+                if sp.get("audio") is None:
+                    sp["audio"], sp["duration"] = _voice_track(sp.get("dialogue", ""), sp["duration"], voice_name,
+                                                               campaign_id, tmp, f"a{sp['index']}_fix")
+                done.append(f"Scene {n}: replaced the generated picture with a real product image.")
+            elif sp["kind"] == "video":
+                sp["kind"] = "generated"
+                if sp.get("audio") is None:
+                    sp["audio"], sp["duration"] = _voice_track(sp.get("dialogue", ""), sp["duration"], voice_name,
+                                                               campaign_id, tmp, f"a{sp['index']}_fix")
+                done.append(f"Scene {n}: used the scene's still image instead of the animated clip.")
+            elif regenerations < MAX_IMAGE_REGENERATIONS:
+                regenerations += 1
+                url = _generate_ad_scene_image(_image_prompt(sp["scene"], campaign, aspect_ratio, stricter=True), [], campaign_id)
+                sp["image"] = os.path.join(tmp, f"gen_{sp['index']}_fix.png")
+                _fetch_local(url, sp["image"])
+                done.append(f"Scene {n}: generated a new picture (the first had a blank screen, black frames or stray text).")
+            else:
+                continue
+            _render_spec(sp, w, h, tmp)
+        elif "voice" in problems and sp.get("dialogue") and not sp.get("native_audio"):
+            sp["audio"], sp["duration"] = _voice_track(sp["dialogue"], sp["duration"], voice_name, campaign_id, tmp,
+                                                       f"a{sp['index']}_retry")
+            _render_spec(sp, w, h, tmp)
+            done.append(f"Scene {n}: redid the voiceover.")
+        elif any(p in problems for p in ("clipping", "safe", "overlap")):
+            _render_spec(sp, w, h, tmp, scale=0.85)
+            done.append(f"Scene {n}: re-rendered with smaller captions.")
+    return done
 
 
 class JobOut(BaseModel):
