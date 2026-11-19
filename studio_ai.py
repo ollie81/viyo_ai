@@ -934,7 +934,11 @@ class FakeStudioAI:
         self._maybe_fail("voice")
         seconds = max(0.8, len(text.split()) / 2.4)
         rate = 24000
-        pcm = b"\x00\x00" * int(rate * seconds)
+        # An audible stand-in voice (a soft tone, not silence), so the final film check treats it like speech.
+        import math
+        import struct
+        n = int(rate * seconds)
+        pcm = b"".join(struct.pack("<h", int(3000 * math.sin(2 * math.pi * 220 * i / rate))) for i in range(n))
         return _pcm_to_wav(pcm, rate), seconds, pricing.voice_cost(seconds)
 
     def video(self, prompt, first_frame, aspect_ratio, seconds=8, references=None):
