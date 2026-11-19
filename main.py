@@ -199,11 +199,13 @@ try:
     from ads_publish import admin_router as ads_publish_admin_router
     from ads_brands import router as ads_brands_router
     from ads_ideas import router as ads_ideas_router
+    from ads_insights import router as ads_insights_router
 
     app.include_router(ads_maker_router)
     app.include_router(ads_publish_admin_router)
     app.include_router(ads_brands_router)
     app.include_router(ads_ideas_router)
+    app.include_router(ads_insights_router)
 except Exception as _ads_maker_import_error:
     print(f"[WARN] Ads Maker router not loaded: {_ads_maker_import_error}")
 
