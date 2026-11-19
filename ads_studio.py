@@ -122,6 +122,7 @@ from studio import (
     _ZOOM_MAX,
 )
 from bunny_stream import _playback_url as _bunny_playback_url
+from bunny_stream import _thumbnail_url as _bunny_thumbnail_url
 
 router = APIRouter(prefix="/api/v1/admin/ads-studio", tags=["ads_studio"])
 
