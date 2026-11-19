@@ -31,6 +31,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from pydantic import BaseModel, Field
 
 import ad_brand
+import ads_publish
 import ads_studio as core
 import studio_pricing as pricing
 from creator_studio import creator
@@ -470,3 +471,25 @@ async def reuse_character(campaign_id: str, character_id: str, user_id: str = De
 async def get_estimate(campaign_id: str, user_id: str = Depends(creator)):
     c = owned_campaign(campaign_id, user_id)
     return {**estimate(c), "available": int(_balance(user_id).get("available") or 0)}
+
+
+# ---------------------------------------------------------------- publish to VIYO
+
+@router.get("/campaigns/{campaign_id}/publish")
+async def publish_options(campaign_id: str, user_id: str = Depends(creator)):
+    """Categories, suggestions, thumbnail choices and the current post (if published) for this ad."""
+    c = owned_campaign(campaign_id, user_id)
+    return ads_publish.options(c, core._load_campaign_assets(c["id"]))
+
+
+@router.post("/campaigns/{campaign_id}/publish")
+async def publish(campaign_id: str, body: ads_publish.PublishIn, user_id: str = Depends(creator)):
+    """Posts the finished ad on VIYO (public or private), or updates its post. The same Bunny video, no copy."""
+    c = owned_campaign(campaign_id, user_id)
+    return ads_publish.publish(c, body, core._load_campaign_assets(c["id"]))
+
+
+@router.post("/campaigns/{campaign_id}/unpublish")
+async def unpublish(campaign_id: str, user_id: str = Depends(creator)):
+    """Takes the post off VIYO (archived, never deleted). The creator keeps the ad and can download it."""
+    return ads_publish.unpublish(owned_campaign(campaign_id, user_id))

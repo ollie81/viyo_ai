@@ -196,8 +196,10 @@ except Exception as _ads_studio_import_error:
 # Ads Maker for creators: same pipeline, signed-in creators, their own campaigns only, paid with Studio credits.
 try:
     from ads_maker import router as ads_maker_router
+    from ads_publish import admin_router as ads_publish_admin_router
 
     app.include_router(ads_maker_router)
+    app.include_router(ads_publish_admin_router)
 except Exception as _ads_maker_import_error:
     print(f"[WARN] Ads Maker router not loaded: {_ads_maker_import_error}")
 
