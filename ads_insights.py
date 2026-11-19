@@ -145,25 +145,32 @@ def insights(user_id: str, days: int = 30) -> dict:
         trend.append({"day": d, "likes": lk.get(d, 0), "comments": cm.get(d, 0),
                       "views": deltas[d]["views"] if d in deltas else None,
                       "shares": deltas[d]["shares"] if d in deltas else None})
+    try:
+        promoted = {r["post_id"] for r in (_db().table("ad_promotions").select("*").eq("owner_id", user_id)
+                                           .execute().data or [])}
+    except Exception:
+        promoted = set()
     totals = {"organic": {"ads": 0, "views": 0, "likes": 0, "comments": 0, "shares": 0},
               "paid": {"ads": 0, "views": 0, "likes": 0, "comments": 0, "shares": 0}}
     out_posts = []
     for p in posts:
         s = _stats(p)
-        bucket = totals["paid" if p.get("is_boosted") else "organic"]
+        paid = bool(p.get("is_boosted")) or p["id"] in promoted
+        bucket = totals["paid" if paid else "organic"]
         bucket["ads"] += 1
         for k in ("views", "likes", "comments", "shares"):
             bucket[k] += s[k]
         out_posts.append({"post_id": p["id"], "campaign_id": p.get("ad_campaign_id"), "caption": p.get("caption") or "",
                           "thumbnail_url": p.get("thumbnail_url"), "public": not p.get("is_private"),
-                          "paid": bool(p.get("is_boosted")), "published_at": p.get("created_at"), **s})
+                          "paid": paid, "published_at": p.get("created_at"), **s})
     for b in totals.values():
         b["engagement_rate"] = round((b["likes"] + b["comments"] + b["shares"]) / b["views"], 4) if b["views"] else None
     out_posts.sort(key=lambda x: x["views"], reverse=True)
     notes = ["Views and shares per day appear from the days your insights were opened (daily snapshots); "
              "likes and comments per day are exact."]
     if totals["paid"]["ads"]:
-        notes.append("Boosted ads are counted as paid. A boosted ad's views can't yet be split into paid and organic.")
+        notes.append("Boosted and promoted ads are counted as paid. Their views can't be split into paid and organic "
+                     "per view; a promotion's own impressions and clicks are in My promotions.")
     return {"days": days, "totals": totals, "posts": out_posts, "trend": trend,
             "followers": _followers(user_id, since), "notes": notes}
 
