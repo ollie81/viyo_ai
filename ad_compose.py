@@ -300,7 +300,7 @@ def _fit_size(text: str, start: int, smallest: int, max_w: int) -> int:
     return s
 
 
-def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_logo: bool) -> dict:
+def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_logo: bool, product: str = "") -> dict:
     """Logo, brand name, website and call to action stacked in the centre of the safe area, each sized to
     fit the width (a long address wraps onto a second line instead of being cut). Missing items are left
     out, never filled in."""
@@ -318,6 +318,10 @@ def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_l
         s = _fit_size(name, round(m * (0.085 if not has_logo else 0.07)), round(m * 0.04), inner)
         for line in wrap(name, s, inner)[:2]:
             items.append(("name", line, s, text_width(line, s), round(s * 1.25)))
+    if product:
+        s = _fit_size(product, round(m * 0.048), round(m * 0.034), inner)
+        for line in wrap(product, s, inner)[:2]:
+            items.append(("product", line, s, text_width(line, s), round(s * 1.25)))
     if display_url:
         s = _fit_size(display_url, round(m * 0.052), round(m * 0.034), inner)
         for line in wrap(display_url, s, inner):
@@ -340,10 +344,10 @@ def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_l
 
 def render_end_card(name: str, display_url: str, cta: str, w: int, h: int, duration: float, audio: str,
                     out: str, tmp: str, logo: Optional[str] = None, background: Optional[str] = None,
-                    plain: bool = False) -> dict:
+                    plain: bool = False, product: str = "") -> dict:
     """The closing card, built only from the advertiser's own facts. [plain]: a solid background (used as
     an automatic correction when the image background made the text hard to read)."""
-    lay = end_card_layout(name, display_url, cta, w, h, bool(logo))
+    lay = end_card_layout(name, display_url, cta, w, h, bool(logo), product)
     inputs, graph = [], []
     if background and not plain:
         inputs += ["-loop", "1", "-framerate", str(FPS), "-i", background]
@@ -365,9 +369,9 @@ def render_end_card(name: str, display_url: str, cta: str, w: int, h: int, durat
     draws = []
     for i, it in enumerate(lay["items"]):
         b, s = it["box"], it["size"]
-        if it["kind"] in ("name", "url"):
+        if it["kind"] in ("name", "product", "url"):
             tf = _textfile(tmp, f"end_{i}.txt", it["text"])
-            color = "white" if it["kind"] == "name" else "0xdfe7ff"
+            color = {"name": "white", "product": "0xd6d6e0", "url": "0xdfe7ff"}[it["kind"]]
             draws.append(f"drawtext=fontfile={FONT_BOLD}:textfile='{tf}':fontsize={s}:fontcolor={color}:"
                          f"borderw={max(2, round(s * 0.06))}:bordercolor=black@0.7:x={b.x}:y={b.y}")
             texts.append(it["text"])

@@ -134,10 +134,41 @@ def flat_dark_block(image: str, min_frac: float = 0.18) -> bool:
     try:
         import cv2
         n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
-        biggest = max((stats[i, cv2.CC_STAT_AREA] for i in range(1, n)), default=0)
-        return biggest / mask.size >= min_frac
     except Exception:
-        return True
+        return False
+    for i in range(1, n):
+        x, y, bw, bh, area = (int(v) for v in stats[i])
+        if area / mask.size < min_frac:
+            continue
+        # A blank device screen sits inside the picture as a solid, roughly rectangular block. A dark sky,
+        # room or background runs from one side of the frame to the other, and isn't a blank screen.
+        spans_width = x <= 1 and x + bw >= 95
+        solid = area / float(bw * bh) >= 0.8
+        if solid and not spans_width:
+            return True
+    return False
+
+
+def logo_visible(image: str, box: dict, logo: str, centered: bool = False, max_diff: float = 38.0) -> bool:
+    """True if the advertiser's logo file is really visible at [box] in the frame: the logo is scaled the way
+    the renderer placed it and its opaque pixels are compared with the frame (mean colour difference).
+    Catches a missing, covered or wrong logo, not just an empty area."""
+    try:
+        frame_im = Image.open(image).convert("RGB")
+        lg = Image.open(logo).convert("RGBA")
+    except Exception:
+        return False
+    scale = min(box["w"] / lg.width, box["h"] / lg.height)
+    lw, lh = max(1, int(lg.width * scale)), max(1, int(lg.height * scale))
+    lg = lg.resize((lw, lh))
+    x = box["x"] + ((box["w"] - lw) // 2 if centered else 0)
+    y = box["y"] + ((box["h"] - lh) // 2 if centered else 0)
+    crop = np.asarray(frame_im.crop((x, y, x + lw, y + lh)), dtype=np.float32)
+    ref = np.asarray(lg, dtype=np.float32)
+    mask = ref[..., 3] > 200
+    if mask.sum() < 20 or crop.shape[:2] != mask.shape:
+        return False
+    return float(np.abs(crop[mask] - ref[..., :3][mask]).mean()) <= max_diff
 
 
 def region_has_content(image: str, box: dict, min_std: float = 12.0) -> bool:
@@ -167,6 +198,13 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
         "" if info["has_audio"] else "The video has no audio track.")
 
     scenes = plan.get("scenes", [])
+    expected = plan.get("expected_seconds")
+    if expected:
+        drift = abs(info["duration"] - expected) / expected
+        add("duration", "Length as planned", "passed" if drift <= 0.25 else "warning" if drift <= 0.6 else "failed",
+            f"{info['duration']:.1f}s (planned {expected:.0f}s).")
+    if info["duration"] < 2.0:
+        add("duration_min", "Long enough to watch", "failed", f"Only {info['duration']:.1f}s long.")
 
     def scene_at(t: float) -> Optional[int]:
         for s in scenes:
@@ -215,6 +253,9 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
             add("clipping", f"Scene {s['index'] + 1}: captions inside the frame", "failed",
                 "Caption text touches the edge of the frame.", s["index"])
         drawn = s.get("drawn", {})
+        if drawn.get("brand_mark") and plan.get("logo_path") and not logo_visible(img, drawn["brand_mark"], plan["logo_path"]):
+            add("brand_mark", f"Scene {s['index'] + 1}: logo visible", "failed", "The logo in the corner isn't visible.",
+                s["index"])
         for c in drawn.get("captions", []):
             cb = Box(**c)
             if not cb.inside(Box(0, 0, w, h)) or not cb.inside(lay["safe"]):
@@ -261,7 +302,8 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
         else:
             boxes = {it["kind"]: it["box"] for it in drawn.get("items", [])}
             if ec.get("has_logo"):
-                ok = "logo" in boxes and region_has_content(img, boxes["logo"])
+                ok = "logo" in boxes and (logo_visible(img, boxes["logo"], plan["logo_path"], centered=True)
+                                          if plan.get("logo_path") else region_has_content(img, boxes["logo"]))
                 add("logo", "Logo visible at the end", "passed" if ok else "failed",
                     "" if ok else "The logo isn't visible on the end card.", None if ok else "end")
             if "cta" in boxes:
@@ -270,6 +312,18 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
                     None if ok else "end")
             if not drawn.get("fits", True):
                 add("end_layout", "End card fits the frame", "failed", "The end card items don't fit the safe area.", "end")
+            # Final scene composition: every fact the advertiser gave is on it, each in its own area, long
+            # enough to read.
+            missing = [k for k, want in (("logo", ec.get("has_logo")), ("name", bool(facts.name)),
+                                         ("url", bool(facts.url)), ("cta", bool(facts.cta))) if want and k not in boxes]
+            seconds = ec["end"] - ec["start"]
+            if missing or seconds < 2.5:
+                add("final_scene", "Final scene shows the brand", "failed",
+                    (f"Missing from the end card: {', '.join(missing)}. " if missing else "") +
+                    (f"Shown for only {seconds:.1f}s." if seconds < 2.5 else ""), "end")
+            else:
+                add("final_scene", "Final scene shows the brand", "passed", f"{seconds:.1f}s with " +
+                    ", ".join(k for k in ("logo", "name", "url", "cta") if k in boxes) + ".")
             text = ocr(img)
             if facts.url:
                 if text is None:

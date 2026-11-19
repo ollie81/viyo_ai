@@ -65,7 +65,8 @@ def parse_url(raw: str) -> tuple[str, str, str]:
 
 @dataclass
 class BrandFacts:
-    name: str = ""
+    name: str = ""                 # the brand: shown on the end card, never changed
+    product: str = ""              # the product, when it has its own name different from the brand
     url: str = ""                  # exactly as the advertiser supplied it
     host: str = ""                 # for comparisons: lowercase, no www
     display_url: str = ""          # what's shown on screen: the address without "https://"
@@ -76,7 +77,10 @@ class BrandFacts:
 
     @classmethod
     def from_campaign(cls, c: dict) -> "BrandFacts":
-        f = cls(name=(c.get("target_name") or "").strip(), cta=(c.get("cta_text") or "").strip(),
+        brand = (c.get("brand_name") or "").strip()
+        target = (c.get("target_name") or "").strip()
+        f = cls(name=brand or target, product=target if brand and target.lower() != brand.lower() else "",
+                cta=(c.get("cta_text") or "").strip(),
                 description=(c.get("target_description") or "").strip(),
                 features=[str(x) for x in (c.get("target_features") or [])])
         supplied = (c.get("destination_link") or "").strip()
@@ -232,7 +236,9 @@ def prompt_facts(facts: BrandFacts) -> str:
     """The exact facts block every script/hook prompt carries, with the rules that go with it."""
     site = facts.display_url or "NONE — this campaign has no website. Never mention or show any website."
     cta = facts.cta or "NONE supplied — end on the brand name. Never invent a call to action."
+    product = f"PRODUCT NAME (exact spelling, never change it): {facts.product}\n" if facts.product else ""
     return (f"BRAND NAME (exact spelling, never change it): {facts.name or 'not given — do not invent one'}\n"
+            f"{product}"
             f"WEBSITE (the only address that may ever appear or be spoken): {site}\n"
             f"CALL TO ACTION (exact words): {cta}\n"
             "Never invent, shorten, translate or vary the brand name, website, product names or call to action. "

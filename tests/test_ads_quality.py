@@ -190,6 +190,16 @@ def test_black_screen_detector(work):
     assert not ad_qc.flat_dark_block(_img(os.path.join(work, "g.png"), 720, 1280))
 
 
+def test_a_dark_night_scene_is_not_mistaken_for_a_blank_screen(work):
+    im = Image.new("RGB", (1024, 1024))
+    d = ImageDraw.Draw(im)
+    for y in range(1024):                       # a dark sky fading lighter, edge to edge
+        d.line([(0, y), (1024, y)], fill=(int(8 + 60 * y / 1024), int(6 + 30 * y / 1024), int(20 + 90 * y / 1024)))
+    d.ellipse([330, 300, 700, 650], fill=(230, 150, 110))
+    im.save(os.path.join(work, "night.png"))
+    assert not ad_qc.flat_dark_block(os.path.join(work, "night.png"))
+
+
 @pytest.mark.skipif(not ad_qc.ocr_available(), reason="Tesseract not installed")
 def test_ocr_reads_an_invented_website_off_a_frame(work):
     p = _img(os.path.join(work, "t.png"), 1280, 720, text="olliecare.com", size=70)
@@ -280,6 +290,8 @@ def pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(ads_studio, "_generate_ad_line_audio", tts)
     monkeypatch.setattr(ads_studio, "_auto_assign_voice", lambda *a: "Kore")
     monkeypatch.setattr(ads_studio, "_upload_image", lambda *a: "https://example.test/thumb.jpg")
+    previews = []
+    monkeypatch.setattr(ads_studio, "_upload_video_preview", lambda data, path: previews.append(path) or f"https://store.test/{path}")
 
     def bunny(path, title):
         vid = uuid.uuid4().hex
@@ -312,6 +324,7 @@ def pipeline(tmp_path, monkeypatch):
     def run(cid):
         ads_studio._run_ad_generation(cid, "job1")
         c = db.db["ad_campaigns"][0]
+        assert c.get("status") != "failed", c.get("error")      # a crash, not a quality result
         vid = c.get("bunny_video_id")
         return c, db.db["ad_generation_jobs"][0], uploaded.get(vid)
 
@@ -412,3 +425,82 @@ def test_no_website_campaign_shows_none(pipeline):
     if ad_qc.ocr_available():
         end = ad_qc.frame(video, ad_qc.probe(video)["duration"] - 1.0, os.path.join(pipeline["work"], "end.png"))
         assert "olliecare" not in (ad_qc.ocr(end) or "").lower()
+
+
+# ---------------------------------------------------------------- 5. more checks on real files
+
+def _video(path, seconds=3, audio=True, black_from=None, w=720, h=1280):
+    """A real test video: a coloured picture (optionally black for its second half), with or without sound."""
+    vf = f"color=c=0x2a6f99:s={w}x{h}:d={seconds}"
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", vf]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=300:duration={seconds}"]
+    if black_from is not None:
+        cmd += ["-vf", f"drawbox=enable='gte(t,{black_from})':x=0:y=0:w=iw:h=ih:color=black:t=fill"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"] + (["-c:a", "aac", "-shortest"] if audio else []) + [path]
+    subprocess.run(cmd, check=True)
+    return path
+
+
+def test_missing_audio_is_detected(work):
+    plan = {"scenes": [{"index": 0, "start": 0, "end": 3, "kind": "generated", "has_voice": True, "drawn": {}}],
+            "end_card": None}
+    rep = ad_qc.inspect(_video(os.path.join(work, "mute.mp4"), audio=False), plan, facts(), 720, 1280, work)
+    assert next(i for i in rep["items"] if i["key"] == "audio_track")["status"] == "failed"
+    assert not rep["passed"]
+
+
+def test_unexpected_silence_in_a_voiceover_scene_is_detected(work):
+    p = os.path.join(work, "silent.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x2a6f99:s=720x1280:d=3", "-f", "lavfi",
+                    "-i", "anullsrc=r=44100:cl=stereo", "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                    p], check=True)
+    plan = {"scenes": [{"index": 0, "start": 0, "end": 3, "kind": "generated", "has_voice": True, "drawn": {}}],
+            "end_card": None}
+    rep = ad_qc.inspect(p, plan, facts(), 720, 1280, work)
+    assert any(i["key"] == "voice" and i["status"] == "failed" and i["scene"] == 0 for i in rep["items"])
+
+
+def test_black_frames_in_a_real_video_are_detected(work):
+    p = _video(os.path.join(work, "black.mp4"), seconds=4, black_from=2)
+    spans = ad_qc.black_intervals(p)
+    assert spans and spans[0][0] == pytest.approx(2.0, abs=0.2)
+    assert not ad_qc.black_intervals(_video(os.path.join(work, "ok.mp4"), seconds=3))
+
+
+def test_wrong_size_is_detected(work):
+    plan = {"scenes": [], "end_card": None}
+    rep = ad_qc.inspect(_video(os.path.join(work, "landscape.mp4"), w=1280, h=720), plan, facts(), 720, 1280, work)
+    assert next(i for i in rep["items"] if i["key"] == "format")["status"] == "failed"
+
+
+@pytest.mark.parametrize("w,h", SIZES)
+def test_logo_has_a_reserved_place(w, h):
+    lay = ad_compose.frame_layout(w, h)
+    mark = lay["brand_mark"]
+    assert mark.inside(lay["safe"]) and not mark.intersects(lay["caption"])
+    end = ad_compose.end_card_layout("Ollie", "ourollie.space", "Try Ollie free", w, h, has_logo=True)
+    logo = next(it["box"] for it in end["items"] if it["kind"] == "logo")
+    assert logo.inside(lay["safe"])
+    for it in end["items"]:
+        if it["kind"] != "logo":
+            assert not it["box"].intersects(logo)
+
+
+def test_captions_never_appear_on_the_end_card_with_the_cta(pipeline):
+    cid = pipeline["make"]("9:16")
+    c, job, video = pipeline["run"](cid)
+    # What the end card drew is only the advertiser's facts; the closing scene's caption isn't drawn there.
+    texts = c["quality_report"]["items"]
+    assert c["status"] == "ready", [i for i in texts if i["status"] == "failed"]
+    final = next(i for i in texts if i["key"] == "final_scene")
+    assert final["status"] == "passed" and "url" in final["note"] and "cta" in final["note"]
+
+
+def test_a_failed_ad_is_never_uploaded_to_bunny(pipeline):
+    for _ in range(4):
+        pipeline["images"]["queue"].append(lambda p: _img(p, 1024, 1024, black_screen=True))
+    cid = pipeline["make"]("9:16", assets=("logo",))
+    c, job, video = pipeline["run"](cid)
+    assert c["status"] == "needs_correction" and c["bunny_video_id"] is None and video is None
+    assert c["preview_video_url"], "kept privately as a preview"

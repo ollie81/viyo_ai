@@ -160,6 +160,37 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
+# ---------------------------------------------------------------------------
+# Who pays for a run. Admin runs: the shared real-money daily cap (studio.py's _check_daily_cap), as
+# before. Creator runs (ads_maker.py): paid with Studio credits held up front; every provider call is
+# counted here, and a run can never spend more than the credits it held.
+# ---------------------------------------------------------------------------
+import contextvars as _contextvars
+
+_creator_run: "_contextvars.ContextVar[Optional[dict]]" = _contextvars.ContextVar("ads_creator_run", default=None)
+
+
+class BudgetExceeded(HTTPException):
+    def __init__(self):
+        super().__init__(status_code=402, detail="This step would cost more than the credits held for it. "
+                                                 "Nothing more was spent; unused credits are returned.")
+
+
+def _cap(cents) -> None:
+    run = _creator_run.get()
+    if run is None:
+        _check_daily_cap(cents)
+    elif run["spent_cents"] + float(cents) > run["budget_cents"]:
+        raise BudgetExceeded()
+
+
+def _spent(campaign_id: str, call_type: str, cents) -> None:
+    _log_cost(campaign_id, call_type, cents)
+    run = _creator_run.get()
+    if run is not None:
+        run["spent_cents"] += float(cents)
+
+
 def _require_configured() -> None:
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Ads Studio is not configured (Supabase).")
@@ -305,6 +336,7 @@ class CreateCampaignRequest(BaseModel):
     user_id: str
     promote_target: str = Field(..., pattern="^(viyo|ollie_ai|other_app|website|physical_product|business|film|creator_project)$")
     target_name: str = ""
+    brand_name: str = ""          # when the brand and the product have different names
     target_description: str = ""
     target_features: list[str] = []
     target_audience: str = ""
@@ -327,6 +359,7 @@ class CampaignOut(BaseModel):
     target_name: str
     target_description: str
     target_features: list[str]
+    brand_name: str = ""
     target_audience: str
     objective: str
     destination_link: str
@@ -364,6 +397,7 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         target_name=row.get("target_name") or "",
         target_description=row.get("target_description") or "",
         target_features=row.get("target_features") or [],
+        brand_name=row.get("brand_name") or "",
         target_audience=row.get("target_audience") or "",
         objective=row.get("objective") or "",
         destination_link=row.get("destination_link") or "",
@@ -427,6 +461,7 @@ async def create_campaign(req: CreateCampaignRequest):
         "user_id": req.user_id,
         "promote_target": req.promote_target,
         "target_name": req.target_name,
+        **({"brand_name": req.brand_name} if req.brand_name else {}),
         "target_description": req.target_description,
         "target_features": req.target_features,
         "target_audience": req.target_audience,
@@ -453,6 +488,7 @@ async def create_campaign(req: CreateCampaignRequest):
 class UpdateCampaignRequest(BaseModel):
     promote_target: Optional[str] = Field(None, pattern="^(viyo|ollie_ai|other_app|website|physical_product|business|film|creator_project)$")
     target_name: Optional[str] = None
+    brand_name: Optional[str] = None
     target_description: Optional[str] = None
     target_features: Optional[list[str]] = None
     target_audience: Optional[str] = None
@@ -845,7 +881,7 @@ async def generate_hooks(campaign_id: str):
     _require_configured()
     campaign = _get_campaign(campaign_id)
     prompt = _build_hook_prompt(campaign, campaign.get("format"))
-    _check_daily_cap(_estimate_text_cost_cents(prompt))
+    _cap(_estimate_text_cost_cents(prompt))
 
     try:
         response = _gemini_client.models.generate_content(
@@ -864,7 +900,7 @@ async def generate_hooks(campaign_id: str):
         raise HTTPException(status_code=502, detail="Gemini returned a response Ads Studio couldn't parse.")
 
     cost_cents = _text_cost_cents(response.usage_metadata)
-    _log_cost(campaign_id, "ad_hooks", cost_cents)
+    _spent(campaign_id, "ad_hooks", cost_cents)
 
     # Replace this campaign's previous hook set rather than piling up
     # duplicates on every regenerate — a campaign only ever has one
@@ -1173,7 +1209,7 @@ async def generate_script(campaign_id: str):
     # below. This is only a pre-flight budget-cap check; the real spend
     # logged after the call (_text_cost_cents) always reads the actual
     # usage_metadata regardless.
-    _check_daily_cap(_estimate_text_cost_cents(prompt) + len(assets))
+    _cap(_estimate_text_cost_cents(prompt) + len(assets))
     # Gemini actually SEES each uploaded asset (not just a text label)
     # so it can judge which real screenshot/photo genuinely fits which
     # scene — "understand the selected product and use the supplied
@@ -1184,7 +1220,7 @@ async def generate_script(campaign_id: str):
     for i, a in enumerate(assets):
         contents.append(types.Part.from_text(text=f"Asset A{i + 1} ({a.get('asset_type') or 'other'}):"))
         try:
-            contents.append(_fetch_image_part(a["url"]))
+            contents.append(_fetch_image_part(_resolve(a["url"])))
         except HTTPException:
             contents.pop()  # text label with no image behind it is worse than omitting the asset entirely
     contents.append(types.Part.from_text(text=prompt))
@@ -1202,7 +1238,7 @@ async def generate_script(campaign_id: str):
         raise HTTPException(status_code=502, detail="Gemini returned a response Ads Studio couldn't parse.")
 
     cost_cents = _text_cost_cents(response.usage_metadata)
-    _log_cost(campaign_id, "ad_script", cost_cents)
+    _spent(campaign_id, "ad_script", cost_cents)
 
     scenes = sorted((s.model_dump() for s in parsed.scenes), key=lambda s: s["order"])
     scenes = _normalize_scene_durations(scenes, float(campaign.get("duration_seconds") or 15))
@@ -1343,7 +1379,7 @@ def _render_ad_scene_clip_veo_native_audio(
 
 
 def _generate_ad_scene_image(prompt: str, reference_urls: list[str], campaign_id: str) -> str:
-    _check_daily_cap(GEMINI_IMAGE_COST_USD_CENTS)
+    _cap(GEMINI_IMAGE_COST_USD_CENTS)
     reference_parts = [_fetch_image_part(u) for u in reference_urls[:4]]
     try:
         response = _gemini_client.models.generate_content(
@@ -1356,7 +1392,7 @@ def _generate_ad_scene_image(prompt: str, reference_urls: list[str], campaign_id
     image_bytes, mime_type = _extract_image(response)
     ext = "png" if "png" in mime_type else "jpg"
     url = _upload_image(image_bytes, mime_type, f"ads/{campaign_id}/scenes/{uuid.uuid4().hex}.{ext}")
-    _log_cost(campaign_id, "ad_scene_image", GEMINI_IMAGE_COST_USD_CENTS)
+    _spent(campaign_id, "ad_scene_image", GEMINI_IMAGE_COST_USD_CENTS)
     return url
 
 
@@ -1416,7 +1452,7 @@ def _generate_ad_scene_video(
     veo_aspect = "16:9" if aspect_ratio == "16:9" else "9:16"
     duration = _veo_duration_for_scene(target_seconds, bool(dialogue))
     cost_cents = duration * tier["price_per_sec_cents"]
-    _check_daily_cap(cost_cents)
+    _cap(cost_cents)
 
     if dialogue:
         prompt = (
@@ -1442,12 +1478,12 @@ def _generate_ad_scene_video(
     duration = int(round(_omni_seconds))
     cost_cents = _omni_cents
     url = _upload_video_preview(video_bytes, f"ads/{campaign_id}/scenes/{uuid.uuid4().hex}_veo.mp4")
-    _log_cost(campaign_id, "ad_scene_video", cost_cents)
+    _spent(campaign_id, "ad_scene_video", cost_cents)
     return url, duration
 
 
 def _generate_ad_line_audio(text: str, voice_name: str, campaign_id: str) -> str:
-    _check_daily_cap(GEMINI_TTS_LINE_COST_USD_CENTS)
+    _cap(GEMINI_TTS_LINE_COST_USD_CENTS)
     try:
         response = _gemini_client.models.generate_content(
             model=GEMINI_TTS_MODEL,
@@ -1464,7 +1500,7 @@ def _generate_ad_line_audio(text: str, voice_name: str, campaign_id: str) -> str
     pcm_bytes, sample_rate = _extract_audio_pcm(response)
     wav_bytes = _pcm_to_wav(pcm_bytes, sample_rate)
     url = _upload_audio(wav_bytes, f"ads/{campaign_id}/lines/{uuid.uuid4().hex}.wav")
-    _log_cost(campaign_id, "ad_line_audio", GEMINI_TTS_LINE_COST_USD_CENTS)
+    _spent(campaign_id, "ad_line_audio", GEMINI_TTS_LINE_COST_USD_CENTS)
     return url
 
 
@@ -1517,8 +1553,56 @@ MAX_IMAGE_REGENERATIONS = 2     # paid corrections per run (one image each)
 MIN_END_CARD_SECONDS = 3.0
 
 
+PRIVATE_BUCKET = "creator-studio"     # creators' ad files: private, served as one-hour signed links
+PRIVATE_PREFIX = "private:"
+SIGN_SECONDS = 3600
+
+
+def _is_creator(campaign: dict) -> bool:
+    return (campaign.get("created_via") or "admin") == "creator"
+
+
+def _store_file(campaign: dict, data: bytes, mime: str, name: str) -> str:
+    """Stores a file for a campaign. Creator campaigns: the private bucket under the creator's own folder
+    (returns a "private:" reference, never a public link). Admin campaigns: the existing public buckets."""
+    if _is_creator(campaign):
+        path = f"ads/{campaign['user_id']}/{campaign['id']}/{name}"
+        supabase_admin.storage.from_(PRIVATE_BUCKET).upload(path, data, {"content-type": mime, "upsert": "true"})
+        return f"{PRIVATE_PREFIX}{PRIVATE_BUCKET}/{path}"
+    if mime.startswith("video/"):
+        return _upload_video_preview(data, f"ads/{campaign['id']}/{name}")
+    return _upload_image(data, mime, f"ads/{campaign['id']}/{name}")
+
+
+def _resolve(ref: Optional[str]) -> Optional[str]:
+    """A link the app (or the renderer) can open: private references become one-hour signed links."""
+    if not ref or not ref.startswith(PRIVATE_PREFIX):
+        return ref
+    bucket, _, path = ref[len(PRIVATE_PREFIX):].partition("/")
+    try:
+        res = supabase_admin.storage.from_(bucket).create_signed_url(path, SIGN_SECONDS)
+        return (res or {}).get("signedURL") or (res or {}).get("signed_url")
+    except Exception:
+        return None
+
+
+def _preflight(campaign: dict) -> None:
+    """Checks that cost nothing, before any paid step: a website that was given must be valid (it is never
+    guessed or 'fixed'), and there must be a script."""
+    link = (campaign.get("destination_link") or "").strip()
+    if link and not ad_brand.parse_url(link)[0]:
+        raise HTTPException(status_code=400, detail=f'The website "{link}" isn\'t a valid web address. Fix it in the '
+                                                    "campaign before generating; nothing was charged.")
+    if not campaign.get("script"):
+        raise HTTPException(status_code=400, detail="Generate a script first.")
+
+
 def _fetch_local(url: str, path: str) -> None:
     """Downloads a URL (or copies a local file, used by tests and local renders)."""
+    if url.startswith(PRIVATE_PREFIX):
+        url = _resolve(url) or ""
+        if not url:
+            raise RuntimeError("private file not found")
     if url.startswith("file://") or os.path.exists(url):
         shutil.copyfile(url.removeprefix("file://"), path)
     else:
@@ -1693,7 +1777,7 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             logo_id = next((a["id"] for a in assets if a.get("asset_type") == "logo" and a["id"] in local), None)
             logo_path = local.get(logo_id) if logo_id else None
             # Generated scenes may borrow a product photo/logo as style grounding; never a screenshot.
-            creative_refs = [a["url"] for a in assets if a.get("asset_type") != "screenshot" and a["id"] in local]
+            creative_refs = [_resolve(a["url"]) for a in assets if a.get("asset_type") != "screenshot" and a["id"] in local]
 
             body, closing = scenes[:-1], scenes[-1]
             specs, total = [], len(scenes) + 1
@@ -1743,7 +1827,8 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                 end_card["clip"] = os.path.join(tmp, f"end_{version}.mp4")
                 end_card["drawn"] = ad_compose.render_end_card(
                     facts.name, facts.display_url, facts.cta, w, h, end_card["duration"], end_card["audio"],
-                    end_card["clip"], tmp, logo=end_card["logo"], background=end_card["background"], plain=end_card["plain"])
+                    end_card["clip"], tmp, logo=end_card["logo"], background=end_card["background"], plain=end_card["plain"],
+                    product=facts.product)
 
             render_end(0)
             _update_job(job_id, progress_pct=84)
@@ -1764,8 +1849,10 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             final_path = assemble("0")
             # A missing name/website is simply left out; a website that was given but isn't valid must be fixed.
             blocking = asset_issues + ([i for i in facts.issues if "valid web address" in i])
+            expected = float(sum(float(s.get("seconds") or 0) for s in scenes)) or None
             plan = _plan_timeline(specs, end_card)
-            plan["asset_issues"] = blocking
+            plan["asset_issues"], plan["expected_seconds"] = blocking, expected
+            plan["logo_path"] = logo_path
             report = ad_qc.inspect(final_path, plan, facts, w, h, tmp)
             corrections: list[str] = []
             if not report["passed"]:
@@ -1774,7 +1861,8 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                 if corrections:
                     final_path = assemble("1")
                     plan = _plan_timeline(specs, end_card)
-                    plan["asset_issues"] = blocking
+                    plan["asset_issues"], plan["expected_seconds"] = blocking, expected
+                    plan["logo_path"] = logo_path
                     report = ad_qc.inspect(final_path, plan, facts, w, h, tmp)
             report["corrections"] = corrections
             report["brand_corrections"] = brand_changes
@@ -1785,9 +1873,16 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             thumb_path = os.path.join(tmp, "thumb.jpg")
             _extract_thumbnail(final_path, thumb_path)
             with open(thumb_path, "rb") as f:
-                thumbnail_url = _upload_image(f.read(), "image/jpeg", f"ads/{campaign_id}/thumb_{uuid.uuid4().hex}.jpg")
-            video_id = _upload_finished_video_to_bunny(final_path, campaign.get("target_name") or "Viyo Ad")
-            playback = _bunny_playback_url(video_id)
+                thumbnail_url = _store_file(campaign, f.read(), "image/jpeg", f"thumb_{uuid.uuid4().hex}.jpg")
+            if report["passed"]:
+                # Only an ad that passed every check goes to Bunny as a finished video.
+                video_id = _upload_finished_video_to_bunny(final_path, campaign.get("target_name") or "Viyo Ad")
+                playback, preview = _bunny_playback_url(video_id), None
+            else:
+                # A failed ad is kept privately as a preview to look at, never published.
+                with open(final_path, "rb") as f:
+                    preview = _store_file(campaign, f.read(), "video/mp4", f"preview_{uuid.uuid4().hex}.mp4")
+                video_id, playback = None, None
             _update_job(job_id, progress_pct=97)
 
         if report["passed"]:
@@ -1799,9 +1894,9 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
         else:
             reason = ad_qc.explain(report)
             _save_campaign(campaign_id, {
-                "video_url": None, "bunny_video_id": video_id, "thumbnail_url": thumbnail_url,
+                "video_url": None, "bunny_video_id": None, "thumbnail_url": thumbnail_url,
                 "duration_actual_seconds": duration_actual, "status": "needs_correction", "error": reason,
-                "quality_report": report, "preview_video_url": playback})
+                "quality_report": report, "preview_video_url": preview})
             _update_job(job_id, status="needs_correction", progress_pct=100, error=reason[:1000])
     except HTTPException as e:
         supabase_admin.table("ad_campaigns").update({"status": "failed", "error": e.detail}).eq("id", campaign_id).execute()
@@ -1884,8 +1979,13 @@ async def generate_video(campaign_id: str, background_tasks: BackgroundTasks):
     assets/hooks/script all live on rows this endpoint never touches."""
     _require_configured()
     campaign = _get_campaign(campaign_id)
-    if not campaign.get("script"):
-        raise HTTPException(status_code=400, detail="Generate a script first.")
+    job = _start_generation(campaign)
+    background_tasks.add_task(_run_ad_generation, campaign_id, job["id"])
+    return JobOut(id=job["id"], campaign_id=campaign_id, stage="video", status="pending", progress_pct=0)
+
+
+def _start_generation(campaign: dict) -> dict:
+    """Free checks, then the job row. Shared by the admin and creator routes."""
     aspect_ratio = campaign.get("aspect_ratio") or "9:16"
     resolution = campaign.get("resolution") or "720p"
     if aspect_ratio not in AD_ASPECT_RATIOS:
@@ -1894,20 +1994,17 @@ async def generate_video(campaign_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"resolution must be one of {AD_RESOLUTIONS}.")
     if campaign.get("use_veo") and aspect_ratio == "1:1":
         raise HTTPException(status_code=400, detail="Veo doesn't support 1:1 — turn off Veo animation or change aspect ratio.")
-
+    _preflight(campaign)
     try:
-        supabase_admin.table("ad_campaigns").update({"status": "generating", "error": None}).eq("id", campaign_id).execute()
-        job = (
+        supabase_admin.table("ad_campaigns").update({"status": "generating", "error": None}).eq("id", campaign["id"]).execute()
+        return (
             supabase_admin.table("ad_generation_jobs")
-            .insert({"campaign_id": campaign_id, "stage": "video", "status": "pending", "progress_pct": 0})
+            .insert({"campaign_id": campaign["id"], "stage": "video", "status": "pending", "progress_pct": 0})
             .execute()
             .data[0]
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not start generation: {e}")
-
-    background_tasks.add_task(_run_ad_generation, campaign_id, job["id"])
-    return JobOut(id=job["id"], campaign_id=campaign_id, stage="video", status="pending", progress_pct=0)
 
 
 @router.get("/campaign/{campaign_id}/job", response_model=Optional[JobOut], dependencies=[Depends(_require_admin)])
