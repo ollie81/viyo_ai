@@ -193,6 +193,14 @@ try:
 except Exception as _ads_studio_import_error:
     print(f"[WARN] Ads Studio router not loaded: {_ads_studio_import_error}")
 
+# Ads Maker for creators: same pipeline, signed-in creators, their own campaigns only, paid with Studio credits.
+try:
+    from ads_maker import router as ads_maker_router
+
+    app.include_router(ads_maker_router)
+except Exception as _ads_maker_import_error:
+    print(f"[WARN] Ads Maker router not loaded: {_ads_maker_import_error}")
+
 # Drama Creator (the AI-assistant-driven "New Drama" flow) also imports
 # `from studio import ...` for its reused Gemini/image/cast/scene
 # helpers — same isolation reasoning as Ads Studio's try/except above.

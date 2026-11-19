@@ -12,8 +12,11 @@ FROM python:3.11-slim
 # which doesn't exist here either — fontconfig just substitutes
 # whatever default it can find) and the drawtext-based quote card
 # feature fail to render any text at all.
+# tesseract-ocr: Ads Maker's final quality check reads the text on the rendered frames (to confirm the
+# advertiser's real website is shown and no other address appears). Without it those checks report
+# "unchecked" instead of failing.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core tesseract-ocr tesseract-ocr-eng && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
