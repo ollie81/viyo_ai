@@ -239,6 +239,10 @@ try:
     from search import router as search_router
     app.include_router(trending_router)
     app.include_router(search_router)
+    from creator_analytics import router as creator_analytics_router
+    from fraud import router as fraud_router
+    app.include_router(creator_analytics_router)
+    app.include_router(fraud_router)
 except Exception as _intel_err:
     print(f"[WARN] Intelligence routers not loaded: {_intel_err}")
 # Creator Hub: the creator's own audience, productions, earnings and the real earning rules (read-only).
