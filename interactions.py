@@ -22,6 +22,7 @@ codebase has no visibility into; going through the admin client sidesteps
 the question entirely rather than guessing at a policy fix blind.
 """
 import os
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -203,6 +204,50 @@ async def view_post(post_id: str, user_id: str = Depends(_get_current_user_id)):
         raise HTTPException(status_code=500, detail=f"Could not update view count: {e}")
 
     return ViewResponse(view_count=new_count)
+
+
+class ShareResponse(BaseModel):
+    share_count: int
+
+
+# One count per person per post per window: a share sheet opened twice in a row is one share, so the number
+# can't be pumped up by tapping. In memory (like the view counter, a rough engagement signal, not billing).
+SHARE_WINDOW_SECONDS = 6 * 3600
+_recent_shares: dict[tuple[str, str], float] = {}
+
+
+@router.post("/posts/{post_id}/share", response_model=ShareResponse)
+async def share_post(post_id: str, user_id: str = Depends(_get_current_user_id)):
+    """Counts one share of a post (the app calls it when the share sheet opens). A private or archived post
+    can't be shared by anyone but its owner."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Interactions service is not configured.")
+    try:
+        rows = supabase_admin.table("posts").select("*").eq("id", post_id).limit(1).execute().data or []
+    except Exception:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Post not found")
+    post = rows[0]
+    if (post.get("is_private") or post.get("is_archived")) and post.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Post not found")
+    current = int(post.get("share_count") or 0)
+    now = time.time()
+    key = (user_id, post_id)
+    if now - _recent_shares.get(key, 0) < SHARE_WINDOW_SECONDS:
+        return ShareResponse(share_count=current)
+    if len(_recent_shares) > 50_000:
+        for k in [k for k, t in _recent_shares.items() if now - t > SHARE_WINDOW_SECONDS]:
+            _recent_shares.pop(k, None)
+    try:
+        result = (supabase_admin.table("posts").update({"share_count": current + 1})
+                  .eq("id", post_id).eq("share_count", current).execute())
+    except Exception as e:
+        if "share_count" in str(e):          # column not added yet: sharing still works, just isn't counted
+            return ShareResponse(share_count=0)
+        raise HTTPException(status_code=500, detail="Could not count the share.")
+    _recent_shares[key] = now
+    return ShareResponse(share_count=current + 1 if result.data else current)
 
 
 class AddCommentRequest(BaseModel):
