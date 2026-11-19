@@ -333,3 +333,59 @@ def test_credit_hold_and_settle_on_postgres(credits_db):
     no = rpc("ads_credit_hold", {"p_user_id": u, "p_credits": 500})
     assert no == {**no, "ok": False, "error": "insufficient_credits"}
     assert rpc("studio_credit_balance", {"p_user_id": u})["available"] == 88, "a refused hold takes nothing"
+
+
+# ---------------------------------------------------------------- universal ads: profile and characters
+
+def test_creator_can_advertise_any_kind_with_a_fact_sheet(env):
+    c = new_campaign(env, ALICE, promote_target="physical_product", target_name="Kivu Sunrise", destination_link="",
+                     product_subtype="drink", facts={"prices": ["RWF 800"], "features": ["330 ml can"]},
+                     brand_colors=["#E8452C"], contact={"phone": "+250 788 123 456"}, character_mode="none",
+                     ad_style="product_cinematic")
+    row = env["db"].db["ad_campaigns"][0]
+    assert row["facts"]["prices"] == ["RWF 800"] and row["brand_colors"] == ["#E8452C"]
+    assert row["character_mode"] == "none" and row["ad_style"] == "product_cinematic"
+    for kind in ("service", "event", "music", "personal_brand", "digital_product"):
+        assert env["c"].post("/api/v1/ads-maker/campaigns", json={"promote_target": kind},
+                             headers=token(ALICE)).status_code == 200
+
+
+def test_bad_profile_is_refused(env):
+    r = env["c"].post("/api/v1/ads-maker/campaigns", json={"brand_colors": ["blue"]}, headers=token(ALICE))
+    assert r.status_code == 400
+
+
+def test_custom_character_needs_an_appearance(env):
+    cid = new_campaign(env, ALICE)["id"]
+    assert env["c"].put(f"/api/v1/ads-maker/campaigns/{cid}/character", json={"name": "Aline"},
+                        headers=token(ALICE)).status_code == 400
+    r = env["c"].put(f"/api/v1/ads-maker/campaigns/{cid}/character",
+                     json={"name": "Aline", "appearance": "short curly hair, round glasses"}, headers=token(ALICE))
+    assert r.status_code == 200 and env["db"].db["ad_campaigns"][0]["character_mode"] == "custom"
+
+
+def test_saved_characters_are_private_and_reusable_only_by_their_owner(env):
+    env["db"].db["ad_characters"] = [
+        {"id": str(uuid.uuid4()), "owner_id": ALICE, "name": "Aline", "spec": {"appearance": "curly hair"},
+         "portrait": "private:creator-studio/ads/a/p.png", "voice_name": "Kore"}]
+    env["db"].storage.files["creator-studio/ads/a/p.png"] = b"x"
+    mine = env["c"].get("/api/v1/ads-maker/characters", headers=token(ALICE)).json()
+    assert [c["name"] for c in mine] == ["Aline"] and mine[0]["portrait_url"].startswith("https://signed.test/")
+    assert env["c"].get("/api/v1/ads-maker/characters", headers=token(BOB)).json() == []
+    bob_campaign = new_campaign(env, BOB, target_name="Bob")["id"]
+    cid = mine[0]["id"]
+    assert env["c"].post(f"/api/v1/ads-maker/campaigns/{bob_campaign}/character/reuse/{cid}",
+                         headers=token(BOB)).status_code == 404
+    alice_campaign = new_campaign(env, ALICE)["id"]
+    r = env["c"].post(f"/api/v1/ads-maker/campaigns/{alice_campaign}/character/reuse/{cid}", headers=token(ALICE))
+    assert r.status_code == 200
+    row = next(c for c in env["db"].db["ad_campaigns"] if c["id"] == alice_campaign)
+    assert row["character_mode"] == "reuse" and row["character"]["voice_name"] == "Kore"
+
+
+def test_estimate_includes_a_portrait_only_when_needed(env):
+    base = {"id": "x", "duration_seconds": 15, "target_name": "X"}
+    with_char = ads_maker.estimate({**base, "character_mode": "auto"}, assets=[])["video"]
+    none = ads_maker.estimate({**base, "character_mode": "none"}, assets=[])["video"]
+    saved = ads_maker.estimate({**base, "character_mode": "reuse", "character": {"portrait": "p"}}, assets=[])["video"]
+    assert with_char > none == saved
