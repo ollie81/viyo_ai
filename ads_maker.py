@@ -37,7 +37,8 @@ from creator_studio import creator
 
 router = APIRouter(prefix="/api/v1/ads-maker", tags=["ads_maker"])
 
-CREATOR_KINDS = ("other_app", "website", "physical_product", "business", "film", "creator_project")
+CREATOR_KINDS = ("other_app", "website", "digital_product", "physical_product", "service", "business",
+                 "personal_brand", "film", "music", "event", "creator_project")
 MAX_RUNS_PER_HOUR = 6
 _runs: dict[str, deque] = defaultdict(deque)
 
@@ -143,7 +144,9 @@ def estimate(campaign: dict, assets: Optional[list] = None) -> dict:
     prompt = core._build_hook_prompt(campaign, campaign.get("format"))
     hooks_cents = max(2, 2 * core._estimate_text_cost_cents(prompt))
     script_cents = max(3, 2 * core._estimate_text_cost_cents(prompt + " " * 3000)) + len(assets)
-    video_cents = ((scenes - 1 + core.MAX_IMAGE_REGENERATIONS) * core.GEMINI_IMAGE_COST_USD_CENTS
+    # + one character reference portrait when the ad may have a character that isn't saved yet
+    portrait = 0 if (campaign.get("character_mode") == "none" or (campaign.get("character") or {}).get("portrait")) else 1
+    video_cents = ((scenes - 1 + core.MAX_IMAGE_REGENERATIONS + portrait) * core.GEMINI_IMAGE_COST_USD_CENTS
                    + scenes * 2 * core.GEMINI_TTS_LINE_COST_USD_CENTS + 2)
     if campaign.get("use_veo"):
         tier = core.VEO_TIERS.get(campaign.get("veo_tier") or core.DEFAULT_VEO_TIER, core.VEO_TIERS[core.DEFAULT_VEO_TIER])
@@ -158,6 +161,14 @@ class CampaignIn(BaseModel):
     promote_target: str = Field("other_app", pattern="^(" + "|".join(CREATOR_KINDS) + ")$")
     target_name: str = ""
     brand_name: str = ""
+    product_subtype: str = ""
+    facts: Optional[dict] = None
+    brand_colors: Optional[list[str]] = None
+    social_links: Optional[list[str]] = None
+    contact: Optional[dict] = None
+    character_mode: str = "auto"
+    character: Optional[dict] = None
+    ad_style: str = "auto"
     target_description: str = ""
     target_features: list[str] = []
     target_audience: str = ""
@@ -176,6 +187,14 @@ class CampaignPatch(BaseModel):
     promote_target: Optional[str] = Field(None, pattern="^(" + "|".join(CREATOR_KINDS) + ")$")
     target_name: Optional[str] = None
     brand_name: Optional[str] = None
+    product_subtype: Optional[str] = None
+    facts: Optional[dict] = None
+    brand_colors: Optional[list[str]] = None
+    social_links: Optional[list[str]] = None
+    contact: Optional[dict] = None
+    character_mode: Optional[str] = None
+    character: Optional[dict] = None
+    ad_style: Optional[str] = None
     target_description: Optional[str] = None
     target_features: Optional[list[str]] = None
     target_audience: Optional[str] = None
@@ -192,7 +211,8 @@ class CampaignPatch(BaseModel):
 
 @router.get("/options")
 async def options(user_id: str = Depends(creator)):
-    return {"kinds": {k: core.PRODUCT_KINDS[k] for k in CREATOR_KINDS},
+    return {"kinds": {k: core.PRODUCT_KINDS[k] for k in CREATOR_KINDS}, "subtypes": core.PRODUCT_SUBTYPES,
+            "styles": core.AD_STYLES, "character_modes": core.CHARACTER_MODES, "fact_fields": core.ad_claims.FACT_FIELDS,
             "formats": [{"key": k, "label": v["label"]} for k, v in core.AD_FORMATS.items()],
             "durations": core.AD_DURATIONS, "aspect_ratios": core.AD_ASPECT_RATIOS, "resolutions": core.AD_RESOLUTIONS,
             "asset_types": core.AD_ASSET_TYPES, "credits": _balance(user_id)}
@@ -394,6 +414,56 @@ async def generate_video(campaign_id: str, background_tasks: BackgroundTasks, us
 async def latest_job(campaign_id: str, user_id: str = Depends(creator)):
     c = owned_campaign(campaign_id, user_id)
     return await core.get_latest_job(c["id"])
+
+
+# ---------------------------------------------------------------- characters
+
+class CharacterIn(BaseModel):
+    name: str = ""
+    role: str = ""
+    appearance: str = ""
+    clothing: str = ""
+    personality: str = ""
+    voice_style: str = ""
+    gender: str = ""
+    age: str = ""
+
+
+def _character_out(r: dict) -> dict:
+    return {"id": r["id"], "name": r.get("name") or "", "spec": r.get("spec") or {},
+            "portrait_url": core._resolve(r.get("portrait")), "voice_name": r.get("voice_name")}
+
+
+@router.get("/characters")
+async def list_characters(user_id: str = Depends(creator)):
+    """The creator's own saved ad characters (made by earlier ads), to reuse."""
+    rows = (_db().table("ad_characters").select("*").eq("owner_id", user_id).order("created_at", desc=True)
+            .execute().data) or []
+    return [_character_out(r) for r in rows]
+
+
+@router.put("/campaigns/{campaign_id}/character")
+async def set_character(campaign_id: str, body: CharacterIn, user_id: str = Depends(creator)):
+    """The creator describes the character (custom mode). Generation makes one reference portrait from it."""
+    c = owned_campaign(campaign_id, user_id)
+    spec = {k: v for k, v in body.model_dump().items() if v}
+    if not spec.get("appearance"):
+        raise HTTPException(status_code=400, detail="Describe how the character looks (appearance).")
+    await core.update_campaign(c["id"], core.UpdateCampaignRequest(character_mode="custom", character=spec))
+    return _out(owned_campaign(c["id"], user_id))
+
+
+@router.post("/campaigns/{campaign_id}/character/reuse/{character_id}")
+async def reuse_character(campaign_id: str, character_id: str, user_id: str = Depends(creator)):
+    """Reuse one of the creator's saved characters: same description, same portrait, same voice."""
+    c = owned_campaign(campaign_id, user_id)
+    rows = (_db().table("ad_characters").select("*").eq("id", _uuid(character_id)).limit(1).execute().data) or []
+    if not rows or rows[0].get("owner_id") != user_id:
+        raise HTTPException(status_code=404, detail="Not found.")
+    r = rows[0]
+    ch = {**(r.get("spec") or {}), "portrait": r.get("portrait"), "voice_name": r.get("voice_name"), "saved_id": r["id"]}
+    _db().table("ad_campaigns").update({"character_mode": "reuse", "character": ch}).eq("id", c["id"]).execute()
+    return _out(owned_campaign(c["id"], user_id))
 
 
 @router.get("/campaigns/{campaign_id}/estimate")

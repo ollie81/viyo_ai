@@ -40,7 +40,8 @@ def probe(path: str) -> dict:
     v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
     a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     return {"width": int(v.get("width") or 0), "height": int(v.get("height") or 0),
-            "duration": float((data.get("format") or {}).get("duration") or 0), "has_audio": a is not None}
+            "duration": float((data.get("format") or {}).get("duration") or 0), "has_audio": a is not None,
+            "video_seconds": float(v.get("duration") or 0), "audio_seconds": float((a or {}).get("duration") or 0)}
 
 
 def _intervals(cmd: list[str], start_key: str, end_key: str) -> list[tuple[float, float]]:
@@ -196,6 +197,10 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
         f"File is {info['width']}x{info['height']}, expected {w}x{h}.")
     add("audio_track", "Has sound", "passed" if info["has_audio"] else "failed",
         "" if info["has_audio"] else "The video has no audio track.")
+    if info["has_audio"] and info["video_seconds"] and info["audio_seconds"]:
+        gap = abs(info["video_seconds"] - info["audio_seconds"])
+        add("av_sync", "Sound and picture stay together", "passed" if gap <= 0.35 else "failed",
+            f"Sound and picture differ by {gap:.2f}s." if gap > 0.35 else "")
 
     scenes = plan.get("scenes", [])
     expected = plan.get("expected_seconds")
@@ -252,6 +257,14 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
         if caps and edge_text(img, Box(0, y1, w, y2 - y1)):
             add("clipping", f"Scene {s['index'] + 1}: captions inside the frame", "failed",
                 "Caption text touches the edge of the frame.", s["index"])
+        drawn = s.get("drawn", {})
+        if s.get("product_photo") and drawn.get("product"):
+            ok = logo_visible(img, drawn["product"], s["product_photo"], max_diff=42.0)
+            add("product", f"Scene {s['index'] + 1}: the real product is shown", "passed" if ok else "failed",
+                "" if ok else "The product photo isn't clearly visible in this scene.", None if ok else s["index"])
+        if s.get("character_ref") is False:
+            add("character", f"Scene {s['index'] + 1}: same character", "failed",
+                "This scene shows the character but wasn't made from the character's reference portrait.", s["index"])
         drawn = s.get("drawn", {})
         if drawn.get("brand_mark") and plan.get("logo_path") and not logo_visible(img, drawn["brand_mark"], plan["logo_path"]):
             add("brand_mark", f"Scene {s['index'] + 1}: logo visible", "failed", "The logo in the corner isn't visible.",
@@ -337,6 +350,13 @@ def inspect(path: str, plan: dict, facts: ad_brand.BrandFacts, w: int, h: int, w
                 ok = _norm(facts.name) in _norm(text)
                 add("name_visible", "Brand name shown at the end", "passed" if ok else "warning",
                     "" if ok else "The brand name couldn't be read clearly (it may be in the logo).")
+
+    char_scenes = [s for s in scenes if s.get("character_ref") is not None]
+    if char_scenes and not any(i["key"] == "character" and i["status"] == "failed" for i in items):
+        add("character", "Same character throughout", "passed",
+            f"{len(char_scenes)} scenes made from one reference portrait, one voice.")
+    notes = plan.get("story_notes") or []
+    add("continuity", "Complete story, in order", "warning" if notes else "passed", " ".join(notes))
 
     for issue in plan.get("asset_issues", []):
         add("assets", "Campaign assets", "failed", issue)

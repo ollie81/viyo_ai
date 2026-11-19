@@ -70,6 +70,7 @@ import uuid
 from typing import Optional
 
 import ad_brand
+import ad_claims
 import ad_compose
 import ad_qc
 
@@ -220,9 +221,83 @@ AD_RESOLUTIONS = ("720p", "1080p")
 # one advertiser. (viyo / ollie_ai are kept so existing campaigns stay valid; both are apps.)
 PRODUCT_KINDS: dict[str, str] = {
     "viyo": "a mobile app", "ollie_ai": "a mobile app", "other_app": "a mobile app", "website": "a website",
-    "physical_product": "a physical product", "business": "a business or service", "film": "a film or show",
-    "creator_project": "a creator's project",
+    "digital_product": "a digital product (software or an online platform)",
+    "physical_product": "a physical product", "service": "a service", "business": "a business",
+    "personal_brand": "a personal brand", "film": "a film or show", "music": "a music project",
+    "event": "an event", "creator_project": "a creator's project",
 }
+_KIND_PATTERN = "^(" + "|".join(PRODUCT_KINDS) + ")$"
+# Common kinds of thing within each category, offered in the app (any short text is accepted).
+PRODUCT_SUBTYPES: dict[str, list[str]] = {
+    "physical_product": ["drink", "food", "clothing", "shoes", "electronics", "furniture", "cosmetics", "accessories"],
+    "service": ["restaurant", "hotel", "education", "cleaning", "transport", "consulting", "health", "beauty salon"],
+    "digital_product": ["software", "online platform", "online course", "game"],
+    "event": ["concert", "conference", "festival", "workshop"],
+    "music": ["single", "album", "tour"],
+}
+# Products whose look (packaging, label, logo) must be shown exactly: real product photos are composited
+# into the ad, never redrawn by an image model.
+PHYSICAL_KINDS = {"physical_product"}
+CHARACTER_MODES = ("auto", "custom", "reuse", "none")
+AD_STYLES = {
+    "auto": "Pick the style that suits the product best.",
+    "product_cinematic": "Product-led cinematic shots: no people needed; the product is the hero.",
+    "character": "A character-led commercial: one consistent character carries the story.",
+    "lifestyle": "Lifestyle: the product in real everyday moments of the people it's for.",
+    "demo": "Demonstration/explainer: show exactly how it works or what it does.",
+    "social": "Native social-media ad: fast, direct, feels like a post, not a TV spot.",
+}
+_HEX = re.compile(r"^#?[0-9a-fA-F]{6}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+
+
+def _clean_profile(p: dict) -> dict:
+    """Validates the product profile fields of a campaign (create or update) and returns them cleaned.
+    Facts are the advertiser's word and are kept exactly; only shape and size are checked."""
+    out = {}
+    if p.get("product_subtype") is not None:
+        out["product_subtype"] = str(p["product_subtype"]).strip()[:40]
+    if p.get("facts") is not None:
+        facts = {}
+        for key in ad_claims.FACT_FIELDS:
+            items = [str(x).strip()[:300] for x in (p["facts"].get(key) or []) if str(x).strip()]
+            if len(items) > 12:
+                raise HTTPException(status_code=400, detail=f"Up to 12 {key.replace('_', ' ')} please.")
+            facts[key] = items
+        out["facts"] = facts
+    if p.get("brand_colors") is not None:
+        colors = [c.strip() for c in p["brand_colors"] if c and c.strip()]
+        if len(colors) > 4 or any(not _HEX.match(c) for c in colors):
+            raise HTTPException(status_code=400, detail="Brand colours: up to 4, as hex like #FF6A3D.")
+        out["brand_colors"] = ["#" + c.lstrip("#").upper() for c in colors]
+    if p.get("social_links") is not None:
+        links = [str(x).strip()[:120] for x in p["social_links"] if str(x).strip()]
+        if len(links) > 5:
+            raise HTTPException(status_code=400, detail="Up to 5 social accounts.")
+        out["social_links"] = links
+    if p.get("contact") is not None:
+        c = {k: str(v).strip()[:120] for k, v in (p["contact"] or {}).items() if k in ("phone", "email", "address") and v}
+        if c.get("email") and not _EMAIL_RE.match(c["email"]):
+            raise HTTPException(status_code=400, detail=f'"{c["email"]}" isn\'t a valid email address.')
+        if c.get("phone") and len(re.sub(r"\D", "", c["phone"])) < 7:
+            raise HTTPException(status_code=400, detail=f'"{c["phone"]}" isn\'t a valid phone number.')
+        out["contact"] = c
+    if p.get("character_mode") is not None:
+        if p["character_mode"] not in CHARACTER_MODES:
+            raise HTTPException(status_code=400, detail=f"character_mode must be one of {CHARACTER_MODES}.")
+        out["character_mode"] = p["character_mode"]
+    if p.get("character") is not None:
+        out["character"] = {k: str(v).strip()[:300] for k, v in (p["character"] or {}).items()
+                            if k in CHARACTER_FIELDS and v is not None}
+    if p.get("ad_style") is not None:
+        if p["ad_style"] not in AD_STYLES:
+            raise HTTPException(status_code=400, detail=f"ad_style must be one of {list(AD_STYLES)}.")
+        out["ad_style"] = p["ad_style"]
+    return out
+
+
+CHARACTER_FIELDS = ("name", "role", "appearance", "clothing", "personality", "voice_style", "gender", "age",
+                    "portrait", "voice_name", "saved_id")
 AD_ASSET_TYPES = ("screenshot", "product_photo", "logo", "other")
 EXACT_ASSET_TYPES = {"screenshot", "product_photo", "logo"}
 
@@ -334,9 +409,17 @@ async def list_veo_tiers():
 # ---------------------------------------------------------------------------
 class CreateCampaignRequest(BaseModel):
     user_id: str
-    promote_target: str = Field(..., pattern="^(viyo|ollie_ai|other_app|website|physical_product|business|film|creator_project)$")
+    promote_target: str = Field(..., pattern=_KIND_PATTERN)
     target_name: str = ""
     brand_name: str = ""          # when the brand and the product have different names
+    product_subtype: str = ""
+    facts: Optional[dict] = None              # {features, benefits, prices, selling_points, specs}: lists
+    brand_colors: Optional[list[str]] = None
+    social_links: Optional[list[str]] = None
+    contact: Optional[dict] = None            # {phone, email, address}
+    character_mode: str = "auto"
+    character: Optional[dict] = None
+    ad_style: str = "auto"
     target_description: str = ""
     target_features: list[str] = []
     target_audience: str = ""
@@ -360,6 +443,14 @@ class CampaignOut(BaseModel):
     target_description: str
     target_features: list[str]
     brand_name: str = ""
+    product_subtype: str = ""
+    facts: dict = {}
+    brand_colors: list[str] = []
+    social_links: list[str] = []
+    contact: dict = {}
+    character_mode: str = "auto"
+    character: dict = {}
+    ad_style: str = "auto"
     target_audience: str
     objective: str
     destination_link: str
@@ -398,6 +489,14 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         target_description=row.get("target_description") or "",
         target_features=row.get("target_features") or [],
         brand_name=row.get("brand_name") or "",
+        product_subtype=row.get("product_subtype") or "",
+        facts=row.get("facts") or {},
+        brand_colors=row.get("brand_colors") or [],
+        social_links=row.get("social_links") or [],
+        contact=row.get("contact") or {},
+        character_mode=row.get("character_mode") or "auto",
+        character=row.get("character") or {},
+        ad_style=row.get("ad_style") or "auto",
         target_audience=row.get("target_audience") or "",
         objective=row.get("objective") or "",
         destination_link=row.get("destination_link") or "",
@@ -462,6 +561,10 @@ async def create_campaign(req: CreateCampaignRequest):
         "promote_target": req.promote_target,
         "target_name": req.target_name,
         **({"brand_name": req.brand_name} if req.brand_name else {}),
+        **_clean_profile({"product_subtype": req.product_subtype or None, "facts": req.facts,
+                          "brand_colors": req.brand_colors, "social_links": req.social_links, "contact": req.contact,
+                          "character_mode": req.character_mode if req.character_mode != "auto" else None,
+                          "character": req.character, "ad_style": req.ad_style if req.ad_style != "auto" else None}),
         "target_description": req.target_description,
         "target_features": req.target_features,
         "target_audience": req.target_audience,
@@ -486,9 +589,17 @@ async def create_campaign(req: CreateCampaignRequest):
 
 
 class UpdateCampaignRequest(BaseModel):
-    promote_target: Optional[str] = Field(None, pattern="^(viyo|ollie_ai|other_app|website|physical_product|business|film|creator_project)$")
+    promote_target: Optional[str] = Field(None, pattern=_KIND_PATTERN)
     target_name: Optional[str] = None
     brand_name: Optional[str] = None
+    product_subtype: Optional[str] = None
+    facts: Optional[dict] = None
+    brand_colors: Optional[list[str]] = None
+    social_links: Optional[list[str]] = None
+    contact: Optional[dict] = None
+    character_mode: Optional[str] = None
+    character: Optional[dict] = None
+    ad_style: Optional[str] = None
     target_description: Optional[str] = None
     target_features: Optional[list[str]] = None
     target_audience: Optional[str] = None
@@ -519,6 +630,8 @@ async def update_campaign(campaign_id: str, req: UpdateCampaignRequest):
         raise HTTPException(status_code=400, detail=f"veo_tier must be one of {list(VEO_TIERS)}.")
     if (patch.get("destination_link") or "").strip() and not ad_brand.parse_url(patch["destination_link"])[0]:
         raise HTTPException(status_code=400, detail=f'"{patch["destination_link"]}" isn\'t a valid website address.')
+    patch.update(_clean_profile({k: patch.get(k) for k in ("product_subtype", "facts", "brand_colors", "social_links",
+                                                           "contact", "character_mode", "character", "ad_style")}))
     if not patch:
         return _row_to_campaign(_get_campaign(campaign_id))
     try:
@@ -1054,9 +1167,34 @@ class AdSceneSchema(BaseModel):
     # an older client's save-script request (sent before this field
     # existed) still validates instead of 422ing.
     featured_asset_id: str = ""
+    # What the scene is for in the story (SCENE_PURPOSES), how it leads into the next one, which verified facts
+    # its words rely on, and whether the product / the ad's character are on screen. Defaulted so older saved
+    # scripts and clients still validate.
+    purpose: str = ""
+    transition: str = ""
+    fact_ids: list[str] = []
+    features_product: bool = False
+    features_character: bool = False
+
+
+SCENE_PURPOSES = ("hook", "story", "demo", "product_intro", "selling_point", "cta")
+
+
+class AdCharacterSchema(BaseModel):
+    """A fictional advertising character (never a real person)."""
+    name: str = ""
+    role: str = ""            # e.g. "a student who discovers the drink"
+    appearance: str = ""      # face, hair, build: specific, so every scene shows the same person
+    clothing: str = ""
+    personality: str = ""
+    voice_style: str = ""
+    gender: str = ""          # "female" / "male" / "" (for the voice)
+    age: str = ""             # "child" / "teen" / "adult" / "senior"
 
 
 class AdScriptSchema(BaseModel):
+    uses_character: bool = False
+    character: AdCharacterSchema = AdCharacterSchema()
     scenes: list[AdSceneSchema]
 
 
@@ -1084,6 +1222,10 @@ stock scenes, no scenery that doesn't move the message forward.
 - Any scene that shows the app, the website or a screen must use one of the real screenshots (featured_asset_id) \
 when there is one; never describe an invented interface or a blank/black screen.
 
+Every scene needs a clear purpose and must lead visually into the next. Use these purposes, in an order that \
+makes a complete ad: hook (scene 1), then story and/or demo, product_intro (where the product is introduced), \
+one or more selling_point scenes (each built on verified facts), and cta (the final scene).
+{style}{character}
 For each scene give:
 - order: 1-based scene number
 - seconds: this scene's target duration (all scenes must sum to {duration})
@@ -1093,6 +1235,11 @@ For each scene give:
 - caption_text: the on-screen caption for this scene: at most 8 words, the key phrase of the line (never a website)
 - is_cta: true only for the final scene
 - featured_asset_id: {asset_field_instruction}
+- purpose: one of hook, story, demo, product_intro, selling_point, cta
+- transition: how this scene's last image leads into the next scene (a matching action, object, colour or move)
+- fact_ids: ids of the verified facts this scene's words rely on (empty if it states no facts)
+- features_product: true if the product itself is on screen
+- features_character: true if the ad's character is on screen
 
 Keep dialogue natural and in-character for the format — never a generic ad-read, never "Hey guys, check out this app."
 """
@@ -1149,15 +1296,47 @@ def _build_script_prompt(campaign: dict, hook_text: str, assets: list[dict]) -> 
         hook_text=hook_text,
         target_name=campaign.get("target_name") or "this product",
         product_kind=PRODUCT_KINDS.get(campaign.get("promote_target") or "", "a product"),
-        facts=ad_brand.prompt_facts(ad_brand.BrandFacts.from_campaign(campaign)),
+        facts=ad_brand.prompt_facts(ad_brand.BrandFacts.from_campaign(campaign))
+        + ad_claims.FactSheet.from_campaign(campaign).prompt_block(),
         target_description=campaign.get("target_description") or "",
         features=features,
         audience=campaign.get("target_audience") or "general short-form video viewers",
         objective=campaign.get("objective") or "drive interest and engagement",
+        style=_style_block(campaign),
+        character=_character_block(campaign),
         scene_count=_scene_count_for_duration(duration),
         asset_block=asset_block,
         asset_field_instruction=asset_field_instruction,
     )
+
+
+def _style_block(campaign: dict) -> str:
+    style = campaign.get("ad_style") or "auto"
+    kind = campaign.get("promote_target") or ""
+    extra = ""
+    if kind in PHYSICAL_KINDS:
+        extra = (" The product's real photos are composited into product scenes exactly as uploaded (packaging, label "
+                 "and logo unchanged), so describe the setting around the product, never a redesigned product.")
+    sub = (campaign.get("product_subtype") or "").strip()
+    return f"PRODUCTION STYLE: {AD_STYLES.get(style, AD_STYLES['auto'])}{f' The product is a {sub}.' if sub else ''}{extra}\n"
+
+
+def _character_block(campaign: dict) -> str:
+    mode = campaign.get("character_mode") or "auto"
+    ch = campaign.get("character") or {}
+    if mode == "none":
+        return ("CHARACTER: none. Make a product-focused ad with no recurring character (hands or passers-by are fine "
+                "only where needed). Set uses_character to false.\n")
+    if mode in ("custom", "reuse") and (ch.get("appearance") or ch.get("name")):
+        desc = "; ".join(f"{k}: {ch[k]}" for k in ("name", "role", "appearance", "clothing", "personality", "voice_style")
+                         if ch.get(k))
+        return (f"CHARACTER (use exactly this fictional character, the same person in every scene they appear in): {desc}. "
+                "Set uses_character to true and copy these details into character.\n")
+    return ("CHARACTER: decide whether this ad is better with one fictional character (a relatable person the audience "
+            "sees themselves in) or without (product-led). Don't force a character in: a product-only cinematic ad is "
+            "often better for physical products. If you use one, set uses_character to true and describe them in "
+            "character: specific appearance (face, hair, build), clothing, personality, voice style, gender and age, "
+            "so every scene can show the same person. Never a real or famous person.\n")
 
 
 def _normalize_scene_durations(scenes: list[dict], target_total: float) -> list[dict]:
@@ -1171,6 +1350,39 @@ def _normalize_scene_durations(scenes: list[dict], target_total: float) -> list[
 class GenerateScriptResponse(BaseModel):
     scenes: list[dict]
     cost_usd_cents: int
+    notes: list[str] = []          # what was corrected (invented brand facts/claims) and story structure warnings
+
+
+def story_notes(scenes: list[dict]) -> list[str]:
+    """Story structure check: a hook first, the product introduced, at least one selling point when facts
+    exist, a call to action last, and every scene with a purpose and a lead into the next."""
+    notes = []
+    purposes = [(s.get("purpose") or "").strip() for s in scenes]
+    if not scenes:
+        return ["The script has no scenes."]
+    if purposes[0] not in ("hook", ""):
+        notes.append("Scene 1 isn't a hook.")
+    if purposes and any(purposes) and "product_intro" not in purposes and not any(s.get("features_product") for s in scenes):
+        notes.append("The product is never introduced.")
+    if purposes and purposes[-1] not in ("cta", ""):
+        notes.append("The last scene isn't the call to action.")
+    for i, s in enumerate(scenes[:-1]):
+        if s.get("purpose") and not (s.get("transition") or "").strip():
+            notes.append(f"Scene {i + 1} has no lead into scene {i + 2}.")
+    return notes
+
+
+def _character_from_script(campaign: dict, parsed) -> dict:
+    """In auto mode, the model's character (if it chose one) becomes the campaign's character, so the scenes,
+    the reference portrait and the voice all use the same one. Custom and reused characters are never
+    overwritten; "none" stays none."""
+    mode = campaign.get("character_mode") or "auto"
+    if mode != "auto":
+        return {}
+    if not getattr(parsed, "uses_character", False):
+        return {"character": {}}
+    ch = parsed.character.model_dump()
+    return {"character": {k: str(v)[:300] for k, v in ch.items() if v}}
 
 
 def _resolve_featured_asset_tokens(scenes: list[dict], assets: list[dict]) -> list[dict]:
@@ -1241,14 +1453,19 @@ async def generate_script(campaign_id: str):
     _spent(campaign_id, "ad_script", cost_cents)
 
     scenes = sorted((s.model_dump() for s in parsed.scenes), key=lambda s: s["order"])
+    character_update = _character_from_script(campaign, parsed)
     scenes = _normalize_scene_durations(scenes, float(campaign.get("duration_seconds") or 15))
     scenes = _resolve_featured_asset_tokens(scenes, assets)
     # Brand facts are the advertiser's, never the model's: any invented website or brand-name variant in
     # the captions, voiceover or visual descriptions is corrected now, before anyone reviews the script.
     scenes, _brand_changes = ad_brand.sanitize_script(scenes, ad_brand.BrandFacts.from_campaign(campaign))
+    # Claims: only what the advertiser supplied. Unsupported lines are dropped now, before anyone reviews it.
+    scenes, _claim_changes = ad_claims.enforce_script(scenes, ad_claims.FactSheet.from_campaign(campaign))
+    notes = _brand_changes + _claim_changes + story_notes(scenes)
 
     try:
         supabase_admin.table("ad_campaigns").update({
+            **character_update,
             "script": scenes,
             "cost_usd_cents": (campaign.get("cost_usd_cents") or 0) + cost_cents,
             "status": "script_ready",
@@ -1256,7 +1473,7 @@ async def generate_script(campaign_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not save script: {e}")
 
-    return GenerateScriptResponse(scenes=scenes, cost_usd_cents=cost_cents)
+    return GenerateScriptResponse(scenes=scenes, cost_usd_cents=cost_cents, notes=notes)
 
 
 class SaveScriptRequest(BaseModel):
@@ -1277,6 +1494,7 @@ async def save_script(campaign_id: str, req: SaveScriptRequest):
             raise HTTPException(status_code=400, detail=f"Scene {s.order} has a non-positive duration.")
     scenes = [s.model_dump() for s in sorted(req.scenes, key=lambda s: s.order)]
     scenes, _brand_changes = ad_brand.sanitize_script(scenes, ad_brand.BrandFacts.from_campaign(campaign))
+    scenes, _claim_changes = ad_claims.enforce_script(scenes, ad_claims.FactSheet.from_campaign(campaign))
     try:
         updated = (
             supabase_admin.table("ad_campaigns")
@@ -1378,9 +1596,20 @@ def _render_ad_scene_clip_veo_native_audio(
     _run_ffmpeg(cmd, "Ad scene render (Veo native audio)")
 
 
+def _reference_part(ref: str):
+    """A reference image for the image model: a local file (e.g. the character portrait made in this run) or a
+    link (private references are signed first)."""
+    if os.path.exists(ref):
+        with open(ref, "rb") as f:
+            data = f.read()
+        mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+        return types.Part.from_bytes(data=data, mime_type=mime)
+    return _fetch_image_part(_resolve(ref) or ref)
+
+
 def _generate_ad_scene_image(prompt: str, reference_urls: list[str], campaign_id: str) -> str:
     _cap(GEMINI_IMAGE_COST_USD_CENTS)
-    reference_parts = [_fetch_image_part(u) for u in reference_urls[:4]]
+    reference_parts = [_reference_part(u) for u in reference_urls[:4] if u]
     try:
         response = _gemini_client.models.generate_content(
             model=GEMINI_IMAGE_MODEL,
@@ -1631,6 +1860,25 @@ def _prepare_assets(assets: list[dict], tmp: str) -> tuple[dict, list[str]]:
     return paths, issues
 
 
+def _assign_product_photos(scenes: list[dict], assets: list[dict], local: dict, kind: str) -> list[dict]:
+    """For a physical product, every scene that shows the product (or introduces it / sells a point about it)
+    composites a REAL product photo into a generated setting (a hero shot), so packaging, label and logo are
+    exactly the advertiser's. Photos are used in turn."""
+    if kind not in PHYSICAL_KINDS:
+        return scenes
+    photos = [a["id"] for a in assets if a.get("asset_type") == "product_photo" and a["id"] in local]
+    if not photos:
+        return scenes
+    k = 0
+    for s in scenes[:-1]:
+        if s.get("featured_asset_id"):
+            continue
+        if s.get("features_product") or (s.get("purpose") in ("product_intro", "selling_point")):
+            s["product_asset_id"] = photos[k % len(photos)]
+            k += 1
+    return scenes
+
+
 def _assign_real_assets(scenes: list[dict], assets: list[dict], local: dict) -> list[dict]:
     """Scenes about the app/website/screen show a real screenshot when the advertiser supplied one, instead
     of an AI-drawn interface (or a blank phone). Screenshots are used in turn so they don't repeat."""
@@ -1649,7 +1897,8 @@ def _assign_real_assets(scenes: list[dict], assets: list[dict], local: dict) -> 
     return scenes
 
 
-def _image_prompt(scene: dict, campaign: dict, aspect_ratio: str, stricter: bool = False) -> str:
+def _image_prompt(scene: dict, campaign: dict, aspect_ratio: str, stricter: bool = False,
+                  character: Optional[dict] = None, for_product: bool = False) -> str:
     kind = PRODUCT_KINDS.get(campaign.get("promote_target") or "", "a product")
     prompt = (
         f"Photorealistic scene for a short marketing video about {kind}. {aspect_ratio} framing. "
@@ -1660,9 +1909,72 @@ def _image_prompt(scene: dict, campaign: dict, aspect_ratio: str, stricter: bool
         "from the side or back or with the screen out of view: never a blank or black screen, never an invented "
         "app interface."
     )
+    if character and scene.get("features_character"):
+        prompt += (f" The person in this scene is the SAME person as in the reference portrait: {character.get('appearance', '')}; "
+                   f"wearing {character.get('clothing', 'the same clothes')}. Keep the face, hair and clothes identical. "
+                   "A fictional person, not a real or famous one.")
+    if for_product:
+        prompt += (" Leave the centre of the picture clear and uncluttered: the real product photo is placed there "
+                   "afterwards. Do not draw the product, any packaging, bottle, can, box or label yourself.")
     if stricter:
         prompt += " Keep every device screen completely out of view, and keep the scene bright and clearly lit."
     return prompt
+
+
+def _contact_line(campaign: dict) -> str:
+    """The advertiser's own social account and phone/email for the end card, exactly as supplied."""
+    sheet = ad_claims.FactSheet.from_campaign(campaign)
+    bits = sheet.handles[:1] + (sheet.phones[:1] or sheet.emails[:1])
+    return "  ·  ".join(bits)
+
+
+def _age_bucket(age: str) -> str:
+    a = (age or "").lower()
+    if any(w in a for w in ("child", "kid")):
+        return "child"
+    if "teen" in a:
+        return "teen"
+    if any(w in a for w in ("senior", "elder", "old")):
+        return "senior"
+    return "adult"
+
+
+def _prepare_character(campaign: dict, scenes: list[dict], tmp: str) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+    """The ad's one character, if its scenes use one: (character, local reference portrait, voice). The
+    portrait is made once (or reused from a saved character) and given to every scene the character is in,
+    and the same voice speaks every line, so the person looks and sounds the same throughout."""
+    ch = dict(campaign.get("character") or {})
+    if (campaign.get("character_mode") or "auto") == "none" or not ch or not any(s.get("features_character") for s in scenes):
+        return None, None, None
+    portrait_ref = ch.get("portrait")
+    path = os.path.join(tmp, "character_ref.png")
+    if portrait_ref:
+        _fetch_local(portrait_ref, path)          # a saved (reused) character's portrait
+    else:
+        prompt = ("Character reference portrait for a video ad: a single fictional person, head and shoulders, facing the "
+                  f"camera, soft even light, plain background. {ch.get('appearance', '')}. Wearing {ch.get('clothing', '')}. "
+                  f"Expression: {ch.get('personality', 'friendly')}. No text, no logos. Not a real or famous person.")
+        url = _generate_ad_scene_image(prompt, [], campaign["id"])
+        _fetch_local(url, path)
+        with open(path, "rb") as f:
+            portrait_ref = _store_file(campaign, f.read(), "image/png", f"character_{uuid.uuid4().hex}.png")
+        ch["portrait"] = portrait_ref
+    voice = ch.get("voice_name") or _auto_assign_voice(ch.get("gender") or campaign.get("voice_gender_preference") or "",
+                                                       _age_bucket(ch.get("age", "")), set())
+    ch["voice_name"] = voice
+    try:
+        supabase_admin.table("ad_campaigns").update({"character": ch}).eq("id", campaign["id"]).execute()
+        if not ch.get("saved_id"):
+            saved = supabase_admin.table("ad_characters").insert({
+                "owner_id": campaign["user_id"], "name": ch.get("name") or "Character",
+                "spec": {k: v for k, v in ch.items() if k not in ("portrait", "voice_name", "saved_id")},
+                "portrait": portrait_ref, "voice_name": voice}).execute().data
+            if saved:
+                ch["saved_id"] = saved[0]["id"]
+                supabase_admin.table("ad_campaigns").update({"character": ch}).eq("id", campaign["id"]).execute()
+    except Exception as e:      # saving for reuse is a convenience; the ad itself still uses the character
+        print(f"[WARN] could not save ad character: {e}")
+    return ch, path, voice
 
 
 def _clip_seconds(path: str) -> float:
@@ -1675,7 +1987,10 @@ def _render_spec(spec: dict, w: int, h: int, tmp: str, scale: float = 1.0) -> No
     timed = ad_compose.time_pages(pages, 0.0, spec["duration"])
     out = os.path.join(tmp, f"scene_{spec['index']}_{spec.get('version', 0)}.mp4")
     prefix = f"s{spec['index']}v{spec.get('version', 0)}"
-    if spec["kind"] == "video":
+    if spec["kind"] == "hero":
+        spec["drawn"] = ad_compose.render_hero_scene(spec["image"], spec["product"], w, h, spec["duration"], spec["audio"],
+                                                     timed, out, tmp, prefix, logo=spec.get("logo"))
+    elif spec["kind"] == "video":
         spec["drawn"] = ad_compose.render_video_scene(
             spec["video"], w, h, timed, out, tmp, prefix,
             duration=None if spec.get("native_audio") else spec["duration"],
@@ -1713,7 +2028,9 @@ def _plan_timeline(specs: list[dict], end_card: dict) -> dict:
     for sp in specs:
         d = _clip_seconds(sp["clip"])
         scenes.append({"index": sp["index"], "start": t, "end": t + d, "kind": sp["kind"],
-                       "has_voice": bool(sp.get("dialogue")), "drawn": sp.get("drawn", {})})
+                       "has_voice": bool(sp.get("dialogue")), "drawn": sp.get("drawn", {}),
+                       "product_photo": sp.get("product") if sp["kind"] == "hero" else None,
+                       "character_ref": sp.get("character_ref")})
         t += d
     d = _clip_seconds(end_card["clip"])
     return {"scenes": scenes, "end_card": {"start": t, "end": t + d, "drawn": end_card.get("drawn", {}),
@@ -1756,6 +2073,7 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             raise HTTPException(status_code=400, detail="No script to generate from.")
         facts = ad_brand.BrandFacts.from_campaign(campaign)
         scenes, brand_changes = ad_brand.sanitize_script(copy.deepcopy(script), facts)
+        scenes, claim_changes = ad_claims.enforce_script(scenes, ad_claims.FactSheet.from_campaign(campaign))
         assets = _load_campaign_assets(campaign_id)
         assets_by_id = {a["id"]: a for a in assets}
         aspect_ratio = campaign.get("aspect_ratio") or "9:16"
@@ -1779,7 +2097,12 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             # Generated scenes may borrow a product photo/logo as style grounding; never a screenshot.
             creative_refs = [_resolve(a["url"]) for a in assets if a.get("asset_type") != "screenshot" and a["id"] in local]
 
+            kind = campaign.get("promote_target") or ""
+            scenes = _assign_product_photos(scenes, assets, local, kind)
             body, closing = scenes[:-1], scenes[-1]
+            character, character_path, character_voice = _prepare_character(campaign, body, tmp)
+            if character_voice:
+                voice_name = character_voice          # one voice for the whole ad: the character's
             specs, total = [], len(scenes) + 1
             for i, scene in enumerate(body):
                 dialogue = (scene.get("dialogue_or_vo") or "").strip()
@@ -1792,11 +2115,27 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                     spec["audio"], spec["duration"] = _voice_track(dialogue, planned, voice_name, campaign_id, tmp, f"a{i}")
                     # The brand mark stays off the hook and off a scene already showing the logo.
                     spec["logo"] = logo_path if (i > 0 and featured["id"] != logo_id) else None
+                elif scene.get("product_asset_id") in local:
+                    # Physical product: generated setting + the real product photo composited on top.
+                    pid = scene["product_asset_id"]
+                    refs = ([character_path] if character and scene.get("features_character") else [])
+                    bg_url = _generate_ad_scene_image(
+                        _image_prompt(scene, campaign, aspect_ratio, character=character, for_product=True), refs, campaign_id)
+                    bg_path = os.path.join(tmp, f"gen_{i}.png")
+                    _fetch_local(bg_url, bg_path)
+                    spec.update(kind="hero", image=bg_path, product=local[pid], asset_id=pid,
+                                logo=logo_path if i > 0 else None,
+                                character_ref=bool(refs) if (character and scene.get("features_character")) else None)
+                    spec["audio"], spec["duration"] = _voice_track(dialogue, planned, voice_name, campaign_id, tmp, f"a{i}")
                 else:
-                    image_url = _generate_ad_scene_image(_image_prompt(scene, campaign, aspect_ratio), creative_refs, campaign_id)
+                    with_character = bool(character) and bool(scene.get("features_character"))
+                    refs = ([character_path] if with_character else []) + creative_refs
+                    image_url = _generate_ad_scene_image(
+                        _image_prompt(scene, campaign, aspect_ratio, character=character), refs[:4], campaign_id)
                     image_path = os.path.join(tmp, f"gen_{i}.png")
                     _fetch_local(image_url, image_path)
-                    spec.update(kind="generated", image=image_path, logo=logo_path if i > 0 else None)
+                    spec.update(kind="generated", image=image_path, logo=logo_path if i > 0 else None,
+                                character_ref=with_character if (character and scene.get("features_character")) else None)
                     if use_veo:
                         video_url, veo_seconds = _generate_ad_scene_video(
                             image_url, scene.get("visual_description") or "", scene.get("camera_shot") or "",
@@ -1828,7 +2167,8 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                 end_card["drawn"] = ad_compose.render_end_card(
                     facts.name, facts.display_url, facts.cta, w, h, end_card["duration"], end_card["audio"],
                     end_card["clip"], tmp, logo=end_card["logo"], background=end_card["background"], plain=end_card["plain"],
-                    product=facts.product)
+                    product=facts.product, contact=_contact_line(campaign),
+                    brand_colors=campaign.get("brand_colors") or None)
 
             render_end(0)
             _update_job(job_id, progress_pct=84)
@@ -1850,9 +2190,11 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
             # A missing name/website is simply left out; a website that was given but isn't valid must be fixed.
             blocking = asset_issues + ([i for i in facts.issues if "valid web address" in i])
             expected = float(sum(float(s.get("seconds") or 0) for s in scenes)) or None
+            continuity = story_notes(scenes)
             plan = _plan_timeline(specs, end_card)
             plan["asset_issues"], plan["expected_seconds"] = blocking, expected
             plan["logo_path"] = logo_path
+            plan["story_notes"] = continuity
             report = ad_qc.inspect(final_path, plan, facts, w, h, tmp)
             corrections: list[str] = []
             if not report["passed"]:
@@ -1863,9 +2205,11 @@ def _run_ad_generation(campaign_id: str, job_id: str) -> None:
                     plan = _plan_timeline(specs, end_card)
                     plan["asset_issues"], plan["expected_seconds"] = blocking, expected
                     plan["logo_path"] = logo_path
+                    plan["story_notes"] = continuity
                     report = ad_qc.inspect(final_path, plan, facts, w, h, tmp)
             report["corrections"] = corrections
             report["brand_corrections"] = brand_changes
+            report["claim_corrections"] = claim_changes
             report["notes"] = list(facts.issues)
             _update_job(job_id, progress_pct=92)
 
@@ -1925,7 +2269,18 @@ def _auto_correct(report: dict, specs: list[dict], end_card: dict, render_end, a
         if not sp:
             continue
         n = sp["index"] + 1
-        if any(p in problems for p in ("black", "screen", "website")) and sp["kind"] in ("generated", "video"):
+        if any(p in problems for p in ("black", "screen", "website")) and sp["kind"] == "hero":
+            # Keep the real product; only the generated setting behind it is redone.
+            if regenerations >= MAX_IMAGE_REGENERATIONS:
+                continue
+            regenerations += 1
+            url = _generate_ad_scene_image(_image_prompt(sp["scene"], campaign, aspect_ratio, stricter=True,
+                                                         for_product=True), [], campaign_id)
+            sp["image"] = os.path.join(tmp, f"gen_{sp['index']}_fix.png")
+            _fetch_local(url, sp["image"])
+            _render_spec(sp, w, h, tmp)
+            done.append(f"Scene {n}: generated a new setting behind the product.")
+        elif any(p in problems for p in ("black", "screen", "website")) and sp["kind"] in ("generated", "video"):
             if spare:
                 aid = spare.pop(0)
                 sp.update(kind="asset", image=local[aid], asset_id=aid, native_audio=False)

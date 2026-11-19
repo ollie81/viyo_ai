@@ -291,6 +291,106 @@ def render_video_scene(video: str, w: int, h: int, timed: list, out: str, tmp: s
             "texts": [p.text for p, _, _ in timed]}
 
 
+def product_box(w: int, h: int, logo: bool = False) -> Box:
+    """Where a product hero shot sits: centred in the content area (above the captions), large but with
+    breathing room."""
+    lay = frame_layout(w, h)
+    c = lay["content_below_mark"] if logo else lay["content"]
+    bw, bh = round(c.w * 0.86), round(c.h * 0.86)
+    return Box(c.x + (c.w - bw) // 2, c.y + (c.h - bh) // 2, bw, bh)
+
+
+def prepare_product(photo: str, box: Box, out: str) -> Box:
+    """The real product photo, unchanged, fitted into [box], with rounded corners and a soft shadow so it sits
+    on any background. Returns the box the photo itself occupies (for QC)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    im = Image.open(photo).convert("RGBA")
+    scale = min(box.w / im.width, box.h / im.height)
+    pw, ph = max(1, int(im.width * scale)), max(1, int(im.height * scale))
+    im = im.resize((pw, ph), Image.LANCZOS)
+    if im.getchannel("A").getextrema()[0] == 255:            # opaque photo: round its corners
+        r = max(6, min(pw, ph) // 18)
+        mask = Image.new("L", (pw, ph), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, pw - 1, ph - 1], r, fill=255)
+        im.putalpha(mask)
+    pad = max(12, min(pw, ph) // 12)
+    canvas = Image.new("RGBA", (pw + 2 * pad, ph + 2 * pad), (0, 0, 0, 0))
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    shadow.paste((0, 0, 0, 150), (pad, pad + pad // 3), im.getchannel("A"))
+    canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(pad / 2.2)))
+    canvas.alpha_composite(im, (pad, pad))
+    canvas.save(out)
+    return Box(box.x + (box.w - pw) // 2, box.y + (box.h - ph) // 2, pw, ph)
+
+
+def render_hero_scene(background: str, product: str, w: int, h: int, duration: float, audio: str, timed: list,
+                      out: str, tmp: str, prefix: str, logo: Optional[str] = None) -> dict:
+    """A product hero shot: the generated setting (slow push-in, softened) with the REAL product photo
+    composited in front of it, above the captions. The product's pixels are the advertiser's photo."""
+    lay = frame_layout(w, h)
+    box = product_box(w, h, bool(logo))
+    prod_png = os.path.join(tmp, f"{prefix}_product.png")
+    shown = prepare_product(product, box, prod_png)
+    frames = max(1, int(round(duration * FPS)))
+    step = 0.06 / frames
+    graph = [f"[0:v]scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
+             f"zoompan=z='min(zoom+{step:.8f},1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:"
+             f"s={w}x{h}:fps={FPS},boxblur=6:1,eq=brightness=-0.10,setsar=1[bg]",
+             f"[bg][2:v]overlay=x={box.x}+({box.w}-overlay_w)/2:y={box.y}+({box.h}-overlay_h)/2[v0]"]
+    inputs = ["-loop", "1", "-framerate", str(FPS), "-i", background, "-i", audio, "-loop", "1", "-i", prod_png]
+    last = "v0"
+    drawn = {"captions": [p.box.as_dict() for p, _, _ in timed], "content": shown.as_dict(), "product": shown.as_dict(),
+             "texts": [p.text for p, _, _ in timed]}
+    if logo:
+        m = lay["brand_mark"]
+        inputs += ["-loop", "1", "-i", logo]
+        graph.append(f"[3:v]scale={m.w}:{m.h}:force_original_aspect_ratio=decrease[lg]")
+        graph.append(f"[{last}][lg]overlay=x={m.x}:y={m.y}[v1]")
+        last = "v1"
+        drawn["brand_mark"] = m.as_dict()
+    caps = caption_filters(timed, tmp, prefix)
+    graph.append(f"[{last}]" + (",".join(caps) if caps else "null") + "[vout]")
+    cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", "[vout]", "-map", "1:a:0",
+           "-t", f"{duration:.3f}"] + _encode(out)
+    _ff(cmd, "Product scene render")
+    return drawn
+
+
+def _hex_rgb(c: str) -> tuple:
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _luminance(rgb: tuple) -> float:
+    def ch(v):
+        v = v / 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (ch(v) for v in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a: tuple, b: tuple) -> float:
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def brand_background(colors: list, w: int, h: int, out: str) -> tuple:
+    """A vertical gradient in the brand's colours (one colour: a gentle shade of it). Returns the text colour
+    with the best contrast against it (white or near-black)."""
+    from PIL import Image, ImageDraw
+    c1 = _hex_rgb(colors[0])
+    c2 = _hex_rgb(colors[1]) if len(colors) > 1 else tuple(max(0, int(v * 0.6)) for v in c1)
+    im = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(im)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        d.line([(0, y), (w, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(c1, c2)))
+    im.save(out)
+    worst_white = min(contrast((255, 255, 255), c1), contrast((255, 255, 255), c2))
+    worst_dark = min(contrast((17, 17, 17), c1), contrast((17, 17, 17), c2))
+    return ("white", (255, 255, 255)) if worst_white >= worst_dark else ("0x111111", (17, 17, 17))
+
+
 # ---------------------------------------------------------------- end card
 
 def _fit_size(text: str, start: int, smallest: int, max_w: int) -> int:
@@ -300,7 +400,8 @@ def _fit_size(text: str, start: int, smallest: int, max_w: int) -> int:
     return s
 
 
-def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_logo: bool, product: str = "") -> dict:
+def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_logo: bool, product: str = "",
+                    contact: str = "") -> dict:
     """Logo, brand name, website and call to action stacked in the centre of the safe area, each sized to
     fit the width (a long address wraps onto a second line instead of being cut). Missing items are left
     out, never filled in."""
@@ -326,6 +427,10 @@ def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_l
         s = _fit_size(display_url, round(m * 0.052), round(m * 0.034), inner)
         for line in wrap(display_url, s, inner):
             items.append(("url", line, s, text_width(line, s), round(s * 1.3)))
+    if contact:
+        s = _fit_size(contact, round(m * 0.036), round(m * 0.028), inner)
+        for line in wrap(contact, s, inner)[:2]:
+            items.append(("contact", line, s, text_width(line, s), round(s * 1.3)))
     if cta:
         s = _fit_size(cta, round(m * 0.05), round(m * 0.034), inner - round(m * 0.08))
         lines = wrap(cta, s, inner - round(m * 0.08))[:2]
@@ -344,12 +449,22 @@ def end_card_layout(name: str, display_url: str, cta: str, w: int, h: int, has_l
 
 def render_end_card(name: str, display_url: str, cta: str, w: int, h: int, duration: float, audio: str,
                     out: str, tmp: str, logo: Optional[str] = None, background: Optional[str] = None,
-                    plain: bool = False, product: str = "") -> dict:
+                    plain: bool = False, product: str = "", contact: str = "",
+                    brand_colors: Optional[list] = None) -> dict:
     """The closing card, built only from the advertiser's own facts. [plain]: a solid background (used as
     an automatic correction when the image background made the text hard to read)."""
-    lay = end_card_layout(name, display_url, cta, w, h, bool(logo), product)
+    lay = end_card_layout(name, display_url, cta, w, h, bool(logo), product, contact)
     inputs, graph = [], []
-    if background and not plain:
+    text_color, text_rgb, pill_text = "white", (255, 255, 255), "0x111111"
+    if brand_colors:
+        # The brand's own colours, with text in whichever of white/black reads best on them.
+        bg = os.path.join(tmp, "end_brand_bg.png")
+        text_color, text_rgb = brand_background(brand_colors, w, h, bg)
+        c1 = _hex_rgb(brand_colors[0])
+        pill_text = "0x" + brand_colors[0].lstrip("#") if contrast(c1, (255, 255, 255)) >= 3.0 else "0x111111"
+        inputs += ["-loop", "1", "-framerate", str(FPS), "-i", bg]
+        graph.append("[0:v]setsar=1[v0]")
+    elif background and not plain:
         inputs += ["-loop", "1", "-framerate", str(FPS), "-i", background]
         graph.append(f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=30:3,"
                      f"eq=brightness=-0.42:saturation=0.6,setsar=1[v0]")
@@ -369,11 +484,16 @@ def render_end_card(name: str, display_url: str, cta: str, w: int, h: int, durat
     draws = []
     for i, it in enumerate(lay["items"]):
         b, s = it["box"], it["size"]
-        if it["kind"] in ("name", "product", "url"):
+        if it["kind"] in ("name", "product", "url", "contact"):
             tf = _textfile(tmp, f"end_{i}.txt", it["text"])
-            color = {"name": "white", "product": "0xd6d6e0", "url": "0xdfe7ff"}[it["kind"]]
-            draws.append(f"drawtext=fontfile={FONT_BOLD}:textfile='{tf}':fontsize={s}:fontcolor={color}:"
-                         f"borderw={max(2, round(s * 0.06))}:bordercolor=black@0.7:x={b.x}:y={b.y}")
+            if brand_colors:
+                color, border = text_color, ("black@0.25" if text_color == "white" else "white@0.25")
+            else:
+                color = {"name": "white", "product": "0xd6d6e0", "url": "0xdfe7ff", "contact": "0xc9cbd6"}[it["kind"]]
+                border = "black@0.7"
+            draws.append(f"drawtext=fontfile={FONT_BOLD if it['kind'] != 'contact' else FONT_REGULAR}:textfile='{tf}':"
+                         f"fontsize={s}:fontcolor={color}:borderw={max(1, round(s * 0.05))}:bordercolor={border}:"
+                         f"x={b.x}:y={b.y}")
             texts.append(it["text"])
         elif it["kind"] == "cta":
             draws.append(f"drawbox=x={b.x}:y={b.y}:w={b.w}:h={b.h}:color=white@0.96:t=fill")
@@ -381,7 +501,7 @@ def render_end_card(name: str, display_url: str, cta: str, w: int, h: int, durat
                 tf = _textfile(tmp, f"end_{i}_{li}.txt", line)
                 lw = text_width(line, s)
                 ty = b.y + round(s * 0.55) + round(li * s * LINE_SPACING)
-                draws.append(f"drawtext=fontfile={FONT_BOLD}:textfile='{tf}':fontsize={s}:fontcolor=0x111111:"
+                draws.append(f"drawtext=fontfile={FONT_BOLD}:textfile='{tf}':fontsize={s}:fontcolor={pill_text}:"
                              f"x={b.x + (b.w - lw) // 2}:y={ty}")
                 texts.append(line)
     graph.append(f"[{last}]" + (",".join(draws) if draws else "null") + "[vout]")
