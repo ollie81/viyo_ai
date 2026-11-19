@@ -444,6 +444,7 @@ class CampaignOut(BaseModel):
     target_description: str
     target_features: list[str]
     brand_name: str = ""
+    brand_id: Optional[str] = None     # the saved brand (My Brands) this campaign belongs to
     product_subtype: str = ""
     facts: dict = {}
     brand_colors: list[str] = []
@@ -490,6 +491,7 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         target_description=row.get("target_description") or "",
         target_features=row.get("target_features") or [],
         brand_name=row.get("brand_name") or "",
+        brand_id=row.get("brand_id"),
         product_subtype=row.get("product_subtype") or "",
         facts=row.get("facts") or {},
         brand_colors=row.get("brand_colors") or [],
@@ -1804,6 +1806,17 @@ def _store_file(campaign: dict, data: bytes, mime: str, name: str) -> str:
     return _upload_image(data, mime, f"ads/{campaign['id']}/{name}")
 
 
+def _store_character_portrait(campaign: dict, data: bytes) -> str:
+    """A character's reference portrait. Creators: in their own characters folder, not the campaign's, so a
+    saved character keeps working after the campaign it came from is deleted."""
+    name = f"character_{uuid.uuid4().hex}.png"
+    if _is_creator(campaign):
+        path = f"ads/{campaign['user_id']}/characters/{name}"
+        supabase_admin.storage.from_(PRIVATE_BUCKET).upload(path, data, {"content-type": "image/png", "upsert": "true"})
+        return f"{PRIVATE_PREFIX}{PRIVATE_BUCKET}/{path}"
+    return _store_file(campaign, data, "image/png", name)
+
+
 def _resolve(ref: Optional[str]) -> Optional[str]:
     """A link the app (or the renderer) can open: private references become one-hour signed links."""
     if not ref or not ref.startswith(PRIVATE_PREFIX):
@@ -1958,7 +1971,7 @@ def _prepare_character(campaign: dict, scenes: list[dict], tmp: str) -> tuple[Op
         url = _generate_ad_scene_image(prompt, [], campaign["id"])
         _fetch_local(url, path)
         with open(path, "rb") as f:
-            portrait_ref = _store_file(campaign, f.read(), "image/png", f"character_{uuid.uuid4().hex}.png")
+            portrait_ref = _store_character_portrait(campaign, f.read())
         ch["portrait"] = portrait_ref
     voice = ch.get("voice_name") or _auto_assign_voice(ch.get("gender") or campaign.get("voice_gender_preference") or "",
                                                        _age_bucket(ch.get("age", "")), set())
@@ -1969,7 +1982,8 @@ def _prepare_character(campaign: dict, scenes: list[dict], tmp: str) -> tuple[Op
             saved = supabase_admin.table("ad_characters").insert({
                 "owner_id": campaign["user_id"], "name": ch.get("name") or "Character",
                 "spec": {k: v for k, v in ch.items() if k not in ("portrait", "voice_name", "saved_id")},
-                "portrait": portrait_ref, "voice_name": voice}).execute().data
+                "portrait": portrait_ref, "voice_name": voice,
+                **({"brand_id": campaign["brand_id"]} if campaign.get("brand_id") else {})}).execute().data
             if saved:
                 ch["saved_id"] = saved[0]["id"]
                 supabase_admin.table("ad_campaigns").update({"character": ch}).eq("id", campaign["id"]).execute()

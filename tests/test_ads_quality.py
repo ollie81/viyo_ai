@@ -238,8 +238,16 @@ class _Q:
         self.row = row
         return self
 
+    def delete(self):
+        self.deleting = True
+        return self
+
     def execute(self):
         rows = self.db.setdefault(self.table, [])
+        if getattr(self, "deleting", False):
+            hit = [r for r in rows if all(r.get(k) == v for k, v in self.filters)]
+            self.db[self.table] = [r for r in rows if r not in hit]
+            return _Res(hit)
         if self.row is not None:
             r = {"id": str(uuid.uuid4()), **self.row}
             rows.append(r)

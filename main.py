@@ -197,9 +197,11 @@ except Exception as _ads_studio_import_error:
 try:
     from ads_maker import router as ads_maker_router
     from ads_publish import admin_router as ads_publish_admin_router
+    from ads_brands import router as ads_brands_router
 
     app.include_router(ads_maker_router)
     app.include_router(ads_publish_admin_router)
+    app.include_router(ads_brands_router)
 except Exception as _ads_maker_import_error:
     print(f"[WARN] Ads Maker router not loaded: {_ads_maker_import_error}")
 
