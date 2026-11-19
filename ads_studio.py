@@ -193,6 +193,18 @@ def _spent(campaign_id: str, call_type: str, cents) -> None:
         run["spent_cents"] += float(cents)
 
 
+def _objective_text(campaign: dict) -> str:
+    """The objective line of the hook and script prompts, plus the creative concept the advertiser chose (from a
+    daily idea), when there is one. A concept is direction only: it never adds claims (the facts guard still
+    applies to everything written)."""
+    text = campaign.get("objective") or "drive interest and engagement"
+    brief = (campaign.get("creative_brief") or "").strip()
+    if brief:
+        text += ("\nCREATIVE CONCEPT (chosen by the advertiser; follow it, but it adds no facts or claims): "
+                 + brief[:1200])
+    return text
+
+
 def _require_configured() -> None:
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Ads Studio is not configured (Supabase).")
@@ -445,6 +457,8 @@ class CampaignOut(BaseModel):
     target_features: list[str]
     brand_name: str = ""
     brand_id: Optional[str] = None     # the saved brand (My Brands) this campaign belongs to
+    track: str = ""                     # Campaign Universe: which kind of ad in the brand's ongoing campaign
+    creative_brief: str = ""            # the concept chosen from a daily idea, if any
     product_subtype: str = ""
     facts: dict = {}
     brand_colors: list[str] = []
@@ -492,6 +506,8 @@ def _row_to_campaign(row: dict) -> CampaignOut:
         target_features=row.get("target_features") or [],
         brand_name=row.get("brand_name") or "",
         brand_id=row.get("brand_id"),
+        track=row.get("track") or "",
+        creative_brief=row.get("creative_brief") or "",
         product_subtype=row.get("product_subtype") or "",
         facts=row.get("facts") or {},
         brand_colors=row.get("brand_colors") or [],
@@ -964,7 +980,7 @@ def _build_hook_prompt(campaign: dict, format_key: Optional[str]) -> str:
         target_description=campaign.get("target_description") or "",
         features=features,
         audience=campaign.get("target_audience") or "general short-form video viewers",
-        objective=campaign.get("objective") or "drive interest and engagement",
+        objective=_objective_text(campaign),
         format_label=format_label,
         format_style=format_style,
         format_keys=", ".join(AD_FORMATS.keys()),
@@ -1304,7 +1320,7 @@ def _build_script_prompt(campaign: dict, hook_text: str, assets: list[dict]) -> 
         target_description=campaign.get("target_description") or "",
         features=features,
         audience=campaign.get("target_audience") or "general short-form video viewers",
-        objective=campaign.get("objective") or "drive interest and engagement",
+        objective=_objective_text(campaign),
         style=_style_block(campaign),
         character=_character_block(campaign),
         scene_count=_scene_count_for_duration(duration),
