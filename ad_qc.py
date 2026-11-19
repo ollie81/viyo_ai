@@ -86,17 +86,23 @@ def ocr(image: str) -> Optional[str]:
     im = Image.open(image).convert("L")
     if im.width < 1400:
         im = im.resize((im.width * 2, im.height * 2))
-    texts = []
+    texts, failed = [], 0
     # As-is and inverted (light text on dark and dark on light), each read as scattered text (psm 11)
     # and as a block (psm 3): together they catch signs, captions and end-card text.
     for vi, variant in enumerate((im, Image.eval(im, lambda p: 255 - p))):
         tmp = f"{image}.ocr{vi}.png"
         variant.save(tmp)
         for psm in ("11", "3"):
-            r = subprocess.run(["tesseract", tmp, "-", "--psm", psm], capture_output=True, text=True, timeout=60)
-            texts.append(r.stdout)
+            try:
+                # One thread: Tesseract's own threading is much slower on a busy server, never faster.
+                r = subprocess.run(["tesseract", tmp, "-", "--psm", psm], capture_output=True, text=True, timeout=60,
+                                   env={**os.environ, "OMP_THREAD_LIMIT": "1"})
+                texts.append(r.stdout)
+            except (subprocess.TimeoutExpired, OSError):
+                failed += 1
         os.remove(tmp)
-    return "\n".join(texts)
+    # A text reader that can't finish is "not checked", never a crashed ad.
+    return None if failed == 4 else "\n".join(texts)
 
 
 def _norm(s: str) -> str:

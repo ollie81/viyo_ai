@@ -261,3 +261,13 @@ def test_reused_character_makes_no_new_portrait(pipeline):
     assert c["status"] == "ready"
     assert pipeline["paid"]["images"] - before == 3, "one picture per story scene, no new portrait"
     assert not ads_studio.supabase_admin.db.get("ad_characters"), "already saved"
+
+
+def test_text_reader_timeout_is_unchecked_not_a_crash(tmp_path, monkeypatch):
+    img = _img(os.path.join(str(tmp_path), "f.png"), 200, 200)
+    monkeypatch.setattr(ad_qc, "ocr_available", lambda: True)
+
+    def slow(*a, **k):
+        raise subprocess.TimeoutExpired(a[0], 60)
+    monkeypatch.setattr(ad_qc.subprocess, "run", slow)
+    assert ad_qc.ocr(img) is None
