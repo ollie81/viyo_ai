@@ -171,13 +171,17 @@ async def get_subscription_status(user: tuple[str, str] = Depends(_get_current_u
     user_id, _ = user
     if supabase_admin is None:
         return SubscriptionStatusResponse(is_subscribed=False)
-    rows = (
-        supabase_admin.table("profiles")
-        .select("is_subscribed, subscription_plan, subscription_status, subscription_renews_at, subscription_ends_at")
-        .eq("id", user_id)
-        .limit(1)
-        .execute()
-    ).data
+    try:
+        rows = (
+            supabase_admin.table("profiles")
+            .select("is_subscribed, subscription_plan, subscription_status, subscription_renews_at, subscription_ends_at")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        ).data
+    except Exception as e:
+        print(f"[WARN] subscription status for {user_id} unavailable: {e}")
+        rows = None
     if not rows:
         return SubscriptionStatusResponse(is_subscribed=False)
     row = rows[0]
@@ -196,7 +200,14 @@ def is_active_subscriber(admin, user_id: str) -> bool:
     needs to happen for the backend's own gate."""
     if admin is None:
         return False
-    rows = admin.table("profiles").select("is_subscribed").eq("id", user_id).limit(1).execute().data
+    # Never let this check break a paid unlock: if the subscription columns are missing (the migration hasn't
+    # been run: Postgres error 42703) or the lookup fails, the viewer is treated as not subscribed and simply
+    # pays with coins as normal. Failing this way can only ever charge someone, never give premium for free.
+    try:
+        rows = admin.table("profiles").select("is_subscribed").eq("id", user_id).limit(1).execute().data
+    except Exception as e:
+        print(f"[WARN] subscriber check for {user_id} failed, treating as not subscribed: {e}")
+        return False
     return bool(rows and rows[0].get("is_subscribed"))
 
 
