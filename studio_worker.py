@@ -24,6 +24,7 @@ import studio_elements as world_mod
 import studio_identity as ident
 import studio_pricing as pricing
 import studio_render as render
+import film_qc
 import studio_music as music_mod
 import studio_continuity as continuity
 import studio_inspect as inspect_mod
@@ -2050,6 +2051,11 @@ class StudioWorker:
             out = os.path.join(tmp, "film.mp4")
             info = render.render_film(inputs, project["aspect_ratio"], out, tmp, captions=bool(project.get("captions", True)),
                                       music=music, music_volume=float(project.get("music_volume") or 0.25))
+            # Only a usable film counts as made: the final check runs before anything is saved or charged.
+            qc = film_qc.inspect_film(out, film_qc.plan_from_inputs(inputs), project["aspect_ratio"])
+            if not qc["passed"]:
+                print(f"[INFO] studio render {job['id']}: final check failed: {qc['items']}")
+                raise JobFailed("quality_check", film_qc.explain(qc))
             prev = self.store.select("studio_renders", {"project_id": project["id"]}, order="version", desc=True, limit=1)
             version = (prev[0]["version"] + 1) if prev else 1
             path, bunny_id = None, None

@@ -229,6 +229,12 @@ try:
     app.include_router(creator_downloads_router)
 except Exception as _dl_err:
     print(f"[WARN] Creator downloads router not loaded: {_dl_err}")
+# Creator Hub: the creator's own audience, productions, earnings and the real earning rules (read-only).
+try:
+    from creator_hub import router as creator_hub_router
+    app.include_router(creator_hub_router)
+except Exception as _hub_err:
+    print(f"[WARN] Creator Hub router not loaded: {_hub_err}")
 try:
     from share_pages import router as share_pages_router
     app.include_router(share_pages_router)
