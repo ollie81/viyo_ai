@@ -61,6 +61,32 @@ async def _get_current_user_id(authorization: str = Header(None)) -> str:
     return await get_current_user_id(authorization)
 
 
+def _activity(user_id: str, kind: str, post: dict) -> None:
+    """Records the action for recommendations/analytics (best-effort, never breaks the action)."""
+    try:
+        import activity
+        activity.supabase_admin = activity.supabase_admin or supabase_admin
+        activity.record(user_id, kind, post_id=post.get("id"), series_id=post.get("series_id"),
+                        creator_id=post.get("user_id"))
+    except Exception as e:
+        print(f"[WARN] activity {kind}: {str(e)[:120]}")
+
+
+# A view is counted once per person per post in this window, and never the creator's own.
+VIEW_WINDOW_HOURS = 6
+
+
+def _viewed_recently(user_id: str, post_id: str) -> bool:
+    import datetime as _dt
+    since = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=VIEW_WINDOW_HOURS)).isoformat()
+    try:
+        rows = (supabase_admin.table("viewer_events").select("id").eq("user_id", user_id).eq("post_id", post_id)
+                .eq("kind", "view").gte("created_at", since).limit(1).execute().data)
+        return bool(rows)
+    except Exception:
+        return False           # table not added yet: count as before
+
+
 def _notify_post_owner(post_owner_id: str, actor_id: str, notif_type: str, message_template: str,
                        push_title: str, post_id: str = None) -> None:
     """
@@ -80,7 +106,7 @@ def _get_post(post_id: str) -> dict:
         result = (
             supabase_admin
             .table("posts")
-            .select("id,user_id,like_count,view_count")
+            .select("id,user_id,like_count,view_count,series_id")
             .eq("id", post_id)
             .limit(1)
             .execute()
@@ -131,6 +157,7 @@ async def like_post(post_id: str, user_id: str = Depends(_get_current_user_id_no
         raise HTTPException(status_code=500, detail=f"Liked, but could not update like count: {e}")
 
     _notify_post_owner(post["user_id"], user_id, "like", "{actor_name} liked your post", "New like ❤️", post_id)
+    _activity(user_id, "like", post)
 
     return LikeResponse(liked=True, like_count=new_count)
 
@@ -190,6 +217,10 @@ async def view_post(post_id: str, user_id: str = Depends(_get_current_user_id)):
 
     post = _get_post(post_id)
     current = int(post.get("view_count") or 0)
+    # Honest counts: the creator's own views and repeat views within VIEW_WINDOW_HOURS don't add up.
+    if post.get("user_id") == user_id or _viewed_recently(user_id, post_id):
+        return ViewResponse(view_count=current)
+    _activity(user_id, "view", post)
 
     try:
         result = (
@@ -247,6 +278,7 @@ async def share_post(post_id: str, user_id: str = Depends(_get_current_user_id))
             return ShareResponse(share_count=0)
         raise HTTPException(status_code=500, detail="Could not count the share.")
     _recent_shares[key] = now
+    _activity(user_id, "share", post)
     return ShareResponse(share_count=current + 1 if result.data else current)
 
 
@@ -325,6 +357,7 @@ async def add_comment(
     # owner at all, in-app or push.
     _notify_post_owner(post["user_id"], user_id, "comment", "{actor_name} commented on your post", "New comment 💬", post_id)
 
+    _activity(user_id, "comment", post)
     return CommentResponse(**rows[0])
 
 

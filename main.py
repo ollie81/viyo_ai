@@ -229,6 +229,22 @@ try:
     app.include_router(creator_downloads_router)
 except Exception as _dl_err:
     print(f"[WARN] Creator downloads router not loaded: {_dl_err}")
+# VIYO intelligence: viewer activity, For You recommendations, trending, search, fraud review.
+try:
+    from activity import router as activity_router
+    from recommend import router as recommend_router
+    app.include_router(activity_router)
+    app.include_router(recommend_router)
+    from trending import router as trending_router
+    from search import router as search_router
+    app.include_router(trending_router)
+    app.include_router(search_router)
+    from creator_analytics import router as creator_analytics_router
+    from fraud import router as fraud_router
+    app.include_router(creator_analytics_router)
+    app.include_router(fraud_router)
+except Exception as _intel_err:
+    print(f"[WARN] Intelligence routers not loaded: {_intel_err}")
 # Creator Hub: the creator's own audience, productions, earnings and the real earning rules (read-only).
 try:
     from creator_hub import router as creator_hub_router
