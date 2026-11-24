@@ -309,3 +309,13 @@ def estimate_listen(seconds: float = 15, video: bool = False) -> Cost:
     of the characters (about 600 tokens) are sent with it."""
     per = 332 if video else 32
     return text_cost(2100 + int(per * max(1.0, seconds)), THINKING_BUDGET + 900)
+
+def estimate_interview_turn() -> Cost:
+    """One interview question: the idea and the answers so far in, one short JSON turn out."""
+    return text_cost(4000, THINKING_BUDGET + 1500)
+
+
+def estimate_outline(chapters: int) -> Cost:
+    """The novel outline: one plan call, sent back at most once if the plan check finds problems."""
+    out = THINKING_BUDGET + 3000 + int(chapters) * 550
+    return text_cost(2 * (7000 + out // 2), 2 * out)

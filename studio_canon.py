@@ -332,6 +332,12 @@ class Canon:
             scored.append((prio, f))
         # Secrets in play: anyone involved who knows a secret, and the involved people it's kept from.
         secrets = {f.get("object_id") for f in st.facts if f["kind"] == "knows" and f.get("subject_id") in main}
+        # ...and secrets an open thread ties to someone here (a planned reveal to them): the writer must know
+        # what they don't know yet.
+        for t in st.threads:
+            ids = set(t.get("entities") or [])
+            if ids & main:
+                secrets |= {i for i in ids if self.by_id.get(i, {}).get("kind") == "secret"}
         secret_lines = []
         for s in secrets:
             if not s:
@@ -723,6 +729,33 @@ class CanonRepo:
         if existing:
             return self.store.update("studio_story_episodes", {"id": existing["id"]}, fields)[0]
         return self.store.insert("studio_story_episodes", [{**self._base(), "number": int(number), **fields}])[0]
+
+    # ---- imports from a plan the creator approved (an outline): approved, with the plan text as evidence
+
+    def import_entity(self, kind: str, name: str, quote: str, source_ref: str, profile: Optional[dict] = None,
+                      aliases: Iterable[str] = ()) -> dict:
+        if kind not in ENTITY_KINDS:
+            raise CanonError(f"Unknown kind: {kind}")
+        return self.store.insert("studio_story_entities", [{
+            **self._base(), "kind": kind, "name": name.strip()[:120], "profile": profile or {},
+            "aliases": [a.strip()[:120] for a in aliases if a and a.strip()],
+            "source_quote": (quote or name)[:1000], "origin": "import", "status": "approved",
+            **self._decision("creator")}])[0]
+
+    def import_fact(self, fact: dict, source_ref: str) -> dict:
+        row = self._fact_row({**fact, "source_ref": source_ref, "source_quote": (fact.get("source_quote") or source_ref)})
+        row.update(origin="import", status="approved", **self._decision("creator"))
+        return self.store.insert("studio_story_facts", [row])[0]
+
+    def import_thread(self, kind: str, description: str, planted_chapter: int, quote: str, source_ref: str,
+                      due_chapter: Optional[int] = None, entities: Iterable[str] = ()) -> dict:
+        if kind not in THREAD_KINDS:
+            raise CanonError(f"Unknown thread kind: {kind}")
+        return self.store.insert("studio_story_threads", [{
+            **self._base(), "kind": kind, "description": description[:600], "planted_chapter": int(planted_chapter),
+            "planted_quote": (quote or source_ref)[:1000], "entities": list(entities),
+            "payoff_plan": f"planned in {source_ref}"[:600], "due_chapter": due_chapter, "origin": "import",
+            "status": "approved", **self._decision("creator")}])[0]
 
     # ---- AI extraction intake
 
