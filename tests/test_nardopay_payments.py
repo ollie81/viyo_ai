@@ -231,6 +231,7 @@ def test_no_redirect_or_get_route_can_credit_coins():
     routes = {(r.path, m) for r in np_.router.routes for m in r.methods}
     gets = sorted(p for p, m in routes if m == "GET")
     assert gets == ["/api/v1/admin/nardopay/duplicate-payments", "/api/v1/admin/nardopay/rate",
+                    "/api/v1/coins/purchase/nardopay/availability",
                     "/api/v1/coins/purchase/nardopay/orders/{order_id}"]
 
 
@@ -465,3 +466,46 @@ def test_raw_bodies_are_purged_after_the_retention_period(env):
     assert rows == {"processed": True, "mismatch": False}
     assert db.execute("select count(*) from public.nardopay_webhook_events where status = 'processed' and "
                       "body_sha256 is not null and transaction_id = 'tx_1'").fetchone()[0] == 1
+
+
+# ------------------------------------------------------------------------------------------- availability and schedule
+
+def test_availability_is_a_plain_yes_or_no(env, monkeypatch):
+    client, db, calls, st = env
+    assert client.get("/api/v1/coins/purchase/nardopay/availability").json() == {"available": True}
+    monkeypatch.setenv("NARDOPAY_ENABLED", "false")
+    assert client.get("/api/v1/coins/purchase/nardopay/availability").json() == {"available": False}
+    monkeypatch.setenv("NARDOPAY_ENABLED", "true")
+    db.execute("update public.nardopay_rates set set_at = now() - interval '30 days'")
+    assert client.get("/api/v1/coins/purchase/nardopay/availability").json() == {"available": False}
+
+
+def test_the_scheduled_loop_reconciles_and_survives_errors(env, monkeypatch):
+    import threading
+    client, db, calls, st = env
+    seen, stop = [], threading.Event()
+
+    def fake_reconcile():
+        seen.append(1)
+        if len(seen) == 1:
+            raise RuntimeError("database blip")           # an error must not stop the loop
+        stop.set()
+        return {"finished": 0, "skipped": [], "expired": 0, "purged": 0}
+    monkeypatch.setattr(np_, "reconcile", fake_reconcile)
+    np_.reconcile_forever(interval_seconds=0, stop=stop)
+    assert len(seen) == 2
+
+
+def test_the_schedule_does_nothing_until_nardopay_is_set_up(env, monkeypatch):
+    import threading
+    client, db, calls, st = env
+    for k in ("NARDOPAY_ENABLED", "NARDOPAY_WEBHOOK_SECRET"):
+        monkeypatch.delenv(k)
+    assert np_.reconciler_should_run() is False
+    seen, stop = [], threading.Event()
+    monkeypatch.setattr(np_, "reconcile", lambda: seen.append(1))
+    threading.Timer(0.05, stop.set).start()
+    np_.reconcile_forever(interval_seconds=0.01, stop=stop)
+    assert seen == []
+    monkeypatch.setenv("NARDOPAY_RECONCILE", "off")
+    assert np_.start_reconciler() is False

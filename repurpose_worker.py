@@ -273,6 +273,11 @@ def main() -> None:
         studio_worker.start_production()
     except Exception as e:  # never let the Studio stop the Repurposer
         print(f"[WARN] Creator Studio worker not started: {e}")
+    try:
+        import nardopay_payments
+        nardopay_payments.start_reconciler()
+    except Exception as e:  # never let payments upkeep stop the Repurposer
+        print(f"[WARN] NardoPay reconciliation not started: {e}")
     worker.run_forever()
 
 

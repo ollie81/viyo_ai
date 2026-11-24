@@ -509,3 +509,58 @@ async def duplicate_payments():
                               limit=200)
     return {"payments": [{k: r.get(k) for k in ("id", "order_id", "transaction_id", "amount", "currency", "detail",
                                                  "received_at")} for r in rows]}
+
+
+# ====================================================================== availability and the reconciliation schedule
+
+def checkout_problem() -> Optional[str]:
+    """Why web checkout can't take an order right now (for logs), or None."""
+    if not _flag("NARDOPAY_ENABLED") or not _flag("NARDOPAY_LEDGER_VERIFIED"):
+        return "switched off"
+    if not _env("NARDOPAY_API_KEY") or amount_multiplier() is None or missing_contract():
+        return "not configured"
+    try:
+        return rate_problem(latest_rate())
+    except Exception:
+        return "rates unavailable"
+
+
+@router.get("/coins/purchase/nardopay/availability")
+async def availability():
+    """Whether the web app should offer "Pay with NardoPay". Only a yes/no: no setting is revealed. The Android app
+    never shows NardoPay (it keeps Google Play Billing), whatever this says."""
+    return {"available": checkout_problem() is None}
+
+
+def reconciler_should_run() -> bool:
+    return _flag("NARDOPAY_ENABLED") or bool(_env("NARDOPAY_WEBHOOK_SECRET"))
+
+
+def reconcile_forever(interval_seconds: int = 600, stop=None) -> None:
+    """Runs reconcile() every interval (finishing verified payments, expiring unpaid orders, purging old raw webhook
+    bodies). Errors are logged and never stop the loop."""
+    import threading
+    stop = stop or threading.Event()
+    while not stop.is_set():
+        try:
+            if reconciler_should_run():
+                out = reconcile()
+                if out["finished"] or out["skipped"] or out["purged"]:
+                    print(f"[INFO] NardoPay reconcile: {out['finished']} finished, {len(out['skipped'])} skipped, "
+                          f"{out['expired']} expired, {out['purged']} raw bodies purged")
+        except Exception as e:
+            print(f"[WARN] NardoPay reconcile failed: {type(e).__name__}: {str(e)[:160]}")
+        stop.wait(interval_seconds)
+
+
+def start_reconciler() -> bool:
+    """Starts the reconciliation loop in a background thread (called from the worker service). Returns whether it
+    started; NARDOPAY_RECONCILE=off turns it off."""
+    import threading
+    if _env("NARDOPAY_RECONCILE", "on").lower() in ("off", "false", "0", "no"):
+        print("[INFO] NardoPay reconciliation off (NARDOPAY_RECONCILE=off)")
+        return False
+    interval = int(_env("NARDOPAY_RECONCILE_SECONDS", "600") or 600)
+    threading.Thread(target=reconcile_forever, args=(max(60, interval),), name="nardopay-reconcile", daemon=True).start()
+    print(f"[INFO] NardoPay reconciliation scheduled every {max(60, interval)}s (acts only when NardoPay is set up)")
+    return True
