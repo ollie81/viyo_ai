@@ -215,68 +215,50 @@ async def save_payout_settings(req: PayoutSettings, user_id: str = Depends(_get_
     return PayoutSettings(**row)
 
 
+def _rpc(name: str, params: dict) -> dict:
+    """Calls one of the payout database functions (creator_payouts_safety.sql). Each runs as a single locked
+    transaction, so if it fails nothing has changed. If the function isn't installed yet, withdrawals stop
+    (HTTP 503) rather than falling back to the old, non-atomic steps."""
+    try:
+        data = supabase_admin.rpc(name, params).execute().data
+    except Exception as e:
+        text = str(e)
+        if name in text and ("PGRST202" in text or "Could not find" in text or "does not exist" in text):
+            print(f"[ERROR] {name} is missing: run creator_payouts_safety.sql")
+            raise HTTPException(status_code=503, detail="Withdrawals are paused for an upgrade. Try again later.")
+        print(f"[ERROR] {name} failed: {text[:300]}")
+        raise HTTPException(status_code=500, detail="Couldn't complete this right now. Nothing was changed. Try again.")
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return data or {}
+
+
 @router.post("/wallet/withdraw", response_model=WithdrawResponse)
 async def request_withdrawal(user_id: str = Depends(_get_current_user_id_no_guest)):
+    """Reserves all of the creator's available earnings for one withdrawal, atomically (viyo_request_withdrawal):
+    two requests at the same moment can't reserve the same earnings, and a failure leaves nothing reserved."""
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Wallet service is not configured.")
-
-    try:
-        available = (
-            supabase_admin.table("creator_earnings")
-            .select("id,coins")
-            .eq("creator_id", user_id)
-            .eq("status", "available")
-            .execute()
-        )
-        rows = available.data or []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not load available earnings: {e}")
-
-    total = sum(int(r.get("coins") or 0) for r in rows)
-    if total < MIN_WITHDRAWAL_COINS:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"You can withdraw from ${MIN_WITHDRAWAL_USD:.0f} ({MIN_WITHDRAWAL_COINS:,} coins). "
-                    f"You have ${coins_to_usd(total):.2f} ({total:,} coins)."),
-        )
     settings = _load_settings(user_id)
     if not settings:
         raise HTTPException(status_code=400, detail="Add your payout details first (PayPal or mobile money).")
-    if _pending_request(user_id):
-        raise HTTPException(status_code=409, detail="You already have a withdrawal on its way. You can request another once it's paid.")
-
-    ids = [r["id"] for r in rows]
-    usd = coins_to_usd(total)
     destination = describe_destination(settings)
-
-    try:
-        created = supabase_admin.table("withdrawal_requests").insert({
-            "creator_id": user_id,
-            "coins": total,
-            "status": "pending",
-            "usd_amount": usd,
-            "payout_method": settings.get("method"),
-            "payout_destination": destination,
-        }).execute()
-        request_id = ((created.data or [{}])[0]).get("id")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not create withdrawal request: {e}")
-
-    # Marked pending_withdrawal AFTER the request row exists, so a
-    # failure here never leaves a withdrawal request with nothing
-    # backing it — worst case some rows stay "available" and get swept
-    # into the creator's next withdrawal request instead of this one.
-    try:
-        (
-            supabase_admin.table("creator_earnings")
-            .update({"status": "pending_withdrawal", "withdrawal_request_id": request_id})
-            .in_("id", ids)
-            .execute()
-        )
-    except Exception as e:
-        print(f"[WARN] Withdrawal request created but earnings rows not marked pending for {user_id}: {e}")
-
-    return WithdrawResponse(requested=True, coins=total, usd_amount=usd, payout_destination=destination)
+    r = _rpc("viyo_request_withdrawal", {"p_creator": user_id, "p_min_coins": MIN_WITHDRAWAL_COINS,
+                                         "p_coin_usd": COIN_USD, "p_method": settings.get("method"),
+                                         "p_destination": destination})
+    if not r.get("ok"):
+        if r.get("error") == "pending_exists":
+            raise HTTPException(status_code=409, detail="You already have a withdrawal on its way. You can request "
+                                                        "another once it's paid.")
+        if r.get("error") == "below_minimum":
+            total = int(r.get("coins") or 0)
+            raise HTTPException(
+                status_code=400,
+                detail=(f"You can withdraw from ${MIN_WITHDRAWAL_USD:.0f} ({MIN_WITHDRAWAL_COINS:,} coins). "
+                        f"You have ${coins_to_usd(total):.2f} ({total:,} coins)."))
+        raise HTTPException(status_code=500, detail="Couldn't request the withdrawal. Nothing was changed. Try again.")
+    return WithdrawResponse(requested=True, coins=int(r["coins"]), usd_amount=float(r["usd_amount"]),
+                            payout_destination=destination)
 
 
 # ---------------------------------------------------------------- admin: pay creators
@@ -325,54 +307,55 @@ async def admin_list_withdrawals(status: Literal["pending", "paid", "rejected"] 
         admin_note=r.get("admin_note")) for r in rows]
 
 
-def _settle(request_id: str, new_status: str, earnings_status: str, note: Optional[str]) -> dict:
+def _settle(request_id: str, action: str, note: Optional[str]) -> dict:
+    """Marks a withdrawal paid or rejected in one locked transaction (viyo_settle_withdrawal). Repeating the same
+    action changes nothing and notifies no one again; the opposite action after it is refused; rejected earnings
+    return to available exactly once."""
     if supabase_admin is None:
         raise HTTPException(status_code=503, detail="Wallet service is not configured.")
+    import uuid as _uuid
     try:
-        found = (supabase_admin.table("withdrawal_requests").select("*").eq("id", request_id).limit(1).execute()).data or []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not load withdrawal: {e}")
-    if not found:
+        rid = str(_uuid.UUID(str(request_id)))
+    except ValueError:
         raise HTTPException(status_code=404, detail="Withdrawal not found.")
-    req = found[0]
-    if (req.get("status") or "pending") != "pending":
-        raise HTTPException(status_code=409, detail=f"This withdrawal is already {req.get('status')}.")
-    update = {"status": new_status, "admin_note": note}
-    if new_status == "paid":
-        update["paid_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    try:
-        supabase_admin.table("withdrawal_requests").update(update).eq("id", request_id).eq("status", "pending").execute()
-        rows_update = {"status": earnings_status}
-        if earnings_status == "available":
-            rows_update["withdrawal_request_id"] = None
-        (supabase_admin.table("creator_earnings").update(rows_update)
-         .eq("withdrawal_request_id", request_id).execute())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not update withdrawal: {e}")
-    try:
-        from notify import notify
-        usd = float(req.get("usd_amount") or coins_to_usd(req.get("coins") or 0))
-        if new_status == "paid":
-            notify(str(req["creator_id"]), "payout_paid",
-                   f"Your ${usd:.2f} payout was sent to {req.get('payout_destination') or 'you'}.",
-                   entity_id=request_id, push_title="Payout sent 💸", admin=supabase_admin)
-        else:
-            reason = f" Note: {note}" if note else ""
-            notify(str(req["creator_id"]), "payout_rejected",
-                   f"Your ${usd:.2f} withdrawal couldn't be sent. Check your payout details and request again.{reason}",
-                   entity_id=request_id, push_title="Withdrawal not sent", admin=supabase_admin)
-    except Exception as e:
-        print(f"[WARN] payout notification failed for {request_id}: {e}")
-    return {"id": request_id, "status": new_status}
+    r = _rpc("viyo_settle_withdrawal", {"p_request": rid, "p_action": action, "p_note": note})
+    if not r.get("ok"):
+        err = r.get("error")
+        if err == "not_found":
+            raise HTTPException(status_code=404, detail="Withdrawal not found.")
+        if err in ("already_paid", "already_rejected"):
+            raise HTTPException(status_code=409, detail=f"This withdrawal is already {err.split('_', 1)[1]}.")
+        if err == "earnings_mismatch":
+            print(f"[ERROR] withdrawal {rid}: reserved earnings ({r.get('reserved_coins')}) don't match the request "
+                  f"({r.get('request_coins')}); not settled")
+            raise HTTPException(status_code=409, detail="This withdrawal's reserved earnings don't match its amount. "
+                                                        "It needs a manual check before it can be paid or rejected.")
+        raise HTTPException(status_code=500, detail="Couldn't update the withdrawal. Nothing was changed.")
+    if r.get("changed"):
+        try:
+            from notify import notify
+            usd = float(r.get("usd_amount") or coins_to_usd(r.get("coins") or 0))
+            if action == "paid":
+                notify(str(r["creator_id"]), "payout_paid",
+                       f"Your ${usd:.2f} payout was sent to {r.get('payout_destination') or 'you'}.",
+                       entity_id=rid, push_title="Payout sent 💸", admin=supabase_admin)
+            else:
+                reason = f" Note: {note}" if note else ""
+                notify(str(r["creator_id"]), "payout_rejected",
+                       f"Your ${usd:.2f} withdrawal couldn't be sent. Check your payout details and request again.{reason}",
+                       entity_id=rid, push_title="Withdrawal not sent", admin=supabase_admin)
+        except Exception as e:
+            print(f"[WARN] payout notification failed for {rid}: {e}")
+    return {"id": rid, "status": r["status"], "changed": bool(r.get("changed"))}
 
 
 @router.post("/admin/withdrawals/{request_id}/paid", dependencies=[Depends(_require_admin)])
 async def admin_mark_paid(request_id: str, body: AdminNote = AdminNote()):
     """Call after sending the money in PayPal or mobile money."""
-    return _settle(request_id, "paid", "paid", body.note)
+    return _settle(request_id, "paid", body.note)
 
 
 @router.post("/admin/withdrawals/{request_id}/reject", dependencies=[Depends(_require_admin)])
 async def admin_reject(request_id: str, body: AdminNote = AdminNote()):
     """Cancels a request (e.g. wrong payout details); the earnings go back to available."""
-    return _settle(request_id, "rejected", "available", body.note)
+    return _settle(request_id, "rejected", body.note)
