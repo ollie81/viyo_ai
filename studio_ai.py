@@ -459,6 +459,15 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
+    def novel_json(self, prompt: str, schema: dict, what: str):
+        """One structured Story Intelligence call (an interview turn, a novel outline). Returns (dict, cost)."""
+        resp = self._text(prompt, response_mime_type="application/json", response_json_schema=schema)
+        i, o = self._text_usage(resp)
+        try:
+            return json.loads(resp.text), pricing.text_cost(i, o)
+        except (TypeError, ValueError):
+            raise ProviderError(f"The AI returned an unreadable {what}.")
+
     def chat(self, prompt: str, mode: str = "quick", images: Optional[list] = None):
         """One assistant reply (studio_chat): {reply, proposals, memory, focus}.
 
@@ -827,6 +836,17 @@ class FakeStudioAI:
                 {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running down a wet street",
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
+
+    def novel_json(self, prompt, schema, what):
+        """novel_results[what]: a dict, a list of dicts (one per call), or fn(prompt) -> dict."""
+        self.calls.append(("novel_json", what))
+        self.novel_prompts = getattr(self, "novel_prompts", []) + [(what, prompt)]
+        self._maybe_fail("novel_json")
+        r = (getattr(self, "novel_results", None) or {}).get(what)
+        if isinstance(r, list):
+            r = r.pop(0) if len(r) > 1 else r[0]
+        out = r(prompt) if callable(r) else (r if r is not None else {})
+        return json.loads(json.dumps(out)), pricing.text_cost(3000, 1500)
 
     def chat(self, prompt, mode="quick", images=None):
         self.calls.append(("chat",))

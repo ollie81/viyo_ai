@@ -225,6 +225,11 @@ try:
 except Exception as _studio_err:
     print(f"[WARN] Creator Studio router not loaded: {_studio_err}")
 try:
+    from studio_novel_api import router as studio_novel_router
+    app.include_router(studio_novel_router)
+except Exception as _novel_err:
+    print(f"[WARN] Story Intelligence router not loaded: {_novel_err}")
+try:
     from creator_downloads import router as creator_downloads_router
     app.include_router(creator_downloads_router)
 except Exception as _dl_err:
