@@ -291,7 +291,9 @@ def _chapter_summary(c: dict) -> dict:
     ex = c.get("extraction") or {}
     return {"number": c["number"], "title": c.get("title") or "", "status": c.get("status"), "words": c.get("words") or 0,
             "version": c.get("version") or 1, "summary": c.get("summary") or "",
-            "issues": len(ex.get("issues") or []), "proposed": ex.get("proposed") or {}}
+            "issues": len(ex.get("issues") or []), "proposed": ex.get("proposed") or {},
+            "review": (c.get("review") or {}).get("status"),
+            "revised": ((c.get("review") or {}).get("revision") or {}).get("kept")}
 
 
 @router.get("/stories/{story_id}/chapters")
@@ -315,7 +317,8 @@ async def get_chapter(story_id: str, number: int, user_id: str = Depends(cs.crea
     c = _chapters(story).get(number)
     if not c:
         raise HTTPException(status_code=404, detail="This chapter hasn't been written yet.")
-    return {"chapter": {**_chapter_summary(c), "text": c.get("text") or "", "extraction": c.get("extraction") or {}},
+    return {"chapter": {**_chapter_summary(c), "text": c.get("text") or "", "extraction": c.get("extraction") or {},
+                        "review_report": c.get("review") or {}},
             "suggestions": _proposals(story, number)}
 
 

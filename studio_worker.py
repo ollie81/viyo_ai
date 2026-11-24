@@ -519,9 +519,11 @@ class StudioWorker:
         if ch.words(text) < target * ch.MIN_LENGTH_SHARE:
             raise JobFailed("too_short", "The chapter came out much shorter than planned (it was probably cut off). "
                                          "Nothing was charged; try again.", absorbed=cost_write)
+        # VIYO's own review before anyone sees it, and at most one targeted revision (studio_novel_review).
+        text, review, costs = self._review_chapter(outline, plan, n, text, memory, [cost_write])
         if not ai_mod.moderate_text(text[:20000]):
             raise JobFailed("content_blocked", "This chapter came out with content Viyo can't publish. Add a note "
-                                               "and try again.", absorbed=cost_write)
+                                               "and try again.", absorbed=pricing.combine(costs))
 
         # Read it back: what it establishes (proposals only), checked against the memory.
         open_threads = [{"ref": f"T{i + 1}", "id": t["id"], "description": t["description"]}
@@ -532,7 +534,7 @@ class StudioWorker:
                                                 "chapter memory")
         except Exception:
             raise JobFailed("read_back_failed", "The chapter was written but couldn't be read back for the story "
-                                                "memory. Nothing was charged; try again.", absorbed=cost_write)
+                                                "memory. Nothing was charged; try again.", absorbed=pricing.combine(costs))
         old = chapters.get(n)
         version = int(old["version"]) + 1 if old else 1
         if old:       # a new version: the old version's unreviewed proposals no longer apply
@@ -560,7 +562,7 @@ class StudioWorker:
                       "checked_claims": len(ch.claims_from(raw, n, text))}
         row = {"title": (plan.get("title") or "")[:200], "text": text, "summary": (raw.get("summary") or "")[:2000],
                "words": ch.words(text), "version": version, "outline_version": story.get("outline_version"),
-               "status": "draft", "approved_at": None, "extraction": extraction, "job_id": job["id"],
+               "status": "draft", "approved_at": None, "extraction": extraction, "review": review, "job_id": job["id"],
                "updated_at": _now()}
         if old:
             self.store.update("studio_story_chapters", {"id": old["id"]}, row)
@@ -568,10 +570,52 @@ class StudioWorker:
             self.store.insert("studio_story_chapters", [{"story_id": story["id"], "owner_id": story["owner_id"],
                                                          "number": n, **row}])
         return {"chapter": n, "version": version, "words": row["words"], "proposed": extraction["proposed"],
-                "rejected": len(got["rejected"]), "issues": len(report["issues"]),
+                "rejected": len(got["rejected"]), "issues": len(report["issues"]), "review": review.get("status"),
+                "revision_kept": (review.get("revision") or {}).get("kept"),
                 "conflicts": [describe(c["fact"], canon.names) if isinstance(c.get("fact"), dict) else ""
                               for x in got["conflicts"] for c in x.get("with") or []][:10]}, \
-            pricing.combine([cost_write, cost_read])
+            pricing.combine(costs + [cost_read])
+
+    def _review_chapter(self, outline, plan, n, text, memory, costs):
+        """Reviews the chapter; revises only verifiably weak passages, once, and keeps the revision only if the
+        second review shows it is better. A review that can't be made doesn't stop the chapter: it is marked
+        unavailable. Returns (text, review, costs)."""
+        import studio_novel_review as rv
+        ps = rv.passages(text)
+        text = rv.join(ps)
+        try:
+            raw, c = self.ai.novel_json(rv.review_prompt(outline, plan, n, ps), rv.SCHEMA, "chapter review")
+        except Exception as e:
+            print(f"[WARN] chapter {n} review unavailable: {str(e)[:160]}")
+            return text, {"status": "unavailable", "summary": "VIYO couldn't review this chapter. Read it carefully."}, costs
+        costs = costs + [c]
+        first = final = rv.verify(raw, ps)
+        revision = None
+        which = rv.targets(first)
+        if first["status"] == "needs_work" and which:
+            try:
+                raw_rev, c = self.ai.novel_json(rv.revision_prompt(outline, plan, n, ps, first, memory),
+                                                rv.REVISION_SCHEMA, "chapter revision")
+                costs = costs + [c]
+                new_ps = rv.splice(ps, raw_rev, which)
+                if new_ps is None:
+                    revision = {"kept": False, "passages": which, "why": "the rewritten passages weren't usable"}
+                else:
+                    raw2, c = self.ai.novel_json(rv.review_prompt(outline, plan, n, new_ps), rv.SCHEMA, "chapter review")
+                    costs = costs + [c]
+                    second = rv.verify(raw2, new_ps)
+                    kept, why = rv.improved(first, second)
+                    revision = {"kept": kept, "passages": which, "why": why,
+                                "scores_before": rv.scores(first), "scores_after": rv.scores(second)}
+                    if kept:
+                        ps, final = new_ps, second
+            except Exception as e:
+                print(f"[WARN] chapter {n} revision failed: {str(e)[:160]}")
+                revision = {"kept": False, "passages": which, "why": "the revision couldn't be made"}
+        elif first["status"] == "needs_work":
+            revision = {"kept": False, "passages": [], "why": "the weakness is in the whole chapter, not one passage: "
+                                                              "ask for a new version with a note"}
+        return rv.join(ps), rv.report(first, final, revision), costs
 
     def do_breakdown(self, job, project):
         script = project["script"].strip()

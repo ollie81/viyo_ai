@@ -20,7 +20,7 @@ FILLER = " ".join(["The afternoon light moved slowly across the floor of the nar
 def chapters_schema(studio_schema):
     conn = connect()
     for f in ("creator_studio_canon.sql", "creator_studio_novel.sql", "creator_studio_chapters.sql",
-              "creator_studio_chapters.sql"):                              # twice: safe to run again
+              "creator_studio_chapters.sql", "creator_studio_review.sql"):                              # twice: safe to run again
         conn.execute((ROOT / f).read_text())
     conn.close()
 
