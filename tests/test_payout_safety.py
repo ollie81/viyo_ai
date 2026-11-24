@@ -28,8 +28,10 @@ def schema(migrated):
 
 @pytest.fixture
 def pg(schema, db):
-    db.execute("truncate public.creator_earnings, public.withdrawal_requests, public.creator_payout_settings cascade")
-    return db
+    clean = "truncate public.creator_earnings, public.withdrawal_requests, public.creator_payout_settings cascade"
+    db.execute(clean)
+    yield db
+    db.execute(clean)        # leave nothing behind for other test files that expect these tables empty
 
 
 def earn(db, creator, coins, status="available"):
