@@ -65,6 +65,7 @@ ten additive `series_characters` columns) are NOT created by this
 codebase — handed over separately as drama_creator_schema.sql, same
 "no migration-runner access" constraint as every other table here.
 """
+import viyo_files
 import datetime
 import io
 import os
@@ -619,8 +620,8 @@ async def generate_character_views(character_id: str):
     sheet_bytes = _compose_four_view_sheet([portrait_url, view_urls["front"], view_urls["side"], view_urls["rear"]])
     sheet_path = f"drama-characters/{character_id}/four_view_{uuid.uuid4().hex}.jpg"
     try:
-        supabase_admin.storage.from_(STUDIO_IMAGES_BUCKET).upload(sheet_path, sheet_bytes, file_options={"content-type": "image/jpeg"})
-        sheet_url = supabase_admin.storage.from_(STUDIO_IMAGES_BUCKET).get_public_url(sheet_path)
+        viyo_files.from_(supabase_admin, STUDIO_IMAGES_BUCKET).upload(sheet_path, sheet_bytes, file_options={"content-type": "image/jpeg"})
+        sheet_url = viyo_files.from_(supabase_admin, STUDIO_IMAGES_BUCKET).get_public_url(sheet_path)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload the composed reference sheet: {e}")
 

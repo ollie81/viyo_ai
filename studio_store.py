@@ -10,6 +10,7 @@ same code against a local Postgres and a temp folder in tests.
 """
 from __future__ import annotations
 
+import viyo_files
 import json
 import os
 import time
@@ -165,7 +166,7 @@ class SupabaseFiles(Files):
         self.admin, self.bucket = admin, bucket
 
     def _b(self):
-        return self.admin.storage.from_(self.bucket)
+        return viyo_files.from_(self.admin, self.bucket)
 
     def put(self, path, data, content_type):
         self._b().upload(path, data, file_options={"content-type": content_type, "cache-control": "3600", "upsert": "false"})

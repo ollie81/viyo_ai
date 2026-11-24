@@ -52,6 +52,7 @@ and must be run by hand in the Supabase SQL editor before this router
 will do anything but fail with a clear 500 on the first real table
 access.
 """
+import viyo_files
 import datetime
 import io
 import os
@@ -398,12 +399,12 @@ def _upload_image(image_bytes: bytes, mime_type: str, path: str) -> str:
     repurpose.py already uses for thumbnails, same public-bucket
     convention (not Bunny, which is video-only)."""
     try:
-        supabase_admin.storage.from_(STUDIO_IMAGES_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_IMAGES_BUCKET).upload(
             path, image_bytes, file_options={"content-type": mime_type}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload generated image: {e}")
-    return supabase_admin.storage.from_(STUDIO_IMAGES_BUCKET).get_public_url(path)
+    return viyo_files.from_(supabase_admin, STUDIO_IMAGES_BUCKET).get_public_url(path)
 
 
 def _extract_image(response: types.GenerateContentResponse) -> tuple[bytes, str]:
@@ -469,12 +470,12 @@ def _fetch_image_part(url: str) -> types.Part:
 
 def _upload_audio(wav_bytes: bytes, path: str) -> str:
     try:
-        supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_AUDIO_BUCKET).upload(
             path, wav_bytes, file_options={"content-type": "audio/wav"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload generated audio: {e}")
-    return supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).get_public_url(path)
+    return viyo_files.from_(supabase_admin, STUDIO_AUDIO_BUCKET).get_public_url(path)
 
 
 def _normalize_gender(raw: str) -> str:
@@ -1905,12 +1906,12 @@ async def generate_scene_video(scene_id: str, req: SceneVideoRequest):
     estimated_cost_cents = _omni_cents
     path = f"scenes/{scene_id}/{uuid.uuid4().hex}.mp4"
     try:
-        supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_VIDEOS_BUCKET).upload(
             path, video_bytes, file_options={"content-type": "video/mp4"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload Veo video: {e}")
-    video_url = supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
+    video_url = viyo_files.from_(supabase_admin, STUDIO_VIDEOS_BUCKET).get_public_url(path)
 
     try:
         supabase_admin.table("series_scenes").update({"video_url": video_url}).eq("id", scene_id).execute()
@@ -2012,12 +2013,12 @@ async def generate_talking_portrait(scene_id: str):
             audio_bytes = f.read()
     audio_storage_path = f"scenes/{scene_id}/{uuid.uuid4().hex}.wav"
     try:
-        supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_AUDIO_BUCKET).upload(
             audio_storage_path, audio_bytes, file_options={"content-type": "audio/wav"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload scene audio for lip sync: {e}")
-    scene_audio_url = supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).get_public_url(audio_storage_path)
+    scene_audio_url = viyo_files.from_(supabase_admin, STUDIO_AUDIO_BUCKET).get_public_url(audio_storage_path)
 
     try:
         create_resp = requests.post(
@@ -2083,12 +2084,12 @@ async def generate_talking_portrait(scene_id: str):
 
     path = f"scenes/{scene_id}/talking_{uuid.uuid4().hex}.mp4"
     try:
-        supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_VIDEOS_BUCKET).upload(
             path, video_bytes, file_options={"content-type": "video/mp4"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload the talking-portrait video: {e}")
-    talking_portrait_url = supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
+    talking_portrait_url = viyo_files.from_(supabase_admin, STUDIO_VIDEOS_BUCKET).get_public_url(path)
 
     try:
         supabase_admin.table("series_scenes").update({"talking_portrait_url": talking_portrait_url}).eq(
@@ -2704,12 +2705,12 @@ def _extract_thumbnail(video_path: str, out_path: str, at_seconds: float = 0.5) 
 
 def _upload_video_preview(video_bytes: bytes, path: str) -> str:
     try:
-        supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_VIDEOS_BUCKET).upload(
             path, video_bytes, file_options={"content-type": "video/mp4"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload assembled video: {e}")
-    return supabase_admin.storage.from_(STUDIO_VIDEOS_BUCKET).get_public_url(path)
+    return viyo_files.from_(supabase_admin, STUDIO_VIDEOS_BUCKET).get_public_url(path)
 
 
 class MusicUploadResponse(BaseModel):
@@ -2731,12 +2732,12 @@ async def upload_music(file: UploadFile = File(...)):
     ext = os.path.splitext(file.filename or "")[1] or ".mp3"
     path = f"music/{uuid.uuid4().hex}{ext}"
     try:
-        supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).upload(
+        viyo_files.from_(supabase_admin, STUDIO_AUDIO_BUCKET).upload(
             path, data, file_options={"content-type": file.content_type or "audio/mpeg"}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not upload music: {e}")
-    music_url = supabase_admin.storage.from_(STUDIO_AUDIO_BUCKET).get_public_url(path)
+    music_url = viyo_files.from_(supabase_admin, STUDIO_AUDIO_BUCKET).get_public_url(path)
     return MusicUploadResponse(music_url=music_url)
 
 

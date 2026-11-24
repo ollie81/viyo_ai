@@ -17,6 +17,7 @@ Gated by the same shared X-Admin-Key header as analytics.py, for the
 same reason: there's no per-user admin role anywhere else in this app,
 and a solo operator doesn't need one built just for this.
 """
+import viyo_files
 import os
 from typing import Literal, Optional
 
@@ -216,7 +217,7 @@ def _delete_post(post_id: str) -> None:
             marker = "posts-media/"
             idx = url.find(marker)
             if idx != -1:
-                supabase_admin.storage.from_("posts-media").remove([url[idx + len(marker):]])
+                viyo_files.from_(supabase_admin, "posts-media").remove([url[idx + len(marker):]])
         except Exception:
             pass  # best-effort — a stray file left in storage is not worth failing the removal over
 

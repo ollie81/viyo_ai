@@ -18,6 +18,7 @@ Viyo Glow Up — Stage 2: AI hairstyle previews.
 """
 from __future__ import annotations
 
+import viyo_files
 import base64
 import datetime as dt
 import io
@@ -213,7 +214,7 @@ async def preview(req: PreviewRequest, user_id: str = Depends(g._user_no_guest))
         try:
             preview_id = str(uuid.uuid4())
             path = f"{user_id}/{preview_id}.jpg"
-            admin.storage.from_(BUCKET).upload(path, out, file_options={"content-type": "image/jpeg"})
+            viyo_files.from_(admin, BUCKET).upload(path, out, file_options={"content-type": "image/jpeg"})
             admin.table("glow_up_previews").insert({
                 "id": preview_id, "user_id": user_id, "kind": req.kind, "style": style, "image_path": path,
             }).execute()
@@ -228,7 +229,7 @@ async def preview(req: PreviewRequest, user_id: str = Depends(g._user_no_guest))
 
 def _signed(admin, path: str) -> Optional[str]:
     try:
-        r = admin.storage.from_(BUCKET).create_signed_url(path, SIGNED_URL_SECONDS)
+        r = viyo_files.from_(admin, BUCKET).create_signed_url(path, SIGNED_URL_SECONDS)
         return r.get("signedURL") or r.get("signedUrl")
     except Exception:
         return None
@@ -254,7 +255,7 @@ def delete_previews(admin, user_id: str, preview_id: Optional[str] = None) -> in
         q = q.eq("id", preview_id)
     rows = q.execute().data or []
     if rows:
-        admin.storage.from_(BUCKET).remove([r["image_path"] for r in rows])
+        viyo_files.from_(admin, BUCKET).remove([r["image_path"] for r in rows])
         d = admin.table("glow_up_previews").delete().eq("user_id", user_id)
         if preview_id:
             d = d.eq("id", preview_id)

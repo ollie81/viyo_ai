@@ -61,6 +61,7 @@ ready campaign simply reruns it from the already-saved script — nothing
 about retry needs a separate endpoint or any partial-stage checkpoint,
 since assets/hooks/script all live on rows /generate never touches.
 """
+import viyo_files
 import copy
 import datetime
 import os
@@ -1815,7 +1816,7 @@ def _store_file(campaign: dict, data: bytes, mime: str, name: str) -> str:
     (returns a "private:" reference, never a public link). Admin campaigns: the existing public buckets."""
     if _is_creator(campaign):
         path = f"ads/{campaign['user_id']}/{campaign['id']}/{name}"
-        supabase_admin.storage.from_(PRIVATE_BUCKET).upload(path, data, {"content-type": mime, "upsert": "true"})
+        viyo_files.from_(supabase_admin, PRIVATE_BUCKET).upload(path, data, {"content-type": mime, "upsert": "true"})
         return f"{PRIVATE_PREFIX}{PRIVATE_BUCKET}/{path}"
     if mime.startswith("video/"):
         return _upload_video_preview(data, f"ads/{campaign['id']}/{name}")
@@ -1828,7 +1829,7 @@ def _store_character_portrait(campaign: dict, data: bytes) -> str:
     name = f"character_{uuid.uuid4().hex}.png"
     if _is_creator(campaign):
         path = f"ads/{campaign['user_id']}/characters/{name}"
-        supabase_admin.storage.from_(PRIVATE_BUCKET).upload(path, data, {"content-type": "image/png", "upsert": "true"})
+        viyo_files.from_(supabase_admin, PRIVATE_BUCKET).upload(path, data, {"content-type": "image/png", "upsert": "true"})
         return f"{PRIVATE_PREFIX}{PRIVATE_BUCKET}/{path}"
     return _store_file(campaign, data, "image/png", name)
 
@@ -1839,7 +1840,7 @@ def _resolve(ref: Optional[str]) -> Optional[str]:
         return ref
     bucket, _, path = ref[len(PRIVATE_PREFIX):].partition("/")
     try:
-        res = supabase_admin.storage.from_(bucket).create_signed_url(path, SIGN_SECONDS)
+        res = viyo_files.from_(supabase_admin, bucket).create_signed_url(path, SIGN_SECONDS)
         return (res or {}).get("signedURL") or (res or {}).get("signed_url")
     except Exception:
         return None

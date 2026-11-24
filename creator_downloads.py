@@ -20,6 +20,7 @@ Rules this file keeps:
 """
 from __future__ import annotations
 
+import viyo_files
 import os
 import re
 import time
@@ -83,7 +84,7 @@ def sign_storage(bucket: str, path: str, seconds: int, file_name: str) -> str:
     admin = _get_admin()
     if admin is None:
         raise HTTPException(status_code=503, detail="Downloads are not configured.")
-    r = admin.storage.from_(bucket).create_signed_url(path, seconds, {"download": file_name})
+    r = viyo_files.from_(admin, bucket).create_signed_url(path, seconds, {"download": file_name})
     url = r.get("signedURL") or r.get("signedUrl")
     if not url:
         raise RuntimeError("storage returned no signed link")
@@ -126,17 +127,8 @@ def _owned_post(user_id: str, post_id: str) -> dict:
 
 
 def storage_location(url: Optional[str]) -> Optional[tuple[str, str]]:
-    """(bucket, path) for a Supabase Storage URL on this project, else None."""
-    if not url:
-        return None
-    parsed = urllib.parse.urlparse(url)
-    base = urllib.parse.urlparse(os.environ.get("SUPABASE_URL", ""))
-    if base.netloc and parsed.netloc != base.netloc:
-        return None
-    m = _PUBLIC_PATH.search(parsed.path)
-    if not m:
-        return None
-    return m.group(1), urllib.parse.unquote(m.group(2))
+    """(bucket, path) for a file URL of this project (Supabase Storage or Bunny Storage), else None."""
+    return viyo_files.parse_url(url, os.environ.get("SUPABASE_URL", ""))
 
 
 def _slug(text: str, fallback: str) -> str:

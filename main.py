@@ -231,6 +231,12 @@ try:
 except Exception as _nardopay_err:
     print(f"[WARN] NardoPay router not loaded: {_nardopay_err}")
 try:
+    # App uploads when files live on Bunny Storage (FILE_STORE=bunny); tells the app which way to upload.
+    from files_api import router as files_router
+    app.include_router(files_router)
+except Exception as _files_err:
+    print(f"[WARN] Files router not loaded: {_files_err}")
+try:
     from studio_novel_api import router as studio_novel_router
     app.include_router(studio_novel_router)
 except Exception as _novel_err:

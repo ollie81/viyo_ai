@@ -26,6 +26,7 @@ Routed through here with the service-role client so the fix isn't just
     else's asset or an off-platform image, and it only ever fires once
     per series while the cover is still empty.
 """
+import viyo_files
 import io
 import os
 import uuid
@@ -104,12 +105,12 @@ def _compress_cover_image(url: str) -> Optional[bytes]:
 def _store_compressed_cover(jpeg_bytes: bytes) -> Optional[str]:
     path = f"{_COVER_STORAGE_PREFIX}{uuid.uuid4().hex}.jpg"
     try:
-        supabase_admin.storage.from_(_COVER_BUCKET).upload(
+        viyo_files.from_(supabase_admin, _COVER_BUCKET).upload(
             path, jpeg_bytes, file_options={"content-type": "image/jpeg"}
         )
     except Exception:
         return None
-    return supabase_admin.storage.from_(_COVER_BUCKET).get_public_url(path)
+    return viyo_files.from_(supabase_admin, _COVER_BUCKET).get_public_url(path)
 
 
 def _is_own_supabase_storage_url(url: str) -> bool:
@@ -119,7 +120,8 @@ def _is_own_supabase_storage_url(url: str) -> bool:
         and bool(_SUPABASE_HOST)
         and parsed.netloc == _SUPABASE_HOST
         and "/storage/v1/object/" in parsed.path
-    )
+    ) or (parsed.scheme == "https" and viyo_files.parse_url(url) is not None
+          and not parsed.netloc.endswith("supabase.co"))
 
 
 class SetSeriesCoverRequest(BaseModel):
