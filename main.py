@@ -225,6 +225,12 @@ try:
 except Exception as _studio_err:
     print(f"[WARN] Creator Studio router not loaded: {_studio_err}")
 try:
+    # Web-only NardoPay coin checkout. Off until NARDOPAY_ENABLED / NARDOPAY_LEDGER_VERIFIED and its settings are set.
+    from nardopay_payments import router as nardopay_router
+    app.include_router(nardopay_router)
+except Exception as _nardopay_err:
+    print(f"[WARN] NardoPay router not loaded: {_nardopay_err}")
+try:
     from studio_novel_api import router as studio_novel_router
     app.include_router(studio_novel_router)
 except Exception as _novel_err:
