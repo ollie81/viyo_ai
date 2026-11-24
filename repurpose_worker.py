@@ -278,6 +278,14 @@ def main() -> None:
         nardopay_payments.start_reconciler()
     except Exception as e:  # never let payments upkeep stop the Repurposer
         print(f"[WARN] NardoPay reconciliation not started: {e}")
+    try:
+        # One-time move of old files to Bunny Storage, only when BUNNY_MOVE_FILES is set (see viyo_files.py).
+        import repurpose as _r
+        import viyo_files
+        if viyo_files.start_mover(_r.supabase_admin):
+            print(f"[INFO] moving files to Bunny: {os.environ.get('BUNNY_MOVE_FILES')}")
+    except Exception as e:
+        print(f"[WARN] file move not started: {e}")
     worker.run_forever()
 
 

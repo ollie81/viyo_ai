@@ -13,6 +13,7 @@ Rules this file keeps:
 """
 from __future__ import annotations
 
+import viyo_files
 import io
 import uuid
 from typing import Optional
@@ -140,14 +141,14 @@ def _read_private(ref: str) -> Optional[bytes]:
         return None
     bucket, _, path = ref[len(core.PRIVATE_PREFIX):].partition("/")
     try:
-        return _db().storage.from_(bucket).download(path)
+        return viyo_files.from_(_db(), bucket).download(path)
     except Exception:
         return None
 
 
 def _store_brand_file(user_id: str, brand_id: str, data: bytes, mime: str, ext: str) -> str:
     path = f"ads/{user_id}/brands/{brand_id}/{uuid.uuid4().hex}.{ext}"
-    _db().storage.from_(core.PRIVATE_BUCKET).upload(path, data, {"content-type": mime, "upsert": "true"})
+    viyo_files.from_(_db(), core.PRIVATE_BUCKET).upload(path, data, {"content-type": mime, "upsert": "true"})
     return f"{core.PRIVATE_PREFIX}{core.PRIVATE_BUCKET}/{path}"
 
 
@@ -236,7 +237,7 @@ async def delete_brand_asset(brand_id: str, asset_id: str, user_id: str = Depend
     if ref.startswith(core.PRIVATE_PREFIX):
         bucket, _, path = ref[len(core.PRIVATE_PREFIX):].partition("/")
         try:
-            _db().storage.from_(bucket).remove([path])
+            viyo_files.from_(_db(), bucket).remove([path])
         except Exception:
             pass
     if b.get("logo") == ref:

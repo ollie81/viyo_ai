@@ -17,6 +17,7 @@ Rules this file keeps:
 """
 from __future__ import annotations
 
+import viyo_files
 import uuid
 from typing import Optional
 
@@ -151,7 +152,7 @@ def _public_thumbnail(c: dict, choice: str, assets: list[dict]) -> Optional[str]
         return ref
     bucket, _, path = ref[len(core.PRIVATE_PREFIX):].partition("/")
     try:
-        data = core.supabase_admin.storage.from_(bucket).download(path)
+        data = viyo_files.from_(core.supabase_admin, bucket).download(path)
     except Exception:
         raise HTTPException(status_code=502, detail="The thumbnail couldn't be read. Try again or pick another one.")
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else "jpg"

@@ -11,6 +11,7 @@ bucket, as before, because the app plays and posts them by URL.
 """
 from __future__ import annotations
 
+import viyo_files
 import os
 import shutil
 import time
@@ -38,7 +39,7 @@ class StorageUnavailable(Exception):
     """Network/provider trouble — retryable."""
 
 
-def stream_url_to_file(url: str, dest: str, max_bytes: int, allowed_host: Optional[str],
+def stream_url_to_file(url: str, dest: str, max_bytes: int, allowed_host,
                        headers: Optional[dict] = None) -> int:
     """
     Streams `url` to `dest`, enforcing `max_bytes` while downloading (not
@@ -47,7 +48,8 @@ def stream_url_to_file(url: str, dest: str, max_bytes: int, allowed_host: Option
     """
     def check(u: str) -> None:
         parsed = urllib.parse.urlparse(u)
-        if allowed_host and (parsed.scheme != "https" or parsed.hostname != allowed_host):
+        allowed = {allowed_host} if isinstance(allowed_host, str) else set(allowed_host or ())
+        if allowed and (parsed.scheme != "https" or parsed.hostname not in allowed):
             raise SourceMissing(f"refusing to download from {parsed.scheme}://{parsed.hostname}")
 
     check(url)
@@ -86,7 +88,7 @@ class SupabaseStorage:
         self._limit_cache: dict[str, tuple[float, Optional[int]]] = {}
 
     def _bucket(self, bucket: str):
-        return self._admin.storage.from_(bucket)
+        return viyo_files.from_(self._admin, bucket)
 
     def signed_upload(self, bucket: str, path: str) -> dict:
         data = self._bucket(bucket).create_signed_upload_url(path)
@@ -110,7 +112,13 @@ class SupabaseStorage:
         except (TypeError, ValueError):
             return -1
 
+    def _hosts(self):
+        # Our Supabase project, plus the Bunny file hosts once files live there.
+        return ({self._host} | viyo_files.file_hosts()) - {None}
+
     def bucket_file_size_limit(self, bucket: str) -> Optional[int]:
+        if viyo_files.using_bunny():
+            return None          # Bunny Storage has no per-bucket upload cap
         cached = self._limit_cache.get(bucket)
         if cached and time.time() - cached[0] < _BUCKET_LIMIT_CACHE_SECONDS:
             return cached[1]
@@ -131,10 +139,10 @@ class SupabaseStorage:
                 raise SourceMissing(str(e))
             raise StorageUnavailable(str(e))
         url = signed.get("signedURL") or signed.get("signedUrl")
-        return stream_url_to_file(url, dest, max_bytes, self._host)
+        return stream_url_to_file(url, dest, max_bytes, self._hosts())
 
     def download_url(self, url: str, dest: str, max_bytes: int) -> int:
-        return stream_url_to_file(url, dest, max_bytes, self._host)
+        return stream_url_to_file(url, dest, max_bytes, self._hosts())
 
     def upload(self, bucket: str, path: str, local_path: str, content_type: str) -> str:
         with open(local_path, "rb") as f:

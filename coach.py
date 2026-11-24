@@ -1,3 +1,4 @@
+import viyo_files
 import datetime
 import json
 import os
@@ -1135,9 +1136,9 @@ def _purge_storage(user_id: str, keep: Optional[set] = None) -> list[str]:
     for bucket in _STORAGE_BUCKETS_TO_PURGE:
         try:
             # Files a kept drama still shows (its cover, thumbnails) stay.
-            paths = [p for p in _list_files(supabase_admin.storage.from_(bucket), user_id) if (bucket, p) not in keep]
+            paths = [p for p in _list_files(viyo_files.from_(supabase_admin, bucket), user_id) if (bucket, p) not in keep]
             for i in range(0, len(paths), 500):
-                supabase_admin.storage.from_(bucket).remove(paths[i:i + 500])
+                viyo_files.from_(supabase_admin, bucket).remove(paths[i:i + 500])
         except Exception as e:
             errors.append(f"storage:{bucket}: {e}")
     return errors
@@ -1232,7 +1233,7 @@ def _kept_media(series_ids: list) -> tuple[set, set]:
             videos.add(r["bunny_video_id"])
         for v in r.values():
             if isinstance(v, str):
-                files |= {(b, p) for b, p in _STORAGE_URL.findall(v)}
+                files |= {(b, p) for b, p in _STORAGE_URL.findall(v)} | viyo_files.find_files(v)
     return videos, files
 
 

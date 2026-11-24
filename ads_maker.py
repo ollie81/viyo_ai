@@ -20,6 +20,7 @@ Payment
 """
 from __future__ import annotations
 
+import viyo_files
 import io
 import time
 import uuid
@@ -262,9 +263,9 @@ async def delete_campaign(campaign_id: str, user_id: str = Depends(creator)):
     c = owned_campaign(campaign_id, user_id)
     try:   # the creator's private files for this campaign
         folder = f"ads/{user_id}/{c['id']}"
-        names = [f["name"] for f in (_db().storage.from_(core.PRIVATE_BUCKET).list(folder) or []) if f.get("name")]
+        names = [f["name"] for f in (viyo_files.from_(_db(), core.PRIVATE_BUCKET).list(folder) or []) if f.get("name")]
         if names:
-            _db().storage.from_(core.PRIVATE_BUCKET).remove([f"{folder}/{n}" for n in names])
+            viyo_files.from_(_db(), core.PRIVATE_BUCKET).remove([f"{folder}/{n}" for n in names])
     except Exception:
         pass
     return await core.delete_campaign(c["id"])
@@ -323,7 +324,7 @@ async def delete_asset(campaign_id: str, asset_id: str, user_id: str = Depends(c
     if ref.startswith(core.PRIVATE_PREFIX):
         bucket, _, path = ref[len(core.PRIVATE_PREFIX):].partition("/")
         try:
-            _db().storage.from_(bucket).remove([path])
+            viyo_files.from_(_db(), bucket).remove([path])
         except Exception:
             pass
     _db().table("ad_assets").delete().eq("id", rows[0]["id"]).execute()

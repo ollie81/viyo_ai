@@ -40,6 +40,7 @@ What changed from the original version, and why:
    already working.
 """
 
+import viyo_files
 import os
 import re
 import json
@@ -442,7 +443,7 @@ def _job_path(job_id: str) -> str:
 
 def _read_job(job_id: str) -> Optional[dict]:
     try:
-        raw = supabase_admin.storage.from_(PROCESSED_BUCKET).download(_job_path(job_id))
+        raw = viyo_files.from_(supabase_admin, PROCESSED_BUCKET).download(_job_path(job_id))
         return json.loads(raw)
     except Exception:
         # Covers both "genuinely doesn't exist" (404 from Storage) and
@@ -457,7 +458,7 @@ def _cleanup_expired_repurpose_jobs() -> None:
     a failed listing/delete here must not block the new job that
     triggered it."""
     try:
-        entries = supabase_admin.storage.from_(PROCESSED_BUCKET).list(
+        entries = viyo_files.from_(supabase_admin, PROCESSED_BUCKET).list(
             _JOB_PREFIX, {"limit": 1000}
         )
     except Exception as e:
@@ -482,7 +483,7 @@ def _cleanup_expired_repurpose_jobs() -> None:
 
     if stale_paths:
         try:
-            supabase_admin.storage.from_(PROCESSED_BUCKET).remove(stale_paths)
+            viyo_files.from_(supabase_admin, PROCESSED_BUCKET).remove(stale_paths)
         except Exception as e:
             print(f"[WARN] Could not remove expired repurpose jobs: {e}")
 
@@ -1536,6 +1537,10 @@ async def create_repurpose_upload(
     Nothing is charged here.
     """
     _require_jobs()
+    if viyo_files.using_bunny():
+        # Files live on Bunny now, which has no direct-upload links: the app sends the video to Bunny Stream
+        # through POST /repurpose/bunny-uploads instead (it knows this code).
+        raise HTTPException(status_code=409, detail="use_bunny_upload")
     content_type = req.content_type.split(";")[0].strip().lower()
     ext = _ALLOWED_UPLOAD_TYPES.get(content_type)
     if ext is None:

@@ -37,6 +37,7 @@ forever — the client has no reason to ever ask again for a post it's
 not uploading right now. This walks every such post once and fills it
 in the same way.
 """
+import viyo_files
 import json
 import os
 import subprocess
@@ -150,12 +151,12 @@ def upload_thumbnail_bytes(jpeg_bytes: bytes) -> Optional[str]:
         return None
     path = f"generated-thumbnails/{uuid.uuid4().hex}.jpg"
     try:
-        supabase_admin.storage.from_(_THUMB_BUCKET).upload(
+        viyo_files.from_(supabase_admin, _THUMB_BUCKET).upload(
             path, jpeg_bytes, file_options={"content-type": "image/jpeg"}
         )
     except Exception:
         return None
-    return supabase_admin.storage.from_(_THUMB_BUCKET).get_public_url(path)
+    return viyo_files.from_(supabase_admin, _THUMB_BUCKET).get_public_url(path)
 
 
 class ProbeDimensionsRequest(BaseModel):

@@ -12,6 +12,7 @@ rule of Viyo Dramas still applies to paid series).
 """
 from __future__ import annotations
 
+import viyo_files
 import os
 import uuid
 from typing import Optional
@@ -36,8 +37,8 @@ class Publisher:
 
     def public_image(self, data: bytes, mime: str, owner_id: str) -> str:
         path = f"studio-covers/{owner_id}/{uuid.uuid4().hex}.png"
-        self.db.storage.from_(COVERS_BUCKET).upload(path, data, file_options={"content-type": mime})
-        return self.db.storage.from_(COVERS_BUCKET).get_public_url(path)
+        viyo_files.from_(self.db, COVERS_BUCKET).upload(path, data, file_options={"content-type": mime})
+        return viyo_files.from_(self.db, COVERS_BUCKET).get_public_url(path)
 
     def series(self, series_id: str) -> Optional[dict]:
         rows = self.db.table("series").select("*").eq("id", series_id).limit(1).execute().data

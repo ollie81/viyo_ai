@@ -26,6 +26,7 @@ still fails, or anything else fails, the coins are refunded.
 """
 from __future__ import annotations
 
+import viyo_files
 import base64
 import io
 import json
@@ -370,7 +371,7 @@ def _signed(admin, path: Optional[str]) -> Optional[str]:
     if not path:
         return None
     try:
-        r = admin.storage.from_(PHOTOS_BUCKET).create_signed_url(path, SIGNED_URL_SECONDS)
+        r = viyo_files.from_(admin, PHOTOS_BUCKET).create_signed_url(path, SIGNED_URL_SECONDS)
         return r.get("signedURL") or r.get("signedUrl")
     except Exception:
         return None
@@ -383,7 +384,7 @@ def _store_photo(admin, user_id: str, session_id: str, jpeg: bytes) -> tuple[boo
     try:
         # cache-control 0: the CDN must never keep a copy, so a deleted photo
         # stops loading at once, even through a link issued earlier.
-        admin.storage.from_(PHOTOS_BUCKET).upload(
+        viyo_files.from_(admin, PHOTOS_BUCKET).upload(
             path, jpeg, file_options={"content-type": "image/jpeg", "cache-control": "0"})
     except Exception as e:
         print(f"[WARN] glow up: could not store photo: {str(e)[:300]}")
@@ -393,7 +394,7 @@ def _store_photo(admin, user_id: str, session_id: str, jpeg: bytes) -> tuple[boo
     except Exception as e:
         print(f"[WARN] glow up: could not attach photo to session: {str(e)[:300]}")
         try:
-            admin.storage.from_(PHOTOS_BUCKET).remove([path])
+            viyo_files.from_(admin, PHOTOS_BUCKET).remove([path])
         except Exception:
             pass
         return False, None
@@ -407,7 +408,7 @@ def _remove_photos(admin, paths: list) -> None:
     paths = [p for p in paths if p]
     if not paths:
         return
-    removed = admin.storage.from_(PHOTOS_BUCKET).remove(paths) or []
+    removed = viyo_files.from_(admin, PHOTOS_BUCKET).remove(paths) or []
     gone = {r.get("name") for r in removed if isinstance(r, dict)}
     missing = [p for p in paths if p not in gone]
     if missing:
@@ -516,7 +517,7 @@ async def delete_all_sessions(user_id: str = Depends(_user)):
         _remove_photos(admin, [r.get("photo_path") for r in rows])
         # Anything else under this user's folder (e.g. left by a failed save) goes too.
         try:
-            leftovers = admin.storage.from_(PHOTOS_BUCKET).list(user_id) or []
+            leftovers = viyo_files.from_(admin, PHOTOS_BUCKET).list(user_id) or []
             _remove_photos(admin, [f"{user_id}/{f['name']}" for f in leftovers if f.get("name")])
         except Exception:
             pass
