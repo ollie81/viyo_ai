@@ -459,6 +459,12 @@ class GoogleStudioAI:
         i, o = self._text_usage(resp)
         return studio_identity.clean_identity(data), pricing.text_cost(i, o)
 
+    def novel_text(self, prompt: str, what: str):
+        """Long prose for Story Intelligence (a chapter). Returns (text, cost)."""
+        resp = self._text(prompt)
+        i, o = self._text_usage(resp)
+        return (resp.text or ""), pricing.text_cost(i, o)
+
     def novel_json(self, prompt: str, schema: dict, what: str):
         """One structured Story Intelligence call (an interview turn, a novel outline). Returns (dict, cost)."""
         resp = self._text(prompt, response_mime_type="application/json", response_json_schema=schema)
@@ -836,6 +842,16 @@ class FakeStudioAI:
                 {"heading": "EXT. STREET - NIGHT", "visual": "Daniel running down a wet street",
                  "dialogue": [{"character": "Daniel", "text": "Maya! Wait!"}], "duration_seconds": 3},
             ]}, pricing.text_cost(1400, 1800)
+
+    def novel_text(self, prompt, what):
+        """novel_results[what]: a string, a list of strings (one per call), or fn(prompt) -> str."""
+        self.calls.append(("novel_text", what))
+        self.novel_prompts = getattr(self, "novel_prompts", []) + [(what, prompt)]
+        self._maybe_fail("novel_text")
+        r = (getattr(self, "novel_results", None) or {}).get(what)
+        if isinstance(r, list):
+            r = r.pop(0) if len(r) > 1 else r[0]
+        return (r(prompt) if callable(r) else (r or "")), pricing.text_cost(9000, 5000)
 
     def novel_json(self, prompt, schema, what):
         """novel_results[what]: a dict, a list of dicts (one per call), or fn(prompt) -> dict."""

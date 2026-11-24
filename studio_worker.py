@@ -477,6 +477,102 @@ class StudioWorker:
                 out.append({**sb, "title": e.get("title") or sb.get("title"), **({"_screenplay_end": end} if end else {})})
         return out
 
+    def do_chapter(self, job, project):
+        """Story Intelligence: writes one chapter of an approved novel outline from the story memory at that point,
+        then reads it back for proposed memory and continuity problems (studio_chapters)."""
+        import studio_chapters as ch
+        import studio_novel as nv
+        import studio_story
+        import studio_world
+        from studio_canon import CanonRepo, describe
+        inp = job.get("input") or {}
+        story = self.store.one("studio_stories", {"id": inp.get("story_id")}) if inp.get("story_id") else None
+        if not story or story["owner_id"] != job["owner_id"]:
+            raise JobFailed("not_found", "This story no longer exists.")
+        if story.get("stage") != "outline_approved":
+            raise JobFailed("not_ready", "Approve the novel plan first.")
+        n = int(inp.get("chapter") or 0)
+        outline = story.get("outline") or {}
+        plan = ch.chapter_plan(outline, n)
+        if not plan:
+            raise JobFailed("not_found", f"The plan has no chapter {n}.")
+        chapters = {c["number"]: c for c in self.store.select("studio_story_chapters", {"story_id": story["id"]})}
+        if n > 1 and (chapters.get(n - 1) or {}).get("status") != "approved":
+            raise JobFailed("not_ready", f"Approve chapter {n - 1} first: each chapter is written from approved memory.")
+        if any(k > n for k in chapters) or (chapters.get(n) or {}).get("status") == "approved":
+            raise JobFailed("not_ready", f"Chapter {n} can't be rewritten now.")
+
+        repo = CanonRepo(self.store, story["id"], story["owner_id"])
+        canon = repo.load()
+        prev = chapters.get(n - 1)
+        # Who the chapter needs: the point-of-view character, everyone its plan names, and whoever was on stage
+        # when the previous chapter ended (it continues from there).
+        memory = canon.render({"at": (n, 0), "entities": [plan.get("pov") or ""], "limit": 80,
+                               "text": " ".join([plan.get("summary") or ""] + list(plan.get("beats") or []) +
+                                                [ch.tail((prev or {}).get("text") or "", 250)])})
+        world = studio_world.block(self.story_world(project), "story")
+        craft = studio_story.genre_craft(outline.get("genre") or "", story.get("idea") or "")
+        target = nv.target(story)["words"]
+        prompt = ch.write_prompt(story, outline, n, memory, prev, world, craft, inp.get("note") or "", target)
+        raw_text, cost_write = self.ai.novel_text(prompt, "chapter")
+        text = ch.clean_text(raw_text, plan.get("title") or "")
+        if ch.words(text) < target * ch.MIN_LENGTH_SHARE:
+            raise JobFailed("too_short", "The chapter came out much shorter than planned (it was probably cut off). "
+                                         "Nothing was charged; try again.", absorbed=cost_write)
+        if not ai_mod.moderate_text(text[:20000]):
+            raise JobFailed("content_blocked", "This chapter came out with content Viyo can't publish. Add a note "
+                                               "and try again.", absorbed=cost_write)
+
+        # Read it back: what it establishes (proposals only), checked against the memory.
+        open_threads = [{"ref": f"T{i + 1}", "id": t["id"], "description": t["description"]}
+                        for i, t in enumerate(canon.state_at((n, 0)).threads)]
+        names = [e["name"] for e in canon.entities if e.get("status") != "retired"]
+        try:
+            raw, cost_read = self.ai.novel_json(ch.extract_prompt(n, text, names, open_threads), ch.EXTRACT_SCHEMA,
+                                                "chapter memory")
+        except Exception:
+            raise JobFailed("read_back_failed", "The chapter was written but couldn't be read back for the story "
+                                                "memory. Nothing was charged; try again.", absorbed=cost_write)
+        old = chapters.get(n)
+        version = int(old["version"]) + 1 if old else 1
+        if old:       # a new version: the old version's unreviewed proposals no longer apply
+            for f in canon.facts:
+                if f.get("status") == "proposed" and f.get("source_chapter") == n:
+                    repo.retire(f["id"], f"chapter {n} rewritten")
+            for table, rows in (("studio_story_events", canon.events), ("studio_story_threads", canon.threads)):
+                key = "chapter" if table == "studio_story_events" else "planted_chapter"
+                for r in rows:
+                    if r.get("status") == "proposed" and int(r.get(key) or 0) == n:
+                        self.store.update(table, {"id": r["id"]}, {"status": "retired"})
+        got = repo.ingest({"entities": raw.get("entities") or [], "facts": ch.placed(raw.get("facts"), text),
+                           "events": ch.placed(raw.get("events"), text), "threads": raw.get("threads") or []},
+                          text, chapter=n, source_ref=f"chapter {n} v{version}")
+        canon = repo.load()
+        pending = [f for f in canon.facts if f.get("status") == "proposed" and f.get("source_chapter") == n]
+        report = canon.check(ch.claims_from(raw, n, text), pending=pending)
+        refs = {t["ref"]: t["id"] for t in open_threads}
+        resolved = [{"thread_id": refs[r["ref"]], "quote": r.get("quote") or ""} for r in raw.get("resolved_threads") or []
+                    if r.get("ref") in refs and ch.seq_of(r.get("quote") or "", text) is not None]
+        extraction = {"proposed": {"facts": len(got["facts"]), "entities": len(got["entities"]),
+                                   "events": len(got["events"]), "threads": len(got["threads"])},
+                      "rejected": got["rejected"][:40], "conflicts": got["conflicts"][:40],
+                      "issues": report["issues"][:40], "excepted": report["excepted"][:40], "resolved": resolved,
+                      "checked_claims": len(ch.claims_from(raw, n, text))}
+        row = {"title": (plan.get("title") or "")[:200], "text": text, "summary": (raw.get("summary") or "")[:2000],
+               "words": ch.words(text), "version": version, "outline_version": story.get("outline_version"),
+               "status": "draft", "approved_at": None, "extraction": extraction, "job_id": job["id"],
+               "updated_at": _now()}
+        if old:
+            self.store.update("studio_story_chapters", {"id": old["id"]}, row)
+        else:
+            self.store.insert("studio_story_chapters", [{"story_id": story["id"], "owner_id": story["owner_id"],
+                                                         "number": n, **row}])
+        return {"chapter": n, "version": version, "words": row["words"], "proposed": extraction["proposed"],
+                "rejected": len(got["rejected"]), "issues": len(report["issues"]),
+                "conflicts": [describe(c["fact"], canon.names) if isinstance(c.get("fact"), dict) else ""
+                              for x in got["conflicts"] for c in x.get("with") or []][:10]}, \
+            pricing.combine([cost_write, cost_read])
+
     def do_breakdown(self, job, project):
         script = project["script"].strip()
         if not script:

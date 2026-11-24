@@ -319,3 +319,15 @@ def estimate_outline(chapters: int) -> Cost:
     """The novel outline: one plan call, sent back at most once if the plan check finds problems."""
     out = THINKING_BUDGET + 3000 + int(chapters) * 550
     return text_cost(2 * (7000 + out // 2), 2 * out)
+
+
+def estimate_chapter(words: int) -> Cost:
+    """One chapter: writing it (outline, memory and the previous chapter's ending in; the prose out), then reading
+    it back for the story memory (the prose in; facts, events, threads and claims out)."""
+    prose = int(words * 1.4)
+    return combine([text_cost(9000, THINKING_BUDGET + prose), text_cost(prose + 3000, THINKING_BUDGET + 3500)])
+
+
+def chapter_hold(words: int) -> int:
+    """Credits held for a chapter job (text varies: a margin is held and the unused part returned)."""
+    return credits_for(estimate_chapter(words).total_usd * HOLD_FACTOR)

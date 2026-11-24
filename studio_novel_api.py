@@ -231,3 +231,198 @@ async def approve_outline(story_id: str, body: ApproveIn, user_id: str = Depends
     story = _save(story, {"stage": "outline_approved", "outline_approved_version": body.version,
                           "outline_approved_at": _now()})
     return {"story": _out(story), "memory": seeded}
+
+
+# ====================================================================== stage 3: chapters
+
+class WriteChapterIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    note: str = Field("", max_length=1500)
+
+
+class ApproveChapterIn(BaseModel):
+    version: int
+    with_suggestions: bool = False      # also approve this chapter's memory suggestions (conflicts are skipped)
+
+
+class MemoryDecisionIn(BaseModel):
+    approve: dict = Field(default_factory=dict)     # {"facts": [ids], "events": [ids], "threads": [ids]}
+    reject: dict = Field(default_factory=dict)
+    reason: str = Field("", max_length=400)
+
+
+def _chapters(story: dict) -> dict:
+    return {c["number"]: c for c in cs.get_store().select("studio_story_chapters", {"story_id": story["id"]})}
+
+
+def _chapter_jobs(story: dict) -> list:
+    if not story.get("project_id"):
+        return []
+    jobs = cs.get_store().select("studio_jobs", {"project_id": story["project_id"], "kind": "chapter"},
+                                 order="created_at", desc=True, limit=20)
+    return [j for j in jobs if (j.get("input") or {}).get("story_id") == story["id"]]
+
+
+def _next_chapter(story: dict, chapters: dict) -> Optional[int]:
+    """The chapter that can be written now: the first one, or the one after the last approved chapter."""
+    total = len((story.get("outline") or {}).get("chapters") or [])
+    if story.get("stage") != "outline_approved" or not total:
+        return None
+    done = [k for k, c in chapters.items() if c.get("status") == "approved"]
+    n = max(done) + 1 if done else 1
+    return n if n <= total else None
+
+
+def _proposals(story: dict, n: int) -> dict:
+    """This chapter's memory suggestions waiting for the creator, in plain sentences, with their evidence."""
+    from studio_canon import CanonRepo, describe
+    canon = CanonRepo(cs.get_store(), story["id"], story["owner_id"]).load()
+    facts = [{"id": f["id"], "statement": describe(f, canon.names), "quote": f.get("source_quote") or "",
+              "conflicts": [c["reason"] for c in canon.conflicts_for(f)]}
+             for f in canon.facts if f.get("status") == "proposed" and f.get("source_chapter") == n]
+    events = [{"id": e["id"], "statement": e["summary"], "quote": e.get("source_quote") or ""}
+              for e in canon.events if e.get("status") == "proposed" and int(e["chapter"]) == n]
+    threads = [{"id": t["id"], "statement": f"{t['kind']}: {t['description']}", "quote": t.get("planted_quote") or ""}
+               for t in canon.threads if t.get("status") == "proposed" and int(t["planted_chapter"]) == n]
+    return {"facts": facts, "events": events, "threads": threads}
+
+
+def _chapter_summary(c: dict) -> dict:
+    ex = c.get("extraction") or {}
+    return {"number": c["number"], "title": c.get("title") or "", "status": c.get("status"), "words": c.get("words") or 0,
+            "version": c.get("version") or 1, "summary": c.get("summary") or "",
+            "issues": len(ex.get("issues") or []), "proposed": ex.get("proposed") or {}}
+
+
+@router.get("/stories/{story_id}/chapters")
+async def list_chapters(story_id: str, user_id: str = Depends(cs.creator)):
+    story = _story(story_id, user_id)
+    chapters = _chapters(story)
+    plan = (story.get("outline") or {}).get("chapters") or []
+    jobs = _chapter_jobs(story)
+    writing = next(({"chapter": (j.get("input") or {}).get("chapter"), "status": j["status"], "job_id": j["id"],
+                     "error": j.get("error_message")} for j in jobs), None)
+    return {"chapters": [_chapter_summary(chapters[k]) if k in chapters else
+                         {"number": k, "title": c.get("title") or "", "status": "planned"}
+                         for k, c in ((int(c.get("number") or 0), c) for c in plan)],
+            "next": _next_chapter(story, chapters), "writing": writing,
+            "price": pricing.chapter_hold(nv.target(story)["words"]), "balance": cs._balance(user_id)}
+
+
+@router.get("/stories/{story_id}/chapters/{number}")
+async def get_chapter(story_id: str, number: int, user_id: str = Depends(cs.creator)):
+    story = _story(story_id, user_id)
+    c = _chapters(story).get(number)
+    if not c:
+        raise HTTPException(status_code=404, detail="This chapter hasn't been written yet.")
+    return {"chapter": {**_chapter_summary(c), "text": c.get("text") or "", "extraction": c.get("extraction") or {}},
+            "suggestions": _proposals(story, number)}
+
+
+@router.post("/stories/{story_id}/chapters/{number}/write")
+async def write_chapter(story_id: str, number: int, body: WriteChapterIn, user_id: str = Depends(cs.creator)):
+    """Queues one chapter (an ordinary Studio job: credits held, the unused part returned, everything returned if
+    it fails). Chapters are written in order, each after the one before it is approved."""
+    import studio_ai
+    story = _story(story_id, user_id)
+    if story.get("stage") != "outline_approved":
+        raise HTTPException(status_code=409, detail="Approve the novel plan first.")
+    if not story.get("project_id"):
+        raise HTTPException(status_code=409, detail="This story isn't linked to a production.")
+    chapters = _chapters(story)
+    nxt = _next_chapter(story, chapters)
+    if nxt is None or number != nxt:
+        raise HTTPException(status_code=409, detail=(f"Chapter {nxt} is next: chapters are written in order, each "
+                                                     "after the one before it is approved.") if nxt else
+                            "Every chapter is written and approved.")
+    if any(j["status"] in ("queued", "running") for j in _chapter_jobs(story)):
+        raise HTTPException(status_code=409, detail="A chapter is already being written. Wait for it to finish.")
+    if body.note and not studio_ai.moderate_text(body.note):
+        raise HTTPException(status_code=422, detail="This note can't be used on Viyo. Please change it.")
+    cs._rate_limit(user_id)
+    credits = pricing.chapter_hold(nv.target(story)["words"])
+    r = cs.get_store().rpc("studio_create_job", {
+        "p_owner": user_id, "p_project": story["project_id"], "p_kind": "chapter", "p_lane": "generation",
+        "p_key": f"{user_id}:{body.request_id}:chapter:{story['id']}:{number}", "p_credits": credits,
+        "p_input": {"story_id": story["id"], "chapter": number, "note": body.note.strip()}})
+    if not r or not r.get("ok"):
+        err = (r or {}).get("error", "failed")
+        if err == "insufficient_credits":
+            raise HTTPException(status_code=402, detail={"message": "Not enough credits.", "balance": cs._balance(user_id)})
+        raise HTTPException(status_code=400, detail={"too_many_jobs": "Too many jobs running. Wait for some to finish."}
+                            .get(err, err))
+    return {"job_id": r["job_id"], "credits_held": credits, "balance": cs._balance(user_id)}
+
+
+@router.post("/stories/{story_id}/chapters/{number}/approve")
+async def approve_chapter(story_id: str, number: int, body: ApproveChapterIn, user_id: str = Depends(cs.creator)):
+    """The creator approves this exact chapter version. With with_suggestions, its memory suggestions are approved
+    too (one by one: anything that contradicts a creator-locked fact is skipped and listed), and the threads it
+    pays off are marked resolved."""
+    from studio_canon import CanonConflict, CanonRepo
+    story = _story(story_id, user_id)
+    c = _chapters(story).get(number)
+    if not c:
+        raise HTTPException(status_code=404, detail="This chapter hasn't been written yet.")
+    if c.get("status") == "approved":
+        raise HTTPException(status_code=409, detail="This chapter is already approved.")
+    if body.version != int(c.get("version") or 1):
+        raise HTTPException(status_code=409, detail="A newer version of this chapter exists. Read it, then approve it.")
+    approved, skipped = 0, []
+    if body.with_suggestions:
+        repo = CanonRepo(cs.get_store(), story["id"], user_id)
+        s = _proposals(story, number)
+        for f in s["facts"]:
+            try:
+                repo.approve(f["id"])
+                approved += 1
+            except CanonConflict as e:
+                skipped.append({"statement": f["statement"], "reason": e.conflicts[0]["reason"] if e.conflicts else str(e)})
+        for e in s["events"]:
+            repo.approve_event(e["id"])
+            approved += 1
+        for t in s["threads"]:
+            repo.approve_thread(t["id"])
+            approved += 1
+        for r in (c.get("extraction") or {}).get("resolved") or []:
+            try:
+                repo.resolve_thread(r["thread_id"], number, r.get("quote") or "")
+            except Exception:
+                pass
+    row = cs.get_store().update("studio_story_chapters", {"id": c["id"]},
+                                {"status": "approved", "approved_at": _now(), "updated_at": _now()})[0]
+    return {"chapter": _chapter_summary(row), "approved_suggestions": approved, "skipped": skipped}
+
+
+@router.post("/stories/{story_id}/memory/decide")
+async def decide_memory(story_id: str, body: MemoryDecisionIn, user_id: str = Depends(cs.creator)):
+    """The creator approves or rejects individual memory suggestions (facts, events, threads)."""
+    from studio_canon import CanonConflict, CanonError, CanonRepo
+    story = _story(story_id, user_id)
+    repo = CanonRepo(cs.get_store(), story["id"], user_id)
+    done, refused = [], []
+    for kind, fn in (("facts", repo.approve), ("events", repo.approve_event), ("threads", repo.approve_thread)):
+        for rid in body.approve.get(kind) or []:
+            try:
+                fn(cs._uuid(rid))
+                done.append(rid)
+            except CanonConflict as e:
+                refused.append({"id": rid, "reason": e.conflicts[0]["reason"] if e.conflicts else str(e)})
+            except CanonError as e:
+                refused.append({"id": rid, "reason": str(e)})
+    reason = body.reason.strip() or "rejected by the creator"
+    for rid in body.reject.get("facts") or []:
+        try:
+            repo.retire(cs._uuid(rid), reason)
+            done.append(rid)
+        except CanonError as e:
+            refused.append({"id": rid, "reason": str(e)})
+    for kind, table in (("events", "studio_story_events"), ("threads", "studio_story_threads")):
+        for rid in body.reject.get(kind) or []:
+            row = cs.get_store().one(table, {"id": cs._uuid(rid), "story_id": story["id"]})
+            if row and row.get("status") == "proposed":
+                cs.get_store().update(table, {"id": row["id"]}, {"status": "retired"})
+                done.append(rid)
+            else:
+                refused.append({"id": rid, "reason": "Only a suggestion can be rejected."})
+    return {"done": done, "refused": refused}
