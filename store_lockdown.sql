@@ -12,6 +12,7 @@ begin
      where n.nspname = 'public' and p.proname in ('purchase_premium', 'purchase_badge')
   loop
     execute format('revoke execute on function %s from public, anon, authenticated', f.sig);
+    execute format('grant execute on function %s to service_role', f.sig);
     raise notice 'locked %', f.sig;
   end loop;
 end $$;
