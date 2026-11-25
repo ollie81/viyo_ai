@@ -9,8 +9,8 @@ Rules
   * Coins are credited only by a signed webhook (or reconciliation of a payment already verified from one), never
     by a redirect or anything the client says, and only through coins.credit_coins with external_ref
     "nardopay:<transaction id>" (the atomic viyo_coin_apply ledger).
-  * Before crediting: valid signature (hex HMAC-SHA256 of the exact raw body), the order from the payment's
-    metadata exists, amount equals the order's RWF amount, currency is RWF, a transaction id is present, and the
+  * Before crediting: valid signature (hex HMAC-SHA256 of the exact raw body), the payment's order exists (found
+    by the paid link's code, saved on the order when the link was made), amount equals the order's RWF amount, currency is RWF, a transaction id is present, and the
     order is claimed for that transaction (one order, one transaction, ever).
 
 Undocumented details are never guessed
@@ -38,6 +38,7 @@ import hmac
 import json
 import math
 import os
+import re
 import uuid
 from typing import Any, Optional
 
@@ -60,14 +61,17 @@ TEST_FLAG, TEST_EVENTS = "test", ("webhook.test",)
 
 # Where each value is in NardoPay's JSON, as a dotted path (e.g. "data.id"), set from NardoPay's documentation.
 CONTRACT = {
-    "link_url": "NARDOPAY_LINK_URL_FIELD",            # create-link response: the payment page URL (unverified)
-    "event_type": "NARDOPAY_FIELD_EVENT_TYPE",        # webhook: payment.completed / payment.failed
-    "order_id": "NARDOPAY_FIELD_ORDER_ID",            # webhook: our metadata.order_id as sent back
+    "link_url": "NARDOPAY_LINK_URL_FIELD",            # create-link response: the payment page URL ("url")
+    "event_type": "NARDOPAY_FIELD_EVENT_TYPE",        # webhook: payment.completed / payment.failed ("event")
     "transaction_id": "NARDOPAY_FIELD_TRANSACTION_ID",
     "amount": "NARDOPAY_FIELD_AMOUNT",
     "currency": "NARDOPAY_FIELD_CURRENCY",
 }
-OPTIONAL_CONTRACT = {"event_id": "NARDOPAY_FIELD_EVENT_ID"}
+# How a payment finds its order: by the link's code (NardoPay sends "link_code"; it doesn't send metadata back,
+# seen in a real payment on 25 Nov 2026), or by an order id the webhook carries. At least one must be set.
+ORDER_MATCH = {"link_code": "NARDOPAY_FIELD_LINK_CODE", "order_id": "NARDOPAY_FIELD_ORDER_ID"}
+OPTIONAL_CONTRACT = {"event_id": "NARDOPAY_FIELD_EVENT_ID", **ORDER_MATCH}
+LINK_CODE_IN_URL = re.compile(r"/p/([A-Za-z0-9_-]{6,64})(?:[/?#]|$)")
 AMOUNT_UNITS = {"rwf": 1, "rwf_minor": 100}         # NARDOPAY_AMOUNT_UNIT: what `amount` counts (unverified)
 
 RATE_MIN_DEFAULT, RATE_MAX_DEFAULT = 1000.0, 3000.0
@@ -90,7 +94,16 @@ def contract_field(key: str) -> str:
 
 
 def missing_contract(keys=None) -> list[str]:
-    return [CONTRACT[k] for k in (keys or CONTRACT) if not _env(CONTRACT[k])]
+    out = [CONTRACT[k] for k in (keys or CONTRACT) if not _env(CONTRACT[k])]
+    if keys is None and not any(_env(v) for v in ORDER_MATCH.values()):
+        out.append("NARDOPAY_FIELD_LINK_CODE (or NARDOPAY_FIELD_ORDER_ID)")
+    return out
+
+
+def link_code_of(url: str) -> Optional[str]:
+    """The code in a NardoPay payment link (https://nardopay.com/p/<code>?pay=1), or None."""
+    m = LINK_CODE_IN_URL.search(url or "")
+    return m.group(1) if m else None
 
 
 def amount_multiplier() -> Optional[int]:
@@ -316,8 +329,17 @@ async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
     link = pick(data, contract_field("link_url"))
     if not isinstance(link, str) or not link.startswith("https://") or len(link) > 2000:
         fail("no https payment link at the configured field")
-    order = get_store().update("nardopay_orders", {"id": order["id"]},
-                               {"payment_link": link, "updated_at": _now().isoformat()})[0]
+    code = link_code_of(link)
+    if contract_field("link_code") and not code:
+        # Payments are matched by link code: a link whose code can't be read could never be credited.
+        fail("no link code in the payment link")
+    fields = {"payment_link": link, "updated_at": _now().isoformat()}
+    if code:
+        fields["link_code"] = code
+    try:
+        order = get_store().update("nardopay_orders", {"id": order["id"]}, fields)[0]
+    except Exception:
+        fail("the payment link's code is already used by another order")
     return _order_out(order)
 
 
@@ -343,8 +365,14 @@ def _parse_event(payload: dict) -> dict:
     cur = pick(payload, contract_field("currency"))
     tx = pick(payload, contract_field("transaction_id"))
     ev = pick(payload, contract_field("event_id")) if contract_field("event_id") else None
+    order_id = _uuid_or_none(pick(payload, contract_field("order_id"))) if contract_field("order_id") else None
+    if order_id is None and contract_field("link_code"):
+        code = pick(payload, contract_field("link_code"))
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_-]{6,64}", code):
+            row = get_store().one("nardopay_orders", {"link_code": code})
+            order_id = row["id"] if row else None
     return {"event_type": str(pick(payload, contract_field("event_type")) or "")[:80],
-            "order_id": _uuid_or_none(pick(payload, contract_field("order_id"))),
+            "order_id": order_id,
             "transaction_id": str(tx)[:200] if tx not in (None, "") else None,
             "amount": amount, "currency": str(cur).strip().upper()[:10] if cur not in (None, "") else None,
             "provider_event_id": str(ev)[:200] if ev not in (None, "") else None}

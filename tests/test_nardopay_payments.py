@@ -59,6 +59,8 @@ def schema(migrated):
     conn.execute((ROOT / "creator_payouts_schema.sql").read_text())
     conn.execute((ROOT / "coin_ledger_fix.sql").read_text())
     conn.execute((ROOT / "nardopay_orders.sql").read_text())
+    for _ in range(2):                                               # safe to run again
+        conn.execute((ROOT / "nardopay_link_code.sql").read_text())
     conn.close()
 
 
@@ -667,3 +669,108 @@ def test_https_fields():
     data = {"a": "https://x.example/1", "b": {"c": ["http://no", "https://x.example/2"]}, "d": 5}
     assert np_.https_fields(data) == [{"field": "a", "url": "https://x.example/1"},
                                       {"field": "b.c.1", "url": "https://x.example/2"}]
+
+
+# ====================================================================== matching by link code (the real NardoPay shape)
+
+REAL_FIELDS = {"NARDOPAY_LINK_URL_FIELD": "url", "NARDOPAY_FIELD_EVENT_TYPE": "event",
+               "NARDOPAY_FIELD_TRANSACTION_ID": "transaction_id", "NARDOPAY_FIELD_AMOUNT": "amount",
+               "NARDOPAY_FIELD_CURRENCY": "currency", "NARDOPAY_FIELD_LINK_CODE": "link_code"}
+
+
+@pytest.fixture
+def real(env, monkeypatch):
+    """The settings confirmed from NardoPay's real responses on 25 Nov 2026 (no order id comes back)."""
+    client, db, calls, st = env
+    monkeypatch.delenv("NARDOPAY_FIELD_ORDER_ID")
+    for k, v in REAL_FIELDS.items():
+        monkeypatch.setenv(k, v)
+    codes = iter(["8d12d2d13a314c47", "a1b2c3d4e5f60718", "ffeeddccbbaa0099"])
+    st["response"] = lambda body: FakeResponse(200, {"url": f"https://nardopay.com/p/{next(codes)}?pay=1"})
+    return env
+
+
+def real_payment(link_code, amount=1396, tx="24f92470-f2f4-452b-8524-7b5e6d08fa53", **extra):
+    """The exact payment.completed NardoPay sent on 25 Nov 2026, with the payer's details replaced."""
+    return {"event": "payment.completed", "amount": amount, "status": "completed", "currency": "RWF", "metadata": {},
+            "link_code": link_code, "link_type": "payment", "reference": "NP-PAY-1795609444211",
+            "created_at": "2026-11-25T12:23:51.835591+00:00", "payer_name": "Test Payer",
+            "payer_email": "payer@example.com", "transaction_id": tx, **extra}
+
+
+def test_each_order_keeps_its_links_code(real):
+    client, db, calls, st = real
+    out = buy(client, make_user(db))
+    row = db.execute("select link_code, payment_link from public.nardopay_orders where id = %s", (out["order_id"],)).fetchone()
+    assert row == ("8d12d2d13a314c47", "https://nardopay.com/p/8d12d2d13a314c47?pay=1")
+
+
+def test_a_real_payment_is_matched_by_link_code_and_credited_once(real):
+    client, db, calls, st = real
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    body = real_payment("8d12d2d13a314c47")
+    r = deliver(client, body)
+    assert r.status_code == 200 and r.json()["result"] == "processed"
+    assert balance(db, u) == 200 and credits(db, body["transaction_id"]) == 1
+    assert order_row(db, oid)["status"] == "credited"
+    assert str(db.execute("select order_id from public.nardopay_webhook_events").fetchone()[0]) == oid
+    assert deliver(client, body).json()["duplicate"] is True and balance(db, u) == 200     # retried by NardoPay
+
+
+def test_a_payment_for_an_unknown_link_or_the_admin_test_link_credits_nothing(real):
+    client, db, calls, st = real
+    u = make_user(db)
+    buy(client, u)
+    r = deliver(client, real_payment("zzzzzzzzzzzzzzzz", tx="tx_unknown"))
+    assert r.json()["result"] == "ignored" and balance(db, u) == 100
+    r = deliver(client, real_payment("../../etc", tx="tx_bad"))                          # not a link code
+    assert r.json()["result"] == "ignored" and balance(db, u) == 100
+
+
+def test_a_link_code_match_still_needs_the_exact_amount_rwf_and_no_test_flag(real):
+    client, db, calls, st = real
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    assert deliver(client, real_payment("8d12d2d13a314c47", amount=100, tx="t1")).json()["result"] == "mismatch"
+    assert balance(db, u) == 100
+    v = make_user(db)
+    oid2 = buy(client, v)["order_id"]
+    r = deliver(client, real_payment("a1b2c3d4e5f60718", tx="t2", test=True))
+    assert r.json()["result"] == "ignored" and balance(db, v) == 100
+    usd = real_payment("a1b2c3d4e5f60718", tx="t3")
+    usd["currency"] = "USD"
+    assert deliver(client, usd).json()["result"] == "mismatch" and balance(db, v) == 100
+    assert order_row(db, oid)["status"] == "mismatch" and order_row(db, oid2)["status"] == "mismatch"
+
+
+def test_a_second_payment_on_a_paid_link_is_not_credited_again(real):
+    client, db, calls, st = real
+    u = make_user(db)
+    buy(client, u)
+    deliver(client, real_payment("8d12d2d13a314c47", tx="first"))
+    r = deliver(client, real_payment("8d12d2d13a314c47", tx="second"))
+    assert r.json()["result"] == "duplicate_payment" and balance(db, u) == 200 and credits(db, "second") == 0
+
+
+def test_a_link_without_a_readable_code_fails_the_order_instead_of_leaving_it_unmatchable(real):
+    client, db, calls, st = real
+    st["response"] = lambda body: FakeResponse(200, {"url": "https://nardopay.com/checkout?id=1"})
+    r = client.post("/api/v1/coins/purchase/nardopay/create", headers=H(make_user(db)), json={"package_id": "starter"})
+    assert r.status_code == 502
+    assert db.execute("select status, failure_reason from public.nardopay_orders").fetchone() == \
+        ("failed", "no link code in the payment link")
+
+
+def test_checkout_needs_a_way_to_match_payments(env, monkeypatch):
+    client, db, calls, st = env
+    monkeypatch.delenv("NARDOPAY_FIELD_ORDER_ID")
+    assert "NARDOPAY_FIELD_LINK_CODE (or NARDOPAY_FIELD_ORDER_ID)" in np_.missing_contract()
+    r = client.post("/api/v1/coins/purchase/nardopay/create", headers=H(make_user(db)), json={"package_id": "starter"})
+    assert r.status_code == 503 and calls == []
+
+
+def test_link_code_of():
+    assert np_.link_code_of("https://nardopay.com/p/8d12d2d13a314c47?pay=1") == "8d12d2d13a314c47"
+    assert np_.link_code_of("https://nardopay.com/p/abc123def") == "abc123def"
+    assert np_.link_code_of("https://nardopay.com/checkout") is None and np_.link_code_of("") is None
