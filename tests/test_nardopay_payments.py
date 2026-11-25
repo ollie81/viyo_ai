@@ -17,6 +17,7 @@ from conftest import ROOT, connect, make_user
 from studio_store import PgStore
 
 SECRET = "test-webhook-secret"
+HOOK = "https://api.viyo.test/api/v1/webhooks/nardopay"
 FIELDS = {"NARDOPAY_LINK_URL_FIELD": "x_link", "NARDOPAY_FIELD_EVENT_TYPE": "x_event",
           "NARDOPAY_FIELD_ORDER_ID": "x_meta.order", "NARDOPAY_FIELD_TRANSACTION_ID": "x_tx",
           "NARDOPAY_FIELD_AMOUNT": "x_amount", "NARDOPAY_FIELD_CURRENCY": "x_currency"}
@@ -67,7 +68,8 @@ def env(schema, db, monkeypatch):
     monkeypatch.setattr(np_, "_store", PgStore(db))
     monkeypatch.setattr(np_, "_admin", PgAdmin(db))
     for k, v in {**FIELDS, "NARDOPAY_ENABLED": "true", "NARDOPAY_LEDGER_VERIFIED": "true", "NARDOPAY_API_KEY": "test-key",
-                 "NARDOPAY_AMOUNT_UNIT": "rwf", "NARDOPAY_WEBHOOK_SECRET": SECRET, "ADMIN_API_KEY": "admin-secret"}.items():
+                 "NARDOPAY_AMOUNT_UNIT": "rwf", "NARDOPAY_WEBHOOK_SECRET": SECRET, "ADMIN_API_KEY": "admin-secret",
+                 "NARDOPAY_WEBHOOK_URL": HOOK}.items():
         monkeypatch.setenv(k, v)
     calls = []
 
@@ -175,7 +177,7 @@ def test_an_order_is_created_server_side_with_the_documented_request(env):
     assert sent["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
     assert sent["body"] == {"link_type": "payment", "product_name": "VIYO Coins", "amount_mode": "fixed",
                             "amount": 1396, "description": "VIYO Coins purchase: 100 Coins",
-                            "metadata": {"order_id": out["order_id"]}}
+                            "metadata": {"order_id": out["order_id"]}, "webhook_url": HOOK}
     row = db.execute("select user_id, usd_rwf_rate, rate_id is not null from public.nardopay_orders where id = %s",
                      (out["order_id"],)).fetchone()
     assert str(row[0]) == str(u) and float(row[1]) == 1410 and row[2] is True
@@ -594,3 +596,74 @@ def test_is_test_event():
     assert not np_.is_test_event({"test": False}) and not np_.is_test_event({"test": 0})
     assert not np_.is_test_event({"event": "payment.completed"}) and not np_.is_test_event(None)
     assert not np_.is_test_event({"test": "no"}) and not np_.is_test_event([])
+
+
+# ====================================================================== webhook_url and the admin test link
+
+def test_every_link_tells_nardopay_where_to_report_the_payment(env):
+    client, db, calls, st = env
+    buy(client, make_user(db))
+    assert calls[-1]["body"]["webhook_url"] == HOOK
+    assert calls[-1]["body"]["metadata"]["order_id"]
+
+
+@pytest.mark.parametrize("value", [None, "http://insecure.example/hook", "not a url"])
+def test_without_a_valid_webhook_url_no_link_is_created(env, monkeypatch, value):
+    client, db, calls, st = env
+    if value is None:
+        monkeypatch.delenv("NARDOPAY_WEBHOOK_URL")
+    else:
+        monkeypatch.setenv("NARDOPAY_WEBHOOK_URL", value)
+    r = client.post("/api/v1/coins/purchase/nardopay/create", headers=H(make_user(db)), json={"package_id": "starter"})
+    assert r.status_code == 503 and calls == []
+    assert db.execute("select count(*) from public.nardopay_orders").fetchone()[0] == 0
+    assert client.get("/api/v1/coins/purchase/nardopay/availability").json() == {"available": False}
+
+
+def test_the_admin_test_link_works_while_checkout_is_off_and_belongs_to_no_order(env, monkeypatch):
+    client, db, calls, st = env
+    for k in ("NARDOPAY_ENABLED", "NARDOPAY_LEDGER_VERIFIED", "NARDOPAY_LINK_URL_FIELD"):
+        monkeypatch.delenv(k)
+    st["response"] = lambda body: FakeResponse(200, {"ok": True, "data": {"payment_url": "https://pay.example/l/xyz",
+                                                                          "id": "lnk_1"}})
+    assert client.post("/api/v1/admin/nardopay/test-link", json={}).status_code == 403          # admin only
+    r = client.post("/api/v1/admin/nardopay/test-link", headers=ADMIN, json={"amount_rwf": 100})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["link"] == "https://pay.example/l/xyz" and out["link_field_setting"] is None
+    assert out["links_found"] == [{"field": "data.payment_url", "url": "https://pay.example/l/xyz"}]
+    sent = calls[-1]["body"]
+    assert sent["webhook_url"] == HOOK and "order_id" not in sent["metadata"] and sent["amount"] == 100
+    assert db.execute("select count(*) from public.nardopay_orders").fetchone()[0] == 0           # no VIYO order
+
+
+def test_paying_the_test_link_never_credits_coins(env):
+    client, db, calls, st = env
+    u = make_user(db)
+    buy(client, u)                                       # a real pending order exists for the same amount
+    body = {"x_event": "payment.completed", "x_meta": {"viyo_test": "admin"}, "x_tx": "tx_link", "x_amount": 1396,
+            "x_currency": "RWF"}
+    r = deliver(client, body)
+    assert r.status_code == 200 and r.json()["result"] == "ignored"
+    assert balance(db, u) == 100 and credits(db, "tx_link") == 0
+    assert db.execute("select detail from public.nardopay_webhook_events").fetchone()[0] == "no order for this payment's order id"
+
+
+def test_the_test_link_needs_its_settings_and_reports_a_bad_answer(env, monkeypatch):
+    client, db, calls, st = env
+    monkeypatch.delenv("NARDOPAY_WEBHOOK_URL")
+    r = client.post("/api/v1/admin/nardopay/test-link", headers=ADMIN, json={})
+    assert r.status_code == 503 and "NARDOPAY_WEBHOOK_URL" in r.json()["detail"]
+    monkeypatch.setenv("NARDOPAY_WEBHOOK_URL", HOOK)
+    st["response"] = lambda body: FakeResponse(400, {"error": "bad amount"})
+    r = client.post("/api/v1/admin/nardopay/test-link", headers=ADMIN, json={})
+    assert r.status_code == 502 and r.json()["detail"]["response_fields"] == ["error"]
+    assert client.post("/api/v1/admin/nardopay/test-link", headers=ADMIN, json={"amount_rwf": 50}).status_code == 422
+    assert client.post("/api/v1/admin/nardopay/test-link", headers=ADMIN,
+                       json={"amount_rwf": 100, "order_id": "x"}).status_code == 422
+
+
+def test_https_fields():
+    data = {"a": "https://x.example/1", "b": {"c": ["http://no", "https://x.example/2"]}, "d": 5}
+    assert np_.https_fields(data) == [{"field": "a", "url": "https://x.example/1"},
+                                      {"field": "b.c.1", "url": "https://x.example/2"}]
