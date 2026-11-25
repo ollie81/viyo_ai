@@ -243,6 +243,15 @@ IMMERSION = """IMMERSION (use the world, don't decorate with it):
 """
 
 
+def _novel(b: dict) -> str:
+    """The novel this episode adapts, when it has one (studio_adapt): its plan, its source words and the memory."""
+    ep = b.get("novel_episode")
+    if not ep:
+        return ""
+    import studio_adapt
+    return studio_adapt.block(ep, ep.get("memory") or "")
+
+
 def plan_prompt(b: dict, previous: list[dict]) -> str:
     seconds = int(b.get("target_seconds") or 90)
     scenes = max(3, seconds // 8)
@@ -253,7 +262,7 @@ def plan_prompt(b: dict, previous: list[dict]) -> str:
     saga = studio_saga.position(b.get("saga"), len(previous) + 1)
     return f"""You are the head writer of a top short-drama studio. Develop the creator's idea into a story plan.
 
-{world + IMMERSION if world else ''}{saga}{_continuity(previous)}CREATOR'S IDEA (keep its core: the same people, situation and promise; make it stronger, not different):
+{world + IMMERSION if world else ''}{saga}{_novel(b)}{_continuity(previous)}CREATOR'S IDEA (keep its core: the same people, situation and promise; make it stronger, not different):
 Title: {b.get('title')}
 Idea: {b.get('logline') or '(none given: invent a gripping original story in this genre)'}
 Genre: {b.get('genre') or 'drama'}
@@ -287,7 +296,7 @@ def draft_prompt(b: dict, plan: dict, previous: list[dict]) -> str:
     world = studio_world.block(b.get("world"), "story")
     return f"""Write the screenplay for this story plan.
 
-{world + IMMERSION if world else ''}{_continuity(previous)}STORY PLAN:
+{world + IMMERSION if world else ''}{_novel(b)}{_continuity(previous)}STORY PLAN:
 {json.dumps(plan, ensure_ascii=False, indent=1)}
 
 {CRAFT}

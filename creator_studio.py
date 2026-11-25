@@ -904,6 +904,14 @@ async def next_episode(project_id: str, user_id: str = Depends(creator)):
     if src.get("image_quality"):
         row["image_quality"] = src["image_quality"]
     new = st.insert("studio_projects", [row])[0]
+    copy_cast_and_elements(src, new, user_id)
+    return _project_out(new)
+
+
+def copy_cast_and_elements(src: dict, new: dict, user_id: str) -> None:
+    """Copies a production's cast (voice, delivery, portrait, identity, saved outfits) and its places and objects
+    into another production of the same series (also used by Story Intelligence stage 7)."""
+    st = get_store()
     cast = sorted(st.select("studio_characters", {"project_id": src["id"]}), key=lambda c: c.get("position") or 0)
     copies = []
     for c in cast:
@@ -936,7 +944,6 @@ async def next_episode(project_id: str, user_id: str = Depends(creator)):
         st.insert("studio_elements", [{k: e.get(k) for k in ("kind", "name", "description", "details", "reference_path",
                                                              "status", "position")} |
                                       {"project_id": new["id"], "owner_id": user_id}])
-    return _project_out(new)
 
 
 @router.get("/projects/{project_id}")

@@ -321,6 +321,13 @@ def estimate_outline(chapters: int) -> Cost:
     return text_cost(2 * (7000 + out // 2), 2 * out)
 
 
+def estimate_episode_plan(chapters: int, episodes: int) -> Cost:
+    """Splitting an approved novel into episodes: one plan call from the chapter summaries, sent back at most once
+    if the plan check finds problems."""
+    out = THINKING_BUDGET + 1500 + int(episodes) * 300
+    return text_cost(2 * (6000 + int(chapters) * 700 + out // 2), 2 * out)
+
+
 def estimate_chapter(words: int) -> Cost:
     """One chapter: writing it, VIYO's review (and at most one targeted revision with a second review), reading it
     back for the story memory, and judging any continuity problems. The hold covers the revision and the judgement;
