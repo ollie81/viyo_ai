@@ -1427,30 +1427,36 @@ async def archive_project(project_id: str, user_id: str = Depends(creator)):
 @router.post("/projects/{project_id}/characters")
 async def add_character(project_id: str, body: CharacterIn, user_id: str = Depends(creator)):
     p = _project(project_id, user_id)
+    row = create_character(p, user_id, body.name, body.description, body.voice, body.voice_style)
+    _touch(p["id"])
+    return _character_out(row, {})
+
+
+def create_character(p: dict, user_id: str, name: str, description: str = "", voice: str = "",
+                     voice_style: str = "") -> dict:
+    """A new cast member, cast automatically unless a voice is chosen (also used by Story Intelligence stage 6)."""
     st = get_store()
     from studio_worker import profile_fields
     cast_rows = st.select("studio_characters", {"project_id": p["id"]})
-    profile = studio_casting.build_profile(body.name.strip(), None, body.description, p.get("language") or "English")
-    fields = {"project_id": p["id"], "owner_id": user_id, "name": body.name.strip(),
-              "description": body.description, "position": 999}
-    extra = {**profile_fields(profile), "voice_style": body.voice_style.strip(), "voice_language": p.get("language")}
-    if body.voice and _available_voice(body.voice):
-        fields["voice"] = body.voice
+    profile = studio_casting.build_profile(name.strip(), None, description, p.get("language") or "English")
+    fields = {"project_id": p["id"], "owner_id": user_id, "name": name.strip(),
+              "description": description, "position": 999}
+    extra = {**profile_fields(profile), "voice_style": voice_style.strip(), "voice_language": p.get("language")}
+    if voice and _available_voice(voice):
+        fields["voice"] = voice
         extra.update(voice_status="manual", voice_assignment_version=1,
                      voice_category=studio_casting.voice_category(profile))
     else:
         # Cast automatically, the same way the scene list does.
-        seed = studio_casting.identity_seed(user_id, p.get("series_id") or p["id"], body.name)
+        seed = studio_casting.identity_seed(user_id, p.get("series_id") or p["id"], name)
         d = studio_casting.cast(profile, _catalog(), {c.get("voice") for c in cast_rows if c.get("voice")}, seed,
-                                body.description)
+                                description)
         fields["voice"] = d.voice
         extra.update(voice_status=d.status, voice_category=d.voice_category, voice_description=d.voice_description,
                      voice_language=d.language, voice_assignment_version=1 if d.voice else 0)
         if not extra["voice_style"]:
             extra["voice_style"] = d.voice_style
-    row = _write_with_fallback(lambda f: st.insert("studio_characters", [f])[0], {**fields, **extra})
-    _touch(p["id"])
-    return _character_out(row, {})
+    return _write_with_fallback(lambda f: st.insert("studio_characters", [f])[0], {**fields, **extra})
 
 
 @router.patch("/characters/{character_id}")

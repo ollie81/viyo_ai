@@ -325,7 +325,7 @@ async def list_chapters(story_id: str, user_id: str = Depends(cs.creator)):
     return {"chapters": [_chapter_summary(chapters[k]) if k in chapters else
                          {"number": k, "title": c.get("title") or "", "status": "planned"}
                          for k, c in ((int(c.get("number") or 0), c) for c in plan)],
-            "next": _next_chapter(story, chapters), "writing": writing,
+            "next": _next_chapter(story, chapters), "writing": writing, "stage": story.get("stage"),
             "price": pricing.chapter_hold(nv.target(story)["words"]), "balance": cs._balance(user_id)}
 
 
@@ -537,3 +537,127 @@ async def decide_memory(story_id: str, body: MemoryDecisionIn, user_id: str = De
             else:
                 refused.append({"id": rid, "reason": "Only a suggestion can be rejected."})
     return {"done": done, "refused": refused}
+
+
+# ====================================================================== stage 6: the novel and its Story Bible
+
+class ApproveNovelIn(BaseModel):
+    chapters: int = Field(..., ge=1)           # how many approved chapters the creator is looking at
+    accept_problems: bool = False              # approve even though the memory still has inconsistencies
+
+
+def _blocking_memory_problems(canon) -> list:
+    """Inconsistencies inside the memory that would go into the Story Bible (overdue threads are only warned)."""
+    return [m for m in canon.audit() if m.get("rule") in ("conflicting_facts", "object_two_places", "cause_after_effect")]
+
+
+def _seed_production(story: dict, canon, user_id: str) -> dict:
+    """Links the novel's characters, places and objects to the production's cast and elements: an existing one with
+    the same name is linked (never changed), a missing one is created (characters are cast automatically)."""
+    import studio_story_bible as sb
+    st = cs.get_store()
+    p = cs._project(story["project_id"], user_id)
+    out = {"characters_created": 0, "characters_linked": 0, "elements_created": 0, "elements_linked": 0, "notes": []}
+    cast = {c["name"].lower(): c for c in st.select("studio_characters", {"project_id": p["id"]})}
+    outline = story.get("outline") or {}
+    for e in canon.entities:
+        if e.get("status") not in ("approved", "creator_locked") or e["kind"] != "character":
+            continue
+        if e.get("character_id") and any(c["id"] == e["character_id"] for c in cast.values()):
+            continue
+        row = cast.get(e["name"].lower()) or cast.get(e["name"][:60].lower())
+        if row:
+            out["characters_linked"] += 1
+        else:
+            row = cs.create_character(p, user_id, e["name"][:60], sb.character_description(sb.character_profile(canon, e, outline)))
+            cast[row["name"].lower()] = row
+            out["characters_created"] += 1
+        st.update("studio_story_entities", {"id": e["id"]}, {"character_id": row["id"]})
+    try:
+        have = {(x["kind"], x["name"].lower()): x for x in st.select("studio_elements", {"project_id": p["id"]})}
+        for el in sb.element_rows(canon, outline):
+            if el["element_id"] and any(x["id"] == el["element_id"] for x in have.values()):
+                continue
+            row = have.get((el["kind"], el["name"].lower()))
+            if row:
+                out["elements_linked"] += 1
+            else:
+                row = st.insert("studio_elements", [{"project_id": p["id"], "owner_id": user_id, "kind": el["kind"],
+                                                     "name": el["name"], "description": el["description"],
+                                                     "details": {}, "position": len(have)}])[0]
+                have[(el["kind"], el["name"].lower())] = row
+                out["elements_created"] += 1
+            st.update("studio_story_entities", {"id": el["entity_id"]}, {"element_id": row["id"]})
+    except Exception as e:                       # places and objects need creator_studio_elements.sql
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        out["notes"].append(f"Places and objects weren't added to the production: {type(e).__name__}.")
+    cs._touch(p["id"])
+    return out
+
+
+def _compile_to_production(story: dict, user_id: str) -> dict:
+    import studio_story_bible as sb
+    from studio_canon import CanonRepo
+    canon = CanonRepo(cs.get_store(), story["id"], user_id).load()
+    compiled = sb.compile_bible(story, _chapters(story), canon)
+    p = cs._project(story["project_id"], user_id)
+    cs.get_store().update("studio_projects", {"id": p["id"]},
+                          {"story_bible": sb.merge_into(p.get("story_bible"), compiled), "updated_at": _now()})
+    seeded = _seed_production(story, CanonRepo(cs.get_store(), story["id"], user_id).load(), user_id)
+    return {"characters": len(compiled["saga"]["characters"]), "secrets": len(compiled["saga"]["secrets"]),
+            "mysteries": len(compiled["saga"]["mysteries"]), "open_threads": len(compiled["saga"]["open_threads"]),
+            "knowledge": len(compiled["knowledge"]), "chapters": len(compiled["novel"]["chapters"]), **seeded}
+
+
+@router.post("/stories/{story_id}/approve")
+async def approve_novel(story_id: str, body: ApproveNovelIn, user_id: str = Depends(cs.creator)):
+    """The creator approves the whole novel (every chapter approved first). Free: its memory becomes the
+    production's Story Bible and its characters, places and objects join the production."""
+    from studio_canon import CanonRepo
+    story = _story(story_id, user_id)
+    if story.get("stage") == "novel_approved":
+        raise HTTPException(status_code=409, detail="This novel is already approved.")
+    if story.get("stage") != "outline_approved" or not story.get("project_id"):
+        raise HTTPException(status_code=409, detail="Approve the novel plan and write its chapters first.")
+    chapters = _chapters(story)
+    planned = [int(c.get("number") or 0) for c in (story.get("outline") or {}).get("chapters") or []]
+    missing = [n for n in planned if (chapters.get(n) or {}).get("status") != "approved"]
+    if missing:
+        raise HTTPException(status_code=409, detail={
+            "message": f"{len(missing)} chapter(s) aren't approved yet (first: chapter {missing[0]}).", "missing": missing[:50]})
+    if body.chapters != len(planned):
+        raise HTTPException(status_code=409, detail="The novel changed since you opened it. Look again, then approve.")
+    problems = _blocking_memory_problems(CanonRepo(cs.get_store(), story["id"], user_id).load())
+    if problems and not body.accept_problems:
+        raise HTTPException(status_code=409, detail={
+            "message": f"The story memory has {len(problems)} inconsistency(ies). Fix them in the Story Bible, or "
+                       "approve anyway.", "problems": problems[:20], "code": "memory_problems"})
+    result = _compile_to_production(story, user_id)
+    story = _save(story, {"stage": "novel_approved", "novel_approved_at": _now()})
+    return {"story": _out(story), "bible": result, "approved_with_memory_problems": len(problems)}
+
+
+@router.post("/stories/{story_id}/bible/sync")
+async def sync_bible(story_id: str, user_id: str = Depends(cs.creator)):
+    """Compiles the memory into the production again (after the creator corrected or locked facts). Free."""
+    story = _story(story_id, user_id)
+    if story.get("stage") != "novel_approved":
+        raise HTTPException(status_code=409, detail="Approve the novel first.")
+    return {"bible": _compile_to_production(story, user_id)}
+
+
+@router.get("/stories/{story_id}/bible")
+async def story_bible(story_id: str, user_id: str = Depends(cs.creator)):
+    """The Story Bible browser: characters, secrets and who knows them, places, objects, threads and the timeline,
+    from the approved memory; plus whether the production's bible has been compiled."""
+    import studio_story_bible as sb
+    from studio_canon import CanonRepo
+    story = _story(story_id, user_id)
+    canon = CanonRepo(cs.get_store(), story["id"], user_id).load()
+    p = cs.get_store().one("studio_projects", {"id": story["project_id"]}) if story.get("project_id") else None
+    saga = ((p or {}).get("story_bible") or {}).get("saga") or {}
+    return {**sb.browse(canon, story), "approved": story.get("stage") == "novel_approved",
+            "approved_at": story.get("novel_approved_at"),
+            "compiled_at": saga.get("built_at") if (saga.get("source") or {}).get("story_id") == story["id"] else None,
+            "memory_problems": _blocking_memory_problems(canon)}
