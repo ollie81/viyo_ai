@@ -191,7 +191,11 @@ def test_a_suggestion_that_contradicts_a_locked_fact_is_skipped_on_approval(nv):
          "quote": "Amani, only nineteen years old"}]}}
     write(client, u, sid, 1)
     run(gen)
-    r = approve(client, u, sid, 1)
+    # Since stage 5 the conflict is a continuity problem the creator settles first (test_story_continuity);
+    # approving anyway still never lets the contradicting suggestion past the locked fact.
+    assert approve(client, u, sid, 1).status_code == 409
+    r = client.post(f"/api/v1/studio/stories/{sid}/chapters/1/approve", headers=H(u),
+                    json={"version": 1, "with_suggestions": True, "accept_problems": True})
     assert r.status_code == 200
     assert r.json()["approved_suggestions"] == 0 and r.json()["skipped"][0]["reason"] == "creator-locked"
     canon = repo.load()
