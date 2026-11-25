@@ -187,6 +187,9 @@ class StudioWorker:
             brief["world"] = world
         if saga:
             brief["saga"] = saga
+        novel_episode = self.novel_episode(project)
+        if novel_episode:
+            brief["novel_episode"] = novel_episode
         if develop is None:
             text, cost = self.ai.write_script(brief)
             bible = None
@@ -458,6 +461,33 @@ class StudioWorker:
         if not cache or cache[0] != key:
             self._world_cache = cache = (key, self.story_world(project))
         return wb.block(cache[1], purpose)
+
+    def novel_episode(self, project) -> Optional[dict]:
+        """For an episode adapted from an approved novel (Story Intelligence stage 7): its plan, the novel's own
+        words for it, and the story memory at that episode. None for any other production."""
+        if not project.get("story_id") or not project.get("episode_number"):
+            return None
+        import studio_adapt as ad
+        from studio_canon import CanonRepo
+        story = self.store.one("studio_stories", {"id": project["story_id"]})
+        if not story or story["owner_id"] != project["owner_id"]:
+            return None
+        plan = story.get("episode_plan") or []
+        n = int(project["episode_number"])
+        e = next((x for x in plan if x.get("number") == n), None)
+        if not e:
+            return None
+        texts = {c["number"]: c.get("text") or "" for c in self.store.select("studio_story_chapters", {"story_id": story["id"]})
+                 if c.get("status") == "approved"}
+        canon = CanonRepo(self.store, story["id"], story["owner_id"]).load()
+        passages = ad.source_passages(plan, n, texts)
+        # Who the episode needs: everyone its plan or its source passages name.
+        text = " ".join([e.get("summary") or ""] + list(e.get("beats") or []) + [p["text"] for p in passages])[:20000]
+        try:
+            memory = canon.render({"at": {"episode": n}, "limit": 60, "text": text})
+        except Exception:
+            memory = canon.render({"at": (int(e["chapter_from"]), 0), "limit": 60, "text": text})
+        return {**e, "of": len(plan), "last": n == len(plan), "memory": memory, "passages": passages}
 
     def earlier_episodes(self, project) -> list[dict]:
         """The story bibles of the episodes before this one in its series,

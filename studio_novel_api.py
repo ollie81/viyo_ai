@@ -661,3 +661,158 @@ async def story_bible(story_id: str, user_id: str = Depends(cs.creator)):
             "approved_at": story.get("novel_approved_at"),
             "compiled_at": saga.get("built_at") if (saga.get("source") or {}).get("story_id") == story["id"] else None,
             "memory_problems": _blocking_memory_problems(canon)}
+
+
+# ====================================================================== stage 7: the episode planner
+
+class EpisodePlanIn(BaseModel):
+    request_id: str = Field(..., min_length=8, max_length=80)
+    episodes: int = Field(0, ge=0, le=200)          # 0 = the number chosen when the story started
+    seconds: int = Field(0, ge=0, le=600)           # 0 = the production's episode length (or 90)
+    note: str = Field("", max_length=1500)
+
+
+class EpisodePlanEditIn(BaseModel):
+    episodes: list[dict] = Field(..., max_length=200)
+
+
+class ApprovePlanIn(BaseModel):
+    version: int
+
+
+def _plan_out(story: dict) -> dict:
+    plan = story.get("episode_plan") or []
+    created = []
+    if story.get("episodes_created_at"):
+        rows = cs.get_store().select("studio_projects", {"story_id": story["id"], "owner_id": story["owner_id"]})
+        created = sorted(({"number": r.get("episode_number"), "project_id": r["id"], "title": r.get("title") or ""}
+                          for r in rows), key=lambda x: x["number"] or 0)
+    chapters = len((story.get("outline") or {}).get("chapters") or [])
+    n = int(story.get("episodes") or 0) or len(plan) or max(1, chapters)
+    return {"plan": plan, "problems": story.get("episode_plan_problems") or [],
+            "version": story.get("episode_plan_version") or 0, "approved_version": story.get("episode_plan_approved_version"),
+            "seconds": story.get("episode_seconds") or 90, "episodes_wanted": int(story.get("episodes") or 0),
+            "created": created, "created_at": story.get("episodes_created_at"),
+            "price": pricing.estimate_episode_plan(chapters, n).credits, "stage": story.get("stage"),
+            "chapters": len((story.get("outline") or {}).get("chapters") or [])}
+
+
+def _approved_chapters(story: dict) -> list:
+    return [c for _, c in sorted(_chapters(story).items()) if c.get("status") == "approved"]
+
+
+@router.get("/stories/{story_id}/episodes")
+async def episode_plan(story_id: str, user_id: str = Depends(cs.creator)):
+    return _plan_out(_story(story_id, user_id))
+
+
+@router.post("/stories/{story_id}/episodes/plan")
+async def make_episode_plan(story_id: str, body: EpisodePlanIn, user_id: str = Depends(cs.creator)):
+    """Plans the episodes of an approved novel (a paid step, a new version each time), checked and sent back once
+    if the check finds problems."""
+    import studio_adapt as ad
+    import studio_ai
+    story = _story(story_id, user_id)
+    if story.get("stage") != "novel_approved":
+        raise HTTPException(status_code=409, detail="Approve the novel first.")
+    if story.get("episodes_created_at"):
+        raise HTTPException(status_code=409, detail="The episodes have already been created from the approved plan.")
+    n = body.episodes or int(story.get("episodes") or 0)
+    if n < 1:
+        raise HTTPException(status_code=422, detail="Choose how many episodes the novel should become.")
+    if body.note and not studio_ai.moderate_text(body.note):
+        raise HTTPException(status_code=422, detail="This note can't be used on Viyo. Please change it.")
+    p = cs._project(story["project_id"], user_id)
+    seconds = body.seconds or int(story.get("episode_seconds") or 0) or int(p.get("target_seconds") or 90)
+    seconds = min(600, max(30, seconds))
+    chapters = _approved_chapters(story)
+    cs._rate_limit(user_id)
+    base = ad.plan_prompt(story, chapters, n, seconds, body.note)
+    ai = cs.get_ai()
+
+    def plan():
+        raw, cost = ai.novel_json(base, ad.PLAN_SCHEMA, "episode plan")
+        pl = ad.clean_plan(raw)
+        probs = ad.plan_problems(pl, len(chapters), n)
+        if probs:
+            raw2, cost2 = ai.novel_json(ad.fix_prompt(base, pl, probs), ad.PLAN_SCHEMA, "episode plan")
+            cost = pricing.combine([cost, cost2])
+            pl2 = ad.clean_plan(raw2)
+            p2 = ad.plan_problems(pl2, len(chapters), n)
+            if pl2 and len(p2) <= len(probs):
+                pl, probs = pl2, p2
+        text = " ".join(e["summary"] + " " + " ".join(e["beats"]) for e in pl)
+        if not studio_ai.moderate_text(text[:20000]):
+            raise HTTPException(status_code=422, detail="The episode plan came out with content Viyo can't make. "
+                                                        "Add a note and try again.")
+        return (pl, probs), cost
+
+    pl, probs = cs._paid_call(user_id, pricing.estimate_episode_plan(len(chapters), n).credits, plan, "the episode plan")
+    story = _save(story, {"episode_plan": pl, "episode_plan_problems": probs, "episodes": n, "episode_seconds": seconds,
+                          "episode_plan_version": int(story.get("episode_plan_version") or 0) + 1,
+                          "episode_plan_approved_version": None})
+    return {**_plan_out(story), "balance": cs._balance(user_id)}
+
+
+@router.put("/stories/{story_id}/episodes/plan")
+async def edit_episode_plan(story_id: str, body: EpisodePlanEditIn, user_id: str = Depends(cs.creator)):
+    """The creator's own changes to the plan (free): checked again, saved as a new version."""
+    import studio_adapt as ad
+    import studio_ai
+    story = _story(story_id, user_id)
+    if story.get("stage") != "novel_approved" or story.get("episodes_created_at") or not story.get("episode_plan"):
+        raise HTTPException(status_code=409, detail="There's no episode plan to edit (or the episodes already exist).")
+    pl = ad.clean_plan({"episodes": body.episodes})
+    if not studio_ai.moderate_text(" ".join(e["summary"] + " " + " ".join(e["beats"]) for e in pl)[:20000]):
+        raise HTTPException(status_code=422, detail="This plan can't be made on Viyo. Please change it.")
+    probs = ad.plan_problems(pl, len(_approved_chapters(story)), len(pl))
+    story = _save(story, {"episode_plan": pl, "episode_plan_problems": probs, "episodes": len(pl) or story.get("episodes"),
+                          "episode_plan_version": int(story.get("episode_plan_version") or 0) + 1})
+    return _plan_out(story)
+
+
+@router.post("/stories/{story_id}/episodes/plan/approve")
+async def approve_episode_plan(story_id: str, body: ApprovePlanIn, user_id: str = Depends(cs.creator)):
+    """The creator approves this exact plan: one episode production per planned episode is created (free), in a
+    new series, with the novel's production's settings, cast and places, and the novel's Story Bible."""
+    import uuid as _uuid
+
+    import studio_adapt as ad
+    from studio_canon import CanonRepo
+    story = _story(story_id, user_id)
+    if story.get("episodes_created_at"):
+        raise HTTPException(status_code=409, detail="The episodes have already been created.")
+    if story.get("stage") != "novel_approved" or not story.get("episode_plan"):
+        raise HTTPException(status_code=409, detail="There's no episode plan to approve.")
+    if body.version != int(story.get("episode_plan_version") or 0):
+        raise HTTPException(status_code=409, detail="The plan changed since you opened it. Look again, then approve.")
+    if story.get("episode_plan_problems"):
+        raise HTTPException(status_code=409, detail={"message": "Fix the plan's problems first.",
+                                                     "problems": story["episode_plan_problems"]})
+    st = cs.get_store()
+    src = cs._project(story["project_id"], user_id)
+    plan = story["episode_plan"]
+    series = str(_uuid.uuid4())
+    bible = dict(src.get("story_bible") or {})
+    bible.pop("_assistant_approval", None)
+    if bible.get("saga"):
+        bible["saga"] = ad.place_reveals(bible["saga"], plan)
+    keep = {k: bible[k] for k in ("world", "saga", "knowledge", "novel", "voices", "voice_refs") if k in bible}
+    title = (story.get("title") or src.get("title") or "Story")[:80]
+    repo = CanonRepo(st, story["id"], user_id)
+    made = []
+    for e in plan:
+        row = {k: src.get(k) for k in ("aspect_ratio", "genre", "visual_style", "language", "captions")}
+        for k in ("production_style", "image_quality"):
+            if src.get(k):
+                row[k] = src[k]
+        row.update(owner_id=user_id, series_id=series, kind="episode", target_seconds=int(story.get("episode_seconds") or 90),
+                   title=f"{title} · Episode {e['number']}: {e['title']}"[:120], logline=e["summary"][:1000],
+                   story_bible=keep, story_id=story["id"], episode_number=e["number"])
+        new = st.insert("studio_projects", [row])[0]
+        cs.copy_cast_and_elements(src, new, user_id)
+        repo.set_episode(e["number"], e["chapter_from"], e["chapter_to"], project_id=new["id"])
+        made.append({"number": e["number"], "project_id": new["id"], "title": new["title"]})
+    story = _save(story, {"episodes_created_at": _now(), "episode_series_id": series,
+                          "episode_plan_approved_version": body.version})
+    return {**_plan_out(story), "created": made}
