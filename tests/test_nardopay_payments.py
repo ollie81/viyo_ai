@@ -61,6 +61,7 @@ def schema(migrated):
     conn.execute((ROOT / "nardopay_orders.sql").read_text())
     for _ in range(2):                                               # safe to run again
         conn.execute((ROOT / "nardopay_link_code.sql").read_text())
+        conn.execute((ROOT / "nardopay_rates_auto.sql").read_text())
     conn.close()
 
 

@@ -279,6 +279,13 @@ def main() -> None:
     except Exception as e:  # never let payments upkeep stop the Repurposer
         print(f"[WARN] NardoPay reconciliation not started: {e}")
     try:
+        # Daily BNR USD/RWF rate for NardoPay checkout, only when NARDOPAY_RATE_AUTO=on (see nardopay_fx.py).
+        import nardopay_fx
+        import nardopay_payments as _np
+        nardopay_fx.start_updater(_np.get_store)
+    except Exception as e:  # never let rate upkeep stop the Repurposer
+        print(f"[WARN] NardoPay rate updates not started: {e}")
+    try:
         # One-time move of old files to Bunny Storage, only when BUNNY_MOVE_FILES is set (see viyo_files.py).
         import repurpose as _r
         import viyo_files
