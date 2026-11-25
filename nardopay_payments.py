@@ -19,6 +19,11 @@ Undocumented details are never guessed
   orders aren't created and nothing is credited; signed webhooks are still stored and can be reprocessed once they
   are set. The unit of `amount` (whole francs or minor units) is a setting too.
 
+Where NardoPay reports payments
+  NardoPay only sends a webhook for a link created through the API with a webhook_url (documented in its dashboard,
+  Developers > Webhooks). NARDOPAY_WEBHOOK_URL is that address (this server's /api/v1/webhooks/nardopay, https);
+  without it no link is created, because no payment could ever be confirmed.
+
 Switches (all off by default: nothing goes live by deploying this)
   NARDOPAY_ENABLED=true         allow creating orders
   NARDOPAY_LEDGER_VERIFIED=true set only after checking viyo_coin_apply and transactions_external_ref_key exist in
@@ -252,6 +257,12 @@ def _order_out(o: dict) -> dict:
             "created_at": o.get("created_at"), "credited_at": o.get("credited_at")}
 
 
+def webhook_url() -> Optional[str]:
+    """NARDOPAY_WEBHOOK_URL if it's an https address, else None."""
+    u = _env("NARDOPAY_WEBHOOK_URL")
+    return u if u.startswith("https://") and len(u) <= 500 and " " not in u else None
+
+
 def _http_post(url: str, headers: dict, body: dict):
     return requests.post(url, headers=headers, json=body, timeout=15)
 
@@ -265,7 +276,7 @@ async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
     if not _flag("NARDOPAY_LEDGER_VERIFIED"):
         raise HTTPException(status_code=503, detail="NardoPay checkout isn't available yet.")
     api_key, unit = _env("NARDOPAY_API_KEY"), amount_multiplier()
-    if not api_key or unit is None or missing_contract(["link_url"]) or missing_contract():
+    if not api_key or unit is None or missing_contract(["link_url"]) or missing_contract() or not webhook_url():
         raise HTTPException(status_code=503, detail="NardoPay checkout isn't configured.")
     package = COIN_PACKAGES.get(body.package_id)
     if package is None:
@@ -288,7 +299,7 @@ async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
 
     request_body = {"link_type": "payment", "product_name": "VIYO Coins", "amount_mode": "fixed",
                     "amount": rwf * unit, "description": f"VIYO Coins purchase: {package['label']}",
-                    "metadata": {"order_id": order["id"]}}
+                    "metadata": {"order_id": order["id"]}, "webhook_url": webhook_url()}
     try:
         resp = _http_post(CREATE_LINK_URL, {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                           request_body)
@@ -518,6 +529,63 @@ def reprocess_stored(limit: int = 100) -> dict:
     return out
 
 
+class TestLinkIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    amount_rwf: int = Field(100, ge=100, le=2000)
+
+
+def https_fields(obj, prefix: str = "", depth: int = 0) -> list[dict]:
+    """Every https URL in a JSON response, with its dotted path ("data.url"): shown to the admin so the link field
+    setting comes from what NardoPay really returns, not from a guess."""
+    out = []
+    if depth > 4:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out += https_fields(v, f"{prefix}.{k}" if prefix else str(k), depth + 1)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:10]):
+            out += https_fields(v, f"{prefix}.{i}" if prefix else str(i), depth + 1)
+    elif isinstance(obj, str) and obj.startswith("https://") and len(obj) <= 2000:
+        out.append({"field": prefix, "url": obj})
+    return out
+
+
+@router.post("/admin/nardopay/test-link", dependencies=[Depends(require_admin)])
+async def admin_test_link(body: TestLinkIn):
+    """A real NardoPay payment link for the owner to pay once, so the webhook NardoPay really sends can be seen
+    (nardopay_webhook_events.raw_body). It belongs to NO VIYO order (no order_id in its metadata), so it can never
+    credit coins: it's stored, then ignored once the field settings exist. Works while checkout is still off, and
+    shows which response field holds the link (for NARDOPAY_LINK_URL_FIELD)."""
+    api_key, unit, hook = _env("NARDOPAY_API_KEY"), amount_multiplier(), webhook_url()
+    missing = [n for n, ok in (("NARDOPAY_API_KEY", api_key), ("NARDOPAY_WEBHOOK_URL", hook)) if not ok]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"Set these first in Railway: {', '.join(missing)}.")
+    # The amount unit isn't confirmed yet: whole francs unless NARDOPAY_AMOUNT_UNIT says otherwise.
+    amount = body.amount_rwf * (unit or 1)
+    request_body = {"link_type": "payment", "product_name": "VIYO test payment", "amount_mode": "fixed",
+                    "amount": amount, "description": "VIYO webhook test (not a coin purchase)",
+                    "metadata": {"viyo_test": "admin"}, "webhook_url": hook}
+    try:
+        resp = _http_post(CREATE_LINK_URL, {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                          request_body)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"NardoPay couldn't be reached ({type(e).__name__}).")
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    found = https_fields(data) if isinstance(data, (dict, list)) else []
+    configured = pick(data, contract_field("link_url")) if contract_field("link_url") and data is not None else None
+    if not 200 <= resp.status_code < 300 or not found:
+        raise HTTPException(status_code=502, detail={
+            "message": f"NardoPay answered HTTP {resp.status_code} without a payment link.",
+            "response_fields": sorted(data.keys())[:30] if isinstance(data, dict) else []})
+    link = configured if isinstance(configured, str) and configured.startswith("https://") else found[0]["url"]
+    return {"link": link, "links_found": found[:10], "link_field_setting": contract_field("link_url") or None,
+            "amount_rwf": body.amount_rwf, "amount_sent": amount}
+
+
 @router.post("/admin/nardopay/reconcile", dependencies=[Depends(require_admin)])
 async def admin_reconcile():
     return reconcile()
@@ -543,7 +611,7 @@ def checkout_problem() -> Optional[str]:
     """Why web checkout can't take an order right now (for logs), or None."""
     if not _flag("NARDOPAY_ENABLED") or not _flag("NARDOPAY_LEDGER_VERIFIED"):
         return "switched off"
-    if not _env("NARDOPAY_API_KEY") or amount_multiplier() is None or missing_contract():
+    if not _env("NARDOPAY_API_KEY") or amount_multiplier() is None or missing_contract() or not webhook_url():
         return "not configured"
     try:
         return rate_problem(latest_rate())
