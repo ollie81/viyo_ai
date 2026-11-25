@@ -509,3 +509,88 @@ def test_the_schedule_does_nothing_until_nardopay_is_set_up(env, monkeypatch):
     assert seen == []
     monkeypatch.setenv("NARDOPAY_RECONCILE", "off")
     assert np_.start_reconciler() is False
+
+
+# ====================================================================== test deliveries are never credited
+
+def event_status(db):
+    return db.execute("select status, detail from public.nardopay_webhook_events order by received_at desc limit 1").fetchone()
+
+
+@pytest.mark.parametrize("flag", [True, "true", "TRUE", 1])
+def test_a_test_payment_completed_with_a_real_order_amount_and_currency_credits_nothing(env, flag):
+    client, db, calls, st = env
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    body = payload(oid, tx="tx_test", test=flag)          # valid order, exact amount, RWF, valid signature
+    r = deliver(client, body)
+    assert r.status_code == 200 and r.json()["result"] == "ignored" and r.json()["test"] is True
+    assert balance(db, u) == 100 and credits(db, "tx_test") == 0
+    assert order_row(db, oid)["status"] == "pending" and order_row(db, oid)["transaction_id"] is None
+    assert event_status(db) == ("ignored", "test event: never credited")
+    # Sent again: still ignored, still one row, still nothing credited.
+    again = deliver(client, body)
+    assert again.status_code == 200 and again.json()["result"] == "ignored"
+    assert db.execute("select count(*) from public.nardopay_webhook_events").fetchone()[0] == 1
+    assert balance(db, u) == 100
+    # Reconciliation never finishes it either.
+    client.post("/api/v1/admin/nardopay/reconcile", headers=ADMIN)
+    assert balance(db, u) == 100 and credits(db, "tx_test") == 0
+
+
+def test_webhook_test_events_are_ignored_at_once(env):
+    client, db, calls, st = env
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    r = deliver(client, payload(oid, tx="tx_wt", event="webhook.test"))       # no test flag, event type alone
+    assert r.status_code == 200 and r.json()["result"] == "ignored"
+    assert balance(db, u) == 100 and event_status(db)[0] == "ignored"
+
+
+def test_nardopays_own_test_webhook_is_ignored_even_before_the_fields_are_set(env, monkeypatch):
+    """The exact shape NardoPay sent on 25 Nov 2026, with the field settings still empty (as in production now)."""
+    client, db, calls, st = env
+    for k in FIELDS:
+        monkeypatch.delenv(k)
+    body = {"test": True, "event": "webhook.test", "amount": 10, "status": "completed", "currency": "USD",
+            "metadata": {}, "reference": "TEST-WEBHOOK", "payer_name": "Test Customer",
+            "payer_email": "customer@example.com", "transaction_id": "00000000-0000-0000-0000-000000000000"}
+    r = deliver(client, body)
+    assert r.status_code == 200 and r.json()["result"] == "ignored"             # not left at "received"
+    assert event_status(db) == ("ignored", "test event: never credited")
+    assert db.execute("select count(*) from public.transactions where external_ref like 'nardopay:%'").fetchone()[0] == 0
+
+
+def test_a_test_event_stored_earlier_as_received_is_ignored_when_reprocessed(env, monkeypatch):
+    client, db, calls, st = env
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    body = payload(oid, tx="tx_old", test=True)
+    raw = json.dumps(body, separators=(",", ":"))
+    # As the production row looks now: stored before this fix, status received.
+    db.execute("insert into public.nardopay_webhook_events (body_sha256, signature_ok, raw_body) values (%s, true, %s)",
+               (hashlib.sha256(raw.encode()).hexdigest(), raw))
+    out = client.post("/api/v1/admin/nardopay/reprocess", headers=ADMIN).json()
+    assert out["results"][0]["result"] == "ignored"
+    assert balance(db, u) == 100 and credits(db, "tx_old") == 0 and order_row(db, oid)["status"] == "pending"
+    assert event_status(db)[0] == "ignored"
+
+
+@pytest.mark.parametrize("flag", [False, "false", 0, None])
+def test_a_real_payment_marked_test_false_is_still_credited_once(env, flag):
+    client, db, calls, st = env
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    extra = {} if flag is None else {"test": flag}
+    r = deliver(client, payload(oid, tx="tx_real", **extra))
+    assert r.status_code == 200 and r.json()["result"] == "processed"
+    assert balance(db, u) == 200 and credits(db, "tx_real") == 1
+    assert order_row(db, oid)["status"] == "credited"
+
+
+def test_is_test_event():
+    assert np_.is_test_event({"test": True}) and np_.is_test_event({"event": "webhook.test"})
+    assert np_.is_test_event({"test": "yes"}) and np_.is_test_event({"test": 1})
+    assert not np_.is_test_event({"test": False}) and not np_.is_test_event({"test": 0})
+    assert not np_.is_test_event({"event": "payment.completed"}) and not np_.is_test_event(None)
+    assert not np_.is_test_event({"test": "no"}) and not np_.is_test_event([])
