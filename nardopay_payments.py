@@ -48,6 +48,10 @@ router = APIRouter(prefix="/api/v1", tags=["payments"])
 
 CREATE_LINK_URL = "https://mczqwqsvumfsneoknlep.supabase.co/functions/v1/create-payment-link-api"   # documented
 EVENT_COMPLETED, EVENT_FAILED = "payment.completed", "payment.failed"                               # documented
+# Seen in a real signed NardoPay delivery (25 Nov 2026): its test webhook is {"event": "webhook.test", "test": true, ...}.
+# A payload marked test=true, or a webhook.test event, is never a real payment: it is recorded and ignored, never
+# credited, whatever order, amount and currency it carries.
+TEST_FLAG, TEST_EVENTS = "test", ("webhook.test",)
 
 # Where each value is in NardoPay's JSON, as a dotted path (e.g. "data.id"), set from NardoPay's documentation.
 CONTRACT = {
@@ -335,6 +339,21 @@ def _parse_event(payload: dict) -> dict:
             "provider_event_id": str(ev)[:200] if ev not in (None, "") else None}
 
 
+def is_test_event(payload) -> bool:
+    """True for NardoPay's test deliveries: the payload says test=true (true, "true", 1), or its event type is
+    webhook.test (read from the configured field, or the top-level "event" key the test webhook uses)."""
+    if not isinstance(payload, dict):
+        return False
+    flag = payload.get(TEST_FLAG)
+    if flag is True or (isinstance(flag, str) and flag.strip().lower() in ("true", "1", "yes")) or \
+            (isinstance(flag, int) and not isinstance(flag, bool) and flag == 1):
+        return True
+    kinds = {str(payload.get("event") or "").strip().lower()}
+    if contract_field("event_type"):
+        kinds.add(str(pick(payload, contract_field("event_type")) or "").strip().lower())
+    return bool(kinds & set(TEST_EVENTS))
+
+
 def verify_payment(order: dict, ev: dict) -> Optional[str]:
     """Why a completed payment doesn't match its order, or None if it does."""
     unit = amount_multiplier()
@@ -365,6 +384,8 @@ def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
         _rpc("nardopay_finish_event", {"p_event": eid, "p_status": status, "p_detail": detail})
         return http, {"received": True, "result": status}
 
+    if is_test_event(payload):           # defence in depth: handle_signed already stops these
+        return finish("ignored", "test event: never credited")
     if ev["event_type"] not in (EVENT_COMPLETED, EVENT_FAILED):
         return finish("ignored", f"event type {ev['event_type']!r} isn't handled")
     order = get_store().one("nardopay_orders", {"id": ev["order_id"]}) if ev["order_id"] else None
@@ -415,6 +436,11 @@ def handle_signed(raw: bytes, payload: Optional[dict]) -> tuple[int, dict]:
     if not isinstance(payload, dict):
         _rpc("nardopay_finish_event", {"p_event": row["id"], "p_status": "ignored", "p_detail": "body is not a JSON object"})
         return 200, {"received": True, "result": "ignored"}
+    if is_test_event(payload):
+        # A test delivery (webhook.test, or anything marked test=true, payment.completed included) is recorded and
+        # finished as ignored at once, even before the field settings are filled in: it can never credit coins.
+        _rpc("nardopay_finish_event", {"p_event": row["id"], "p_status": "ignored", "p_detail": "test event: never credited"})
+        return 200, {"received": True, "result": "ignored", "test": True}
     if not configured:
         return 202, {"received": True, "result": "stored", "detail": "NardoPay fields not configured yet"}
     if not _rpc("nardopay_claim_event", {"p_event": row["id"]}):
