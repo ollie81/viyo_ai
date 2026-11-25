@@ -5,7 +5,8 @@ nardopay_orders.sql.
 
 Rules
   * The client sends a package id and nothing else. Price and coins come from payments.COIN_PACKAGES; the RWF
-    amount from the latest exchange rate the owner set (admin only), locked on the order.
+    amount from the USD/RWF rate in use (BNR's daily published average, fetched automatically by nardopay_fx, or a
+    manual admin override), locked on the order with its id so a later rate never changes it.
   * Coins are credited only by a signed webhook (or reconciliation of a payment already verified from one), never
     by a redirect or anything the client says, and only through coins.credit_coins with external_ref
     "nardopay:<transaction id>" (the atomic viyo_coin_apply ledger).
@@ -47,6 +48,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+import nardopay_fx
 from coins import credit_coins
 from payments import COIN_PACKAGES
 
@@ -189,19 +191,22 @@ def _rpc(name: str, params: dict):
 
 # ====================================================================== exchange rate
 
+RATE_HISTORY_LOOKBACK = 400
+
+
+def _rate_rows() -> list[dict]:
+    return get_store().select("nardopay_rates", {}, order="set_at", desc=True, limit=RATE_HISTORY_LOOKBACK)
+
+
 def latest_rate() -> Optional[dict]:
-    rows = get_store().select("nardopay_rates", {}, order="set_at", desc=True, limit=1)
-    return rows[0] if rows else None
+    """The rate checkout uses now (nardopay_fx.current_rate): a held manual override, else the newer of the latest
+    manual rate and BNR's latest published rate. Rejected automatic rates never count."""
+    return nardopay_fx.current_rate(_rate_rows(), _now())
 
 
 def rate_problem(rate: Optional[dict]) -> Optional[str]:
-    """Why the current rate can't be used, or None."""
-    if not rate:
-        return "No exchange rate has been set."
-    max_age = float(_env("NARDOPAY_RATE_MAX_AGE_HOURS", "168") or 168)
-    if _now() - _parse_time(rate["set_at"]) > datetime.timedelta(hours=max_age):
-        return "The exchange rate is out of date."
-    return None
+    """Why the current rate can't be used, or None. An automatic rate's age counts from its publication date."""
+    return nardopay_fx.problem(rate, _now())
 
 
 def validate_new_rate(value: float, previous: Optional[dict], confirm_large_change: bool) -> None:
@@ -228,21 +233,42 @@ class RateIn(BaseModel):
     set_by: str = Field(..., min_length=1, max_length=120)
     note: str = Field("", max_length=400)
     confirm_large_change: bool = False
+    hold_hours: int = Field(0, ge=0, le=24 * 30)
 
 
 @router.get("/admin/nardopay/rate", dependencies=[Depends(require_admin)])
 async def get_rate():
-    r = latest_rate()
-    return {"rate": r, "usable": rate_problem(r) is None, "problem": rate_problem(r)}
+    rows = _rate_rows()
+    r = nardopay_fx.current_rate(rows, _now())
+    out = {"rate": r, "usable": rate_problem(r) is None, "problem": rate_problem(r),
+           "auto_updates": nardopay_fx._env("NARDOPAY_RATE_AUTO").lower() in ("on", "true", "1", "yes"),
+           "sources": nardopay_fx.sources(),
+           "rejected": [x for x in rows if x.get("status") == "rejected"][:10]}
+    try:
+        out["recent_runs"] = get_store().select("nardopay_rate_runs", {}, order="ran_at", desc=True, limit=10)
+    except Exception:
+        out["recent_runs"] = []                       # nardopay_rates_auto.sql not run yet
+    return out
 
 
 @router.post("/admin/nardopay/rate", dependencies=[Depends(require_admin)])
 async def set_rate(body: RateIn):
-    """Adds a new rate (rates are never edited or deleted, so the history stays)."""
+    """Adds a manual rate (rates are never edited or deleted, so the history stays). It is used until BNR publishes a
+    newer rate, or, with hold_hours, for that long whatever BNR publishes."""
     validate_new_rate(body.rate, latest_rate(), body.confirm_large_change)
-    row = get_store().insert("nardopay_rates", [{"rate": body.rate, "set_by": body.set_by.strip(),
-                                                 "note": body.note.strip()}])[0]
-    return {"rate": row}
+    row = {"rate": body.rate, "set_by": body.set_by.strip(), "note": body.note.strip()}
+    if body.hold_hours:
+        row["hold_until"] = (_now() + datetime.timedelta(hours=body.hold_hours)).isoformat()
+    return {"rate": get_store().insert("nardopay_rates", [row])[0]}
+
+
+@router.post("/admin/nardopay/rate/fetch", dependencies=[Depends(require_admin)])
+async def fetch_rate_now():
+    """Fetches BNR's latest rate now (same checks as the daily update). Never touches payment settings."""
+    import asyncio
+    out = await asyncio.to_thread(nardopay_fx.update, get_store())
+    r = latest_rate()
+    return {"result": out, "rate": r, "usable": rate_problem(r) is None, "problem": rate_problem(r)}
 
 
 # ====================================================================== orders
