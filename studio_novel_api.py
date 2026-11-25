@@ -243,6 +243,15 @@ class WriteChapterIn(BaseModel):
 class ApproveChapterIn(BaseModel):
     version: int
     with_suggestions: bool = False      # also approve this chapter's memory suggestions (conflicts are skipped)
+    accept_problems: bool = False       # approve even though continuity problems are undecided or need a fix
+
+
+class ProblemDecisionIn(BaseModel):
+    version: int                                              # the chapter version the creator is looking at
+    action: Literal["fix_chapter", "chapter_right", "intended"]
+    reason: str = Field("", max_length=400)                   # why it's intentional (VIYO's reason if left empty)
+    until_end: bool = False                                   # "intended" for the rest of the story, not only here
+    unlock: bool = False                                      # "chapter_right" may retire a creator-locked fact
 
 
 class MemoryDecisionIn(BaseModel):
@@ -287,11 +296,20 @@ def _proposals(story: dict, n: int) -> dict:
     return {"facts": facts, "events": events, "threads": threads}
 
 
+def _problems(c: dict) -> list:
+    """A chapter's continuity problems (chapters written before stage 5 get them rebuilt, without VIYO's judgement)."""
+    import studio_canon_check as cc
+    ex = c.get("extraction") or {}
+    return ex["problems"] if "problems" in ex else cc.problems_from(ex)
+
+
 def _chapter_summary(c: dict) -> dict:
+    import studio_canon_check as cc
     ex = c.get("extraction") or {}
     return {"number": c["number"], "title": c.get("title") or "", "status": c.get("status"), "words": c.get("words") or 0,
             "version": c.get("version") or 1, "summary": c.get("summary") or "",
-            "issues": len(ex.get("issues") or []), "proposed": ex.get("proposed") or {},
+            "issues": len(ex.get("issues") or []), "problems": cc.summary(_problems(c)),
+            "proposed": ex.get("proposed") or {},
             "review": (c.get("review") or {}).get("status"),
             "revised": ((c.get("review") or {}).get("revision") or {}).get("kept")}
 
@@ -317,9 +335,13 @@ async def get_chapter(story_id: str, number: int, user_id: str = Depends(cs.crea
     c = _chapters(story).get(number)
     if not c:
         raise HTTPException(status_code=404, detail="This chapter hasn't been written yet.")
+    import studio_canon_check as cc
+    probs = _problems(c)
     return {"chapter": {**_chapter_summary(c), "text": c.get("text") or "", "extraction": c.get("extraction") or {},
                         "review_report": c.get("review") or {}},
-            "suggestions": _proposals(story, number)}
+            "suggestions": _proposals(story, number),
+            "problems": [{**p, "actions": cc.allowed_actions(p)} for p in probs],
+            "fix_note": cc.fix_note(probs)}
 
 
 @router.post("/stories/{story_id}/chapters/{number}/write")
@@ -371,6 +393,12 @@ async def approve_chapter(story_id: str, number: int, body: ApproveChapterIn, us
         raise HTTPException(status_code=409, detail="This chapter is already approved.")
     if body.version != int(c.get("version") or 1):
         raise HTTPException(status_code=409, detail="A newer version of this chapter exists. Read it, then approve it.")
+    import studio_canon_check as cc
+    still_open = cc.open_problems(_problems(c))
+    if still_open and not body.accept_problems:
+        raise HTTPException(status_code=409, detail={
+            "message": f"{len(still_open)} continuity problem(s) need a decision first (or a new version of the "
+                       "chapter). You can also approve it anyway.", "open_problems": len(still_open), "code": "open_problems"})
     approved, skipped = 0, []
     if body.with_suggestions:
         repo = CanonRepo(cs.get_store(), story["id"], user_id)
@@ -392,9 +420,89 @@ async def approve_chapter(story_id: str, number: int, body: ApproveChapterIn, us
                 repo.resolve_thread(r["thread_id"], number, r.get("quote") or "")
             except Exception:
                 pass
-    row = cs.get_store().update("studio_story_chapters", {"id": c["id"]},
-                                {"status": "approved", "approved_at": _now(), "updated_at": _now()})[0]
-    return {"chapter": _chapter_summary(row), "approved_suggestions": approved, "skipped": skipped}
+    fields = {"status": "approved", "approved_at": _now(), "updated_at": _now()}
+    if still_open:                      # approved anyway: the problems stay on record, marked as accepted
+        fields["extraction"] = {**(c.get("extraction") or {}), "problems": _problems(c),
+                                "approved_with_open_problems": len(still_open)}
+    row = cs.get_store().update("studio_story_chapters", {"id": c["id"]}, fields)[0]
+    return {"chapter": _chapter_summary(row), "approved_suggestions": approved, "skipped": skipped,
+            "approved_with_open_problems": len(still_open)}
+
+
+@router.post("/stories/{story_id}/chapters/{number}/problems/{problem_id}/decide")
+async def decide_problem(story_id: str, number: int, problem_id: str, body: ProblemDecisionIn,
+                         user_id: str = Depends(cs.creator)):
+    """The creator settles one continuity problem (studio_canon_check): the chapter needs fixing, the memory was
+    wrong, or it's deliberate. Free; VIYO's judgement is shown but never decides."""
+    import studio_ai
+    import studio_canon_check as cc
+    from studio_canon import CanonError, CanonRepo
+    story = _story(story_id, user_id)
+    c = _chapters(story).get(number)
+    if not c:
+        raise HTTPException(status_code=404, detail="This chapter hasn't been written yet.")
+    if c.get("status") == "approved":
+        raise HTTPException(status_code=409, detail="This chapter is already approved.")
+    if body.version != int(c.get("version") or 1):
+        raise HTTPException(status_code=409, detail="A newer version of this chapter exists. Read it first.")
+    probs = _problems(c)
+    p = cc.find(probs, problem_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="This problem isn't in this version of the chapter.")
+    if body.action not in cc.allowed_actions(p):
+        raise HTTPException(status_code=422, detail={
+            "intended": "Two facts that disagree can't both be true, so this one can't be marked as intended.",
+            "chapter_right": "There's no memory fact to replace for this problem."}.get(body.action, "Not allowed."))
+    repo = CanonRepo(cs.get_store(), story["id"], user_id)
+    resolution = {"action": body.action, "at": _now()}
+    try:
+        if body.action == "fix_chapter":
+            if p.get("proposed_fact_id"):                      # the chapter's wrong fact never reaches the memory
+                f = cs.get_store().one("studio_story_facts", {"id": p["proposed_fact_id"], "story_id": story["id"]})
+                if f and f.get("status") == "proposed":
+                    repo.retire(f["id"], f"chapter {number}: continuity fix requested")
+        elif body.action == "chapter_right":
+            f = cs.get_store().one("studio_story_facts", {"id": p["memory_fact_id"], "story_id": story["id"]})
+            if not f:
+                raise HTTPException(status_code=404, detail="The memory fact no longer exists.")
+            if f.get("status") == "creator_locked" and not body.unlock:
+                raise HTTPException(status_code=409, detail={
+                    "message": "You locked this fact. Confirm that you want to unlock and replace it.", "locked": True,
+                    "code": "confirm_unlock"})
+            if f.get("status") != "retired":
+                repo.retire(f["id"], f"replaced by chapter {number}", force_locked=body.unlock)
+            resolution["retired_fact"] = f["id"]
+        else:                                                  # intended
+            reason = body.reason.strip() or ((p.get("judgement") or {}).get("why") if
+                                             (p.get("judgement") or {}).get("verdict") == "intended" else "")
+            if not reason:
+                raise HTTPException(status_code=422, detail="Say in a few words why it's intentional.")
+            if body.reason and not studio_ai.moderate_text(body.reason):
+                raise HTTPException(status_code=422, detail="This reason can't be used on Viyo. Please change it.")
+            x = repo.add_exception(p["rule"], reason, subject_id=p.get("subject_id"), from_chapter=number,
+                                   until_chapter=None if body.until_end else number)
+            resolution.update(exception=x["id"], reason=reason[:400], until_end=body.until_end)
+    except CanonError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    probs = [{**q, "resolution": resolution} if q["id"] == p["id"] else q for q in probs]
+    cs.get_store().update("studio_story_chapters", {"id": c["id"]},
+                          {"extraction": {**(c.get("extraction") or {}), "problems": probs}, "updated_at": _now()})
+    return {"problem": {**p, "resolution": resolution}, "summary": cc.summary(probs), "fix_note": cc.fix_note(probs)}
+
+
+@router.get("/stories/{story_id}/problems")
+async def story_problems(story_id: str, user_id: str = Depends(cs.creator)):
+    """Everything inconsistent in the story right now: problems inside the memory itself (two approved facts that
+    can't both be true, a cause after its effect, an overdue thread), and each chapter's open continuity problems."""
+    import studio_canon_check as cc
+    from studio_canon import CanonRepo
+    story = _story(story_id, user_id)
+    chapters = _chapters(story)
+    current = max([k for k, c in chapters.items() if c.get("status") == "approved"], default=0) + 1
+    memory = CanonRepo(cs.get_store(), story["id"], user_id).load().audit(current_chapter=current)
+    per_chapter = [{"number": k, "status": c.get("status"), **cc.summary(_problems(c))}
+                   for k, c in sorted(chapters.items()) if _problems(c)]
+    return {"memory": memory, "chapters": per_chapter}
 
 
 @router.post("/stories/{story_id}/memory/decide")

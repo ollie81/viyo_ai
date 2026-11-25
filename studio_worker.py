@@ -560,6 +560,20 @@ class StudioWorker:
                       "rejected": got["rejected"][:40], "conflicts": got["conflicts"][:40],
                       "issues": report["issues"][:40], "excepted": report["excepted"][:40], "resolved": resolved,
                       "checked_claims": len(ch.claims_from(raw, n, text))}
+        # Stage 5: VIYO's judgement of each continuity problem (advice only: the creator decides, see
+        # studio_canon_check). One extra call, only when there are problems; if it fails, the problems are still
+        # shown, just without VIYO's opinion.
+        import studio_canon_check as cc
+        problems = cc.problems_from(extraction)
+        if problems:
+            try:
+                judged, cost_judge = self.ai.novel_json(cc.judge_prompt(n, text, problems, memory), cc.JUDGE_SCHEMA,
+                                                        "continuity judgement")
+                problems = cc.apply_judgements(problems, judged, text)
+                costs.append(cost_judge)
+            except Exception as e:
+                print(f"[WARN] continuity judgement skipped for chapter {n}: {type(e).__name__}")
+        extraction["problems"] = problems
         row = {"title": (plan.get("title") or "")[:200], "text": text, "summary": (raw.get("summary") or "")[:2000],
                "words": ch.words(text), "version": version, "outline_version": story.get("outline_version"),
                "status": "draft", "approved_at": None, "extraction": extraction, "review": review, "job_id": job["id"],

@@ -322,14 +322,16 @@ def estimate_outline(chapters: int) -> Cost:
 
 
 def estimate_chapter(words: int) -> Cost:
-    """One chapter: writing it, VIYO's review (and at most one targeted revision with a second review), then reading
-    it back for the story memory. The hold covers the revision; it is only charged when it actually runs."""
+    """One chapter: writing it, VIYO's review (and at most one targeted revision with a second review), reading it
+    back for the story memory, and judging any continuity problems. The hold covers the revision and the judgement;
+    each is only charged when it actually runs."""
     prose = int(words * 1.4)
     review = text_cost(prose + 2500, THINKING_BUDGET + 2500)
     return combine([text_cost(9000, THINKING_BUDGET + prose),                        # write
                     review,                                                          # VIYO's own review
                     text_cost(prose + 4000, THINKING_BUDGET + prose // 2), review,   # at most one revision + re-review
-                    text_cost(prose + 3000, THINKING_BUDGET + 3500)])                # read back for the memory
+                    text_cost(prose + 3000, THINKING_BUDGET + 3500),                 # read back for the memory
+                    text_cost(6000, THINKING_BUDGET + 1500)])                        # judging continuity problems (only if any)
 
 
 def chapter_hold(words: int) -> int:
