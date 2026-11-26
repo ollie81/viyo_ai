@@ -128,6 +128,8 @@ def hub(user_id: str) -> dict:
     totals = {"available": 0, "pending_withdrawal": 0, "paid": 0}
     for e in earnings:
         st = e.get("status") or "available"
+        if st == "reversed":
+            continue                     # cancelled (refund / fraud): never part of what was earned
         totals[st] = totals.get(st, 0) + int(e.get("coins") or 0)
     since = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)).isoformat()
     last_30 = sum(int(e.get("coins") or 0) for e in earnings if str(e.get("created_at") or "") >= since)
@@ -148,6 +150,70 @@ def hub(user_id: str) -> dict:
                      "payout_details_saved": bool(settings), "withdrawal_pending": bool(pending)},
         "productions": productions,
         "how_you_earn": how_you_earn(),
+        "dashboard": dashboard(db, user_id),
+    }
+
+
+DASHBOARD_DAYS = 30
+EARNING_TYPES = (("content", "unlock"), ("donations", "donation"), ("adjustments", "reversal"))
+
+
+def dashboard(db, user_id: str) -> dict:
+    """The unified creator dashboard: audience in the last DASHBOARD_DAYS days, earnings by type (each from its own
+    rows in the earnings ledger), withdrawals and Studio activity. Exact counts from creator_dashboard_stats
+    (creator_dashboard.sql). Advertising revenue and brand campaigns are reported as not available: VIYO doesn't
+    have them yet, and nothing is estimated."""
+    import wallet
+    try:
+        s = db.rpc("creator_dashboard_stats", {"p_creator": user_id, "p_days": DASHBOARD_DAYS}).execute().data or {}
+    except Exception:
+        s = None
+    not_yet = {"available": False, "note": "Not available on VIYO yet."}
+    if not s:
+        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": not_yet, "brand_campaigns": not_yet}
+
+    a = s.get("audience") or {}
+    started, completed = int(a.get("started") or 0), int(a.get("completed") or 0)
+    raw = {k: int(v or 0) for k, v in (s.get("earnings") or {}).items()}
+    by_type = {}
+    for name, kind in EARNING_TYPES:
+        b = {st: raw.get(f"{kind}:{st}", 0) for st in ("pending", "available", "pending_withdrawal", "paid")}
+        total = sum(b.values())
+        by_type[name] = {"coins": total, "usd": wallet.coins_to_usd(total),
+                         "held_coins": b["pending"], "available_coins": b["available"],
+                         "requested_coins": b["pending_withdrawal"], "paid_coins": b["paid"]}
+    held = sum(t["held_coins"] for t in by_type.values())
+    available = sum(t["available_coins"] for t in by_type.values())
+    st = s.get("studio") or {}
+    return {
+        "ready": True,
+        "days": int(s.get("days") or DASHBOARD_DAYS),
+        "computed_at": s.get("computed_at"),
+        "audience": {
+            "plays": int(a.get("plays") or 0),
+            "unique_viewers": int(a.get("unique_viewers") or 0),
+            "watch_minutes": round(float(a.get("watch_seconds") or 0) / 60),
+            "completion_rate": round(min(completed, started) / started, 3) if started else None,
+        },
+        "earnings": {
+            "by_type": by_type,
+            "advertising": not_yet,
+            "brand_campaigns": not_yet,
+            "held_coins": held, "held_usd": wallet.coins_to_usd(held),
+            "available_coins": available, "available_usd": wallet.coins_to_usd(available),
+            "hold_days": wallet.EARNINGS_HOLD_DAYS,
+        },
+        "withdrawals": [{"status": w.get("status"), "usd": float(w.get("usd_amount") or wallet.coins_to_usd(w.get("coins") or 0)),
+                         "created_at": w.get("created_at"), "paid_at": w.get("paid_at")}
+                        for w in (s.get("withdrawals") or [])],
+        "studio": {
+            "projects": int(st.get("projects") or 0),
+            "active_jobs": int(st.get("active_jobs") or 0),
+            "completed_jobs": int(st.get("completed_jobs") or 0),
+            "failed_jobs": int(st.get("failed_jobs") or 0),
+            "credits_used": int(st.get("credits_used") or 0),
+            "credits_used_period": int(st.get("credits_used_period") or 0),
+        },
     }
 
 
