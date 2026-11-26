@@ -39,6 +39,7 @@ order), so there's no way around creating those three variants for
 real and setting LEMONSQUEEZY_WEEKLY_VARIANT_ID /
 LEMONSQUEEZY_MONTHLY_VARIANT_ID / LEMONSQUEEZY_YEARLY_VARIANT_ID.
 """
+import datetime
 import os
 from typing import Literal, Optional
 
@@ -156,6 +157,7 @@ async def create_subscription_checkout(
 class SubscriptionStatusResponse(BaseModel):
     is_subscribed: bool
     plan: Optional[str] = None
+    provider: Optional[str] = None
     status: Optional[str] = None
     renews_at: Optional[str] = None
     ends_at: Optional[str] = None
@@ -174,7 +176,8 @@ async def get_subscription_status(user: tuple[str, str] = Depends(_get_current_u
     try:
         rows = (
             supabase_admin.table("profiles")
-            .select("is_subscribed, subscription_plan, subscription_status, subscription_renews_at, subscription_ends_at")
+            .select("is_subscribed, subscription_plan, subscription_provider, subscription_status, "
+                    "subscription_renews_at, subscription_ends_at")
             .eq("id", user_id)
             .limit(1)
             .execute()
@@ -186,8 +189,9 @@ async def get_subscription_status(user: tuple[str, str] = Depends(_get_current_u
         return SubscriptionStatusResponse(is_subscribed=False)
     row = rows[0]
     return SubscriptionStatusResponse(
-        is_subscribed=bool(row.get("is_subscribed")),
+        is_subscribed=bool(row.get("is_subscribed")) and not _pass_ended(row),
         plan=row.get("subscription_plan"),
+        provider=row.get("subscription_provider"),
         status=row.get("subscription_status"),
         renews_at=row.get("subscription_renews_at"),
         ends_at=row.get("subscription_ends_at"),
@@ -204,11 +208,30 @@ def is_active_subscriber(admin, user_id: str) -> bool:
     # been run: Postgres error 42703) or the lookup fails, the viewer is treated as not subscribed and simply
     # pays with coins as normal. Failing this way can only ever charge someone, never give premium for free.
     try:
-        rows = admin.table("profiles").select("is_subscribed").eq("id", user_id).limit(1).execute().data
+        rows = admin.table("profiles").select("is_subscribed, subscription_provider, subscription_ends_at") \
+            .eq("id", user_id).limit(1).execute().data
     except Exception as e:
         print(f"[WARN] subscriber check for {user_id} failed, treating as not subscribed: {e}")
         return False
-    return bool(rows and rows[0].get("is_subscribed"))
+    if not rows or not rows[0].get("is_subscribed"):
+        return False
+    # A NardoPay pass is prepaid: past its end date it gives nothing, even before the worker switches it off.
+    return not _pass_ended(rows[0])
+
+
+def _pass_ended(row: dict) -> bool:
+    if row.get("subscription_provider") != "nardopay":
+        return False
+    ends = row.get("subscription_ends_at")
+    if not ends:
+        return True
+    try:
+        t = datetime.datetime.fromisoformat(str(ends).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
 
 
 def handle_subscription_event(event: dict) -> None:
@@ -233,6 +256,17 @@ def handle_subscription_event(event: dict) -> None:
     attrs = data.get("attributes") or {}
     status = attrs.get("status")
     is_subscribed = status in _ACTIVE_STATUSES
+
+    # A Lemon Squeezy event that ends an old subscription never switches off a NardoPay pass someone paid for since.
+    if not is_subscribed:
+        try:
+            cur = supabase_admin.table("profiles").select("is_subscribed, subscription_provider, subscription_ends_at") \
+                .eq("id", user_id).limit(1).execute().data
+            if cur and cur[0].get("is_subscribed") and cur[0].get("subscription_provider") == "nardopay" \
+                    and not _pass_ended(cur[0]):
+                return
+        except Exception:
+            pass
 
     try:
         supabase_admin.table("profiles").update({

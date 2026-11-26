@@ -123,6 +123,19 @@ def premium_plans(get: Callable = requests.get, now: Optional[float] = None) -> 
     return value
 
 
+def nardopay_premium_plans() -> list[dict]:
+    """Premium as a prepaid NardoPay pass (no automatic renewal): offered only while NardoPay checkout is genuinely
+    available. Prices and lengths are the server's PREMIUM_PASSES, in USD (charged in RWF at the rate in use)."""
+    try:
+        import nardopay_payments as nd
+        if nd.checkout_problem() is not None:
+            return []
+        return [{"plan": k, "price_cents": v["usd_cents"], "currency": "USD", "days": v["days"]}
+                for k, v in nd.PREMIUM_PASSES.items()]
+    except Exception:
+        return []
+
+
 @router.get("/checkout/options")
 async def checkout_options():
     import asyncio
@@ -133,5 +146,5 @@ async def checkout_options():
             "providers": coin_providers(),
             "packages": [{"id": pid, **pkg} for pid, pkg in COIN_PACKAGES.items()],
         },
-        "premium": premium,
+        "premium": {**premium, "nardopay_plans": nardopay_premium_plans()},
     }

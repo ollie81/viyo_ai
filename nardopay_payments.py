@@ -80,6 +80,15 @@ RATE_MIN_DEFAULT, RATE_MAX_DEFAULT = 1000.0, 3000.0
 LARGE_CHANGE = 0.10
 RECONCILE_MIN_AGE_SECONDS = 300
 
+# VIYO Premium through NardoPay: prepaid passes that don't renew (NardoPay's documented links are one-time payments).
+# Real money, never coins. Prices match the Lemon Squeezy plans in USD; NardoPay charges the RWF equivalent at the
+# rate in use, locked on the order like a coin purchase.
+PREMIUM_PASSES = {
+    "weekly": {"usd_cents": 399, "days": 7, "label": "VIYO Premium, 1 week"},
+    "monthly": {"usd_cents": 999, "days": 30, "label": "VIYO Premium, 30 days"},
+    "yearly": {"usd_cents": 5999, "days": 365, "label": "VIYO Premium, 1 year"},
+}
+
 
 # ====================================================================== settings and helpers
 
@@ -290,7 +299,8 @@ class CreateOrderIn(BaseModel):
 
 
 def _order_out(o: dict) -> dict:
-    return {"order_id": o["id"], "status": o["status"], "package_id": o["package_id"], "coins": o["coins"],
+    return {"order_id": o["id"], "status": o["status"], "package_id": o["package_id"], "coins": o.get("coins"),
+            "kind": o.get("kind") or "coins", "plan": o.get("plan"), "pass_days": o.get("pass_days"),
             "usd_cents": o["usd_cents"], "rwf_amount": o["rwf_amount"], "currency": o["currency"],
             "payment_link": o.get("payment_link") if o["status"] in ("pending", "expired") else None,
             "created_at": o.get("created_at"), "credited_at": o.get("credited_at")}
@@ -306,10 +316,8 @@ def _http_post(url: str, headers: dict, body: dict):
     return requests.post(url, headers=headers, json=body, timeout=15)
 
 
-@router.post("/coins/purchase/nardopay/create")
-async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
-    """A server-side pending order, then a NardoPay payment link for exactly its amount. Web checkout only: the
-    Android app keeps Google Play Billing and never shows this."""
+def _checkout_gate() -> tuple[str, int, dict]:
+    """The checks every NardoPay order needs first. Returns (api key, amount unit, the rate in use)."""
     if not _flag("NARDOPAY_ENABLED"):
         raise HTTPException(status_code=503, detail="NardoPay checkout isn't available.")
     if not _flag("NARDOPAY_LEDGER_VERIFIED"):
@@ -317,27 +325,45 @@ async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
     api_key, unit = _env("NARDOPAY_API_KEY"), amount_multiplier()
     if not api_key or unit is None or missing_contract(["link_url"]) or missing_contract() or not webhook_url():
         raise HTTPException(status_code=503, detail="NardoPay checkout isn't configured.")
-    package = COIN_PACKAGES.get(body.package_id)
-    if package is None:
-        raise HTTPException(status_code=400, detail="Unknown coin package.")
     rate = latest_rate()
     problem = rate_problem(rate)
     if problem:
         raise HTTPException(status_code=503, detail=f"NardoPay checkout is paused: {problem}")
-    rwf = rwf_for(package["usd_cents"], float(rate["rate"]))
+    return api_key, unit, rate
+
+
+def _new_order(user_id: str, usd_cents: int, rate: dict, extra: dict) -> dict:
     ttl = float(_env("NARDOPAY_ORDER_TTL_HOURS", "24") or 24)
-    order = get_store().insert("nardopay_orders", [{
-        "user_id": user_id, "package_id": body.package_id, "coins": int(package["coins"]),
-        "usd_cents": int(package["usd_cents"]), "rate_id": rate["id"], "usd_rwf_rate": rate["rate"],
-        "rwf_amount": rwf, "expires_at": (_now() + datetime.timedelta(hours=ttl)).isoformat()}])[0]
+    return get_store().insert("nardopay_orders", [{
+        "user_id": user_id, "usd_cents": int(usd_cents), "rate_id": rate["id"], "usd_rwf_rate": rate["rate"],
+        "rwf_amount": rwf_for(usd_cents, float(rate["rate"])),
+        "expires_at": (_now() + datetime.timedelta(hours=ttl)).isoformat(), **extra}])[0]
+
+
+@router.post("/coins/purchase/nardopay/create")
+async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
+    """A server-side pending order, then a NardoPay payment link for exactly its amount. Web checkout only: the
+    Android app keeps Google Play Billing and never shows this."""
+    api_key, unit, rate = _checkout_gate()
+    package = COIN_PACKAGES.get(body.package_id)
+    if package is None:
+        raise HTTPException(status_code=400, detail="Unknown coin package.")
+    order = _new_order(user_id, package["usd_cents"], rate,
+                       {"package_id": body.package_id, "coins": int(package["coins"])})
+    return _start_link(order, api_key, unit, "VIYO Coins", f"VIYO Coins purchase: {package['label']}")
+
+
+def _start_link(order: dict, api_key: str, unit: int, product: str, description: str) -> dict:
+    """Asks NardoPay for a payment link for exactly the order's amount and saves it (and its link code)."""
+    rwf = int(order["rwf_amount"])
 
     def fail(reason: str, status: int = 502, message: str = "NardoPay couldn't start the payment. Try again."):
         get_store().update("nardopay_orders", {"id": order["id"]},
                            {"status": "failed", "failure_reason": reason[:400], "updated_at": _now().isoformat()})
         raise HTTPException(status_code=status, detail=message)
 
-    request_body = {"link_type": "payment", "product_name": "VIYO Coins", "amount_mode": "fixed",
-                    "amount": rwf * unit, "description": f"VIYO Coins purchase: {package['label']}",
+    request_body = {"link_type": "payment", "product_name": product, "amount_mode": "fixed",
+                    "amount": rwf * unit, "description": description,
                     "metadata": {"order_id": order["id"]}, "webhook_url": webhook_url()}
     try:
         resp = _http_post(CREATE_LINK_URL, {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -380,6 +406,39 @@ async def order_status(order_id: str, user_id: str = Depends(_buyer)):
 
 
 # ====================================================================== webhook
+
+class PremiumPassIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")      # the price and length come from PREMIUM_PASSES, never the client
+    plan: str = Field(..., pattern="^(weekly|monthly|yearly)$")
+
+
+def _profile_subscription(user_id: str) -> dict:
+    rows = get_store().select("profiles", {"id": user_id}, limit=1)
+    return rows[0] if rows else {}
+
+
+@router.post("/subscription/nardopay/create")
+async def create_premium_pass(body: PremiumPassIn, user_id: str = Depends(_buyer)):
+    """A Premium pass order (paid with money through NardoPay, never with coins), then its payment link. Buying while
+    a NardoPay pass is active adds the time after it ends. Refused while another provider's subscription is active,
+    so nobody pays twice for the same access."""
+    api_key, unit, rate = _checkout_gate()
+    p = _profile_subscription(user_id)
+    provider = p.get("subscription_provider")
+    if p.get("is_subscribed") and provider and provider != "nardopay":
+        ends = p.get("subscription_ends_at")
+        if not ends or _parse_time(ends) > _now():
+            raise HTTPException(status_code=409, detail="You already have VIYO Premium.")
+    plan = PREMIUM_PASSES[body.plan]
+    try:
+        order = _new_order(user_id, plan["usd_cents"], rate, {
+            "kind": "premium", "plan": body.plan, "pass_days": plan["days"], "coins": None,
+            "package_id": f"premium_{body.plan}"})
+    except Exception as e:                 # nardopay_premium.sql not run yet
+        print(f"[WARN] NardoPay Premium order not created: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Premium with NardoPay isn't available yet.")
+    return _start_link(order, api_key, unit, "VIYO Premium", f"{plan['label']} (doesn't renew automatically)")
+
 
 def _parse_event(payload: dict) -> dict:
     """The values this module needs, read only from the configured (documented) fields."""
@@ -434,6 +493,12 @@ def verify_payment(order: dict, ev: dict) -> Optional[str]:
 
 
 def _credit(order: dict, transaction_id: str) -> None:
+    if (order.get("kind") or "coins") == "premium":
+        # Adds the pass and marks the order credited in one database transaction: never twice, never coins.
+        out = _rpc("nardopay_grant_premium", {"p_order": order["id"], "p_transaction": transaction_id}) or {}
+        if out.get("result") not in ("granted", "already"):
+            raise RuntimeError(f"premium pass not granted ({out.get('result')})")
+        return
     package = COIN_PACKAGES.get(order["package_id"]) or {}
     credit_coins(get_admin(), order["user_id"], int(order["coins"]), "coin_purchase",
                  f"Purchased {package.get('label', str(order['coins']) + ' coins')} — NardoPay {transaction_id}",
@@ -554,12 +619,17 @@ def reconcile(min_age_seconds: int = RECONCILE_MIN_AGE_SECONDS) -> dict:
             if problem:
                 out["skipped"].append({"order_id": c["order_id"], "reason": problem})
                 continue
-            _credit({"user_id": c["user_id"], "coins": c["coins"], "package_id": c["package_id"]}, c["transaction_id"])
+            _credit({"id": c["order_id"], "kind": c.get("kind") or "coins", "user_id": c["user_id"],
+                     "coins": c["coins"], "package_id": c["package_id"]}, c["transaction_id"])
             if _rpc("nardopay_finish_order", {"p_order": c["order_id"], "p_transaction": c["transaction_id"]}):
                 _rpc("nardopay_finish_event", {"p_event": c["event_id"], "p_status": "processed",
                                                "p_detail": "credited by reconciliation"})
                 out["finished"] += 1
     out["expired"] = int(_rpc("nardopay_expire_orders", {}) or 0)
+    try:
+        out["passes_ended"] = int(_rpc("nardopay_end_expired_passes", {}) or 0)
+    except Exception:
+        out["passes_ended"] = 0          # nardopay_premium.sql not run yet: nothing to end
     out["purged"] = int(_rpc("nardopay_purge_raw", {
         "p_days": int(_env("NARDOPAY_RAW_BODY_DAYS", "30") or 30),
         "p_problem_days": int(_env("NARDOPAY_RAW_BODY_PROBLEM_DAYS", "90") or 90)}) or 0)
