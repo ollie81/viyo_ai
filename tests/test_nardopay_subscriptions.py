@@ -201,4 +201,12 @@ def test_coin_purchases_are_unchanged_next_to_subscriptions(sv):
     buy(client, u)
     before = balance(db, u)
     assert deliver(client, real_payment("coinlink0001", amount=1396, tx="tx_coin")).json()["result"] == "processed"
-    assert balance(db, u) == before + 100 and profile(db, u)["is_subscribed"] is False
+    assert balance(db, u) == before + 100 + 20 and profile(db, u)["is_subscribed"] is False
+
+
+def test_premium_has_no_fee_margin_the_amount_must_be_exact(sv):
+    client, db, calls, st = sv
+    u = make_user(db)
+    s = subscribe(client, u, "weekly")
+    assert deliver(client, paid(code_of(db, s["subscription_id"]), 6000, "tx_more")).json()["result"] == "mismatch"
+    assert profile(db, u)["is_subscribed"] is False

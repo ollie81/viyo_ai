@@ -17,6 +17,8 @@ from conftest import ROOT, connect, make_user
 from studio_store import PgStore
 
 SECRET = "test-webhook-secret"
+# A new test user has 100 coins; the starter package adds 100 bought + 20 bonus (free) coins.
+AFTER_STARTER = 100 + 100 + 20
 HOOK = "https://api.viyo.test/api/v1/webhooks/nardopay"
 FIELDS = {"NARDOPAY_LINK_URL_FIELD": "x_link", "NARDOPAY_FIELD_EVENT_TYPE": "x_event",
           "NARDOPAY_FIELD_ORDER_ID": "x_meta.order", "NARDOPAY_FIELD_TRANSACTION_ID": "x_tx",
@@ -180,7 +182,8 @@ def test_an_order_is_created_server_side_with_the_documented_request(env):
     assert sent["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
     assert sent["body"] == {"link_type": "payment", "product_name": "VIYO Coins", "amount_mode": "fixed",
                             "amount": 1396, "description": "VIYO Coins purchase: 100 Coins",
-                            "metadata": {"order_id": out["order_id"]}, "webhook_url": HOOK}
+                            "metadata": {"order_id": out["order_id"]}, "webhook_url": HOOK,
+                            "redirect_url": "https://viyo.site/app"}
     row = db.execute("select user_id, usd_rwf_rate, rate_id is not null from public.nardopay_orders where id = %s",
                      (out["order_id"],)).fetchone()
     assert str(row[0]) == str(u) and float(row[1]) == 1410 and row[2] is True
@@ -273,7 +276,7 @@ def test_a_verified_payment_credits_the_package_once(env):
     oid = buy(client, u)["order_id"]
     r = deliver(client, payload(oid))
     assert r.status_code == 200 and r.json()["result"] == "processed"
-    assert balance(db, u) == 200 and credits(db, "tx_1") == 1
+    assert balance(db, u) == AFTER_STARTER and credits(db, "tx_1") == 1
     o = order_row(db, oid)
     assert o["status"] == "credited" and o["transaction_id"] == "tx_1" and o["credited_at"] and o["verified_event_id"]
     assert db.execute("select status from public.nardopay_webhook_events").fetchone()[0] == "processed"
@@ -289,7 +292,7 @@ def test_the_same_delivery_twice_credits_once(env):
     assert deliver(client, body).status_code == 200
     again = deliver(client, body)
     assert again.status_code == 200 and again.json()["duplicate"] is True
-    assert balance(db, u) == 200 and db.execute("select count(*) from public.nardopay_webhook_events").fetchone()[0] == 1
+    assert balance(db, u) == AFTER_STARTER and db.execute("select count(*) from public.nardopay_webhook_events").fetchone()[0] == 1
 
 
 def test_a_retry_of_the_same_transaction_with_a_different_body_credits_once(env):
@@ -299,7 +302,7 @@ def test_a_retry_of_the_same_transaction_with_a_different_body_credits_once(env)
     deliver(client, payload(oid, sent_at="10:00"))
     r = deliver(client, payload(oid, sent_at="10:05"))                      # same transaction, new body
     assert r.status_code == 200
-    assert balance(db, u) == 200 and credits(db, "tx_1") == 1
+    assert balance(db, u) == AFTER_STARTER and credits(db, "tx_1") == 1
 
 
 def test_a_second_transaction_for_a_paid_order_is_never_credited(env):
@@ -309,7 +312,7 @@ def test_a_second_transaction_for_a_paid_order_is_never_credited(env):
     deliver(client, payload(oid, tx="tx_1"))
     r = deliver(client, payload(oid, tx="tx_2"))
     assert r.status_code == 200 and r.json()["result"] == "duplicate_payment"
-    assert balance(db, u) == 200 and credits(db, "tx_2") == 0
+    assert balance(db, u) == AFTER_STARTER and credits(db, "tx_2") == 0
     dup = client.get("/api/v1/admin/nardopay/duplicate-payments", headers=ADMIN).json()["payments"]
     assert [d["transaction_id"] for d in dup] == ["tx_2"]
 
@@ -320,7 +323,7 @@ def test_a_transaction_already_used_for_another_order_is_not_credited_again(env)
     a, b = buy(client, u)["order_id"], buy(client, u)["order_id"]
     deliver(client, payload(a, tx="tx_same"))
     r = deliver(client, payload(b, tx="tx_same"))
-    assert r.json()["result"] == "duplicate_payment" and balance(db, u) == 200
+    assert r.json()["result"] == "duplicate_payment" and balance(db, u) == AFTER_STARTER
     assert order_row(db, b)["status"] == "pending"
 
 
@@ -353,7 +356,7 @@ def test_a_failed_payment_marks_the_order_and_a_later_success_still_credits(env)
     deliver(client, payload(oid, event="payment.failed", tx="tx_f"))
     assert order_row(db, oid)["status"] == "failed" and balance(db, u) == 100
     deliver(client, payload(oid, tx="tx_ok"))
-    assert order_row(db, oid)["status"] == "credited" and balance(db, u) == 200
+    assert order_row(db, oid)["status"] == "credited" and balance(db, u) == AFTER_STARTER
 
 
 def test_a_late_payment_for_an_expired_order_is_honoured(env):
@@ -363,7 +366,7 @@ def test_a_late_payment_for_an_expired_order_is_honoured(env):
     db.execute("update public.nardopay_orders set expires_at = now() - interval '1 hour' where id = %s", (oid,))
     assert np_.reconcile()["expired"] == 1 and order_row(db, oid)["status"] == "expired"
     deliver(client, payload(oid))
-    assert order_row(db, oid)["status"] == "credited" and balance(db, u) == 200
+    assert order_row(db, oid)["status"] == "credited" and balance(db, u) == AFTER_STARTER
 
 
 # ------------------------------------------------------------------------------------------- recovery
@@ -381,10 +384,10 @@ def test_a_crash_after_crediting_is_finished_by_the_retry_without_double_credit(
     monkeypatch.setattr(np_, "_rpc", crash_on_finish)
     r = deliver(client, payload(oid))
     assert r.status_code == 500
-    assert balance(db, u) == 200 and order_row(db, oid)["status"] == "crediting"        # coins in, order not finished
+    assert balance(db, u) == AFTER_STARTER and order_row(db, oid)["status"] == "crediting"        # coins in, order not finished
     monkeypatch.setattr(np_, "_rpc", real)
     assert deliver(client, payload(oid)).status_code == 200                            # NardoPay retries
-    assert balance(db, u) == 200 and credits(db, "tx_1") == 1 and order_row(db, oid)["status"] == "credited"
+    assert balance(db, u) == AFTER_STARTER and credits(db, "tx_1") == 1 and order_row(db, oid)["status"] == "credited"
 
 
 def test_reconciliation_finishes_a_verified_payment_when_no_retry_comes(env, monkeypatch):
@@ -399,7 +402,7 @@ def test_reconciliation_finishes_a_verified_payment_when_no_retry_comes(env, mon
     assert np_.reconcile(min_age_seconds=3600)["finished"] == 0                        # too recent: left alone
     out = np_.reconcile(min_age_seconds=0)
     assert out["finished"] == 1 and order_row(db, oid)["status"] == "credited"
-    assert balance(db, u) == 200 and credits(db, "tx_1") == 1
+    assert balance(db, u) == AFTER_STARTER and credits(db, "tx_1") == 1
 
 
 def test_reconciliation_never_credits_an_unverified_order(env):
@@ -428,7 +431,7 @@ def test_without_the_ledger_check_nothing_is_credited_and_it_recovers_after(env,
     assert r.status_code == 503 and balance(db, u) == 100 and order_row(db, oid)["status"] == "pending"
     assert np_.reconcile(min_age_seconds=0)["skipped"] == [{"reason": "ledger not verified"}]
     monkeypatch.setenv("NARDOPAY_LEDGER_VERIFIED", "true")
-    assert deliver(client, payload(oid)).status_code == 200 and balance(db, u) == 200
+    assert deliver(client, payload(oid)).status_code == 200 and balance(db, u) == AFTER_STARTER
 
 
 def test_events_received_before_the_fields_were_set_are_stored_then_reprocessed(env, monkeypatch):
@@ -441,7 +444,7 @@ def test_events_received_before_the_fields_were_set_are_stored_then_reprocessed(
     assert db.execute("select status, amount from public.nardopay_webhook_events").fetchone() == ("received", None)
     monkeypatch.setenv("NARDOPAY_FIELD_AMOUNT", "x_amount")
     out = client.post("/api/v1/admin/nardopay/reprocess", headers=ADMIN).json()
-    assert out["processed"] == 1 and balance(db, u) == 200
+    assert out["processed"] == 1 and balance(db, u) == AFTER_STARTER
     # The stored event now carries the real amount, so reconciliation could re-check it.
     assert float(db.execute("select amount from public.nardopay_webhook_events").fetchone()[0]) == 1396
 
@@ -590,7 +593,7 @@ def test_a_real_payment_marked_test_false_is_still_credited_once(env, flag):
     extra = {} if flag is None else {"test": flag}
     r = deliver(client, payload(oid, tx="tx_real", **extra))
     assert r.status_code == 200 and r.json()["result"] == "processed"
-    assert balance(db, u) == 200 and credits(db, "tx_real") == 1
+    assert balance(db, u) == AFTER_STARTER and credits(db, "tx_real") == 1
     assert order_row(db, oid)["status"] == "credited"
 
 
@@ -714,10 +717,10 @@ def test_a_real_payment_is_matched_by_link_code_and_credited_once(real):
     body = real_payment("8d12d2d13a314c47")
     r = deliver(client, body)
     assert r.status_code == 200 and r.json()["result"] == "processed"
-    assert balance(db, u) == 200 and credits(db, body["transaction_id"]) == 1
+    assert balance(db, u) == AFTER_STARTER and credits(db, body["transaction_id"]) == 1
     assert order_row(db, oid)["status"] == "credited"
     assert str(db.execute("select order_id from public.nardopay_webhook_events").fetchone()[0]) == oid
-    assert deliver(client, body).json()["duplicate"] is True and balance(db, u) == 200     # retried by NardoPay
+    assert deliver(client, body).json()["duplicate"] is True and balance(db, u) == AFTER_STARTER     # retried by NardoPay
 
 
 def test_a_payment_for_an_unknown_link_or_the_admin_test_link_credits_nothing(real):
@@ -752,7 +755,7 @@ def test_a_second_payment_on_a_paid_link_is_not_credited_again(real):
     buy(client, u)
     deliver(client, real_payment("8d12d2d13a314c47", tx="first"))
     r = deliver(client, real_payment("8d12d2d13a314c47", tx="second"))
-    assert r.json()["result"] == "duplicate_payment" and balance(db, u) == 200 and credits(db, "second") == 0
+    assert r.json()["result"] == "duplicate_payment" and balance(db, u) == AFTER_STARTER and credits(db, "second") == 0
 
 
 def test_a_link_without_a_readable_code_fails_the_order_instead_of_leaving_it_unmatchable(real):
@@ -776,3 +779,55 @@ def test_link_code_of():
     assert np_.link_code_of("https://nardopay.com/p/8d12d2d13a314c47?pay=1") == "8d12d2d13a314c47"
     assert np_.link_code_of("https://nardopay.com/p/abc123def") == "abc123def"
     assert np_.link_code_of("https://nardopay.com/checkout") is None and np_.link_code_of("") is None
+
+
+def test_coin_links_send_the_buyer_back_to_viyo_and_the_return_credits_nothing(env):
+    client, db, calls, st = env
+    u = make_user(db)
+    buy(client, u)
+    assert calls[-1]["body"]["redirect_url"] == "https://viyo.site/app"
+    assert balance(db, u) == 100                     # only the signed webhook credits coins, never the return
+
+
+# ------------------------------------------------------------------------------------------- bonus coins and the fee
+
+def paid_coins(db, u):
+    return db.execute("select paid_coins from public.profiles where id = %s", (u,)).fetchone()[0]
+
+
+def test_a_purchase_adds_20_percent_bonus_coins_once_and_they_count_as_free(env):
+    client, db, calls, st = env
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    assert deliver(client, payload(oid, tx="tx_b")).json()["result"] == "processed"
+    assert balance(db, u) == AFTER_STARTER
+    assert paid_coins(db, u) == 100                          # only the 100 bought coins can ever earn creators cash
+    kinds = db.execute("select type, amount, external_ref from public.transactions where user_id = %s order by amount",
+                       (u,)).fetchall()
+    assert [(k[0], float(k[1]), k[2]) for k in kinds] == [("purchase_bonus", 20.0, "nardopay-bonus:tx_b"),
+                                                         ("coin_purchase", 100.0, "nardopay:tx_b")]
+    np_.reconcile(min_age_seconds=0)                          # nothing left to do: no second bonus
+    assert deliver(client, payload(oid, tx="tx_b", retry=1)).status_code == 200
+    assert balance(db, u) == AFTER_STARTER
+
+
+@pytest.mark.parametrize("amount, credited", [
+    (1396, True),        # the price
+    (1633.32, True),     # the price + 17% (what NardoPay's page showed for the fee)
+    (1635, True),        # within the rounding margin
+    (1640, False),       # more than the fee allows
+    (1395, False),       # less than the price
+])
+def test_a_payment_may_report_the_price_or_the_price_plus_nardopays_fee(env, amount, credited):
+    client, db, calls, st = env
+    u = make_user(db)
+    oid = buy(client, u)["order_id"]
+    r = deliver(client, payload(oid, tx=f"tx_{amount}", amount=amount))
+    assert (r.json()["result"] == "processed") is credited
+    assert balance(db, u) == (AFTER_STARTER if credited else 100)
+
+
+def test_the_order_shows_its_bonus_coins(env):
+    client, db, calls, st = env
+    o = buy(client, make_user(db), "popular")
+    assert o["coins"] == 550 and o["bonus_coins"] == 110

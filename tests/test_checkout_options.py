@@ -83,3 +83,16 @@ def test_premium_plans_are_the_server_prices_only_when_nardopay_subscriptions_ca
     assert [(x["plan"], x["available"], x["price_cents"], x["currency"], x["interval"]) for x in out["plans"]] == [
         ("weekly", True, 399, "USD", "week"), ("monthly", True, 999, "USD", "month"),
         ("yearly", True, 5999, "USD", "year")]
+
+
+def test_with_nardopay_the_packages_show_their_bonus_coins_and_the_fee(nothing, monkeypatch):
+    monkeypatch.setattr(nd, "checkout_problem", lambda: None)
+    coins = client().get("/api/v1/checkout/options").json()["coins"]
+    assert {x["id"]: x["bonus_coins"] for x in coins["packages"]} == {
+        "starter": 20, "popular": 110, "value": 240, "creator": 600}
+    assert coins["nardopay_fee_percent"] == 17
+
+
+def test_without_nardopay_no_bonus_and_no_fee_are_shown(nothing):
+    coins = client().get("/api/v1/checkout/options").json()["coins"]
+    assert all(x["bonus_coins"] == 0 for x in coins["packages"]) and coins["nardopay_fee_percent"] is None
