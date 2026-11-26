@@ -89,7 +89,26 @@ PREMIUM_PLANS = {
                 "name": "VIYO Premium Monthly"},
     "yearly": {"rwf": 88600, "usd_cents": 5999, "billing_cycle": "yearly", "interval": "year", "name": "VIYO Premium Yearly"},
 }
-PREMIUM_REDIRECT_URL = "https://viyo.site/app"      # where NardoPay sends the customer back (not proof of payment)
+PREMIUM_REDIRECT_URL = "https://viyo.site/app"
+
+# Coins bought through NardoPay: NardoPay adds a payment fee on top for the customer on payment links (about 17%,
+# seen on its checkout page on 26 Nov 2026; Premium subscription links show no fee). VIYO says so on Buy Coins and
+# adds 20% bonus coins to every package. Bonus coins are FREE coins (type "purchase_bonus", not "coin_purchase"):
+# they never count as bought coins, so they never earn creators cash.
+NARDOPAY_BONUS_RATE = 0.20
+
+
+def bonus_coins_for(coins: int) -> int:
+    return int(round(int(coins) * NARDOPAY_BONUS_RATE))
+
+
+def customer_fee_percent() -> float:
+    """The fee NardoPay adds for the customer on coin payment links, as shown in VIYO (NARDOPAY_CUSTOMER_FEE_PERCENT,
+    default 17). Also bounds the extra amount a payment may report on top of the price."""
+    try:
+        return max(0.0, float(_env("NARDOPAY_CUSTOMER_FEE_PERCENT", "17") or 17))
+    except ValueError:
+        return 17.0      # where NardoPay sends the customer back (not proof of payment)
 
 
 # ====================================================================== settings and helpers
@@ -302,6 +321,7 @@ class CreateOrderIn(BaseModel):
 
 def _order_out(o: dict) -> dict:
     return {"order_id": o["id"], "status": o["status"], "package_id": o["package_id"], "coins": o["coins"],
+            "bonus_coins": bonus_coins_for(o["coins"]),
             "usd_cents": o["usd_cents"], "rwf_amount": o["rwf_amount"], "currency": o["currency"],
             "payment_link": o.get("payment_link") if o["status"] in ("pending", "expired") else None,
             "created_at": o.get("created_at"), "credited_at": o.get("credited_at")}
@@ -439,8 +459,10 @@ def is_test_event(payload) -> bool:
     return bool(kinds & set(TEST_EVENTS))
 
 
-def verify_payment(order: dict, ev: dict) -> Optional[str]:
-    """Why a completed payment doesn't match its order, or None if it does."""
+def verify_payment(order: dict, ev: dict, fee_allowed: bool = False) -> Optional[str]:
+    """Why a completed payment doesn't match its order, or None if it does. With fee_allowed (coin orders), the reported
+    amount may be the price OR the price plus NardoPay's customer fee (at most customer_fee_percent() on top, rounded
+    up, plus 1 franc for rounding): NardoPay's docs don't say which of the two its webhook reports. Never less."""
     unit = amount_multiplier()
     if unit is None:
         return "amount unit not configured"
@@ -448,9 +470,17 @@ def verify_payment(order: dict, ev: dict) -> Optional[str]:
         return "no transaction id"
     if ev.get("currency") != "RWF":
         return f"currency {ev.get('currency')!r} is not RWF"
-    if ev.get("amount") is None or decimal.Decimal(str(ev["amount"])) != decimal.Decimal(int(order["rwf_amount"]) * unit):
-        return f"amount {ev.get('amount')} doesn't match {int(order['rwf_amount']) * unit}"
-    return None
+    if ev.get("amount") is None:
+        return "no amount"
+    paid = decimal.Decimal(str(ev["amount"]))
+    price = decimal.Decimal(int(order["rwf_amount"]) * unit)
+    if paid == price:
+        return None
+    if fee_allowed and paid > price:
+        max_fee = decimal.Decimal(math.ceil(int(order["rwf_amount"]) * customer_fee_percent() / 100) + 1) * unit
+        if paid <= price + max_fee:
+            return None
+    return f"amount {ev.get('amount')} doesn't match {int(order['rwf_amount']) * unit}"
 
 
 def _credit(order: dict, transaction_id: str) -> None:
@@ -458,6 +488,12 @@ def _credit(order: dict, transaction_id: str) -> None:
     credit_coins(get_admin(), order["user_id"], int(order["coins"]), "coin_purchase",
                  f"Purchased {package.get('label', str(order['coins']) + ' coins')} — NardoPay {transaction_id}",
                  external_ref=f"nardopay:{transaction_id}")
+    bonus = bonus_coins_for(order["coins"])
+    if bonus > 0:
+        # Free coins, credited once per payment (its own reference), never counted as bought.
+        credit_coins(get_admin(), order["user_id"], bonus, "purchase_bonus",
+                     f"Bonus {bonus} coins with your purchase — NardoPay {transaction_id}",
+                     external_ref=f"nardopay-bonus:{transaction_id}")
 
 
 def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
@@ -486,7 +522,7 @@ def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
                                {"status": "failed", "failure_reason": "payment.failed", "updated_at": _now().isoformat()})
         return finish("processed", "payment failed")
 
-    problem = verify_payment(order, ev)
+    problem = verify_payment(order, ev, fee_allowed=True)
     if problem:
         if order["status"] in ("pending", "expired", "failed"):
             get_store().update("nardopay_orders", {"id": order["id"]},
@@ -698,7 +734,7 @@ def reconcile(min_age_seconds: int = RECONCILE_MIN_AGE_SECONDS) -> dict:
             problem = None if c.get("signature_ok") is True else "event signature not verified"
             problem = problem or (None if c.get("event_transaction_id") == c.get("transaction_id")
                                   else "event and order transactions differ")
-            problem = problem or verify_payment(c, ev)
+            problem = problem or verify_payment(c, ev, fee_allowed=(c.get("kind") or "coins") == "coins")
             if problem:
                 out["skipped"].append({"order_id": c["order_id"], "reason": problem})
                 continue

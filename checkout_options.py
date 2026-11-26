@@ -75,10 +75,21 @@ def premium_plans() -> dict:
 @router.get("/checkout/options")
 async def checkout_options():
     from payments import COIN_PACKAGES
+    providers = coin_providers()
+    nardopay = "nardopay" in providers
+    try:
+        import nardopay_payments as nd
+        bonus = nd.bonus_coins_for if nardopay else (lambda c: 0)
+        fee = nd.customer_fee_percent() if nardopay else None
+    except Exception:
+        bonus, fee = (lambda c: 0), None
     return {
         "coins": {
-            "providers": coin_providers(),
-            "packages": [{"id": pid, **pkg} for pid, pkg in COIN_PACKAGES.items()],
+            "providers": providers,
+            # bonus_coins: free coins added to a NardoPay purchase; fee_percent: what NardoPay adds on top for the
+            # customer (shown in VIYO so nobody is surprised at checkout).
+            "packages": [{"id": pid, **pkg, "bonus_coins": bonus(pkg["coins"])} for pid, pkg in COIN_PACKAGES.items()],
+            "nardopay_fee_percent": fee,
         },
         "premium": premium_plans(),
     }
