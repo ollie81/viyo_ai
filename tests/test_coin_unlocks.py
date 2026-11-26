@@ -59,6 +59,10 @@ class FakeDB:
     def table(self, name):
         return _Q(self, name)
 
+    def rpc(self, name, params):
+        """Like the live database before creator_earnings_ledger.sql: the function doesn't exist (PostgREST PGRST202)."""
+        raise Exception(f"{{'code': 'PGRST202', 'message': 'Could not find the function public.{name} in the schema cache'}}")
+
 
 def test_missing_subscription_column_means_not_subscribed():
     assert subscriptions.is_active_subscriber(FakeDB(), "u1") is False

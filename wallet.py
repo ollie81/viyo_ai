@@ -41,6 +41,9 @@ MIN_WITHDRAWAL_COINS = math.ceil(MIN_WITHDRAWAL_USD / COIN_USD)   # 1,667
 
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
+# New earnings are held this long before they can be withdrawn (protects against refunded or fraudulent coin purchases).
+EARNINGS_HOLD_DAYS = max(0, int(os.environ.get("CREATOR_EARNINGS_HOLD_DAYS", "14") or 14))
+
 
 def coins_to_usd(coins: float) -> float:
     return round(float(coins) * COIN_USD, 2)
@@ -60,7 +63,8 @@ _PHONE = re.compile(r"^\+?[0-9]{8,15}$")
 def _require_admin(x_admin_key: str = Header(None)) -> None:
     if not ADMIN_API_KEY:
         raise HTTPException(status_code=503, detail="Admin tools are not configured.")
-    if x_admin_key != ADMIN_API_KEY:
+    import hmac
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
         raise HTTPException(status_code=403, detail="Invalid admin key.")
 
 
@@ -90,6 +94,11 @@ class WalletEarningsResponse(BaseModel):
     lifetime_coins: int
     available_coins: int
     pending_withdrawal_coins: int
+    # Held (holding period) earnings: not withdrawable until next_available_at.
+    held_coins: int = 0
+    held_usd: float = 0
+    next_available_at: Optional[str] = None
+    hold_days: int = EARNINGS_HOLD_DAYS
     paid_coins: int
     min_withdrawal_coins: int = MIN_WITHDRAWAL_COINS
     coin_usd: float = COIN_USD
@@ -157,11 +166,61 @@ def _pending_request(user_id: str) -> Optional[dict]:
     return rows[0] if rows else None
 
 
+# ---------------------------------------------------------------- the earnings ledger (creator_earnings_ledger.sql)
+
+def credit_earning(admin, creator_id: str, post_id: str, viewer_id: str, coins: int) -> bool:
+    """Credits a creator for one unlock, exactly once: the key is one per viewer per episode, so a retry (or a lost
+    reply) never pays twice. Held EARNINGS_HOLD_DAYS before it can be withdrawn. Retried; if it still fails, the credit
+    is written to creator_earning_failures for an admin to retry, and logged loudly. Returns whether it is recorded."""
+    if admin is None or coins <= 0:
+        return False
+    key = f"unlock:{viewer_id}:{post_id}"
+    last_error = ""
+    for _ in range(3):
+        try:
+            r = admin.rpc("viyo_credit_earning", {"p_creator": creator_id, "p_post": post_id, "p_viewer": viewer_id,
+                                                  "p_coins": int(coins), "p_key": key,
+                                                  "p_hold_days": EARNINGS_HOLD_DAYS}).execute().data or {}
+            if r.get("ok"):
+                return True
+            last_error = str(r.get("error"))
+        except Exception as e:
+            last_error = str(e)[:300]
+            if "viyo_credit_earning" in last_error and ("does not exist" in last_error or "PGRST202" in last_error):
+                # creator_earnings_ledger.sql not run yet: the old way (no key, no holding period).
+                try:
+                    admin.table("creator_earnings").insert({"creator_id": creator_id, "source_post_id": post_id,
+                                                            "coins": int(coins)}).execute()
+                    return True
+                except Exception as e2:
+                    last_error = str(e2)[:300]
+                    break
+    print(f"[CRITICAL] Could not credit {coins} coins to creator {creator_id} for {key}: {last_error}")
+    try:
+        admin.table("creator_earning_failures").insert({
+            "creator_id": creator_id, "source_post_id": post_id, "viewer_id": viewer_id, "coins": int(coins),
+            "earning_key": key, "error": last_error[:500]}).execute()
+    except Exception as e:
+        print(f"[CRITICAL] ...and the failure couldn't be recorded either: {str(e)[:200]}")
+    return False
+
+
+def release_earnings(creator_id: Optional[str] = None) -> int:
+    """Moves earnings whose holding period is over from 'pending' to 'available'. Best-effort (0 if not set up)."""
+    if supabase_admin is None:
+        return 0
+    try:
+        return int(supabase_admin.rpc("viyo_release_earnings", {"p_creator": creator_id}).execute().data or 0)
+    except Exception:
+        return 0
+
+
 def _earnings_totals(creator_id: str) -> dict:
+    release_earnings(creator_id)
     try:
         result = (
             supabase_admin.table("creator_earnings")
-            .select("coins,status")
+            .select("*")
             .eq("creator_id", creator_id)
             .execute()
         )
@@ -169,10 +228,15 @@ def _earnings_totals(creator_id: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not load earnings: {e}")
 
-    totals = {"available": 0, "pending_withdrawal": 0, "paid": 0}
+    totals = {"pending": 0, "available": 0, "pending_withdrawal": 0, "paid": 0, "reversed": 0}
+    next_release = None
     for row in rows:
         status = row.get("status") or "available"
         totals[status] = totals.get(status, 0) + int(row.get("coins") or 0)
+        if status == "pending" and row.get("available_at"):
+            at = str(row["available_at"])
+            next_release = at if next_release is None or at < next_release else next_release
+    totals["next_release_at"] = next_release
     return totals
 
 
@@ -185,8 +249,11 @@ async def get_wallet_earnings(user_id: str = Depends(_get_current_user_id_no_gue
     settings = _load_settings(user_id)
     pending = _pending_request(user_id)
     return WalletEarningsResponse(
-        lifetime_coins=sum(totals.values()),
+        lifetime_coins=sum(totals[k] for k in ("pending", "available", "pending_withdrawal", "paid")),
         available_coins=totals["available"],
+        held_coins=totals["pending"],
+        held_usd=coins_to_usd(totals["pending"]),
+        next_available_at=totals["next_release_at"],
         pending_withdrawal_coins=totals["pending_withdrawal"],
         paid_coins=totals["paid"],
         available_usd=coins_to_usd(totals["available"]),
@@ -243,6 +310,7 @@ async def request_withdrawal(user_id: str = Depends(_get_current_user_id_no_gues
     if not settings:
         raise HTTPException(status_code=400, detail="Add your payout details first (PayPal or mobile money).")
     destination = describe_destination(settings)
+    release_earnings(user_id)                      # earnings whose 14 days are up count now
     r = _rpc("viyo_request_withdrawal", {"p_creator": user_id, "p_min_coins": MIN_WITHDRAWAL_COINS,
                                          "p_coin_usd": COIN_USD, "p_method": settings.get("method"),
                                          "p_destination": destination})
@@ -359,3 +427,62 @@ async def admin_mark_paid(request_id: str, body: AdminNote = AdminNote()):
 async def admin_reject(request_id: str, body: AdminNote = AdminNote()):
     """Cancels a request (e.g. wrong payout details); the earnings go back to available."""
     return _settle(request_id, "rejected", body.note)
+
+
+# ---------------------------------------------------------------- admin: reversals and failed credits
+
+class ReverseIn(BaseModel):
+    note: str = Field(..., min_length=3, max_length=400)
+
+
+@router.post("/admin/creator-earnings/{earning_id}/reverse", dependencies=[Depends(_require_admin)])
+async def admin_reverse_earning(earning_id: str, body: ReverseIn):
+    """Reverses one earning (e.g. its coin purchase was refunded), once: not yet paid -> cancelled; already paid -> a
+    deduction from the creator's next withdrawal. An earning inside a pending withdrawal must have that withdrawal
+    rejected first."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Wallet service is not configured.")
+    import uuid as _uuid
+    try:
+        eid = str(_uuid.UUID(str(earning_id)))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Earning not found.")
+    r = _rpc("viyo_reverse_earning", {"p_earning": eid, "p_note": body.note.strip()})
+    if not r.get("ok"):
+        err = r.get("error")
+        if err == "not_found":
+            raise HTTPException(status_code=404, detail="Earning not found.")
+        if err == "in_withdrawal":
+            raise HTTPException(status_code=409, detail="This earning is in a pending withdrawal. Reject that "
+                                                        "withdrawal first, then reverse the earning.")
+        raise HTTPException(status_code=409, detail="This can't be reversed.")
+    return {"id": eid, "changed": bool(r.get("changed")), "status": r.get("status")}
+
+
+@router.get("/admin/creator-earnings/failures", dependencies=[Depends(_require_admin)])
+async def admin_earning_failures():
+    """Credits that failed after the viewer was charged and haven't been retried successfully yet."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Wallet service is not configured.")
+    rows = (supabase_admin.table("creator_earning_failures").select("*").is_("resolved_at", "null")
+            .order("created_at").limit(200).execute().data or [])
+    return rows
+
+
+@router.post("/admin/creator-earnings/failures/retry", dependencies=[Depends(_require_admin)])
+async def admin_retry_earning_failures():
+    """Retries every unresolved failed credit with the same key, so a credit that did go through is never doubled."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Wallet service is not configured.")
+    rows = (supabase_admin.table("creator_earning_failures").select("*").is_("resolved_at", "null")
+            .limit(200).execute().data or [])
+    done = 0
+    for f in rows:
+        try:
+            r = supabase_admin.rpc("viyo_credit_earning", {
+                "p_creator": f["creator_id"], "p_post": f.get("source_post_id"), "p_viewer": f.get("viewer_id"),
+                "p_coins": int(f["coins"]), "p_key": f["earning_key"], "p_hold_days": EARNINGS_HOLD_DAYS}).execute().data
+            done += 1 if (r or {}).get("ok") else 0
+        except Exception as e:
+            print(f"[WARN] retry of failed credit {f['id']} failed: {str(e)[:160]}")
+    return {"retried": len(rows), "credited": done}
