@@ -155,7 +155,7 @@ def hub(user_id: str) -> dict:
 
 
 DASHBOARD_DAYS = 30
-EARNING_TYPES = (("content", "unlock"), ("donations", "donation"), ("brand_deals", "brand"),
+EARNING_TYPES = (("content", "unlock"), ("donations", "donation"), ("brand_deals", "brand"), ("ads", "ads"),
                  ("adjustments", "reversal"))
 
 
@@ -177,8 +177,14 @@ def dashboard(db, user_id: str) -> dict:
         brand = {"available": True, "note": "Brand deals pay 80% of the fee."} if _bc._ready() else not_yet
     except Exception:
         brand = not_yet
+    try:
+        import ad_revenue as _ar
+        ads = {"available": True, "note": "Half of VIYO's ad earnings on your content, paid monthly."} \
+            if _ar._ready() else not_yet
+    except Exception:
+        ads = not_yet
     if not s:
-        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": not_yet, "brand_campaigns": brand,
+        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": ads, "brand_campaigns": brand,
                 "level": level}
 
     a = s.get("audience") or {}
@@ -206,7 +212,7 @@ def dashboard(db, user_id: str) -> dict:
         },
         "earnings": {
             "by_type": by_type,
-            "advertising": not_yet,
+            "advertising": ads,
             "brand_campaigns": brand,
             "held_coins": held, "held_usd": wallet.coins_to_usd(held),
             "available_coins": available, "available_usd": wallet.coins_to_usd(available),
