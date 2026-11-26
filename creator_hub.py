@@ -94,6 +94,8 @@ def hub(user_id: str) -> dict:
 
     by_post = defaultdict(int)
     for e in earnings:
+        if e.get("status") == "reversed":
+            continue                     # cancelled (refund / fraud); a paid one is offset by its negative reversal row
         if e.get("source_post_id"):
             by_post[e["source_post_id"]] += int(e.get("coins") or 0)
     episodes_of = defaultdict(list)

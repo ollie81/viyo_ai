@@ -226,20 +226,8 @@ async def unlock_episode(post_id: str, user_id: str = Depends(_get_current_user_
     # money actually owed to the creator, so a lost credit here needs
     # to be visible for manual reconciliation, not swallowed the way a
     # best-effort push notification would be.
-    for attempt in range(2):
-        try:
-            supabase_admin.table("creator_earnings").insert({
-                "creator_id": episode["user_id"],
-                "source_post_id": post_id,
-                "coins": creator_share,
-            }).execute()
-            break
-        except Exception as e:
-            if attempt == 1:
-                print(
-                    f"[CRITICAL] Could not credit {creator_share} coins to creator "
-                    f"{episode['user_id']} for episode unlock {post_id} by {user_id}: {e}"
-                )
+    from wallet import credit_earning
+    credit_earning(supabase_admin, episode["user_id"], post_id, user_id, creator_share)
 
     return UnlockEpisodeResponse(unlocked=True, coins_spent=price)
 
@@ -394,21 +382,10 @@ async def unlock_series_bundle(series_id: str, user_id: str = Depends(_get_curre
     creator_id = series["user_id"]
     _notify_unlock(creator_id, user_id, claimed_ids[0],
                    f"{len(claimed_ids)} episodes of {series_title}", creator_share * len(claimed_ids))
-    for post_id in (claimed_ids if creator_share > 0 else []):
-        for attempt in range(2):
-            try:
-                supabase_admin.table("creator_earnings").insert({
-                    "creator_id": creator_id,
-                    "source_post_id": post_id,
-                    "coins": creator_share,
-                }).execute()
-                break
-            except Exception as e:
-                if attempt == 1:
-                    print(
-                        f"[CRITICAL] Could not credit {creator_share} coins to creator "
-                        f"{creator_id} for bundle-unlocked episode {post_id} by {user_id}: {e}"
-                    )
+    if creator_share > 0:
+        from wallet import credit_earning
+        for post_id in claimed_ids:
+            credit_earning(supabase_admin, creator_id, post_id, user_id, creator_share)
 
     return UnlockBundleResponse(unlocked_episode_ids=lockable_ids, coins_spent=total_cost, already_complete=False)
 

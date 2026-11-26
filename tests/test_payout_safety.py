@@ -414,6 +414,10 @@ class EarnDB:
     def table(self, name):
         return _EarnQ(self, name)
 
+    def rpc(self, name, params):
+        """Like the live database before creator_earnings_ledger.sql: the function doesn't exist (PostgREST PGRST202)."""
+        raise Exception(f"{{'code': 'PGRST202', 'message': 'Could not find the function public.{name} in the schema cache'}}")
+
 
 @pytest.mark.parametrize("balance,paid,price,expected", [
     (100, 0, 20, None),        # only free coins (check-ins, missions, ads, gifts): the creator earns nothing
