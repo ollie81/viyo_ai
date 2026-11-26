@@ -73,7 +73,10 @@ def as_role(db, role, uid, sql, params=()):
 def test_the_migration_creates_three_tables_with_row_level_security(db):
     tables = {r[0]: r[1] for r in db.execute(
         "select relname, relrowsecurity from pg_class where relkind = 'r' and relname like 'nardopay_%'").fetchall()}
-    assert tables == {"nardopay_rates": True, "nardopay_webhook_events": True, "nardopay_orders": True}
+    assert {"nardopay_rates", "nardopay_webhook_events", "nardopay_orders"} <= set(tables)
+    # Later migrations (e.g. nardopay_rates_auto.sql's nardopay_rate_runs) may add tables: every one keeps RLS on.
+    assert set(tables) <= {"nardopay_rates", "nardopay_webhook_events", "nardopay_orders", "nardopay_rate_runs"}
+    assert all(tables.values())
 
 
 def test_running_it_again_keeps_existing_data(schema, db):
