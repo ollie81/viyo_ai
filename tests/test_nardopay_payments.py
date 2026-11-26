@@ -776,3 +776,11 @@ def test_link_code_of():
     assert np_.link_code_of("https://nardopay.com/p/8d12d2d13a314c47?pay=1") == "8d12d2d13a314c47"
     assert np_.link_code_of("https://nardopay.com/p/abc123def") == "abc123def"
     assert np_.link_code_of("https://nardopay.com/checkout") is None and np_.link_code_of("") is None
+
+
+def test_coin_links_send_the_buyer_back_to_viyo_and_the_return_credits_nothing(env):
+    client, db, calls, st = env
+    u = make_user(db)
+    buy(client, u)
+    assert calls[-1]["body"]["redirect_url"] == "https://viyo.site/app"
+    assert balance(db, u) == 100                     # only the signed webhook credits coins, never the return

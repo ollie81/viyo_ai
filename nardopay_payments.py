@@ -349,7 +349,8 @@ async def create_order(body: CreateOrderIn, user_id: str = Depends(_buyer)):
 
     request_body = {"link_type": "payment", "product_name": "VIYO Coins", "amount_mode": "fixed",
                     "amount": rwf * unit, "description": f"VIYO Coins purchase: {package['label']}",
-                    "metadata": {"order_id": order["id"]}, "webhook_url": webhook_url()}
+                    "metadata": {"order_id": order["id"]}, "webhook_url": webhook_url(),
+                    "redirect_url": PREMIUM_REDIRECT_URL}      # back to VIYO after paying (not proof of payment)
     try:
         resp = _http_post(CREATE_LINK_URL, {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                           request_body)
