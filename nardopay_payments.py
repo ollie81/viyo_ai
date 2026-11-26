@@ -515,6 +515,10 @@ def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
         donation = donations.find_by_link_code(ev["link_code"])
         if donation:
             return donations.process_payment(donation, ev, eid, finish)
+        import brand_campaigns
+        campaign = brand_campaigns.find_by_link_code(ev["link_code"])
+        if campaign:
+            return brand_campaigns.process_payment(campaign, ev, eid, finish)
     if ev["event_type"] not in (EVENT_COMPLETED, EVENT_FAILED):
         return finish("ignored", f"event type {ev['event_type']!r} isn't handled")
     order = get_store().one("nardopay_orders", {"id": ev["order_id"]}) if ev["order_id"] else None
@@ -752,6 +756,11 @@ def reconcile(min_age_seconds: int = RECONCILE_MIN_AGE_SECONDS) -> dict:
         out["premium_ended"] = int(_rpc("nardopay_end_lapsed_subscriptions", {}) or 0)
     except Exception:
         out["premium_ended"] = 0         # nardopay_subscriptions.sql not run yet
+    try:
+        import brand_campaigns
+        out["brand_campaigns"] = brand_campaigns.maintain()
+    except Exception as e:
+        print(f"[WARN] brand campaign maintenance failed: {str(e)[:160]}")
     out["purged"] = int(_rpc("nardopay_purge_raw", {
         "p_days": int(_env("NARDOPAY_RAW_BODY_DAYS", "30") or 30),
         "p_problem_days": int(_env("NARDOPAY_RAW_BODY_PROBLEM_DAYS", "90") or 90)}) or 0)
