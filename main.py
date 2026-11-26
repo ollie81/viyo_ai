@@ -249,6 +249,12 @@ try:
 except Exception as _adrev_err:
     print(f"[WARN] Ad revenue router not loaded: {_adrev_err}")
 try:
+    # Google AdSense on the web app: one switch, off until AdSense approves viyo.site (web_ads.py).
+    from web_ads import router as web_ads_router
+    app.include_router(web_ads_router)
+except Exception as _webads_err:
+    print(f"[WARN] Web ads router not loaded: {_webads_err}")
+try:
     # Which real-money checkouts the app may show (read-only; see checkout_options.py).
     from checkout_options import router as checkout_options_router
     app.include_router(checkout_options_router)
