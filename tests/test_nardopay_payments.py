@@ -237,7 +237,8 @@ def test_no_redirect_or_get_route_can_credit_coins():
     gets = sorted(p for p, m in routes if m == "GET")
     assert gets == ["/api/v1/admin/nardopay/duplicate-payments", "/api/v1/admin/nardopay/rate",
                     "/api/v1/coins/purchase/nardopay/availability",
-                    "/api/v1/coins/purchase/nardopay/orders/{order_id}"]
+                    "/api/v1/coins/purchase/nardopay/orders/{order_id}",
+                    "/api/v1/subscription/nardopay/{subscription_id}"]      # read-only: the owner's own status
 
 
 # ------------------------------------------------------------------------------------------- webhook: signature

@@ -81,76 +81,9 @@ def _configured() -> bool:
     )
 
 
-@router.post("/coins/purchase/lemonsqueezy/initialize", response_model=LemonSqueezyInitResponse)
-async def initialize_lemonsqueezy_purchase(
-    req: LemonSqueezyInitRequest,
-    user: tuple[str, str] = Depends(_get_current_user_and_email),
-):
-    if not _configured():
-        raise HTTPException(status_code=503, detail="Lemon Squeezy payments are not configured.")
-
-    user_id, email = user
-    package = COIN_PACKAGES.get(req.package_id)
-    if package is None:
-        raise HTTPException(status_code=400, detail="Unknown coin package.")
-
-    try:
-        resp = requests.post(
-            f"{LEMONSQUEEZY_BASE_URL}/checkouts",
-            headers={
-                "Accept": "application/vnd.api+json",
-                "Content-Type": "application/vnd.api+json",
-                "Authorization": f"Bearer {LEMONSQUEEZY_API_KEY}",
-            },
-            json={
-                "data": {
-                    "type": "checkouts",
-                    "attributes": {
-                        # Lemon Squeezy takes the smallest currency unit
-                        # (cents) here too, same as Stripe/Paystack.
-                        "custom_price": package["usd_cents"],
-                        "checkout_data": {
-                            "email": email,
-                            "custom": {
-                                "user_id": user_id,
-                                "package_id": req.package_id,
-                                "coins": package["coins"],
-                            },
-                        },
-                    },
-                    "relationships": {
-                        "store": {"data": {"type": "stores", "id": LEMONSQUEEZY_STORE_ID}},
-                        "variant": {"data": {"type": "variants", "id": LEMONSQUEEZY_VARIANT_ID}},
-                    },
-                }
-            },
-            timeout=15,
-        )
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach Lemon Squeezy: {e}")
-
-    if not resp.ok:
-        detail = data.get("errors", [{}])[0].get("detail", "Could not start Lemon Squeezy checkout.")
-        raise HTTPException(status_code=502, detail=detail)
-
-    checkout_url = data.get("data", {}).get("attributes", {}).get("url")
-    if not checkout_url:
-        raise HTTPException(status_code=502, detail="Lemon Squeezy did not return a checkout URL.")
-
-    return LemonSqueezyInitResponse(checkout_url=checkout_url, coins=package["coins"])
-
-
-def _already_credited(admin, order_id: str) -> bool:
-    existing = (
-        admin.table("transactions")
-        .select("id")
-        .eq("type", "coin_purchase")
-        .ilike("description", f"%{order_id}%")
-        .limit(1)
-        .execute()
-    )
-    return bool(existing.data)
+# The Lemon Squeezy coin checkout (POST /coins/purchase/lemonsqueezy/initialize) was removed: VIYO no longer sells
+# through Lemon Squeezy. The webhook below stays so payments and subscriptions made earlier still finish, and is
+# removed together with the LEMONSQUEEZY_* settings once nothing remains on Lemon Squeezy.
 
 
 @router.post("/coins/webhook/lemonsqueezy")

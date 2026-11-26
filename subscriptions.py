@@ -1,5 +1,9 @@
 """
-Viyo Premium — a real, recurring subscription (weekly, monthly, or
+NOW: Premium is sold through NardoPay subscriptions (nardopay_payments.py, nardopay_subscriptions.sql). Lemon
+Squeezy checkout was removed; only its event handling below remains, for subscriptions bought earlier.
+This module also holds is_active_subscriber (the paywall check) and GET /subscription/status.
+
+History: Viyo Premium — a real, recurring subscription (weekly, monthly, or
 yearly) via Lemon Squeezy, alongside Viyo Coins' one-time top-ups
 (lemonsqueezy_payments.py and the other *_payments.py files). An
 active subscriber skips the per-episode coin paywall entirely (see
@@ -39,6 +43,7 @@ order), so there's no way around creating those three variants for
 real and setting LEMONSQUEEZY_WEEKLY_VARIANT_ID /
 LEMONSQUEEZY_MONTHLY_VARIANT_ID / LEMONSQUEEZY_YEARLY_VARIANT_ID.
 """
+import datetime
 import os
 from typing import Literal, Optional
 
@@ -96,66 +101,15 @@ async def _get_current_user_and_email(authorization: str = Header(None)) -> tupl
     return user_id, email
 
 
-class SubscriptionCheckoutRequest(BaseModel):
-    plan: Literal["weekly", "monthly", "yearly"]
-
-
-class SubscriptionCheckoutResponse(BaseModel):
-    checkout_url: str
-
-
-@router.post("/subscription/checkout", response_model=SubscriptionCheckoutResponse)
-async def create_subscription_checkout(
-    req: SubscriptionCheckoutRequest,
-    user: tuple[str, str] = Depends(_get_current_user_and_email),
-):
-    if not _configured():
-        raise HTTPException(status_code=503, detail="Subscriptions are not configured.")
-    user_id, email = user
-    variant_id = _VARIANT_BY_PLAN[req.plan]
-
-    try:
-        resp = requests.post(
-            f"{LEMONSQUEEZY_BASE_URL}/checkouts",
-            headers={
-                "Accept": "application/vnd.api+json",
-                "Content-Type": "application/vnd.api+json",
-                "Authorization": f"Bearer {LEMONSQUEEZY_API_KEY}",
-            },
-            json={
-                "data": {
-                    "type": "checkouts",
-                    "attributes": {
-                        "checkout_data": {
-                            "email": email,
-                            "custom": {"user_id": user_id, "plan": req.plan},
-                        },
-                    },
-                    "relationships": {
-                        "store": {"data": {"type": "stores", "id": LEMONSQUEEZY_STORE_ID}},
-                        "variant": {"data": {"type": "variants", "id": variant_id}},
-                    },
-                }
-            },
-            timeout=15,
-        )
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach Lemon Squeezy: {e}")
-
-    if not resp.ok:
-        detail = data.get("errors", [{}])[0].get("detail", "Could not start checkout.")
-        raise HTTPException(status_code=502, detail=detail)
-
-    checkout_url = data.get("data", {}).get("attributes", {}).get("url")
-    if not checkout_url:
-        raise HTTPException(status_code=502, detail="Lemon Squeezy did not return a checkout URL.")
-    return SubscriptionCheckoutResponse(checkout_url=checkout_url)
+# Premium is sold through NardoPay subscriptions (nardopay_payments.create_premium_subscription). The Lemon Squeezy
+# checkout was removed; handle_subscription_event below stays so subscriptions bought earlier through Lemon Squeezy
+# still receive their renewal / cancellation / expiry updates until they end.
 
 
 class SubscriptionStatusResponse(BaseModel):
     is_subscribed: bool
     plan: Optional[str] = None
+    provider: Optional[str] = None
     status: Optional[str] = None
     renews_at: Optional[str] = None
     ends_at: Optional[str] = None
@@ -174,7 +128,8 @@ async def get_subscription_status(user: tuple[str, str] = Depends(_get_current_u
     try:
         rows = (
             supabase_admin.table("profiles")
-            .select("is_subscribed, subscription_plan, subscription_status, subscription_renews_at, subscription_ends_at")
+            .select("is_subscribed, subscription_plan, subscription_provider, subscription_status, "
+                    "subscription_renews_at, subscription_ends_at")
             .eq("id", user_id)
             .limit(1)
             .execute()
@@ -186,8 +141,9 @@ async def get_subscription_status(user: tuple[str, str] = Depends(_get_current_u
         return SubscriptionStatusResponse(is_subscribed=False)
     row = rows[0]
     return SubscriptionStatusResponse(
-        is_subscribed=bool(row.get("is_subscribed")),
+        is_subscribed=bool(row.get("is_subscribed")) and not nardopay_premium_ended(row),
         plan=row.get("subscription_plan"),
+        provider=row.get("subscription_provider"),
         status=row.get("subscription_status"),
         renews_at=row.get("subscription_renews_at"),
         ends_at=row.get("subscription_ends_at"),
@@ -204,11 +160,31 @@ def is_active_subscriber(admin, user_id: str) -> bool:
     # been run: Postgres error 42703) or the lookup fails, the viewer is treated as not subscribed and simply
     # pays with coins as normal. Failing this way can only ever charge someone, never give premium for free.
     try:
-        rows = admin.table("profiles").select("is_subscribed").eq("id", user_id).limit(1).execute().data
+        rows = admin.table("profiles").select("is_subscribed, subscription_provider, subscription_ends_at") \
+            .eq("id", user_id).limit(1).execute().data
     except Exception as e:
         print(f"[WARN] subscriber check for {user_id} failed, treating as not subscribed: {e}")
         return False
-    return bool(rows and rows[0].get("is_subscribed"))
+    if not rows or not rows[0].get("is_subscribed"):
+        return False
+    # NardoPay Premium always has an end date (paid period + grace): past it, it gives nothing, even before the
+    # worker switches it off.
+    return not nardopay_premium_ended(rows[0])
+
+
+def nardopay_premium_ended(row: dict) -> bool:
+    if row.get("subscription_provider") != "nardopay":
+        return False
+    ends = row.get("subscription_ends_at")
+    if not ends:
+        return True
+    try:
+        t = datetime.datetime.fromisoformat(str(ends).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
 
 
 def handle_subscription_event(event: dict) -> None:
@@ -233,6 +209,16 @@ def handle_subscription_event(event: dict) -> None:
     attrs = data.get("attributes") or {}
     status = attrs.get("status")
     is_subscribed = status in _ACTIVE_STATUSES
+
+    # An old Lemon Squeezy subscription's events never overwrite NardoPay Premium someone has paid for since.
+    try:
+        cur = supabase_admin.table("profiles").select("is_subscribed, subscription_provider, subscription_ends_at") \
+            .eq("id", user_id).limit(1).execute().data
+        if cur and cur[0].get("is_subscribed") and cur[0].get("subscription_provider") == "nardopay" \
+                and not nardopay_premium_ended(cur[0]):
+            return
+    except Exception:
+        pass
 
     try:
         supabase_admin.table("profiles").update({

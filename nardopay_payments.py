@@ -56,6 +56,7 @@ router = APIRouter(prefix="/api/v1", tags=["payments"])
 
 CREATE_LINK_URL = "https://mczqwqsvumfsneoknlep.supabase.co/functions/v1/create-payment-link-api"   # documented
 EVENT_COMPLETED, EVENT_FAILED = "payment.completed", "payment.failed"                               # documented
+EVENT_RENEWED = "subscription.renewed"        # documented: a completed transaction whose link is a subscription
 # Seen in a real signed NardoPay delivery (25 Nov 2026): its test webhook is {"event": "webhook.test", "test": true, ...}.
 # A payload marked test=true, or a webhook.test event, is never a real payment: it is recorded and ignored, never
 # credited, whatever order, amount and currency it carries.
@@ -73,12 +74,22 @@ CONTRACT = {
 # seen in a real payment on 25 Nov 2026), or by an order id the webhook carries. At least one must be set.
 ORDER_MATCH = {"link_code": "NARDOPAY_FIELD_LINK_CODE", "order_id": "NARDOPAY_FIELD_ORDER_ID"}
 OPTIONAL_CONTRACT = {"event_id": "NARDOPAY_FIELD_EVENT_ID", **ORDER_MATCH}
-LINK_CODE_IN_URL = re.compile(r"/p/([A-Za-z0-9_-]{6,64})(?:[/?#]|$)")
+LINK_CODE_IN_URL = re.compile(r"/[ps]/([A-Za-z0-9_-]{6,64})(?:[/?#]|$)")   # /p/ payment, /s/ subscription links
 AMOUNT_UNITS = {"rwf": 1, "rwf_minor": 100}         # NARDOPAY_AMOUNT_UNIT: what `amount` counts (unverified)
 
 RATE_MIN_DEFAULT, RATE_MAX_DEFAULT = 1000.0, 3000.0
 LARGE_CHANGE = 0.10
 RECONCILE_MIN_AGE_SECONDS = 300
+
+# VIYO Premium as a recurring NardoPay subscription (real money, never coins). The RWF amounts and billing cycles are
+# the owner's NardoPay plans; the USD price is what VIYO displays. No trial.
+PREMIUM_PLANS = {
+    "weekly": {"rwf": 5900, "usd_cents": 399, "billing_cycle": "weekly", "interval": "week", "name": "VIYO Premium Weekly"},
+    "monthly": {"rwf": 14800, "usd_cents": 999, "billing_cycle": "monthly", "interval": "month",
+                "name": "VIYO Premium Monthly"},
+    "yearly": {"rwf": 88600, "usd_cents": 5999, "billing_cycle": "yearly", "interval": "year", "name": "VIYO Premium Yearly"},
+}
+PREMIUM_REDIRECT_URL = "https://viyo.site/app"      # where NardoPay sends the customer back (not proof of payment)
 
 
 # ====================================================================== settings and helpers
@@ -401,7 +412,15 @@ def _parse_event(payload: dict) -> dict:
             "order_id": order_id,
             "transaction_id": str(tx)[:200] if tx not in (None, "") else None,
             "amount": amount, "currency": str(cur).strip().upper()[:10] if cur not in (None, "") else None,
-            "provider_event_id": str(ev)[:200] if ev not in (None, "") else None}
+            "provider_event_id": str(ev)[:200] if ev not in (None, "") else None,
+            "link_code": _link_code_in(payload)}
+
+
+def _link_code_in(payload: dict) -> Optional[str]:
+    if not contract_field("link_code"):
+        return None
+    code = pick(payload, contract_field("link_code"))
+    return code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_-]{6,64}", code) else None
 
 
 def is_test_event(payload) -> bool:
@@ -451,6 +470,10 @@ def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
 
     if is_test_event(payload):           # defence in depth: handle_signed already stops these
         return finish("ignored", "test event: never credited")
+    if not ev["order_id"] and ev.get("link_code"):
+        sub = get_store().one("nardopay_subscriptions", {"link_code": ev["link_code"]}) if _subscriptions_ready() else None
+        if sub:
+            return _process_subscription_payment(sub, ev, eid, finish)
     if ev["event_type"] not in (EVENT_COMPLETED, EVENT_FAILED):
         return finish("ignored", f"event type {ev['event_type']!r} isn't handled")
     order = get_store().one("nardopay_orders", {"id": ev["order_id"]}) if ev["order_id"] else None
@@ -484,6 +507,130 @@ def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
     if not _rpc("nardopay_finish_order", {"p_order": order["id"], "p_transaction": ev["transaction_id"]}):
         raise RuntimeError("order could not be marked credited")
     return finish("processed", "credited")
+
+
+# ====================================================================== Premium subscriptions
+
+def _subscriptions_ready() -> bool:
+    """False until nardopay_subscriptions.sql has been run (then subscription payments simply aren't matched)."""
+    try:
+        get_store().select("nardopay_subscriptions", {}, limit=1)
+        return True
+    except Exception:
+        return False
+
+
+def premium_grace_hours() -> int:
+    return max(0, int(_env("NARDOPAY_PREMIUM_GRACE_HOURS", "48") or 48))
+
+
+def _process_subscription_payment(sub: dict, ev: dict, eid: str, finish) -> tuple[int, dict]:
+    """A signed webhook for one of our subscription links. Premium is extended only for a completed payment of exactly
+    the plan's RWF amount; each NardoPay transaction counts once."""
+    if ev["event_type"] == EVENT_FAILED:
+        return finish("processed", "subscription payment failed: Premium not extended")
+    if ev["event_type"] not in (EVENT_COMPLETED, EVENT_RENEWED):
+        return finish("ignored", f"event type {ev['event_type']!r} isn't handled")
+    problem = verify_payment(sub, ev)
+    if problem:
+        print(f"[WARN] NardoPay subscription payment for {sub['id']} not counted: {problem}")
+        return finish("mismatch", problem)
+    out = _rpc("nardopay_record_subscription_payment", {
+        "p_subscription": sub["id"], "p_transaction": ev["transaction_id"], "p_event": eid,
+        "p_event_type": ev["event_type"], "p_amount": str(ev["amount"]), "p_currency": ev["currency"],
+        "p_grace_hours": premium_grace_hours()}) or {}
+    if out.get("result") == "duplicate":
+        return finish("processed", "subscription payment already counted")
+    if out.get("result") != "recorded":
+        raise RuntimeError(f"subscription payment not recorded ({out.get('result')})")
+    return finish("processed", "Premium extended")
+
+
+class PremiumSubscribeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")      # the price and cycle come from PREMIUM_PLANS, never the client
+    plan: str = Field(..., pattern="^(weekly|monthly|yearly)$")
+
+
+def _premium_problem() -> Optional[str]:
+    """Why a Premium subscription can't be started right now, or None."""
+    if not _flag("NARDOPAY_ENABLED") or not _flag("NARDOPAY_LEDGER_VERIFIED"):
+        return "switched off"
+    if not _env("NARDOPAY_API_KEY") or amount_multiplier() is None or missing_contract(["link_url"]) \
+            or missing_contract() or not contract_field("link_code") or not webhook_url():
+        return "not configured"
+    if not _subscriptions_ready():
+        return "not set up"
+    return None
+
+
+def _sub_out(s: dict) -> dict:
+    return {"subscription_id": s["id"], "status": s["status"], "plan": s["plan"], "usd_cents": s["usd_cents"],
+            "payment_link": s.get("payment_link") if s["status"] == "pending" else None,
+            "current_period_end": s.get("current_period_end")}
+
+
+@router.post("/subscription/nardopay/create")
+async def create_premium_subscription(body: PremiumSubscribeIn, user_id: str = Depends(_buyer)):
+    """Creates this user's NardoPay subscription link for the chosen plan (web only). Premium starts only when
+    NardoPay's signed payment webhook for this link arrives, never from the redirect back to VIYO."""
+    problem = _premium_problem()
+    if problem:
+        raise HTTPException(status_code=503, detail="Premium checkout isn't available right now.")
+    rows = get_store().select("profiles", {"id": user_id}, limit=1)
+    prof = rows[0] if rows else {}
+    ends = prof.get("subscription_ends_at")
+    if prof.get("is_subscribed") and (not ends or _parse_time(ends) > _now()):
+        raise HTTPException(status_code=409, detail="You already have VIYO Premium.")
+    plan = PREMIUM_PLANS[body.plan]
+    unit = amount_multiplier()
+    sub = get_store().insert("nardopay_subscriptions", [{
+        "user_id": user_id, "plan": body.plan, "rwf_amount": plan["rwf"], "usd_cents": plan["usd_cents"]}])[0]
+
+    def fail(reason: str):
+        get_store().update("nardopay_subscriptions", {"id": sub["id"]},
+                           {"status": "failed", "failure_reason": reason[:400], "updated_at": _now().isoformat()})
+        raise HTTPException(status_code=502, detail="NardoPay couldn't start the subscription. Try again.")
+
+    request_body = {"link_type": "subscription", "plan_name": plan["name"], "amount": plan["rwf"] * unit,
+                    "billing_cycle": plan["billing_cycle"], "trial_days": 0,
+                    "description": f"{plan['name']}: unlimited episodes on VIYO",
+                    "metadata": {"subscription_id": sub["id"]}, "webhook_url": webhook_url(),
+                    "redirect_url": PREMIUM_REDIRECT_URL}
+    try:
+        resp = _http_post(CREATE_LINK_URL, {"Authorization": f"Bearer {_env('NARDOPAY_API_KEY')}",
+                                            "Content-Type": "application/json"}, request_body)
+    except Exception as e:
+        print(f"[WARN] NardoPay subscription link unreachable for {sub['id']}: {type(e).__name__}")
+        fail("unreachable")
+    if not 200 <= resp.status_code < 300:
+        print(f"[WARN] NardoPay subscription link HTTP {resp.status_code} for {sub['id']}")
+        fail(f"http {resp.status_code}")
+    try:
+        data = resp.json()
+    except ValueError:
+        fail("response is not JSON")
+    link = pick(data, contract_field("link_url"))
+    if not isinstance(link, str) or not link.startswith("https://") or len(link) > 2000:
+        fail("no https link at the configured field")
+    code = link_code_of(link)
+    if not code:
+        fail("no link code in the subscription link")       # payments are matched by it: never sell without one
+    try:
+        sub = get_store().update("nardopay_subscriptions", {"id": sub["id"]},
+                                 {"payment_link": link, "link_code": code, "updated_at": _now().isoformat()})[0]
+    except Exception:
+        fail("the link code is already used")
+    return _sub_out(sub)
+
+
+@router.get("/subscription/nardopay/{subscription_id}")
+async def premium_subscription_status(subscription_id: str, user_id: str = Depends(_buyer)):
+    """The buyer's own subscription (the app checks this after checkout until NardoPay's payment is verified)."""
+    sid = _uuid_or_none(subscription_id)
+    s = get_store().one("nardopay_subscriptions", {"id": sid}) if sid else None
+    if not s or s["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Subscription not found.")
+    return _sub_out(s)
 
 
 def handle_signed(raw: bytes, payload: Optional[dict]) -> tuple[int, dict]:
@@ -560,6 +707,10 @@ def reconcile(min_age_seconds: int = RECONCILE_MIN_AGE_SECONDS) -> dict:
                                                "p_detail": "credited by reconciliation"})
                 out["finished"] += 1
     out["expired"] = int(_rpc("nardopay_expire_orders", {}) or 0)
+    try:
+        out["premium_ended"] = int(_rpc("nardopay_end_lapsed_subscriptions", {}) or 0)
+    except Exception:
+        out["premium_ended"] = 0         # nardopay_subscriptions.sql not run yet
     out["purged"] = int(_rpc("nardopay_purge_raw", {
         "p_days": int(_env("NARDOPAY_RAW_BODY_DAYS", "30") or 30),
         "p_problem_days": int(_env("NARDOPAY_RAW_BODY_PROBLEM_DAYS", "90") or 90)}) or 0)
