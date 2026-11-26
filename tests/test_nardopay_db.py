@@ -75,7 +75,8 @@ def test_the_migration_creates_three_tables_with_row_level_security(db):
         "select relname, relrowsecurity from pg_class where relkind = 'r' and relname like 'nardopay_%'").fetchall()}
     assert {"nardopay_rates", "nardopay_webhook_events", "nardopay_orders"} <= set(tables)
     # Later migrations (e.g. nardopay_rates_auto.sql's nardopay_rate_runs) may add tables: every one keeps RLS on.
-    assert set(tables) <= {"nardopay_rates", "nardopay_webhook_events", "nardopay_orders", "nardopay_rate_runs"}
+    assert set(tables) <= {"nardopay_rates", "nardopay_webhook_events", "nardopay_orders", "nardopay_rate_runs",
+                           "nardopay_subscriptions", "nardopay_subscription_payments"}
     assert all(tables.values())
 
 
