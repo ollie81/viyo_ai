@@ -163,14 +163,17 @@ def dashboard(db, user_id: str) -> dict:
     rows in the earnings ledger), withdrawals and Studio activity. Exact counts from creator_dashboard_stats
     (creator_dashboard.sql). Advertising revenue and brand campaigns are reported as not available: VIYO doesn't
     have them yet, and nothing is estimated."""
+    import creator_levels
     import wallet
+    level = creator_levels.level_for(db, user_id)
     try:
         s = db.rpc("creator_dashboard_stats", {"p_creator": user_id, "p_days": DASHBOARD_DAYS}).execute().data or {}
     except Exception:
         s = None
     not_yet = {"available": False, "note": "Not available on VIYO yet."}
     if not s:
-        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": not_yet, "brand_campaigns": not_yet}
+        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": not_yet, "brand_campaigns": not_yet,
+                "level": level}
 
     a = s.get("audience") or {}
     started, completed = int(a.get("started") or 0), int(a.get("completed") or 0)
@@ -201,8 +204,9 @@ def dashboard(db, user_id: str) -> dict:
             "brand_campaigns": not_yet,
             "held_coins": held, "held_usd": wallet.coins_to_usd(held),
             "available_coins": available, "available_usd": wallet.coins_to_usd(available),
-            "hold_days": wallet.EARNINGS_HOLD_DAYS,
+            "hold_days": level["hold_days"],
         },
+        "level": level,
         "withdrawals": [{"status": w.get("status"), "usd": float(w.get("usd_amount") or wallet.coins_to_usd(w.get("coins") or 0)),
                          "created_at": w.get("created_at"), "paid_at": w.get("paid_at")}
                         for w in (s.get("withdrawals") or [])],

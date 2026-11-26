@@ -187,11 +187,13 @@ def process_payment(d: dict, ev: dict, eid: str, finish) -> tuple[int, dict]:
         if problem:
             print(f"[WARN] NardoPay donation {d['id']} not recorded: {problem}")
             return finish("mismatch", problem)
+    import creator_levels
     import wallet
     amount = ev["amount"] / unit
+    hold = creator_levels.hold_days_for(np_.get_store(), str(d["creator_id"]))
     out = np_._rpc("nardopay_record_donation", {
         "p_donation": str(d["id"]), "p_transaction": ev["transaction_id"], "p_event": eid, "p_amount": str(amount),
-        "p_currency": ev["currency"], "p_hold_days": wallet.EARNINGS_HOLD_DAYS,
+        "p_currency": ev["currency"], "p_hold_days": hold,
         "p_coin_usd": str(wallet.COIN_USD)}) or {}
     result = out.get("result")
     if result == "duplicate":
