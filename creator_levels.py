@@ -1,6 +1,7 @@
 """Creator levels: New, Rising, Pro and Star, worked out from real records (creator_levels.sql).
 
-Business rules (agreed with the owner):
+Business rules (agreed with the owner). Rising (needed for brand deals): 400 followers + 5,000 viewers in 30 days;
+Pro: 1,000 + 20,000, 60 days, $50, clean record; Star: 10,000 + 50,000, 90 days, $500, clean record.
   * every creator earns, at every level, the same share (episodes.CREATOR_SHARE, 65%); levels never change who can earn;
   * the only perk is a shorter earnings hold for Pro and Star (SHORT_HOLD_DAYS instead of wallet.EARNINGS_HOLD_DAYS);
   * Pro and Star also need a clean record: no refunded or reversed earning in the last CLEAN_DAYS days, so the
@@ -18,9 +19,9 @@ CLEAN_DAYS = 90
 # money earned net of refunds in USD, and for Pro and Star a clean record).
 LEVELS = (
     {"key": "new", "name": "New", "followers": 0, "viewers_30d": 0, "account_days": 0, "earned_usd": 0, "clean": False},
-    {"key": "rising", "name": "Rising", "followers": 100, "viewers_30d": 500, "account_days": 0, "earned_usd": 0,
+    {"key": "rising", "name": "Rising", "followers": 400, "viewers_30d": 5000, "account_days": 0, "earned_usd": 0,
      "clean": False},
-    {"key": "pro", "name": "Pro", "followers": 1000, "viewers_30d": 5000, "account_days": 60, "earned_usd": 50,
+    {"key": "pro", "name": "Pro", "followers": 1000, "viewers_30d": 20000, "account_days": 60, "earned_usd": 50,
      "clean": True},
     {"key": "star", "name": "Star", "followers": 10000, "viewers_30d": 50000, "account_days": 90, "earned_usd": 500,
      "clean": True},

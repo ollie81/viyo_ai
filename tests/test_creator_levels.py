@@ -17,11 +17,12 @@ def m(followers=0, viewers=0, days=0, usd=0.0, reversals=0):
 
 def test_levels_are_climbed_with_every_requirement_met():
     assert cl.evaluate(m())["key"] == "new"
-    assert cl.evaluate(m(followers=100, viewers=499))["key"] == "new"
-    assert cl.evaluate(m(followers=100, viewers=500))["key"] == "rising"
-    assert cl.evaluate(m(followers=1000, viewers=5000, days=60, usd=50))["key"] == "pro"
-    assert cl.evaluate(m(followers=1000, viewers=5000, days=59, usd=50))["key"] == "rising"     # too new
-    assert cl.evaluate(m(followers=1000, viewers=5000, days=60, usd=49))["key"] == "rising"     # not enough earned
+    assert cl.evaluate(m(followers=400, viewers=4999))["key"] == "new"
+    assert cl.evaluate(m(followers=399, viewers=5000))["key"] == "new"
+    assert cl.evaluate(m(followers=400, viewers=5000))["key"] == "rising"
+    assert cl.evaluate(m(followers=1000, viewers=20000, days=60, usd=50))["key"] == "pro"
+    assert cl.evaluate(m(followers=1000, viewers=20000, days=59, usd=50))["key"] == "rising"     # too new
+    assert cl.evaluate(m(followers=1000, viewers=20000, days=60, usd=49))["key"] == "rising"     # not enough earned
     assert cl.evaluate(m(followers=10000, viewers=50000, days=90, usd=500))["key"] == "star"
 
 
@@ -33,11 +34,11 @@ def test_a_recent_refund_keeps_a_creator_below_pro():
 
 
 def test_only_the_hold_changes_and_everyone_earns_the_same_share():
-    new, pro = cl.evaluate(m()), cl.evaluate(m(followers=1000, viewers=5000, days=60, usd=50))
+    new, pro = cl.evaluate(m()), cl.evaluate(m(followers=1000, viewers=20000, days=60, usd=50))
     assert new["hold_days"] == wallet.EARNINGS_HOLD_DAYS and new["perks"] == []
     assert pro["hold_days"] == cl.SHORT_HOLD_DAYS == 7 and "7 days" in pro["perks"][0]
     assert new["next"]["key"] == "rising" and new["next"]["perk"] is None
-    assert cl.evaluate(m(followers=100, viewers=500))["next"]["perk"] is not None             # Pro brings the perk
+    assert cl.evaluate(m(followers=400, viewers=5000))["next"]["perk"] is not None             # Pro brings the perk
     assert "same share" in pro["share_note"]
     assert cl.evaluate(m(followers=10000, viewers=50000, days=90, usd=500))["next"] is None
 
@@ -59,7 +60,7 @@ def test_hold_is_cached_and_forgotten_after_a_refund():
     class Pro:
         def rpc(self, name, params):
             calls.append(name)
-            return {"followers": 1000, "viewers_30d": 5000, "account_days": 60,
+            return {"followers": 1000, "viewers_30d": 20000, "account_days": 60,
                     "earned_coins": 10000, "reversals_90d": 0}
     cl._cache.clear()
     c = str(uuid.uuid4())

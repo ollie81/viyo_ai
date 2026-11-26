@@ -237,6 +237,12 @@ try:
 except Exception as _donations_err:
     print(f"[WARN] Donations router not loaded: {_donations_err}")
 try:
+    # Brand campaigns: businesses pay creators for sponsored posts (brand_campaigns.sql).
+    from brand_campaigns import router as brand_campaigns_router
+    app.include_router(brand_campaigns_router)
+except Exception as _brand_err:
+    print(f"[WARN] Brand campaigns router not loaded: {_brand_err}")
+try:
     # Which real-money checkouts the app may show (read-only; see checkout_options.py).
     from checkout_options import router as checkout_options_router
     app.include_router(checkout_options_router)

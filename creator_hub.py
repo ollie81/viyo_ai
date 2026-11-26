@@ -155,7 +155,8 @@ def hub(user_id: str) -> dict:
 
 
 DASHBOARD_DAYS = 30
-EARNING_TYPES = (("content", "unlock"), ("donations", "donation"), ("adjustments", "reversal"))
+EARNING_TYPES = (("content", "unlock"), ("donations", "donation"), ("brand_deals", "brand"),
+                 ("adjustments", "reversal"))
 
 
 def dashboard(db, user_id: str) -> dict:
@@ -171,8 +172,13 @@ def dashboard(db, user_id: str) -> dict:
     except Exception:
         s = None
     not_yet = {"available": False, "note": "Not available on VIYO yet."}
+    try:
+        import brand_campaigns as _bc
+        brand = {"available": True, "note": "Brand deals pay 80% of the fee."} if _bc._ready() else not_yet
+    except Exception:
+        brand = not_yet
     if not s:
-        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": not_yet, "brand_campaigns": not_yet,
+        return {"ready": False, "days": DASHBOARD_DAYS, "advertising": not_yet, "brand_campaigns": brand,
                 "level": level}
 
     a = s.get("audience") or {}
@@ -201,7 +207,7 @@ def dashboard(db, user_id: str) -> dict:
         "earnings": {
             "by_type": by_type,
             "advertising": not_yet,
-            "brand_campaigns": not_yet,
+            "brand_campaigns": brand,
             "held_coins": held, "held_usd": wallet.coins_to_usd(held),
             "available_coins": available, "available_usd": wallet.coins_to_usd(available),
             "hold_days": level["hold_days"],
