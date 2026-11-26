@@ -18,7 +18,8 @@ def get(monkeypatch, **env):
 
 def test_off_by_default_with_the_real_ids(monkeypatch):
     assert get(monkeypatch) == {"enabled": False, "client": "ca-pub-4161816109605295", "slot": "6118261645",
-                                "infeed_slot": None, "infeed_layout_key": None, "multiplex_slot": None}
+                                "infeed_slot": "3636015645", "infeed_layout_key": "-fb+5w+4e-db+86",
+                                "multiplex_slot": "2527655942"}
 
 
 def test_on_only_when_switched_on(monkeypatch):
@@ -31,11 +32,12 @@ def test_a_malformed_id_keeps_ads_off(monkeypatch):
     assert out["enabled"] is False and out["client"] is None and out["slot"] is None
 
 
-def test_in_feed_needs_its_slot_and_layout_key_and_multiplex_its_slot(monkeypatch):
-    out = get(monkeypatch, WEB_ADS_INFEED_SLOT="1234567890")
-    assert out["infeed_slot"] is None                                  # no layout key: not used
-    out = get(monkeypatch, WEB_ADS_INFEED_SLOT="1234567890", WEB_ADS_INFEED_LAYOUT_KEY="-fb+5w+4e-db+86",
-              WEB_ADS_MULTIPLEX_SLOT="9876543210")
-    assert out["infeed_slot"] == "1234567890" and out["infeed_layout_key"] == "-fb+5w+4e-db+86"
-    assert out["multiplex_slot"] == "9876543210"
-    assert get(monkeypatch, WEB_ADS_MULTIPLEX_SLOT="abc")["multiplex_slot"] is None
+def test_the_three_real_units_by_default_and_ads_stay_off(monkeypatch):
+    out = get(monkeypatch)
+    assert out["enabled"] is False
+    assert (out["slot"], out["infeed_slot"], out["multiplex_slot"]) == ("6118261645", "3636015645", "2527655942")
+
+
+def test_a_bad_override_turns_that_unit_off(monkeypatch):
+    out = get(monkeypatch, WEB_ADS_INFEED_LAYOUT_KEY="bad key!", WEB_ADS_MULTIPLEX_SLOT="abc")
+    assert out["infeed_slot"] is None and out["infeed_layout_key"] is None and out["multiplex_slot"] is None
