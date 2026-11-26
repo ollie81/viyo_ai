@@ -180,7 +180,8 @@ def test_an_order_is_created_server_side_with_the_documented_request(env):
     assert sent["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
     assert sent["body"] == {"link_type": "payment", "product_name": "VIYO Coins", "amount_mode": "fixed",
                             "amount": 1396, "description": "VIYO Coins purchase: 100 Coins",
-                            "metadata": {"order_id": out["order_id"]}, "webhook_url": HOOK}
+                            "metadata": {"order_id": out["order_id"]}, "webhook_url": HOOK,
+                            "redirect_url": "https://viyo.site/app"}
     row = db.execute("select user_id, usd_rwf_rate, rate_id is not null from public.nardopay_orders where id = %s",
                      (out["order_id"],)).fetchone()
     assert str(row[0]) == str(u) and float(row[1]) == 1410 and row[2] is True
