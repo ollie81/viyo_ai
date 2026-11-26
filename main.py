@@ -231,6 +231,12 @@ try:
 except Exception as _nardopay_err:
     print(f"[WARN] NardoPay router not loaded: {_nardopay_err}")
 try:
+    # Fan donations (real money to a creator through NardoPay); off whenever NardoPay is.
+    from donations import router as donations_router
+    app.include_router(donations_router)
+except Exception as _donations_err:
+    print(f"[WARN] Donations router not loaded: {_donations_err}")
+try:
     # Which real-money checkouts the app may show (read-only; see checkout_options.py).
     from checkout_options import router as checkout_options_router
     app.include_router(checkout_options_router)

@@ -511,6 +511,10 @@ def process_event(event_row: dict, payload: dict) -> tuple[int, dict]:
         sub = get_store().one("nardopay_subscriptions", {"link_code": ev["link_code"]}) if _subscriptions_ready() else None
         if sub:
             return _process_subscription_payment(sub, ev, eid, finish)
+        import donations
+        donation = donations.find_by_link_code(ev["link_code"])
+        if donation:
+            return donations.process_payment(donation, ev, eid, finish)
     if ev["event_type"] not in (EVENT_COMPLETED, EVENT_FAILED):
         return finish("ignored", f"event type {ev['event_type']!r} isn't handled")
     order = get_store().one("nardopay_orders", {"id": ev["order_id"]}) if ev["order_id"] else None
