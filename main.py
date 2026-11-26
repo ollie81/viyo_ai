@@ -243,6 +243,12 @@ try:
 except Exception as _brand_err:
     print(f"[WARN] Brand campaigns router not loaded: {_brand_err}")
 try:
+    # Ad revenue sharing: half of VIYO's real ad earnings to creators, monthly (ad_revenue.sql).
+    from ad_revenue import router as ad_revenue_router
+    app.include_router(ad_revenue_router)
+except Exception as _adrev_err:
+    print(f"[WARN] Ad revenue router not loaded: {_adrev_err}")
+try:
     # Which real-money checkouts the app may show (read-only; see checkout_options.py).
     from checkout_options import router as checkout_options_router
     app.include_router(checkout_options_router)
