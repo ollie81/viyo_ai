@@ -175,12 +175,14 @@ def credit_earning(admin, creator_id: str, post_id: str, viewer_id: str, coins: 
     if admin is None or coins <= 0:
         return False
     key = f"unlock:{viewer_id}:{post_id}"
+    import creator_levels
+    hold = creator_levels.hold_days_for(admin, creator_id)     # shorter for Pro and Star; normal on any doubt
     last_error = ""
     for _ in range(3):
         try:
             r = admin.rpc("viyo_credit_earning", {"p_creator": creator_id, "p_post": post_id, "p_viewer": viewer_id,
                                                   "p_coins": int(coins), "p_key": key,
-                                                  "p_hold_days": EARNINGS_HOLD_DAYS}).execute().data or {}
+                                                  "p_hold_days": hold}).execute().data or {}
             if r.get("ok"):
                 return True
             last_error = str(r.get("error"))
@@ -246,6 +248,8 @@ async def get_wallet_earnings(user_id: str = Depends(_get_current_user_id_no_gue
         raise HTTPException(status_code=503, detail="Wallet service is not configured.")
 
     totals = _earnings_totals(user_id)
+    import creator_levels
+    hold = creator_levels.hold_days_for(supabase_admin, user_id)
     settings = _load_settings(user_id)
     pending = _pending_request(user_id)
     return WalletEarningsResponse(
@@ -254,6 +258,7 @@ async def get_wallet_earnings(user_id: str = Depends(_get_current_user_id_no_gue
         held_coins=totals["pending"],
         held_usd=coins_to_usd(totals["pending"]),
         next_available_at=totals["next_release_at"],
+        hold_days=hold,
         pending_withdrawal_coins=totals["pending_withdrawal"],
         paid_coins=totals["paid"],
         available_usd=coins_to_usd(totals["available"]),
@@ -456,6 +461,9 @@ async def admin_reverse_earning(earning_id: str, body: ReverseIn):
             raise HTTPException(status_code=409, detail="This earning is in a pending withdrawal. Reject that "
                                                         "withdrawal first, then reverse the earning.")
         raise HTTPException(status_code=409, detail="This can't be reversed.")
+    import creator_levels
+    if r.get("creator_id"):
+        creator_levels.forget(str(r["creator_id"]))              # a refund can drop the creator below Pro at once
     return {"id": eid, "changed": bool(r.get("changed")), "status": r.get("status")}
 
 
