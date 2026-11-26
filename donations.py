@@ -2,10 +2,12 @@
 
 Rules this file keeps
   * Only a signed-in, non-guest viewer can donate, never to themselves, and only to an existing VIYO account.
-  * Each donation gets its own NardoPay donation link (link_type "donation"; the donor chooses the amount on NardoPay's
-    page). The exchange rate in use is locked on the donation when it starts.
-  * A donation counts only when NardoPay's signed webhook for that link reports a completed payment in RWF with a
-    positive amount (nardopay_payments.process_event routes it here by link code). The redirect back to VIYO proves
+  * The donor chooses a US-dollar amount in VIYO (DONATION_MIN_CENTS..DONATION_MAX_CENTS); VIYO converts it at the
+    rate in use (locked on the donation) and asks NardoPay for exactly that many francs with its own fixed-amount
+    payment link, so donors never need to know what a franc is worth. NardoPay may add its customer fee on top
+    (shown in VIYO); the creator's share is computed on the donation itself, never on that fee.
+  * A donation counts only when NardoPay's signed webhook for that link reports a completed payment in RWF of the
+    donation's price (or the price plus NardoPay's customer fee, as for coins) (nardopay_payments.process_event routes it here by link code). The redirect back to VIYO proves
     nothing. Each donation and each NardoPay transaction is recorded once (nardopay_record_donation).
   * The creator receives CREATOR_DONATION_SHARE (80%) of the amount, converted at the locked rate into earnings coins
     (wallet.COIN_USD each, rounded down), as a creator_earnings row of kind 'donation', held for the holding period
@@ -25,6 +27,9 @@ import nardopay_payments as np_
 router = APIRouter(prefix="/api/v1", tags=["donations"])
 
 CREATOR_DONATION_SHARE = 0.80
+DONATION_MIN_CENTS = 100          # $1
+DONATION_MAX_CENTS = 50000        # $500
+DONATION_PRESETS_CENTS = (100, 300, 500, 1000, 2000)
 DONATION_REDIRECT_URL = "https://viyo.site/app"
 
 
@@ -51,12 +56,16 @@ def donation_problem() -> Optional[str]:
 
 
 class DonateIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")      # no amount from the client: the donor chooses it on NardoPay
+    model_config = ConfigDict(extra="forbid")
+    # The donor's chosen amount in US cents. VIYO converts it to francs with the server's rate; no RWF amount or rate
+    # is ever taken from the client.
+    usd_cents: int = Field(..., ge=DONATION_MIN_CENTS, le=DONATION_MAX_CENTS)
     message: str = Field("", max_length=200)
 
 
 def _out(d: dict) -> dict:
     return {"donation_id": d["id"], "status": d["status"], "creator_id": d["creator_id"],
+            "usd_cents": d.get("usd_cents"),
             "payment_link": d.get("payment_link") if d["status"] == "pending" else None,
             "amount_rwf": float(d["amount_rwf"]) if d.get("amount_rwf") is not None else None,
             "paid_at": d.get("paid_at")}
@@ -65,7 +74,10 @@ def _out(d: dict) -> dict:
 @router.get("/donations/availability")
 async def availability():
     """Whether the app should show Donate (a yes/no only)."""
-    return {"available": donation_problem() is None, "creator_share": CREATOR_DONATION_SHARE}
+    return {"available": donation_problem() is None, "creator_share": CREATOR_DONATION_SHARE,
+            "min_cents": DONATION_MIN_CENTS, "max_cents": DONATION_MAX_CENTS,
+            "presets_cents": list(DONATION_PRESETS_CENTS),
+            "fee_percent": np_.customer_fee_percent() if donation_problem() is None else None}
 
 
 @router.post("/creators/{creator_id}/donate")
@@ -83,16 +95,19 @@ async def start_donation(creator_id: str, body: DonateIn, donor_id: str = Depend
         raise HTTPException(status_code=404, detail="Creator not found.")
     name = (creator[0].get("display_name") or creator[0].get("username") or "a VIYO creator")[:60]
     rate = np_.latest_rate()
+    price_rwf = np_.rwf_for(body.usd_cents, float(rate["rate"]))
     d = store.insert("creator_donations", [{
         "creator_id": cid, "donor_id": donor_id, "message": body.message.strip(), "rate_id": rate["id"],
-        "usd_rwf_rate": rate["rate"], "creator_share_rate": CREATOR_DONATION_SHARE}])[0]
+        "usd_rwf_rate": rate["rate"], "creator_share_rate": CREATOR_DONATION_SHARE,
+        "usd_cents": body.usd_cents, "price_rwf": price_rwf}])[0]
 
     def fail(reason: str):
         store.update("creator_donations", {"id": d["id"]}, {"status": "failed", "failure_reason": reason[:400]})
         raise HTTPException(status_code=502, detail="NardoPay couldn't start the donation. Try again.")
 
-    request_body = {"link_type": "donation", "title": f"Support {name} on VIYO",
-                    "description": f"A donation to {name} on VIYO",
+    request_body = {"link_type": "payment", "product_name": f"Donation to {name}", "amount_mode": "fixed",
+                    "amount": price_rwf * np_.amount_multiplier(),
+                    "description": f"A ${body.usd_cents / 100:.2f} donation to {name} on VIYO",
                     "metadata": {"donation_id": d["id"]}, "webhook_url": np_.webhook_url(),
                     "redirect_url": DONATION_REDIRECT_URL}
     try:
@@ -166,6 +181,12 @@ def process_payment(d: dict, ev: dict, eid: str, finish) -> tuple[int, dict]:
     unit = np_.amount_multiplier()
     if unit is None or ev.get("amount") is None or ev["amount"] <= 0:
         return finish("mismatch", "no positive amount")
+    if d.get("price_rwf"):
+        # The exact price VIYO asked for, or the price plus NardoPay's customer fee (as for coins); never less.
+        problem = np_.verify_payment({"rwf_amount": d["price_rwf"]}, ev, fee_allowed=True)
+        if problem:
+            print(f"[WARN] NardoPay donation {d['id']} not recorded: {problem}")
+            return finish("mismatch", problem)
     import wallet
     amount = ev["amount"] / unit
     out = np_._rpc("nardopay_record_donation", {
