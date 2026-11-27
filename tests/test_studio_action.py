@@ -147,6 +147,7 @@ def test_action_review_wants_geography_a_reaction_and_beats_in_order():
     ("The crowd surges toward the gate", "crowd"),
     ("Her body glows with power and she transforms", "transform"),
     ("Maya leaps between the rooftops", "fall"),
+    ("Maya leaps a gap between roofs; Daniel jumps after her", "fall"),
     ("The camera does a 360 orbit around them", "camera"),
 ])
 def test_difficult_shots_are_flagged_with_a_simpler_alternative(desc, kind):
@@ -250,7 +251,8 @@ def test_action_scenes_get_more_shots_priced_in_the_quote_and_kept_inside_the_bu
     q_old = client.post(f"/api/v1/studio/projects/{pid}/production/quote", headers=H(u), json={}).json()
     monkeypatch.setattr(act, "ENABLED", True)
     label = lambda q: [i["label"] for st in q["stages"] for i in st["items"] if i.get("reserve_only")]  # noqa: E731
-    assert "Scene 1: up to 8 shot pictures" in label(q_new) and "Scene 3: up to 4 shot pictures" in label(q_new)
+    assert "Scene 1: up to 8 shot pictures" in label(q_new) and "Scene 2: up to 8 shot pictures" in label(q_new)
+    assert not any(x.startswith("Scene 3: up to 8") for x in label(q_new)), "the drama scene isn't given action shots"
     assert not any("up to 8" in x for x in label(q_old))
     assert q_new["total_credits"] > q_old["total_credits"], "the extra shots are in the price before payment"
     before = balance(client, u)["available"]
@@ -272,9 +274,16 @@ def test_every_shot_picture_gets_its_own_instructions_with_references(env):
     assert len(shot_prompts) >= n_shots
     prompts = [x["prompt"] for x in shot_prompts]
     assert len(set(prompts)) == len(prompts), "no two shot pictures get the same prompt"
-    own = [p.split("SCENE: ", 1)[1].split("\nCAMERA:", 1)[0] for p in prompts]
-    worst = max(ss.similarity(a, b) for i, a in enumerate(own) for b in own[i + 1:])
-    assert worst < 0.9, worst
+    parts = [ss.instructions(p) for p in prompts]
+    by_scene = {}
+    for ctx, own in parts:
+        by_scene.setdefault(ctx, []).append(own)
+    assert len(by_scene) == 3, "each scene's context is its own"
+    within = [ss.similarity(a, b) for owns in by_scene.values() for i, a in enumerate(owns) for b in owns[i + 1:]]
+    assert max(within) < 0.8, ("two shots of one scene got near-identical moments", max(within))
+    whole = [ctx + " " + own for ctx, own in parts]
+    across = max(ss.similarity(a, b) for i, a in enumerate(whole) for b in whole[i + 1:])
+    assert across < 0.9, ("two shots of the film got near-identical instructions", across)
     for p in prompts:
         assert "SCENE CONTEXT" in p and "CHARACTERS (permanent identity" in p and "CAMERA:" in p
         assert "SHOT CONTINUITY" in p and "STYLE AND LIGHT" in p

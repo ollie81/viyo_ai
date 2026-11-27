@@ -107,8 +107,8 @@ def measure(db, ai, pid, q, s, rep, images):
     flagged = sum(len(x["_action"].get("feasibility") or []) for x in all_shots)
     shot_imgs = [x for x in images if "SHOT CONTINUITY" in x["prompt"]]
     prompts = [x["prompt"] for x in shot_imgs]
-    own = [p.split("SCENE: ", 1)[1].split("\nCAMERA:", 1)[0] if "SCENE: " in p else p for p in prompts]
-    sims = [ss.similarity(a, b) for i, a in enumerate(own) for b in own[i + 1:]]
+    whole = [" ".join(ss.instructions(p)) for p in prompts]          # scene context (if any) + the shot's moment
+    sims = [ss.similarity(a, b) for i, a in enumerate(whole) for b in whole[i + 1:]]
     m = rep["metrics"]
     return {
         "shot_variety": {"shots": len(all_shots), "distinct_types": m["distinct_shot_types"],

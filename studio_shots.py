@@ -566,3 +566,11 @@ def clip_direction(scene: dict, shots: list[dict], idx: int) -> str:
     if act.get("environment_change"):
         out.append(f"What changes in the place: {act['environment_change']}.")
     return " ".join(out)
+
+
+def instructions(prompt: str) -> tuple[str, str]:
+    """(the scene context given, the shot's own moment) of a shot picture prompt, for measuring duplication."""
+    own = prompt.split("SCENE: ", 1)[1].split("\nCAMERA:", 1)[0] if "SCENE: " in prompt else prompt
+    ctx = prompt.split("SCENE CONTEXT", 1)[1].split("\n\n", 1)[0].split("SHOT CONTINUITY", 1)[0] \
+        if "SCENE CONTEXT" in prompt else ""
+    return ctx, own

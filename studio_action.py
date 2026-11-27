@@ -191,7 +191,7 @@ _RISKS = [
     ("transform", r"\b(transform\w*|morph\w*|shape-?shift\w*|turns? into|power(s)? (surge|activate)|glow\w* with power)\b",
      "high", "Transformations and powers changing a body: identity drifts during the change.",
      "Cut away on a flash of light; show before and after in separate shots."),
-    ("fall", r"\b(falls? from|jumps? (from|between|across) (the )?(roof|building|rooftop)|leaps? (from|between|across))\b",
+    ("fall", r"\b(falls? from|(jumps?|leaps?) (a |the )?(gap |space )?(from|between|across|off)|jumps? after|leaps? after)\b",
      "medium", "Long jumps or falls: bodies float or the landing breaks.",
      "Split into take-off and landing shots; cut during the flight."),
     ("weapon_precision", r"\b(sword clash|blades? (meet|clash)|bullets? (hit|strike)|through the scope|aims? at)\b",
