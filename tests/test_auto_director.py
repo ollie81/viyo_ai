@@ -90,7 +90,8 @@ def test_one_click_production_directs_makes_and_assembles_every_shot_without_the
     assert "CAMERA:" in ai.last_video_prompt
     # The film follows the shot order and every shot is in it.
     r = db.execute("select duration_seconds from public.studio_renders where project_id = %s", (pid,)).fetchone()
-    assert r and float(r[0]) >= sum(x["duration_seconds"] for x in talk + quiet) - 0.6
+    # The time jump into the quiet scene dissolves (0.8 s overlap, studio_look); nothing else is lost.
+    assert r and float(r[0]) >= sum(x["duration_seconds"] for x in talk + quiet) - 0.6 - 0.8
     made = db.execute("select made_with->'_direction' from public.studio_scenes where project_id = %s order by position",
                       (pid,)).fetchall()
     assert all(m[0]["auto_approved"] and m[0]["auto"] for m in made)

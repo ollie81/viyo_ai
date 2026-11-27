@@ -85,6 +85,9 @@ def test_the_fake_director_varies_its_opening_when_told():
     raw = {"shots": [{"type": "wide_two_shot"}, {"type": "over_the_shoulder"}, {"type": "reaction"}]}
     prompt = "x" + look.recent_block([P, P])
     assert [s["type"] for s in ss.vary(raw, prompt)["shots"]][:2] == ["over_the_shoulder", "wide_two_shot"]
+    beats = {"shots": [{"type": "establishing_wide", "beat": "setup"}, {"type": "medium", "beat": "escalation"}]}
+    assert [x["beat"] for x in ss.vary(beats, "x" + look.recent_block([("establishing_wide",)] * 2))["shots"]] == \
+        ["setup", "escalation"], "only the framing changes: the beats stay in order"
     assert ss.vary(raw, "no recent block") == raw
 
 

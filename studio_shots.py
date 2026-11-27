@@ -469,8 +469,12 @@ def vary(raw: dict, prompt: str) -> dict:
     openings = [ln.strip("- ").split(" -> ")[0] for ln in block.splitlines() if " -> " in ln or ln.startswith("- ")]
     first = raw["shots"][0]["type"].replace("_", " ")
     if openings and all(o.strip() == first for o in openings[-2:]):
-        shots = list(raw["shots"])
-        shots[0], shots[1] = shots[1], shots[0]
+        # Open differently but keep the scene's structure: only the framing moves (beats and line order stay).
+        shots = [dict(x) for x in raw["shots"]]
+        keys = ("type", "description", "frame_prompt", "video_prompt", "characters")
+        a, b = {k: shots[0].get(k) for k in keys}, {k: shots[1].get(k) for k in keys}
+        shots[0].update(b)
+        shots[1].update(a)
         return {**raw, "shots": shots}
     return raw
 
