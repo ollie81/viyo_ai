@@ -15,8 +15,12 @@ def test_full_live_check_with_fakes(tmp_path):
     assert report["status"] == "finished", report
     steps = {s["step"].split(" ")[0]: s for s in report["steps"]}
     assert all(s["status"] == "ok" for s in report["steps"]), [(s["step"], s.get("error")) for s in report["steps"]]
-    for n in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10."):
+    for n in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10.", "11."):
         assert n in steps, n
+    # The free whole-film report runs on the mini film's own pictures and clips; it costs nothing.
+    fr = report["film_report"]
+    assert steps["11."]["cost_usd"] == 0 and fr["fingerprinted"] == fr["pieces"] == 2
+    assert fr["duplicate_threshold_bits"] == 5 and isinstance(fr["closest_pair_bits"], int)
     assert [c["voice_status"] for c in report["casting"]] == ["cast", "cast"]
     assert report["casting"][0]["voice"] != report["casting"][1]["voice"]
     assert steps["6."]["detail"]["refs"] == 3 and "speak on camera" in steps["6."]["detail"]["prompt"]

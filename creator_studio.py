@@ -1037,6 +1037,40 @@ async def visual_audit(project_id: str, user_id: str = Depends(creator)):
     return studio_inspect.audit(scenes, jobs)
 
 
+@router.get("/projects/{project_id}/film-report")
+async def film_report(project_id: str, user_id: str = Depends(creator)):
+    """The whole-film report: duplicated or missing shots, camera repetition, pacing, character screen time,
+    continuity and the ending, each with the recommended correction and how it's fixed. Free: no AI call, and it
+    changes nothing (studio_film_report)."""
+    return _film_report(_project(project_id, user_id))
+
+
+def _film_report(p: dict) -> dict:
+    import studio_film_report
+    from studio_worker import characters_in_scene
+    st = get_store()
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    cast = st.select("studio_characters", {"project_id": p["id"]})
+    shots, checks = {}, {}
+    for s in scenes:
+        rows = sorted(_project_shots_of(s), key=lambda r: r["position"])
+        if studio_shots.uses_shots(s, rows):
+            shots[s["id"]] = rows
+            for sh in rows:
+                checks[sh["id"]] = studio_shot_continuity.report(sh.get("inspection"), sh.get("image_path"))
+    presence = {s["id"]: [c["name"] for c in characters_in_scene(s, cast)] for s in scenes}
+    renders = st.select("studio_renders", {"project_id": p["id"]}, order="version", desc=True, limit=1)
+    render = renders[0] if renders else None
+    segments = None
+    if render and render.get("job_id"):
+        job = st.one("studio_jobs", {"id": render["job_id"]}) or {}
+        segments = (job.get("output") or {}).get("segments")       # films rendered before fingerprints: None
+    jobs = st.select("studio_jobs", {"project_id": p["id"], "kind": "inspect"}, order="created_at", desc=True, limit=1000)
+    return studio_film_report.build(p, scenes, shots, cast, presence, segments=segments, render=render,
+                                    continuity_issues=_project_continuity(p), audit=studio_inspect.audit(scenes, jobs),
+                                    shot_checks=checks)
+
+
 @router.get("/projects/{project_id}/continuity")
 async def project_continuity(project_id: str, user_id: str = Depends(creator)):
     """Compares consecutive scenes: outfits, place, time, objects in hand,
