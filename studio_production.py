@@ -36,6 +36,10 @@ ATTEMPTS = 2          # each step: the first try and one automatic retry
 # Reasons a step can't run *yet* that an earlier stage of the run takes care of.
 LATER = ("has no picture yet", "isn't made yet", "Record this scene's voices first", "shot's picture first")
 LANE = {"render": "render"}
+VIDEO_STAGES = ("videos", "lipsync")      # paid video: waits for the storyboard review when it's on
+STORYBOARD_NOTE = ("Your storyboard is ready. Check the characters, framing, actions, camera directions and scene "
+                   "details of every picture. Fix anything that's wrong, then approve it to start the video clips.")
+WAITING = ("running", "needs_attention", "needs_approval", "storyboard_review")
 
 
 def _cs():
@@ -203,6 +207,60 @@ def _stage_of(job: dict) -> str:
     return job["idempotency_key"].split(":")[2]
 
 
+def approved(run: dict) -> int:
+    return int(run.get("approved_credits") if run.get("approved_credits") is not None else run.get("quoted_credits") or 0)
+
+
+def committed(st, run: dict, jobs: Optional[list] = None) -> int:
+    """What the run has spent or tied up: finished steps at their charge, waiting or running steps at their hold."""
+    jobs = _run_jobs(st, run) if jobs is None else jobs
+    return sum(int(j.get("charged_credits") or 0) if j["status"] == "succeeded"
+               else int(j.get("estimated_credits") or 0) if j["status"] in ("queued", "running") else 0 for j in jobs)
+
+
+def _confirmed_targets(run: dict) -> set:
+    plan_ = run.get("plan") or {}
+    if isinstance(plan_, str):
+        plan_ = json.loads(plan_)
+    return {i.get("target_id") for x in plan_.get("stages") or [] for i in x.get("items") or []}
+
+
+def _still_needed(now: dict, jobs: list, from_stage: str) -> list:
+    """Items the run still has to start, from this stage on (not the ones already running)."""
+    open_targets = {j["idempotency_key"].split(":")[3] for j in jobs if j["status"] in ("queued", "running")}
+    order = STAGES.index(from_stage)
+    out = []
+    for x in now["stages"]:
+        if STAGES.index(x["stage"]) < order:
+            continue
+        for i in x["items"]:
+            if i["target_id"] in open_targets:
+                continue
+            if i.get("reserve_only") and any(y["target_id"] != i["target_id"] and y.get("scene_id") == i["target_id"][8:]
+                                             for z in now["stages"] for y in z["items"]):
+                continue
+            out.append({**i, "stage": x["stage"]})
+    return out
+
+
+def _ask_for_budget(st, run: dict, jobs: list, now: dict, stage: str) -> bool:
+    """Pauses the run and asks for more if what's left to make no longer fits the approved budget.
+    Returns True if it paused."""
+    left = _still_needed(now, jobs, stage)
+    need = committed(st, run, jobs) + sum(int(i["credits"]) for i in left)
+    extra = need - approved(run)
+    if extra <= 0:
+        return False
+    confirmed = _confirmed_targets(run)
+    new = [i["label"] for i in left if i["target_id"] not in confirmed and not i.get("reserve_only")]
+    why = (f"New steps that weren't in the approved plan: {', '.join(new[:6])}{'...' if len(new) > 6 else ''}"
+           if new else "Steps that failed and need another try, or prices that changed since you approved")
+    reason = (f"This production needs {extra} more credits than you approved to finish. {why}. Approve the "
+              f"increase (new total {approved(run) + extra} credits) to continue, or cancel and keep what's made.")
+    st.rpc("studio_run_request_budget", {"p_run": run["id"], "p_extra": extra, "p_reason": reason})
+    return True
+
+
 def advance(st, run: dict) -> bool:
     """Moves one run forward. Returns True if it started any step."""
     if run["status"] != "running":
@@ -237,6 +295,12 @@ def advance(st, run: dict) -> bool:
         items = [i for i in needed.get(stage) or [] if not i.get("reserve_only")]
         if not items:
             continue
+        if stage in VIDEO_STAGES and options.get("storyboard_review") and not run.get("storyboard_approved_at"):
+            # Nothing paid for video starts before the creator has approved the storyboard.
+            st.rpc("studio_run_finish", {"p_run": run["id"], "p_status": "storyboard_review", "p_problem": STORYBOARD_NOTE})
+            return False
+        if run.get("approved_credits") is not None and _ask_for_budget(st, run, jobs, now, stage):
+            return False
         stuck, started = [], False
         for item in items:
             tries = [j for j in mine if j["idempotency_key"].split(":")[3] == item["target_id"]
@@ -259,6 +323,14 @@ def advance(st, run: dict) -> bool:
                 "p_from_reserve": not any(j["idempotency_key"].split(":")[3] == item["target_id"] for j in mine)})
             if r and r.get("ok"):
                 started = True
+            elif (r or {}).get("error") == "budget_exceeded":
+                # The database refused to go past the approved budget (another step got there first): ask.
+                if not _ask_for_budget(st, st.one("studio_production_runs", {"id": run["id"]}) or run,
+                                       _run_jobs(st, run), now, stage):
+                    st.rpc("studio_run_request_budget", {"p_run": run["id"], "p_extra": int(r.get("needed") or 1),
+                                                         "p_reason": f"{item['label']} needs {r.get('needed')} more "
+                                                                     "credits than are left in your approved budget."})
+                return started
             else:
                 err = (r or {}).get("error")
                 msg = {"insufficient_credits": "Not enough credits left to continue. Add credits, then resume."}.get(
@@ -354,9 +426,52 @@ def progress(st, run: dict) -> dict:
         h = st.one("studio_credit_holds", {"id": run["hold_id"]})
         if h and h.get("status") == "open":
             held = int(h["credits_held"]) - int(h.get("credits_captured") or 0)
+    spent = sum(int(j.get("charged_credits") or 0) for j in jobs if j["status"] == "succeeded")
+    refunded = sum(int(j.get("estimated_credits") or 0) - (int(j.get("charged_credits") or 0) if j["status"] == "succeeded" else 0)
+                   for j in jobs if j["status"] in ("succeeded", "failed", "canceled"))
+    budget = approved(run)
+    nxt = next((s for s in stages if s["done"] < s["total"]), None)
+    opts = run.get("options") or {}
+    opts = json.loads(opts) if isinstance(opts, str) else opts
     return {"id": run["id"], "status": run["status"], "problem": run.get("problem"),
             "quoted_credits": int(run.get("quoted_credits") or 0),
-            "spent_credits": sum(int(j.get("charged_credits") or 0) for j in jobs),
+            "approved_credits": budget, "needs_credits": int(run.get("needs_credits") or 0) or None,
+            "spent_credits": spent, "refunded_credits": max(refunded, 0),
+            "committed_credits": committed(st, run, jobs), "remaining_budget": max(budget - committed(st, run, jobs), 0),
             "reserved_left": held, "percent": round(100 * done / total) if run["status"] != "done" else 100,
-            "stages": stages, "render_id": run.get("render_id"), "created_at": run.get("created_at"),
+            "stages": stages, "completed_stages": [s["label"] for s in stages if s["done"] >= s["total"]],
+            "next_step": (nxt or {}).get("label") if run["status"] not in ("done", "canceled") else None,
+            "storyboard_review": bool(opts.get("storyboard_review")),
+            "storyboard_approved_at": run.get("storyboard_approved_at"),
+            "render_id": run.get("render_id"), "created_at": run.get("created_at"),
             "finished_at": run.get("finished_at")}
+
+
+def history(st, run: dict) -> dict:
+    """Where every credit of this production went: the reservation and any approved increases, each step's hold,
+    charge and refund, and what came back at the end."""
+    plan_ = run.get("plan") or {}
+    plan_ = json.loads(plan_) if isinstance(plan_, str) else plan_
+    labels = {i["target_id"]: i["label"] for x in plan_.get("stages") or [] for i in x.get("items") or []}
+    try:
+        events = st.select("studio_run_budget_events", {"run_id": run["id"]}, order="id")
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        events = []
+    steps = []
+    for j in sorted(_run_jobs(st, run), key=lambda j: j.get("created_at") or ""):
+        parts = j["idempotency_key"].split(":")
+        held = int(j.get("estimated_credits") or 0)
+        charged = int(j.get("charged_credits") or 0) if j["status"] == "succeeded" else 0
+        steps.append({"stage": STAGE_LABEL.get(parts[2], parts[2]), "label": labels.get(parts[3]) or STAGE_LABEL.get(parts[2]),
+                      "try": int(parts[5]) + 1 if len(parts) > 5 else 1, "status": j["status"], "held": held,
+                      "charged": charged, "refunded": held - charged if j["status"] in ("succeeded", "failed", "canceled") else 0,
+                      "error": j.get("error_message") if j["status"] == "failed" else None,
+                      "at": j.get("finished_at") or j.get("created_at")})
+    return {"events": [{"kind": e["kind"], "credits": int(e["credits"] or 0), "note": e.get("note") or "",
+                        "at": e.get("created_at")} for e in events],
+            "steps": steps,
+            "totals": {"approved": approved(run), "charged": sum(s["charged"] for s in steps),
+                       "refunded": sum(s["refunded"] for s in steps),
+                       "returned": sum(int(e["credits"] or 0) for e in events if e["kind"] == "returned")}}

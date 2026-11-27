@@ -50,7 +50,8 @@ def quote(client, u, pid, **body):
 def produce(client, gen, ren, u, pid, rounds=30, **body):
     q = quote(client, u, pid, **body)
     r = client.post(f"/api/v1/studio/projects/{pid}/production", headers=H(u),
-                    json={"request_id": uuid.uuid4().hex, "confirm_credits": q["total_credits"], **body})
+                    json={"request_id": uuid.uuid4().hex, "confirm_credits": q["total_credits"],
+                          "storyboard_review": False, **body})
     assert r.status_code == 200, r.text
     for _ in range(rounds):
         run(gen)

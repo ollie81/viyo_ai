@@ -39,7 +39,8 @@ def quote(client, u, pid, **body):
 
 def start(client, u, pid, total, **body):
     return client.post(f"/api/v1/studio/projects/{pid}/production", headers=H(u),
-                       json={"request_id": uuid.uuid4().hex, "confirm_credits": total, "direct": False, **body})
+                       json={"request_id": uuid.uuid4().hex, "confirm_credits": total, "direct": False,
+                             "storyboard_review": False, **body})
 
 
 def drive(gen, ren, rounds=12):
@@ -58,7 +59,8 @@ def test_one_price_reserved_then_everything_made_in_order(env):
     assert [s["stage"] for s in q["stages"]] == ["sheets", "images", "voices", "render"]
     assert [len(s["items"]) for s in q["stages"]] == [2, 3, 2, 1] and not q["blocked"]
     total = q["total_credits"]
-    assert total == sum(s["credits"] for s in q["stages"]) and "reserved" in q["note"]
+    assert q["steps_credits"] == sum(s["credits"] for s in q["stages"]) and "reserved" in q["note"]
+    assert total == q["steps_credits"] + q["safety_credits"] and q["safety_credits"] >= 5
     before = balance(client, u)
     r = start(client, u, pid, total)
     assert r.status_code == 200, r.text

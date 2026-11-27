@@ -1713,14 +1713,16 @@ class StudioWorker:
                                   [f"{c['id']}:{c.get('identity_version') or 0}" for c, _o in entries])
         return idx, prev, entries, sig
 
-    def _inspect_shot(self, project, scene, shot, shots, cast=None):
+    def _inspect_shot(self, project, scene, shot, shots, cast=None, picture: Optional[bytes] = None, save: bool = True):
         """Compares a shot picture with the picture before it and the approved
-        references (vision model). Saves and returns the record."""
-        if not shot.get("image_path"):
+        references (vision model). Saves and returns the record. With `picture` (a frame of the shot's clip) that
+        is checked instead, and nothing is saved."""
+        if not shot.get("image_path") and picture is None:
             raise JobFailed("no_picture", "Make this shot's picture first. Your credits were returned.")
         idx, prev, entries, sig = self.shot_check_inputs(project, scene, shot, shots, cast)
         try:
-            images = [("this shot's picture (check this one)", self.files.get(shot["image_path"]))]
+            images = [("a frame from this shot's clip (check this one)", picture) if picture is not None else
+                      ("this shot's picture (check this one)", self.files.get(shot["image_path"]))]
         except Exception:
             raise JobFailed("unreadable", "This shot's picture couldn't be loaded, so it wasn't checked. "
                                           "Your credits were returned.")
@@ -1744,10 +1746,127 @@ class StudioWorker:
                                 ident.cast_block(entries).splitlines(), self._w(project, "image") + world_mod.world_block(location, props),
                                 [label for label, _d in images])
         result, cost = self.ai.inspect(text, images)
-        rec = inspect_mod.record(result, sig, shot["image_path"], cost.total_usd)
+        rec = inspect_mod.record(result, sig, shot.get("image_path"), cost.total_usd)
         rec["previous"] = (prev or {}).get("image_path")
-        self._optional_update("studio_shots", {"id": shot["id"]}, {"inspection": rec})
+        if save:
+            self._optional_update("studio_shots", {"id": shot["id"]}, {"inspection": rec})
         return rec, cost
+
+    # ------------------------------------------------------------ free defect fixes
+
+    def clip_defects(self, data: bytes, expected_seconds: float) -> list[str]:
+        """Technical faults of a clip that make it unusable: unreadable, far too short, mostly frozen or black.
+        Checked with ffmpeg, no AI."""
+        import os
+        import re
+        import subprocess
+        import tempfile
+        problems = []
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(data or b"")
+            path = f.name
+        try:
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                                   capture_output=True, text=True, timeout=60)
+            try:
+                duration = float(probe.stdout.strip())
+            except ValueError:
+                return ["The clip can't be played (the file is damaged)."]
+            if expected_seconds and duration < 0.6 * expected_seconds:
+                problems.append(f"The clip is {duration:.1f}s long instead of about {expected_seconds:.0f}s.")
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-i", path, "-vf",
+                                  "freezedetect=n=0.003:d=1.5,blackdetect=d=1:pix_th=0.05", "-an", "-f", "null", "-"],
+                                 capture_output=True, text=True, timeout=180).stderr
+            frozen = sum(float(x) for x in re.findall(r"freeze_duration: ([0-9.]+)", out))
+            black = sum(float(x) for x in re.findall(r"black_duration:([0-9.]+)", out))
+            if duration and frozen >= 0.5 * duration:
+                problems.append(f"The picture is frozen for {frozen:.1f}s of {duration:.1f}s.")
+            if duration and black >= 0.5 * duration:
+                problems.append(f"The picture is black for {black:.1f}s of {duration:.1f}s.")
+        except Exception as e:
+            print(f"[INFO] clip check skipped: {str(e)[:160]}")
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return problems
+
+    def clip_frame(self, data: bytes) -> Optional[bytes]:
+        """A still from the middle of a clip (to compare with the approved references)."""
+        import os
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "c.mp4"), os.path.join(d, "f.png")
+            with open(src, "wb") as f:
+                f.write(data or b"")
+            try:
+                dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                                            "csv=p=0", src], capture_output=True, text=True, timeout=60).stdout.strip())
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{dur / 2:.2f}", "-i", src, "-frames:v", "1",
+                                out], check=True, timeout=60)
+                with open(out, "rb") as f:
+                    return f.read()
+            except Exception:
+                return None
+
+    @staticmethod
+    def _defect_in(rep: dict) -> Optional[str]:
+        """A shot check that found a real mistake against the references or the storyboard (not one the creator
+        accepted as intentional)."""
+        if rep.get("status") == "failed":
+            return rep.get("summary") or "The picture doesn't match the approved references or the storyboard."
+        if rep.get("status") == "attention" and any(c["severity"] in ("high", "medium") for c in rep.get("checks") or []
+                                                    if not c["passed"]):
+            return rep.get("summary") or "The picture doesn't match the approved references or the storyboard."
+        return None
+
+    def do_shot_fix(self, job, project):
+        """A free correction of one shot's picture or clip, when VIYO's own check confirms a technical or visual
+        defect (wrong character, broken clip, a mismatch with the approved references or storyboard). If the check
+        finds none, nothing is remade or charged and the creator is told a creative remake has a price.
+        Always free for the creator: what VIYO spent is recorded as absorbed."""
+        inp = job.get("input") or {}
+        target = inp.get("target")
+        shot, scene, shots = self._shot_job(job, project)
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        checks, defect, fix_text = [], None, ""
+        if target == "clip":
+            if not shot.get("video_path"):
+                raise JobFailed("no_clip", "This shot has no clip to fix.")
+            data = self.files.get(shot["video_path"])
+            tech = self.clip_defects(data, float(shots_mod.clip_seconds(shot) or shot.get("duration_seconds") or 0))
+            if tech:
+                defect = " ".join(tech)
+            else:
+                frame = self.clip_frame(data)
+                if frame is not None:
+                    rec, c = self._inspect_shot(project, scene, shot, shots, cast, picture=frame, save=False)
+                    checks.append(c)
+                    defect = self._defect_in(shotcheck.report(rec, shot.get("image_path")))
+                    fix_text = inspect_mod.correction_text(rec["result"])
+        else:
+            if not shot.get("image_path"):
+                raise JobFailed("no_picture", "This shot has no picture to fix.")
+            rec, c = self._inspect_shot(project, scene, shot, shots, cast)
+            checks.append(c)
+            rep = shotcheck.report(rec, shot["image_path"])
+            defect, fix_text = self._defect_in(rep), rep.get("fix") or ""
+        checked = pricing.combine(checks) if checks else pricing.Cost("viyo", "ffmpeg-check")
+        if not defect:
+            raise JobFailed("no_defect_found",
+                            "VIYO checked this shot against the approved characters, storyboard and references and found "
+                            "no technical defect, so it wasn't remade and nothing was charged. To change it anyway, use "
+                            "a creative remake (its price is shown first).", absorbed=checked if checks else None)
+        if target == "clip":
+            out, cost = self.do_shot_video({**job, "input": {"shot_id": shot["id"]}}, project)
+        else:
+            out, cost = self.do_shot_image({**job, "input": {"shot_id": shot["id"], "auto_fix": True,
+                                                              "correction": fix_text[:600]}}, project)
+        out.pop("_billable", None)
+        return {**out, "free_fix": True, "defect": defect[:500],
+                "_billable": pricing.Cost("viyo", "free-fix", {"free": 1})}, pricing.combine([checked, cost])
 
     def do_shot_inspect(self, job, project):
         """Checks one shot picture (reused for free if nothing changed)."""

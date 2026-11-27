@@ -14,13 +14,14 @@ import os
 import uuid
 
 import pytest
+
 from PIL import Image
 
 import creator_studio as cs
 import studio_shot_continuity as shotcheck
 from conftest import make_user
 from test_creator_studio import H, balance, env, grant, studio_schema  # noqa: F401
-from test_creator_studio import run, start
+from test_creator_studio import post_job, run, start
 from test_video_drama import detail, project
 
 pytestmark = pytest.mark.skipif(bool(os.environ.get("STUDIO_PREMIGRATION")), reason="needs creator_studio_shot_continuity.sql")
@@ -112,8 +113,7 @@ def shots(client, u, pid):
 
 
 def make(client, gen, u, pid, ids, **extra):
-    r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
-                    json={"kind": "shot_image", "target_ids": ids, "request_id": uuid.uuid4().hex, **extra})
+    r = post_job(client, u, pid, {"kind": "shot_image", "target_ids": ids, "request_id": uuid.uuid4().hex, **extra})
     assert r.status_code == 200, r.text
     run(gen, times=len(ids) + 2)
     return r
@@ -287,8 +287,7 @@ def test_an_unreadable_shot_picture_is_not_checked_and_the_check_is_refunded(fil
     monkeypatch.setattr(files, "get", lambda p: (_ for _ in ()).throw(OSError("gone")) if p == path else real(p))
     insp = __import__("studio_worker").StudioWorker(store, files, ai, "inspect")
     before = balance(client, u)["available"]
-    r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
-                    json={"kind": "shot_inspect", "target_ids": [target], "request_id": uuid.uuid4().hex})
+    r = post_job(client, u, pid, {"kind": "shot_inspect", "target_ids": [target], "request_id": uuid.uuid4().hex})
     assert r.status_code == 200, r.text
     run(insp)
     assert balance(client, u)["available"] == before
@@ -331,8 +330,7 @@ def test_an_approved_shot_is_never_overwritten_by_a_fix(film):
     make(client, gen, u, pid, [target])
     path = db.execute("select image_path from public.studio_shots where id = %s", (target,)).fetchone()[0]
     client.post(f"/api/v1/studio/shots/{target}/approve", headers=H(u), json={"approved": True})
-    r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
-                    json={"kind": "shot_image", "target_ids": [target], "request_id": uuid.uuid4().hex,
+    r = post_job(client, u, pid, {"kind": "shot_image", "target_ids": [target], "request_id": uuid.uuid4().hex,
                           "correction": "different coat"})
     assert r.status_code == 400 and "approved" in r.text
     assert db.execute("select image_path from public.studio_shots where id = %s", (target,)).fetchone()[0] == path
