@@ -15,8 +15,15 @@ def test_full_live_check_with_fakes(tmp_path):
     assert report["status"] == "finished", report
     steps = {s["step"].split(" ")[0]: s for s in report["steps"]}
     assert all(s["status"] == "ok" for s in report["steps"]), [(s["step"], s.get("error")) for s in report["steps"]]
-    for n in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10.", "11."):
+    for n in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10.", "11.", "12."):
         assert n in steps, n
+    # Stage 2: the director's action plan and three real shot pictures (fake here).
+    a = report["action"]
+    assert a["limit"] == 8 and 3 <= a["shots_planned"] <= 8 and a["beats"][0] == "setup"
+    assert a["spatial_problems"] == 0 and "multi_contact" in a["feasibility_flags"]
+    assert a["instructions_most_similar_pair"] < 0.8 and steps["12."]["cost_usd"] < 1.0
+    for f in ("action-shot-1.png", "action-shot-2.png", "action-shot-3.png"):
+        assert f in set(files.list(f"livecheck/{check.id}")), f
     # The free whole-film report runs on the mini film's own pictures and clips; it costs nothing.
     fr = report["film_report"]
     assert steps["11."]["cost_usd"] == 0 and fr["fingerprinted"] == fr["pieces"] == 2

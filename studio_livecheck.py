@@ -189,8 +189,64 @@ class LiveCheck:
                    lambda: self._film(scenes[:2], pictures, voices, talking, talk))
         self._step("11. Whole-film report on the real mini film (free: ffmpeg fingerprints, no AI)", 0.0,
                    lambda: self._film_report(scenes[:2], cast))
+        # Stage 2: the real director plans one action scene; 3 of its shots get real pictures.
+        est = pricing.estimate_shotplan(600 + __import__("studio_action").BRIEF_CHARS, 8).provider_cost_usd + \
+            3 * pricing.image_cost(1, 2000, size).provider_cost_usd
+        self._step("12. Action scene: real director plan + 3 shot pictures (Gemini text + image)", est,
+                   lambda: self._action(ai, cast, portraits, size))
 
     # ------------------------------------------------------------ steps
+
+    def _action(self, ai, cast, portraits, size):
+        """Stage 2 live check: does the real director use the action brief (beats, positions, directions, a shot
+        count that fits), are risky shots flagged, and do three shots of one scene get visibly different pictures?"""
+        import studio_action as action
+        import studio_film_report as film_report
+        import studio_shots as shots_mod
+        names = [c["name"] for c in cast[:2]] or ["Ama", "Kofi"]
+        scene = {"id": "action1", "position": 0, "heading": "EXT. BUS STATION - NIGHT", "duration_seconds": 12,
+                 "visual": f"A man grabs {names[0]}'s bag and runs; {names[0]} chases him between the parked buses, "
+                           f"trips him and wrestles the bag back while {names[-1]} shouts a warning",
+                 "dialogue": [{"character": names[-1], "text": "Behind you!"}],
+                 "continuity": {"purpose": "She refuses to be a victim again", "transition": "new_place",
+                                "characters": [{"name": n, "in_frame": True} for n in names]}}
+        beat = action.scene_beat(scene, [scene])
+        prompt = shots_mod.planner_prompt(self.brief, scene, 1, 1, None, None,
+                                          [f"{c['name']}: {c.get('description') or ''}" for c in cast[:2]],
+                                          limit=action.max_shots(scene), action=action.planner_block(scene, beat))
+        raw, cost = ai.plan_shots(prompt, scene=scene, cast_names=names)
+        plan = shots_mod.clean_plan(raw, scene, names, action.max_shots(scene))
+        review = shots_mod.plan_quality(scene, plan)
+        usd = cost.provider_cost_usd
+        files, hashes, own = [], [], []
+        for i in range(min(3, len(plan))):
+            refs = [portraits[n]["data"] for n in portraits if any(c["name"] == n for c in plan[i]["characters"])][:2]
+            text = (shots_mod.scene_context(scene) + "SCENE: " + shots_mod.moment(scene, plan, i) + "\nCAMERA: "
+                    + shots_mod.camera_text(plan[i]) + f"\nSTYLE AND LIGHT: {self.brief['visual_style']}. No text.")
+            own.append(shots_mod.moment(scene, plan, i))
+            data, _mime, c = ai.image(text, refs, "9:16", size)
+            usd += c.provider_cost_usd
+            name = f"action-shot-{i + 1}.png"
+            self._put(name, data, "image/png")
+            files.append(name)
+            with tempfile.NamedTemporaryFile(suffix=".png") as f:
+                f.write(data)
+                f.flush()
+                hashes.append(film_report.frame_hash(f.name))
+        dist = [film_report.distance(a, b) for i, a in enumerate(hashes) for b in hashes[i + 1:] if a and b]
+        sims = [shots_mod.similarity(a, b) for i, a in enumerate(own) for b in own[i + 1:]]
+        detail = {"shots_planned": len(plan), "limit": action.max_shots(scene),
+                  "beats": [(s.get("_action") or {}).get("beat") for s in plan],
+                  "with_end_positions": sum(1 for s in plan if any(c.get("end_position") for c in s["characters"])),
+                  "movement_directions": [(s.get("_action") or {}).get("movement_direction") for s in plan],
+                  "review_problems": [p["kind"] for p in review],
+                  "spatial_problems": len(action.spatial_review(plan)),
+                  "feasibility_flags": [f["kind"] for s in plan for f in action.feasibility(s, scene)],
+                  "instructions_most_similar_pair": round(max(sims), 2) if sims else None,
+                  "picture_fingerprint_closest_bits": min(dist) if dist else None,
+                  "duplicate_threshold_bits": film_report.HASH_DUPLICATE}
+        self.report["action"] = detail
+        return {}, usd, detail, files
 
     def _film_report(self, scenes, cast):
         """The free whole-film report on real pictures: are different scenes told apart (no false duplicates)?"""

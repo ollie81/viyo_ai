@@ -42,8 +42,37 @@ GENRES = {
               "on the worst person walking in, or a reversal that makes it worse.",
     "drama": "Open on an emotional revelation or a decision that changes a life. Build with conflict between people who "
              "want different things. End on a relationship shift, disturbing news or a decision the viewer fears.",
+    # Action family (studio_action plans the sequences): every fight or chase must change the story.
+    "action": "Open in the middle of danger or on the moment a plan goes wrong. Every action sequence has a goal, an "
+              "obstacle and a cost: set it up, escalate, reverse it, climax, then show the consequence on the people. "
+              "End on a new threat, a costly win or a decision made under fire. Never action for its own sake.",
+    "adventure": "Open on the call to go: a map, a missing person, a door to somewhere new. Build with a journey whose "
+                 "places get harder and stranger, and a team that is tested. End on a discovery, a betrayal on the "
+                 "road or the way home cut off.",
+    "superhero": "Open on the power or the person behind it at a breaking point. Powers have rules and a price; the "
+                 "villain wants something the hero understands. Build with the secret identity under pressure. End on "
+                 "the price paid, the mask slipping or a greater threat revealed.",
+    "martial_arts": "Open on a fight that reveals character, or the insult that starts the feud. Each fight has a "
+                    "different style, place and stake, and the hero loses before they win. Discipline and honour cost "
+                    "something. End on a challenge accepted, a master's secret or a defeat that teaches.",
+    "spy_thriller": "Open on a mission underway or a cover about to break. Build with double agents, tradecraft and "
+                    "information the viewer has that a character lacks. Violence is sudden and has consequences. End "
+                    "on a cover blown, a traitor revealed or an order the hero can't obey.",
+    "survival_thriller": "Open on the moment the world turns hostile: the crash, the storm, the locked door. Build "
+                         "with dwindling resources, a ticking clock and choices between people. Nature and fear are "
+                         "the enemy. End on a resource lost, a rescue that fails or someone who won't make it.",
+    "science_fiction": "Open on the strange thing treated as ordinary, or the ordinary thing turned strange. One big "
+                       "idea with clear rules, explored through people. Build by pushing the idea's consequences. End "
+                       "on what the technology costs, a truth about the world or a choice it forces.",
 }
-_GENRE_WORDS = {"thriller": ("thriller", "crime", "action", "suspense", "spy", "heist"),
+_GENRE_WORDS = {"superhero": ("superhero", "super hero", "superpower", "super power"),
+                "martial_arts": ("martial art", "kung fu", "karate", "wuxia", "taekwondo"),
+                "spy_thriller": ("spy", "espionage", "secret agent"),
+                "survival_thriller": ("survival", "stranded", "castaway"),
+                "science_fiction": ("science fiction", "sci-fi", "scifi", "sci fi", "space opera", "cyberpunk"),
+                "adventure": ("adventure", "quest", "expedition", "treasure"),
+                "action": ("action",),
+                "thriller": ("thriller", "crime", "action", "suspense", "spy", "heist"),
                 "mystery": ("mystery", "detective", "whodunit", "investigation"),
                 "romance": ("romance", "romantic", "love", "dating"),
                 "family": ("family", "sibling", "mother", "father", "inheritance"),

@@ -25,6 +25,7 @@ import studio_identity as ident
 import studio_pricing as pricing
 import studio_render as render
 import film_qc
+import studio_action as action_mod
 import studio_film_report as film_report
 import studio_music as music_mod
 import studio_continuity as continuity
@@ -1574,12 +1575,16 @@ class StudioWorker:
         prev = self._scene_before(project, scene)
         prev_shots = self._shots(prev["id"]) if prev else []
         names = [c["name"] for c in cast]
+        # Action scenes: their beat in the sequence, up to 8 shots, spatial continuity and what models do badly.
+        beat = action_mod.scene_beat(scene, scenes, project) if action_mod.ENABLED else None
+        limit = action_mod.max_shots(scene, project)
         prompt = shots_mod.planner_prompt(project, scene, scene["position"] + 1, len(scenes), prev,
                                           prev_shots[-1] if prev_shots else None,
-                                          ident.cast_block(self._cast_for_scene(project, scene, cast)).splitlines())
+                                          ident.cast_block(self._cast_for_scene(project, scene, cast)).splitlines(),
+                                          limit=limit, action=action_mod.planner_block(scene, beat))
         raw, cost = self.ai.plan_shots(prompt, scene=scene, cast_names=names)
         try:
-            plan = shots_mod.clean_plan(raw, scene, names)
+            plan = shots_mod.clean_plan(raw, scene, names, limit)
         except ValueError as e:
             raise JobFailed("bad_plan", f"The director couldn't plan this scene ({e}). Your credits were returned.",
                             absorbed=cost)
@@ -1592,7 +1597,7 @@ class StudioWorker:
                 raw2, cost2 = self.ai.plan_shots(prompt + "\n\nYOUR PLAN WAS SENT BACK. Fix these problems:\n" +
                                                  shots_mod.review_text(review), scene=scene, cast_names=names)
                 cost = pricing.combine([cost, cost2])
-                plan2 = shots_mod.clean_plan(raw2, scene, names)
+                plan2 = shots_mod.clean_plan(raw2, scene, names, limit)
                 review2 = shots_mod.plan_quality(scene, plan2)
                 if len(review2) < len(review):
                     plan, review, replanned = plan2, review2, True
@@ -1606,11 +1611,18 @@ class StudioWorker:
         rows = [{"scene_id": scene["id"], "project_id": project["id"], "owner_id": project["owner_id"], "position": i,
                  **{k: sh[k] for k in ("shot_type", "camera_angle", "camera_movement", "duration_seconds", "description",
                                       "characters", "line_indices", "dialogue", "audio", "frame_prompt", "video_prompt",
-                                      "continuity", "reason")}} for i, sh in enumerate(plan)]
+                                      "continuity", "reason")},
+                 "made_with": {"_action": _shot_action(sh, scene)} if action_mod.ENABLED and (beat or sh.get("_action"))
+                 else {}} for i, sh in enumerate(plan)]
         self.store.insert("studio_shots", rows)
         made = dict(scene.get("made_with") or {})
         made["_direction"] = {"review": review, "replanned": replanned, "auto": bool((job.get("input") or {}).get("auto")),
                               "shots": len(rows)}
+        if beat:
+            made["_action"] = {**beat, "action_scene": action_mod.is_action(scene, project), "limit": limit,
+                               "flags": sum(len(_shot_action(sh, scene).get("feasibility") or []) for sh in plan)}
+        else:
+            made.pop("_action", None)
         self._optional_update("studio_scenes", {"id": scene["id"]}, {"made_with": made})
         return {"shots": len(rows), "types": [r["shot_type"] for r in rows], "review": review, "replanned": replanned}, cost
 
@@ -1683,10 +1695,15 @@ class StudioWorker:
         if prev and prev.get("observed"):
             state = ("\nTHE PICTURE BEFORE WAS SEEN TO SHOW (carry this over unless the action changes it): "
                      + json.dumps(prev["observed"], ensure_ascii=False)[:900])
-        prompt = ident.scene_prompt(shot["frame_prompt"] or shot["description"], entries, camera, project["visual_style"],
+        # The shot's OWN moment is the subject; the whole scene is given as labelled context (studio_shots.moment),
+        # so two shots of one scene, or shots of two similar scenes, never get the same instructions.
+        own = action_mod.ENABLED
+        prompt = ident.scene_prompt(shots_mod.moment(scene, shots, idx) if own else (shot["frame_prompt"] or shot["description"]),
+                                    entries, camera, project["visual_style"],
                                     project["aspect_ratio"], extra=(roles + "\n") if roles else "",
                                     world=self._w(project, "image") + world_mod.world_block(location, props),
-                                    continuity=continuity.image_block(before, scene) + shots_mod.continuity_block(
+                                    continuity=(shots_mod.scene_context(scene) if own else "")
+                                    + continuity.image_block(before, scene) + shots_mod.continuity_block(
                                         scene, shots, idx, (before or {}).get("continuity", {}).get("end_state", "")) + state,
                                     camera_text=shots_mod.camera_text(shot))
         if correction:
@@ -1698,7 +1715,7 @@ class StudioWorker:
         labels = [label for label, _d in labelled]
         self.store.update("studio_shots", {"id": shot["id"]}, {
             "image_path": path, "status": "picture", "video_path": None,      # a new picture needs a new clip
-            "made_with": {"_refs": labels[:8], "_previous": (prev or {}).get("image_path"),
+            "made_with": {**_kept_action(shot), "_refs": labels[:8], "_previous": (prev or {}).get("image_path"),
                           **({"_correction": correction} if correction else {}),
                           **({"_rejected": rejected} if rejected else {})},
             "updated_at": _now()})
@@ -1933,7 +1950,7 @@ class StudioWorker:
                 else:
                     # The first picture was better: put it (and its check) back. The new one stays in the history.
                     self.store.update("studio_shots", {"id": shot["id"]}, {
-                        "image_path": path, "made_with": {"_refs": labels[:8], "_previous": (prev or {}).get("image_path"),
+                        "image_path": path, "made_with": {**_kept_action(shot), "_refs": labels[:8], "_previous": (prev or {}).get("image_path"),
                                                           "_kept_over": path2}, "updated_at": _now()})
                     self._optional_update("studio_shots", {"id": shot["id"]}, {"inspection": rec})
                     out["continuity"] = rep["status"]
@@ -1964,6 +1981,9 @@ class StudioWorker:
         shot_scene = dict(scene, visual=shot["video_prompt"] or shot["description"], dialogue=shot.get("dialogue") or [],
                           duration_seconds=float(shot["duration_seconds"]), continuity=c, image_path=shot["image_path"])
         direction = continuity.video_block(None, shot_scene) + (f" Sound: {shot['audio']}." if shot.get("audio") else "")
+        if action_mod.ENABLED:
+            extra = shots_mod.clip_direction(scene, shots, next((k for k, x in enumerate(shots) if x["id"] == shot["id"]), 0))
+            direction += (" " + extra) if extra else ""
         seconds = shots_mod.clip_seconds(shot)
         if seconds is None:
             raise JobFailed("too_long", "This shot has too much dialogue for one clip (15 seconds at most). Edit the "
@@ -2397,6 +2417,16 @@ class StudioWorker:
         if not scene or scene["project_id"] != project["id"]:
             raise JobFailed("not_found", "That scene no longer exists.")
         return scene
+
+
+def _shot_action(sh: dict, scene: dict) -> dict:
+    """A planned shot's action record: beat, movement, environment change and feasibility flags."""
+    return {**(sh.get("_action") or {}), "feasibility": action_mod.feasibility(sh, scene)}
+
+
+def _kept_action(shot: dict) -> dict:
+    a = (shot.get("made_with") or {}).get("_action")
+    return {"_action": a} if a else {}
 
 
 def _segment(scene, shot, k, local, video, seconds, path) -> dict:

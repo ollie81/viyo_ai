@@ -558,6 +558,7 @@ def _scene_out(s: dict, urls: dict, cast: Optional[dict] = None, project: Option
             "image_approved": bool(s.get("image_approved_path")) and s.get("image_approved_path") == s.get("image_path"),
             "inspection": _inspection_out(s),
             "voice_check": ((s.get("made_with") or {}).get("_voice") or None),
+            "action": ((s.get("made_with") or {}).get("_action") or None),
             **_scene_world(s, elements),
             "consistency": _consistency(s, cast, resolved)}
 
@@ -793,7 +794,7 @@ async def admin_live_check(body: LiveCheckIn):
     No creator data or credits are touched. Returns a results link."""
     import studio_livecheck
     if not body.confirm_spend:
-        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.35,
+        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.65,
                 "note": "Send confirm_spend to run it. Costs real money on Viyo's Google and sync.so accounts."}
     with _live_lock:
         busy = [c for c in _live_running.values() if c.report.get("status") == "running"]
@@ -1886,7 +1887,8 @@ def _project_shots_of(scene: dict) -> list:
 
 def _shot_out(sh: dict, urls: dict) -> dict:
     return {"continuity_check": studio_shot_continuity.report(sh.get("inspection"), sh.get("image_path")),
-            "voice_check": ((sh.get("made_with") or {}).get("_voice") or None), "id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
+            "voice_check": ((sh.get("made_with") or {}).get("_voice") or None),
+            "action": ((sh.get("made_with") or {}).get("_action") or None), "id": sh["id"], "scene_id": sh["scene_id"], "position": sh["position"], "shot_type": sh["shot_type"],
             "camera_angle": sh.get("camera_angle") or "", "camera_movement": sh.get("camera_movement") or "static",
             "duration_seconds": float(sh["duration_seconds"]), "description": sh.get("description") or "",
             "characters": sh.get("characters") or [], "dialogue": sh.get("dialogue") or [], "audio": sh.get("audio") or "",
@@ -2357,8 +2359,12 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
     if kind == "shotplan":
         if target.get("shot_plan_approved"):
             return pricing.estimate_shotplan(), "The shot plan is approved. Unapprove it to plan again."
+        import studio_action
+        action = studio_action.is_action(target)
         return pricing.estimate_shotplan(len(target.get("visual") or "") + sum(len(d.get("text") or "")
-                                                                              for d in target.get("dialogue") or [])), \
+                                                                              for d in target.get("dialogue") or [])
+                                         + (studio_action.BRIEF_CHARS if action else 0),
+                                         studio_action.MAX_ACTION_SHOTS if action else 4), \
             (None if (target.get("visual") or target.get("heading") or "").strip() else "Describe what this scene shows first.")
     if kind == "shot_inspect":
         if not target.get("image_path"):
