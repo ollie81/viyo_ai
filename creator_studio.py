@@ -794,7 +794,7 @@ async def admin_live_check(body: LiveCheckIn):
     No creator data or credits are touched. Returns a results link."""
     import studio_livecheck
     if not body.confirm_spend:
-        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.65,
+        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.8,
                 "note": "Send confirm_spend to run it. Costs real money on Viyo's Google and sync.so accounts."}
     with _live_lock:
         busy = [c for c in _live_running.values() if c.report.get("status") == "running"]
@@ -1036,6 +1036,54 @@ async def visual_audit(project_id: str, user_id: str = Depends(creator)):
     scenes = st.select("studio_scenes", {"project_id": p["id"]})
     jobs = st.select("studio_jobs", {"project_id": p["id"], "kind": "inspect"}, order="created_at", desc=True, limit=1000)
     return studio_inspect.audit(scenes, jobs)
+
+
+class LookIn(BaseModel):
+    lens: Optional[str] = Field(None, max_length=240)
+    depth_of_field: Optional[str] = Field(None, max_length=240)
+    camera: Optional[str] = Field(None, max_length=240)
+    light: Optional[str] = Field(None, max_length=240)
+    palette: Optional[list[str]] = Field(None, max_length=8)
+    contrast_and_grade: Optional[str] = Field(None, max_length=240)
+    texture: Optional[str] = Field(None, max_length=240)
+    framing: Optional[str] = Field(None, max_length=240)
+    avoid: Optional[list[str]] = Field(None, max_length=8)
+    style: Optional[str] = Field(None, max_length=400)
+    reset: bool = False
+
+
+def _look_state(p: dict) -> dict:
+    import studio_look
+    saved = (p.get("story_bible") or {}).get("look")
+    st = get_store()
+    made = any(s.get("image_path") or s.get("video_path") for s in st.select("studio_scenes", {"project_id": p["id"]}))
+    look = saved or studio_look.default_look(p, (p.get("story_bible") or {}).get("world"))
+    applies = studio_look.ENABLED and (bool(saved) or not made)
+    return {"look": look, "saved": bool(saved), "applies": applies, "fields": list(studio_look.FIELDS),
+            "labels": studio_look.LABELS,
+            "note": ("Every picture and clip of this production gets this look." if applies else
+                     "This production was started before the look bible: save a look to use it for the pictures and "
+                     "clips made from now on (already-made ones keep their look).")}
+
+
+@router.get("/projects/{project_id}/look")
+async def get_look(project_id: str, user_id: str = Depends(creator)):
+    """The production's look bible (lens, light, palette, grade, framing...): saved, or the one VIYO proposes from
+    the genre, the creator's style and the story world. Free."""
+    return _look_state(_project(project_id, user_id))
+
+
+@router.put("/projects/{project_id}/look")
+async def put_look(project_id: str, body: LookIn, user_id: str = Depends(creator)):
+    """Saves the creator's look (or resets it to VIYO's proposal). Free; used for every picture and clip made after."""
+    import studio_look
+    p = _project(project_id, user_id)
+    base = studio_look.default_look(p, (p.get("story_bible") or {}).get("world"))
+    current = base if body.reset else ((p.get("story_bible") or {}).get("look") or base)
+    look = current if body.reset else studio_look.clean(body.model_dump(exclude_none=True, exclude={"reset"}), current)
+    bible = {**(p.get("story_bible") or {}), "look": look}
+    p = get_store().update("studio_projects", {"id": p["id"]}, {"story_bible": bible, "updated_at": _now_iso()})[0]
+    return _look_state(p)
 
 
 @router.get("/projects/{project_id}/film-report")

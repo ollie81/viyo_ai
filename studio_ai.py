@@ -902,7 +902,7 @@ class FakeStudioAI:
         self._maybe_fail("plan_shots")
         r = getattr(self, "shots_result", None)
         raw = (r(prompt, scene) if callable(r) else r) if r is not None else \
-            studio_shots.default_plan(scene or {}, list(cast_names or []))
+            studio_shots.vary(studio_shots.default_plan(scene or {}, list(cast_names or [])), prompt)
         return raw, pricing.text_cost(1800, 900)
 
     def summarize(self, prompt):

@@ -389,7 +389,7 @@ STRONG = re.compile(r"\b(afraid|terrified|frightened|scared|furious|angry|rage|c
 CLOSE = ("close_up", "extreme_close_up", "reaction")
 
 
-def plan_quality(scene: dict, shots: list[dict]) -> list[dict]:
+def plan_quality(scene: dict, shots: list[dict], recent: Optional[list] = None) -> list[dict]:
     """A cinematography review of a cleaned shot plan (not continuity): coverage, variety, the speaker seen
     when they speak, the reaction to the key line, an emotional beat held close, an establishing view of a
     new place, a reason for every shot, and screen direction kept. Each problem names the shot and the fix."""
@@ -452,7 +452,27 @@ def plan_quality(scene: dict, shots: list[dict]) -> list[dict]:
             for p in studio_action.action_review(scene, shots):
                 if p["kind"] != "screen_direction":           # already checked above
                     add(p["shot"], p["kind"], p["problem"], p["fix"])
+    if recent:
+        import studio_look
+        for p in studio_look.repetition(shots, recent):
+            add(p["shot"], p["kind"], p["problem"], p["fix"])
     return out
+
+
+def vary(raw: dict, prompt: str) -> dict:
+    """The fake director reading 'HOW THE LAST SCENES WERE FILMED': if its plan opens like those scenes, it swaps
+    its first two shots (tests only; a real director plans from the brief)."""
+    import studio_look
+    if "HOW THE LAST SCENES WERE FILMED" not in (prompt or "") or len((raw or {}).get("shots") or []) < 2:
+        return raw
+    block = prompt.split("HOW THE LAST SCENES WERE FILMED", 1)[1].split("\n- If this scene", 1)[0]
+    openings = [ln.strip("- ").split(" -> ")[0] for ln in block.splitlines() if " -> " in ln or ln.startswith("- ")]
+    first = raw["shots"][0]["type"].replace("_", " ")
+    if openings and all(o.strip() == first for o in openings[-2:]):
+        shots = list(raw["shots"])
+        shots[0], shots[1] = shots[1], shots[0]
+        return {**raw, "shots": shots}
+    return raw
 
 
 def _words(text: str) -> set:

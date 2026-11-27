@@ -194,6 +194,9 @@ class LiveCheck:
             3 * pricing.image_cost(1, 2000, size).provider_cost_usd
         self._step("12. Action scene: real director plan + 3 shot pictures (Gemini text + image)", est,
                    lambda: self._action(ai, cast, portraits, size))
+        # Stage 3: two different scenes with the same look; how close is their colour?
+        self._step("13. Look bible: 2 scene pictures with the same film look (image)",
+                   2 * pricing.image_cost(1, 1500, size).provider_cost_usd, lambda: self._look(ai, size))
 
     # ------------------------------------------------------------ steps
 
@@ -246,6 +249,33 @@ class LiveCheck:
                   "picture_fingerprint_closest_bits": min(dist) if dist else None,
                   "duplicate_threshold_bits": film_report.HASH_DUPLICATE}
         self.report["action"] = detail
+        return {}, usd, detail, files
+
+    def _look(self, ai, size):
+        """Stage 3 live check: two different scenes get the identical look block; their average colours are compared
+        (a rough signal only: different scenes may rightly differ)."""
+        import studio_look as look
+        lk = look.default_look({"genre": self.brief.get("genre") or "Drama", "visual_style": self.brief["visual_style"]})
+        block = look.block(lk)
+        usd, files, colours = 0.0, [], []
+        for i, what in enumerate(["A young nurse waits alone at an empty bus stop at night, rain on the shelter glass",
+                                  "The same nurse unlocks the door of a small flat, a single lamp on inside"]):
+            data, _mime, c = ai.image(block + "SCENE: " + what + "\nNo text.", [], "9:16", size)
+            usd += c.provider_cost_usd
+            name = f"look-scene-{i + 1}.png"
+            self._put(name, data, "image/png")
+            files.append(name)
+            with tempfile.NamedTemporaryFile(suffix=".png") as f:
+                f.write(data)
+                f.flush()
+                px = __import__("subprocess").run(["ffmpeg", "-v", "error", "-i", f.name, "-vf", "scale=1:1",
+                                                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
+            colours.append(list(px[:3]) if len(px) >= 3 else None)
+        dist = (sum((a - b) ** 2 for a, b in zip(*colours)) ** 0.5) if all(colours) else None
+        detail = {"genre": lk["genre"], "palette": lk["palette"], "average_colours": colours,
+                  "colour_distance": round(dist, 1) if dist is not None else None,
+                  "note": "0 = identical average colour; under ~40 is close. A rough signal only."}
+        self.report["look"] = detail
         return {}, usd, detail, files
 
     def _film_report(self, scenes, cast):

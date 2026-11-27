@@ -42,6 +42,8 @@ class SceneInput:
     move: str = "push_in"
     fade_in: float = 0.0     # seconds from black (a time jump, a flashback, the film's opening)
     fade_out: float = 0.0    # seconds to black (the film's last shot)
+    # seconds this scene dissolves in from the one before (a time jump or a flashback): the two overlap
+    dissolve_in: float = 0.0
     # (start, end) seconds of each spoken line in the scene's voice track, so captions follow the voices.
     line_times: tuple = ()
 
@@ -230,6 +232,7 @@ def render_film(scenes: list[SceneInput], aspect_ratio: str, out: str, tmp: str,
         clip = os.path.join(tmp, f"scene_{i:03d}.mp4")
         render_scene(s, w, h, clip, tmp, i, captions)
         clips.append(clip)
+    clips = _dissolves(clips, scenes, tmp)
     listing = os.path.join(tmp, "clips.txt")
     with open(listing, "w") as f:
         for c in clips:
@@ -246,6 +249,29 @@ def render_film(scenes: list[SceneInput], aspect_ratio: str, out: str, tmp: str,
             sha.update(chunk)
     return {"duration": round(info["duration"], 2), "width": info["width"], "height": info["height"],
             "bytes": os.path.getsize(out), "sha256": sha.hexdigest()}
+
+
+def _dissolves(clips: list[str], scenes: list[SceneInput], tmp: str) -> list[str]:
+    """Each scene with dissolve_in > 0 is cross-faded (picture and sound) with the scene before it; only those two
+    clips are re-encoded, the rest are joined as they are."""
+    out = [clips[0]]
+    for i in range(1, len(clips)):
+        d = float(getattr(scenes[i], "dissolve_in", 0) or 0)
+        if d <= 0:
+            out.append(clips[i])
+            continue
+        prev = out[-1]
+        pd, cd = probe(prev)["duration"], probe(clips[i])["duration"]
+        d = min(d, pd / 3, cd / 3)
+        merged = os.path.join(tmp, f"dissolve_{i:03d}.mp4")
+        _run(["ffmpeg", "-y", "-v", "error", "-i", prev, "-i", clips[i], "-filter_complex",
+              f"[0:v][1:v]xfade=transition=fade:duration={d:.2f}:offset={pd - d:.2f},format=yuv420p[v];"
+              f"[0:a][1:a]acrossfade=d={d:.2f}[a]", "-map", "[v]", "-map", "[a]",
+              "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-maxrate", "8M", "-bufsize", "16M",
+              "-profile:v", "high", "-pix_fmt", "yuv420p", "-r", str(FPS),
+              "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", merged], f"dissolve into scene {i + 1}")
+        out[-1] = merged
+    return out
 
 
 def add_music(video: str, music: str, out: str, volume: float = 0.25) -> None:

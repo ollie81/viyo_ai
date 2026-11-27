@@ -26,6 +26,7 @@ import studio_pricing as pricing
 import studio_render as render
 import film_qc
 import studio_action as action_mod
+import studio_look as look_mod
 import studio_film_report as film_report
 import studio_music as music_mod
 import studio_continuity as continuity
@@ -200,9 +201,11 @@ class StudioWorker:
         self.store.update("studio_projects", {"id": project["id"]}, {"script": text, "updated_at": _now()})
         if bible:
             # The world and the larger story belong to the production, not to one draft: keep them.
-            bible = {k: v for k, v in bible.items() if k not in ("world", "saga")}
+            bible = {k: v for k, v in bible.items() if k not in ("world", "saga", "look")}
             if world:
                 bible["world"] = world
+            if (project.get("story_bible") or {}).get("look"):
+                bible["look"] = project["story_bible"]["look"]      # the film keeps its look across rewrites
             if saga:
                 bible["saga"] = saga_mod.mark_revealed(saga, len(earlier) + 1)
             self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
@@ -456,13 +459,50 @@ class StudioWorker:
             project["story_bible"] = bible
         return added
 
-    def _w(self, project, purpose: str) -> str:
-        """The world text for one department (cached for this job)."""
+    def _w(self, project, purpose: str, look: bool = True) -> str:
+        """The world text for one department (cached for this job); pictures and clips also get the film's look."""
         key = (project.get("id"), project.get("updated_at"))
         cache = getattr(self, "_world_cache", None)
         if not cache or cache[0] != key:
             self._world_cache = cache = (key, self.story_world(project))
-        return wb.block(cache[1], purpose)
+        text = wb.block(cache[1], purpose)
+        if look and purpose in ("image", "video") and look_mod.ENABLED:
+            text += look_mod.block(self.film_look(project))
+        return text
+
+    def film_look(self, project) -> Optional[dict]:
+        """The production's look (studio_look): its saved one, its series' one, or, for a production with nothing
+        made yet, the default look, saved now so every later picture gets the same one. A production with pictures
+        made before the look bible gets none unless the creator saves one."""
+        key = (project.get("id"), project.get("updated_at"))
+        cached = getattr(self, "_look_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        bible = project.get("story_bible") or {}
+        look = bible.get("look")
+        if not look and project.get("series_id"):
+            for e in self.store.select("studio_projects", {"series_id": project["series_id"], "owner_id": project["owner_id"]}):
+                if e["id"] != project["id"] and (e.get("story_bible") or {}).get("look"):
+                    look = e["story_bible"]["look"]
+                    break
+        if not look and not self._anything_made(project):
+            look = look_mod.default_look(project, self.story_world(project))
+        if look and bible.get("look") != look:
+            bible = {**bible, "look": look}
+            self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
+            project["story_bible"] = bible
+        self._look_cache = (key, look)
+        return look
+
+    def _anything_made(self, project) -> bool:
+        scenes = self.store.select("studio_scenes", {"project_id": project["id"]})
+        if any(s.get("image_path") or s.get("video_path") for s in scenes):
+            return True
+        try:
+            return any(sh.get("image_path") for sh in self.store.select("studio_shots", {"project_id": project["id"]}))
+        except Exception:
+            self._rollback()
+            return False
 
     def novel_episode(self, project) -> Optional[dict]:
         """For an episode adapted from an approved novel (Story Intelligence stage 7): its plan, the novel's own
@@ -924,7 +964,9 @@ class StudioWorker:
             self._optional_update("studio_characters", {"id": ch["id"]}, {"identity": identity})
         ch = dict(ch, identity=identity)
         size, style = _size(project), (project.get("visual_style") or "") + (
-            "\n" + self._w(project, "characters") + self._w(project, "image") if self._w(project, "image") else "")
+            # Reference sheets stay neutral (no film look): they anchor the face for every film the character is in.
+            "\n" + self._w(project, "characters") + self._w(project, "image", look=False)
+            if self._w(project, "image", look=False) else "")
         anchor = self.files.get(anchor_path) if anchor_path and ident.ANCHOR not in order else None
         face = None
         made, failed = [], []
@@ -1578,10 +1620,14 @@ class StudioWorker:
         # Action scenes: their beat in the sequence, up to 8 shots, spatial continuity and what models do badly.
         beat = action_mod.scene_beat(scene, scenes, project) if action_mod.ENABLED else None
         limit = action_mod.max_shots(scene, project)
+        # Film-wide variety: how the last scenes were filmed, so this one doesn't repeat them (studio_look).
+        recent = [look_mod.pattern(self._shots(x["id"])) for x in scenes
+                  if x["position"] < scene["position"]][-3:] if look_mod.ENABLED else []
         prompt = shots_mod.planner_prompt(project, scene, scene["position"] + 1, len(scenes), prev,
                                           prev_shots[-1] if prev_shots else None,
                                           ident.cast_block(self._cast_for_scene(project, scene, cast)).splitlines(),
-                                          limit=limit, action=action_mod.planner_block(scene, beat))
+                                          limit=limit, action=action_mod.planner_block(scene, beat)
+                                          + look_mod.recent_block(recent))
         raw, cost = self.ai.plan_shots(prompt, scene=scene, cast_names=names)
         try:
             plan = shots_mod.clean_plan(raw, scene, names, limit)
@@ -1590,7 +1636,7 @@ class StudioWorker:
                             absorbed=cost)
         # The director's own cinematography review (coverage, variety, the speaker seen, the reaction, the
         # emotional beat, geography, screen direction). Weak plans are re-planned once; the better one is kept.
-        review = shots_mod.plan_quality(scene, plan)
+        review = shots_mod.plan_quality(scene, plan, recent)
         replanned = False
         if review:
             try:
@@ -1598,7 +1644,7 @@ class StudioWorker:
                                                  shots_mod.review_text(review), scene=scene, cast_names=names)
                 cost = pricing.combine([cost, cost2])
                 plan2 = shots_mod.clean_plan(raw2, scene, names, limit)
-                review2 = shots_mod.plan_quality(scene, plan2)
+                review2 = shots_mod.plan_quality(scene, plan2, recent)
                 if len(review2) < len(review):
                     plan, review, replanned = plan2, review2, True
             except Exception as e:          # a failed re-plan never loses the first, valid plan
@@ -2019,7 +2065,11 @@ class StudioWorker:
         last = bool(ordered) and ordered[-1]["id"] == scene["id"]
         timings = () if spoken_in_clip else tuple(tuple(x) for x in ((scene.get("audio_voices") or {}).get("_timings") or []))
         return {"move": render.movement(" ".join(x for x in (c.get("camera_movement"), c.get("camera")) if x)),
-                "fade_in": 0.6 if first else 0.5 if c.get("transition") in ("time_jump", "flashback") else 0.0,
+                # A time jump or flashback dissolves from the scene before (studio_look on), else dips from black.
+                "fade_in": 0.6 if first else 0.0 if look_mod.ENABLED and c.get("transition") in ("time_jump", "flashback")
+                else 0.5 if c.get("transition") in ("time_jump", "flashback") else 0.0,
+                "dissolve_in": 0.8 if look_mod.ENABLED and not first and c.get("transition") in ("time_jump", "flashback")
+                else 0.0,
                 "fade_out": 0.8 if last else 0.0, "line_times": timings}
 
     def _shot_scene_input(self, project, scene, shots, fetch, tmp, segments=None):
@@ -2057,7 +2107,7 @@ class StudioWorker:
                     f"joining the shots of scene {n + 1}")
         has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
         scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
-        film = {k: v for k, v in self._film_edit(scene, scenes, True).items() if k in ("fade_in", "fade_out")}
+        film = {k: v for k, v in self._film_edit(scene, scenes, True).items() if k in ("fade_in", "fade_out", "dissolve_in")}
         return render.SceneInput(
             **film,
             duration=render.probe(joined)["duration"], video=joined,
