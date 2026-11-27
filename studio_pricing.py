@@ -276,10 +276,11 @@ def estimate_inspection(images: int = 5) -> Cost:
     return text_cost(2500 + SHEET_REF_TOKENS * max(1, images), THINKING_BUDGET + 900)
 
 
-def estimate_shotplan(scene_chars: int = 1500) -> Cost:
+def estimate_shotplan(scene_chars: int = 1500, shots: int = 4) -> Cost:
     """The director planning one scene's shots: one text call, and one re-plan if its own cinematography
-    review sends the plan back (only what runs is charged)."""
-    return text_cost(2 * (2200 + scene_chars // 3), 2 * (THINKING_BUDGET + 1400))
+    review sends the plan back (only what runs is charged). An action scene's brief is longer and it may
+    plan up to 8 shots."""
+    return text_cost(2 * (2200 + scene_chars // 3), 2 * (THINKING_BUDGET + 350 * max(4, shots)))
 
 
 SEARCH_USD = 0.035        # one Google Search grounded request (approximate, after the free allowance)

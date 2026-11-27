@@ -46,7 +46,15 @@ SCHEMA = {
         "description": {"type": "string", "description": "What we see in this shot, as one coherent image."},
         "characters": {"type": "array", "items": {"type": "object", "properties": {
             "name": _S, "position": {"type": "string", "description": "Where in frame: left, right, centre, background."},
-            "facing": _S, "action": _S}, "required": ["name"]}},
+            "facing": _S, "action": _S,
+            "end_position": {"type": "string", "description": "Where they are when the shot ends (action scenes)."}},
+            "required": ["name"]}},
+        "beat": {"type": "string", "enum": ["setup", "escalation", "reversal", "climax", "consequence", ""],
+                 "description": "Action scenes: this shot's beat in the sequence."},
+        "movement_direction": {"type": "string", "enum": ["left_to_right", "right_to_left", "toward_camera",
+                                                          "away_from_camera", "none", ""],
+                               "description": "Action scenes: which way the main movement goes on screen."},
+        "environment_change": {"type": "string", "description": "Action scenes: what changes in the place, or empty."},
         "line_indices": {"type": "array", "items": {"type": "integer"},
                          "description": "Which of the scene's lines (0-based) are heard in this shot, in order."},
         "audio": {"type": "string", "description": "Sound besides the lines (e.g. rain, a door slams), or empty."},
@@ -65,7 +73,8 @@ def _t(x, n=400) -> str:
 
 
 def planner_prompt(project: dict, scene: dict, number: int, total: int, prev: Optional[dict],
-                   prev_last_shot: Optional[dict], cast_lines: list[str]) -> str:
+                   prev_last_shot: Optional[dict], cast_lines: list[str], limit: int = MAX_SHOTS,
+                   action: str = "") -> str:
     c = scene.get("continuity") or {}
     lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
     talk = "\n".join(f"{i}. {d.get('character')}: \"{d.get('text')}\"{' (' + d['emotion'] + ')' if d.get('emotion') else ''}"
@@ -93,7 +102,7 @@ CHARACTERS (permanent look):
 {chr(10).join(cast_lines) or '(none)'}
 
 HOW TO DIRECT:
-- Choose 1 to {MAX_SHOTS} shots from what the moment needs, not a fixed pattern. Every shot must add something:
+- Choose 1 to {limit} shots from what the moment needs, not a fixed pattern. Every shot must add something:
   a new piece of information, a reaction, a reveal. No two shots in a row with the same type and framing.
 - A conversation usually opens on a wide two-shot (who is where), then a medium or over-the-shoulder on the speaker,
   a close-up on the listener reacting to an important line, and back to the speaker. An emotional beat lingers on a
@@ -104,7 +113,9 @@ HOW TO DIRECT:
   The first shot starts from how the scene starts (and the scene before, if it's continuous).
 - Every line of the scene is heard in exactly one shot, in order (line_indices). A shot's duration must fit its lines.
 - The durations add up to the scene's {scene.get('duration_seconds')} seconds; no shot under {MIN_SHOT} seconds.
-- reason: one plain sentence for the creator, e.g. "A close-up on Daniel so we see the lie land."."""
+- reason: one plain sentence for the creator, e.g. "A close-up on Daniel so we see the lie land."
+- Every shot shows its OWN moment: write frame_prompt and description for this shot only (who does what, where,
+  how it's framed), never a copy of the scene summary or of another shot.{action}"""
 
 
 def _norm_names(names: list[str], cast_names: list[str]) -> list[str]:
@@ -119,21 +130,22 @@ def _norm_names(names: list[str], cast_names: list[str]) -> list[str]:
     return out
 
 
-def clean_plan(raw, scene: dict, cast_names: list[str]) -> list[dict]:
+def clean_plan(raw, scene: dict, cast_names: list[str], limit: int = MAX_SHOTS) -> list[dict]:
     """Valid shots only, in order: known types, characters from the cast, every
     line heard exactly once in order, durations that add up to the scene."""
     shots_in = (raw or {}).get("shots") if isinstance(raw, dict) else None
     lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
     total = float(scene.get("duration_seconds") or 6)
     shots = []
-    for s in (shots_in or [])[:MAX_SHOTS]:
+    for s in (shots_in or [])[:limit]:
         if not isinstance(s, dict) or s.get("type") not in SHOT_TYPES or not _t(s.get("description")):
             continue
         chars = []
         for c in s.get("characters") or []:
             if isinstance(c, dict) and _norm_names([c.get("name")], cast_names):
                 chars.append({"name": _norm_names([c.get("name")], cast_names)[0], "position": _t(c.get("position"), 80),
-                              "facing": _t(c.get("facing"), 80), "action": _t(c.get("action"), 200)})
+                              "facing": _t(c.get("facing"), 80), "action": _t(c.get("action"), 200),
+                              **({"end_position": _t(c.get("end_position"), 80)} if _t(c.get("end_position")) else {})})
         mov = _t(s.get("movement"), 40).lower()
         dur = s.get("duration_seconds")
         shots.append({"shot_type": s["type"], "camera_angle": _t(s.get("angle"), 80) or "eye level",
@@ -143,7 +155,8 @@ def clean_plan(raw, scene: dict, cast_names: list[str]) -> list[dict]:
                       "lines_wanted": [i for i in s.get("line_indices") or [] if isinstance(i, int) and 0 <= i < len(lines)],
                       "audio": _t(s.get("audio"), 200), "frame_prompt": _t(s.get("frame_prompt"), 900) or _t(s.get("description"), 600),
                       "video_prompt": _t(s.get("video_prompt"), 900) or _t(s.get("description"), 600),
-                      "continuity": _t(s.get("continuity"), 400), "reason": _t(s.get("reason"), 300)})
+                      "continuity": _t(s.get("continuity"), 400), "reason": _t(s.get("reason"), 300),
+                      "_action": _action_fields(s)})
     if not shots:
         raise ValueError("the director returned no usable shots")
     shots = shots[:max(1, int(total // MIN_SHOT))]
@@ -207,6 +220,9 @@ def _fit_durations(shots: list[dict], total: float) -> None:
 def default_plan(scene: dict, cast_names: list[str]) -> dict:
     """A plausible plan (used by the fake AI in tests): coverage chosen from the
     scene's kind, not one pattern for everything."""
+    import studio_action
+    if studio_action.is_action(scene):
+        return _default_action_plan(scene, cast_names)
     lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
     speakers = _norm_names([d.get("character") for d in lines], cast_names)
     present = _norm_names([c.get("name") for c in (scene.get("continuity") or {}).get("characters") or []
@@ -239,6 +255,52 @@ def default_plan(scene: dict, cast_names: list[str]) -> dict:
                   "line_indices": [], "reason": "A quiet moment: one held shot sets the mood."}]
     for s in shots:
         s.update(duration_seconds=0, frame_prompt=s["description"], video_prompt=s["description"], movement="static")
+    return {"shots": shots}
+
+
+def _default_action_plan(scene: dict, cast_names: list[str]) -> dict:
+    """The fake director following the action brief: beats in order, a wide for geography, one action per shot,
+    positions that carry from shot to shot, one screen direction, a reaction at the end. The number of shots
+    follows the scene (its length and how much happens), never always the maximum."""
+    import studio_action
+    lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
+    present = _norm_names([c.get("name") for c in (scene.get("continuity") or {}).get("characters") or []
+                           if c.get("in_frame", True)], cast_names) or \
+        _norm_names([d.get("character") for d in lines], cast_names) or cast_names[:1]
+    a = present[0]
+    b = present[1] if len(present) > 1 else None
+    visual = scene.get("visual") or ""
+    dur = float(scene.get("duration_seconds") or 6)
+    busy = studio_action.action_score(scene)
+    n = max(3, min(studio_action.MAX_ACTION_SHOTS, int(dur // 2), 3 + busy))
+    plan = [("establishing_wide", "setup", f"Wide: {visual}. {a}" + (f" on the left, {b} on the right" if b else " on the left")
+             + ", the whole space visible", "left_to_right", "left", "left"),
+            ("medium", "escalation", f"{a} moves in on the danger: {visual}", "left_to_right", "left", "centre"),
+            ("close_up", "escalation", f"Close on {a}'s face as the threat closes in", "none", "centre", "centre"),
+            ("insert", "escalation", "The hand and the object that decide the moment, up close", "none", "centre", "centre"),
+            ("over_the_shoulder", "reversal", f"Over {a}'s shoulder: the tables turn" + (f" on {b}" if b else ""),
+             "left_to_right", "centre", "centre"),
+            ("medium", "climax", f"The decisive move: {a} acts" + (f" and {b} is thrown back" if b else ""),
+             "left_to_right", "centre", "right"),
+            ("wide_two_shot", "climax", "Wide on the result: the space after the impact, " + visual[:80],
+             "none", "right", "right"),
+            ("reaction", "consequence", f"Close on {a}, breathing hard: what it cost", "none", "right", "right")]
+    if n < len(plan):                      # keep the arc: set-up, the first and last escalation, climax, consequence
+        keep = [0, 1, 5, 7] + [2, 4, 3, 6]
+        idx = sorted(keep[:n])
+        plan = [plan[i] for i in idx]
+    shots = []
+    for k, (kind, beat, desc, move, start, end) in enumerate(plan):
+        who = [{"name": a, "position": start, "end_position": end, "action": desc[:80]}]
+        if b and kind in ("establishing_wide", "over_the_shoulder", "wide_two_shot", "medium"):
+            who.append({"name": b, "position": "right", "end_position": "right"})
+        shots.append({"type": kind, "description": desc, "characters": who if kind != "insert" else [],
+                      "line_indices": [k] if k < len(lines) else [], "reason": f"The {beat}: one clear beat.",
+                      "beat": beat, "movement_direction": move,
+                      "environment_change": "dust and debris in the air" if beat == "climax" else ""})
+    for s in shots:
+        s.update(duration_seconds=0, frame_prompt=s["description"], video_prompt=s["description"], movement="tracking"
+                 if s["movement_direction"] != "none" else "static")
     return {"shots": shots}
 
 
@@ -377,7 +439,56 @@ def plan_quality(scene: dict, shots: list[dict]) -> list[dict]:
                     "Keep the 180-degree rule: each person stays on the same side.")
             elif side:
                 sides.setdefault(name, side)
+            end = (x.get("end_position") or "").lower()
+            end_side = "left" if "left" in end else "right" if "right" in end else None
+            if end_side:                           # a move shown inside the shot: the next shot starts there
+                sides[name] = end_side
+    import studio_action
+    if studio_action.ENABLED:
+        for i, j in same_moment(shots):
+            add(j, "duplicate", f"Shots {i} and {j} show the same moment with the same framing.",
+                "Give each shot its own moment: a different action, reaction, angle or size.")
+        if studio_action.is_action(scene):
+            for p in studio_action.action_review(scene, shots):
+                if p["kind"] != "screen_direction":           # already checked above
+                    add(p["shot"], p["kind"], p["problem"], p["fix"])
     return out
+
+
+def _words(text: str) -> set:
+    return set(re.findall(r"[a-z0-9']+", (text or "").lower())) - _STOP
+
+
+_STOP = {"the", "a", "an", "and", "of", "to", "in", "on", "at", "is", "are", "with", "her", "his", "their", "them",
+         "she", "he", "they", "it", "as", "into", "from", "this", "that", "shot", "frame"}
+
+
+def similarity(a: str, b: str) -> float:
+    """Word overlap of two texts (Jaccard, ignoring small words): 1.0 = the same words."""
+    wa, wb = _words(a), _words(b)
+    return len(wa & wb) / len(wa | wb) if (wa or wb) else 1.0
+
+
+def same_moment(shots: list[dict], threshold: float = 0.85) -> list[tuple[int, int]]:
+    """Pairs of shots (1-based) with the same size, the same people and (nearly) the same moment text."""
+    out = []
+    for i in range(len(shots)):
+        for j in range(i + 1, len(shots)):
+            a, b = shots[i], shots[j]
+            if a.get("shot_type") == b.get("shot_type") and \
+                    {c.get("name") for c in a.get("characters") or []} == {c.get("name") for c in b.get("characters") or []} and \
+                    similarity(a.get("frame_prompt") or a.get("description"), b.get("frame_prompt") or b.get("description")) >= threshold:
+                out.append((i + 1, j + 1))
+    return out
+
+
+def _action_fields(s: dict) -> dict:
+    beat = _t(s.get("beat"), 20).lower()
+    move = _t(s.get("movement_direction"), 20).lower()
+    out = {"beat": beat if beat in ("setup", "escalation", "reversal", "climax", "consequence") else "",
+           "movement_direction": move if move in ("left_to_right", "right_to_left", "toward_camera", "away_from_camera")
+           else "none", "environment_change": _t(s.get("environment_change"), 200)}
+    return {k: v for k, v in out.items() if v and v != "none"} or {}
 
 
 def review_text(problems: list[dict]) -> str:
@@ -386,9 +497,72 @@ def review_text(problems: list[dict]) -> str:
 
 
 def estimate_shots(scene: dict) -> int:
-    """How many shots to reserve for before the director has planned (an upper bound, refunded if unused)."""
+    """How many shots to reserve for before the director has planned (an upper bound, refunded if unused).
+    An action scene reserves up to studio_action.MAX_ACTION_SHOTS; the director may use fewer."""
+    import studio_action
+    if studio_action.is_action(scene):
+        return studio_action.reserve_shots(scene)
     lines = [d for d in scene.get("dialogue") or [] if (d.get("text") or "").strip()]
     dur = float(scene.get("duration_seconds") or 6)
     speakers = len({(d.get("character") or "").lower() for d in lines})
     want = 1 + (1 if lines else 0) + (1 if speakers >= 2 else 0) + (1 if dur >= 8 or len(lines) >= 3 else 0)
     return max(1, min(MAX_SHOTS, want, int(dur // MIN_SHOT) or 1))
+
+
+# ------------------------------------------------------------------ what each shot's picture and clip is told
+
+def scene_context(scene: dict) -> str:
+    """The whole scene, labelled as context: the picture shows ONE moment of it, never a summary of it."""
+    c = scene.get("continuity") or {}
+    parts = [("Where", scene.get("heading")), ("What happens in the scene", scene.get("visual")),
+             ("Why the scene matters", c.get("purpose")), ("During the scene", c.get("action")),
+             ("The scene starts with", c.get("start_state")), ("The scene ends with", c.get("end_state"))]
+    body = "".join(f"- {k}: {_t(v, 500)}\n" for k, v in parts if _t(v))
+    return ("SCENE CONTEXT (the whole scene, for context only; this picture is ONE moment of it, described under "
+            "THIS SHOT, not a summary of the scene):\n" + body) if body else ""
+
+
+def moment(scene: dict, shots: list[dict], idx: int) -> str:
+    """This shot's own moment: what it shows, who is where and moving which way, what changes in the place."""
+    shot = shots[idx]
+    act = (shot.get("made_with") or {}).get("_action") or shot.get("_action") or {}
+    head = f"THIS SHOT (shot {idx + 1} of {len(shots)}" + (f", the {act['beat']}" if act.get("beat") else "") + "): "
+    what = _t(shot.get("frame_prompt") or shot.get("description"), 900)
+    desc = _t(shot.get("description"), 600)
+    if desc and desc.lower() not in what.lower():
+        what += f" {desc}"
+    out = [head + what.rstrip(".") + "."]
+    who = []
+    for c in shot.get("characters") or []:
+        bits = [x for x in (c.get("position"), f"facing {c['facing']}" if c.get("facing") else "", c.get("action"),
+                            f"ends {c['end_position']}" if c.get("end_position") else "") if x]
+        if bits:
+            who.append(f"{c['name']}: {', '.join(bits)}")
+    if who:
+        out.append("Who is where in this shot: " + "; ".join(who) + ".")
+    if act.get("movement_direction") and act["movement_direction"] != "none":
+        out.append(f"Movement on screen: {act['movement_direction'].replace('_', ' ')}.")
+    if act.get("environment_change"):
+        out.append(f"What changes in the place: {act['environment_change']}.")
+    spoken = [d for d in shot.get("dialogue") or [] if (d.get("text") or "").strip()]
+    if spoken:
+        out.append("In this moment: " + "; ".join(f"{d.get('character')} says \"{_t(d['text'], 120)}\""
+                                                 + (f" ({d['emotion']})" if d.get("emotion") else "") for d in spoken) + ".")
+    return " ".join(out)
+
+
+def clip_direction(scene: dict, shots: list[dict], idx: int) -> str:
+    """Added to a shot's clip instructions: the scene for context, and this shot's movement and end positions."""
+    shot = shots[idx]
+    act = (shot.get("made_with") or {}).get("_action") or {}
+    out = []
+    if _t(scene.get("visual")):
+        out.append(f"Scene context (this clip is one moment of it): {_t(scene.get('visual'), 400)}.")
+    if act.get("movement_direction") and act["movement_direction"] != "none":
+        out.append(f"Movement on screen: {act['movement_direction'].replace('_', ' ')}.")
+    ends = [f"{c['name']} ends {c['end_position']}" for c in shot.get("characters") or [] if c.get("end_position")]
+    if ends:
+        out.append("By the end of the clip: " + "; ".join(ends) + ".")
+    if act.get("environment_change"):
+        out.append(f"What changes in the place: {act['environment_change']}.")
+    return " ".join(out)
