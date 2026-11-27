@@ -47,8 +47,9 @@ class Budget:
 
 class LiveCheck:
     def __init__(self, files, ai=None, lipsync=None, cap_usd: float = 5.0, check_id: Optional[str] = None,
-                 brief: Optional[dict] = None):
+                 brief: Optional[dict] = None, make_music=None):
         self.files, self.ai, self.lipsync = files, ai, lipsync
+        self.make_music = make_music
         self.id = check_id or secrets.token_urlsafe(18)
         self.budget = Budget(cap_usd)
         self.brief = dict(brief or BRIEF)
@@ -197,6 +198,8 @@ class LiveCheck:
         # Stage 3: two different scenes with the same look; how close is their colour?
         self._step("13. Look bible: 2 scene pictures with the same film look (image)",
                    2 * pricing.image_cost(1, 1500, size).provider_cost_usd, lambda: self._look(ai, size))
+        # Stage 4: the planned score for the mini film; two cues from the real music model.
+        self._step("14. Score: cue sheet + 2 original cues (Lyria)", 0.16, lambda: self._score(scenes[:2], cast))
 
     # ------------------------------------------------------------ steps
 
@@ -249,6 +252,35 @@ class LiveCheck:
                   "picture_fingerprint_closest_bits": min(dist) if dist else None,
                   "duplicate_threshold_bits": film_report.HASH_DUPLICATE}
         self.report["action"] = detail
+        return {}, usd, detail, files
+
+    def _score(self, scenes, cast):
+        """Stage 4 live check: the cue sheet of the mini film (with a forced second mood) and two real Lyria cues:
+        do they come back as usable audio of a sensible length?"""
+        import studio_music as music
+        import studio_score as score
+        rows = [{"id": f"scene{k + 1}", "position": k, "visual": s.get("visual") or "", "duration_seconds": 12,
+                 "dialogue": s.get("dialogue") or [], "continuity": {}} for k, s in enumerate(scenes)]
+        project = {"genre": self.brief.get("genre") or "Drama", "logline": self.brief.get("logline") or "",
+                   "title": self.brief.get("title") or ""}
+        cues = [c for c in score.sheet(project, rows, cast) if not c["silent"]]
+        if len(cues) < 2:              # make sure two different moods are tried
+            cues = cues + [{**cues[0], "index": 1, "mood": "tension", "intensity": 3}] if cues else []
+        maker = self.make_music or music.generate
+        usd, files, out = 0.0, [], []
+        for cue in cues[:2]:
+            data = maker({**project, "_cue": cue}, cue["seconds"])
+            usd += music.COST_PER_SONG_USD
+            name = f"score-cue-{cue['index'] + 1}-{cue['mood']}.mp3"
+            self._put(name, data, "audio/mpeg")
+            files.append(name)
+            with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
+                f.write(data)
+                f.flush()
+                secs = render.probe(f.name)["duration"]
+            out.append({"mood": cue["mood"], "seconds": round(secs, 1), "bytes": len(data)})
+        detail = {"cues": out, "themes": score.themes(cast, rows)}
+        self.report["score"] = detail
         return {}, usd, detail, files
 
     def _look(self, ai, size):

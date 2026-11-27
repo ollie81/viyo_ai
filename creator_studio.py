@@ -603,7 +603,8 @@ def _project_out(p: dict) -> dict:
     import studio_story_check
     out["story_check_outdated"] = studio_story_check.outdated((p.get("story_bible") or {}).get("evaluation") or {},
                                                               p.get("script") or "")
-    out.update(has_music=bool(p.get("music_path")), music_volume=float(p.get("music_volume") or 0.25),
+    out.update(has_music=bool(p.get("music_path")) or any(c.get("path") for c in ((p.get("story_bible") or {})
+                                                                               .get("score") or {}).get("cues") or []), music_volume=float(p.get("music_volume") or 0.25),
                auto_music=p.get("auto_music") is not False,
                auto_inspect=p.get("auto_inspect") is not False,
                image_quality=p.get("image_quality") or "standard",
@@ -794,7 +795,7 @@ async def admin_live_check(body: LiveCheckIn):
     No creator data or credits are touched. Returns a results link."""
     import studio_livecheck
     if not body.confirm_spend:
-        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.8,
+        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.95,
                 "note": "Send confirm_spend to run it. Costs real money on Viyo's Google and sync.so accounts."}
     with _live_lock:
         busy = [c for c in _live_running.values() if c.report.get("status") == "running"]
@@ -1084,6 +1085,35 @@ async def put_look(project_id: str, body: LookIn, user_id: str = Depends(creator
     bible = {**(p.get("story_bible") or {}), "look": look}
     p = get_store().update("studio_projects", {"id": p["id"]}, {"story_bible": bible, "updated_at": _now_iso()})[0]
     return _look_state(p)
+
+
+@router.get("/projects/{project_id}/score")
+async def score_sheet(project_id: str, user_id: str = Depends(creator)):
+    """The film's planned score (studio_score): each cue's scenes, mood, intensity and character themes, the planned
+    silences, which cues are already made, and what the new ones add to the render. Free."""
+    import studio_score
+    from studio_worker import characters_in_scene
+    p = _project(project_id, user_id)
+    st = get_store()
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    cast = st.select("studio_characters", {"project_id": p["id"]})
+    present = {s["id"]: [c["name"] for c in characters_in_scene(s, cast)] for s in scenes}
+    cues = studio_score.sheet(p, scenes, cast, present)
+    new = {c["index"] for c in studio_score.to_make(p, cues)}
+    own = bool(p.get("music_path"))
+    off = p.get("auto_music") is False
+    return {
+        "enabled": studio_score.ENABLED and not own and not off,
+        "uses": "your music" if own else "no music" if off else "planned score" if studio_score.ENABLED else "one track",
+        "cues": [{**{k: c[k] for k in ("index", "mood", "silent", "positions", "seconds", "intensity", "characters",
+                                       "themes")}, "status": "silent" if c["silent"] else "new" if c["index"] in new
+                  else "made"} for c in cues],
+        "themes": studio_score.themes(cast, scenes),
+        "new_cues": len(new),
+        "music_credits": pricing.credits_for(0.08 * len(new)) if new and not own and not off else 0,
+        "note": "Each new cue is one original instrumental track, made when the film is rendered; cues that haven't "
+                "changed are reused for free. A character's theme is described to every cue they're in, but the same "
+                "melody in every cue isn't guaranteed."}
 
 
 @router.get("/projects/{project_id}/film-report")
@@ -2466,7 +2496,7 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
             if studio_shots.uses_shots(sc, rows):
                 problem = studio_shots.shot_problem(sc["position"] + 1, rows, scene_speech(sc, p) == "video_model", sc)
                 if problem:
-                    return pricing.render_cost(secs, music_generated=music_mod.wanted(p)), problem
+                    return pricing.render_cost(secs, **_music_hold(p)), problem
         scenes = [sc for sc in scenes if not studio_shots.uses_shots(sc, by_scene.get(sc["id"], []))]
         missing = next((s["position"] + 1 for s in sorted(scenes, key=lambda s: s["position"])
                         if not (s.get("image_path") or (s["mode"] == "video" and s.get("video_path")))), None)
@@ -2481,8 +2511,23 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
                          if needs_lipsync(s, p) and not s.get("lipsync_path")), None)
         if reason is None and unsynced:
             reason = f"Scene {unsynced}'s lip sync isn't made yet."
-        return pricing.render_cost(secs, music_generated=music_mod.wanted(p)), reason
+        return pricing.render_cost(secs, **_music_hold(p)), reason
     raise HTTPException(status_code=400, detail="Unknown job type.")
+
+
+def _music_hold(p: dict) -> dict:
+    """What the render holds for music: the score's cues still to be made (studio_score), or one track."""
+    import studio_score
+    if not music_mod.wanted(p):
+        return {"music_generated": False}
+    if not studio_score.ENABLED:
+        return {"music_generated": True}
+    from studio_worker import characters_in_scene
+    st = get_store()
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    cast = st.select("studio_characters", {"project_id": p["id"]})
+    present = {s["id"]: [c["name"] for c in characters_in_scene(s, cast)] for s in scenes}
+    return {"music_tracks": len(studio_score.to_make(p, studio_score.sheet(p, scenes, cast, present)))}
 
 
 def _voice_problem(scene: dict, cast: list[dict]) -> Optional[str]:

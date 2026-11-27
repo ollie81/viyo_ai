@@ -27,6 +27,7 @@ import studio_render as render
 import film_qc
 import studio_action as action_mod
 import studio_look as look_mod
+import studio_score as score_mod
 import studio_film_report as film_report
 import studio_music as music_mod
 import studio_continuity as continuity
@@ -2406,9 +2407,13 @@ class StudioWorker:
                                          (synced or s["video_path"]) if use_video else s["image_path"]))
             music = None
             music_generated = False
+            music_tracks = None
             if project.get("music_path"):
                 music = os.path.join(tmp, "music.m4a")
                 self.files.get_to(project["music_path"], music)
+            elif music_mod.wanted(project) and score_mod.ENABLED:
+                # The planned score (studio_score): cues that follow the story, planned silences, character themes.
+                music, music_tracks = self._score(job, project, scenes, inputs, tmp)
             elif music_mod.wanted(project):
                 # A music problem never stops the film: it's made without music
                 # and the score isn't charged. The next render tries again.
@@ -2460,7 +2465,64 @@ class StudioWorker:
                                               "duration_seconds": info["duration"], "bytes": info["bytes"],
                                               "sha256": info["sha256"]}])
         return {"path": path, "bunny_video_id": bunny_id, "version": version, **info, "segments": segments}, \
-            pricing.render_cost(info["duration"], info["bytes"], music_generated=music_generated)
+            pricing.render_cost(info["duration"], info["bytes"], music_generated=music_generated, music_tracks=music_tracks)
+
+    def _score(self, job, project, scenes, inputs, tmp):
+        """The film's score from its cue sheet. Reuses every cue whose instructions haven't changed; makes the rest
+        (one Lyria track each). A cue that fails stays silent and isn't charged; the film is still made.
+        Returns (local music bed or None, number of cues generated)."""
+        cast = self.store.select("studio_characters", {"project_id": project["id"]})
+        present = {s["id"]: [c["name"] for c in characters_in_scene(s, cast)] for s in scenes}
+        cues = score_mod.sheet(project, scenes, cast, present)
+        bible = project.get("story_bible") or {}
+        saved = {c.get("key"): c for c in (bible.get("score") or {}).get("cues") or [] if c.get("path")}
+        spans = score_mod.timeline([float(i.duration) for i in inputs],
+                                   [float(getattr(i, "dissolve_in", 0) or 0) for i in inputs])
+        where = {s["id"]: spans[k] for k, s in enumerate(scenes)}
+        placed, record, generated = [], [], 0
+        world = self.story_world(project)
+        for cue in cues:
+            entry = {k: cue[k] for k in ("index", "mood", "silent", "positions", "seconds", "intensity", "characters",
+                                         "themes")}
+            if cue["silent"]:
+                record.append(entry)
+                continue
+            key = score_mod.cue_key(project, cue)
+            entry["key"] = key
+            local = os.path.join(tmp, f"cue_{cue['index']}.mp3")
+            path = (saved.get(key) or {}).get("path")
+            if path:
+                try:
+                    self.files.get_to(path, local)
+                except Exception:
+                    path = None
+            if not path:
+                try:
+                    track = self.make_music({**project, "_world": world, "_cue": cue}, cue["seconds"])
+                except music_mod.MusicGenerationError as exc:
+                    print(f"[INFO] studio job {job['id']}: cue {cue['index'] + 1} left silent: {exc}")
+                    record.append({**entry, "failed": True})
+                    continue
+                with open(local, "wb") as f:
+                    f.write(track)
+                path = new_path(job["owner_id"], project["id"], "music", "mp3")
+                self.files.put_file(path, local, "audio/mpeg")
+                self.store.insert("studio_assets", [{"owner_id": job["owner_id"], "project_id": project["id"],
+                                                     "job_id": job["id"], "kind": "music", "path": path,
+                                                     "bytes": len(track)}])
+                generated += 1
+            entry["path"] = path
+            record.append(entry)
+            placed.append((local, where[cue["scenes"][0]][0], where[cue["scenes"][-1]][1]))
+        bible = {**bible, "score": {"cues": record, "made_at": _now()}}
+        self._optional_update("studio_projects", {"id": project["id"]},
+                              {"story_bible": bible, **({"music_name": "Viyo Original Score"} if placed else {})})
+        project["story_bible"] = bible
+        if not placed:
+            return None, generated
+        bed = os.path.join(tmp, "viyo-score.wav")
+        render.score_bed(placed, spans[-1][1] if spans else 0, bed)
+        return bed, generated
 
     def _scene(self, job, project):
         scene = self.store.one("studio_scenes", {"id": job["scene_id"]})

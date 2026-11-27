@@ -274,6 +274,29 @@ def _dissolves(clips: list[str], scenes: list[SceneInput], tmp: str) -> list[str
     return out
 
 
+def score_bed(cues: list[tuple[str, float, float]], total: float, out: str) -> None:
+    """The film's music track from its cues: each cue (path, start, end) is looped or trimmed to its stretch of the
+    film, faded in and out, and placed at its start; everything else (planned silences) is silent."""
+    total = max(0.5, total)
+    if not cues:
+        _run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{total:.2f}",
+              out], "silent score")
+        return
+    cmd = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-t", f"{total:.2f}", "-i", "anullsrc=r=48000:cl=stereo"]
+    parts, labels = [], ["[0:a]"]
+    for k, (path, start, end) in enumerate(cues, start=1):
+        d = max(0.5, end - start)
+        cmd += ["-stream_loop", "-1", "-i", path]
+        fin, fout = min(1.0, d / 4), min(1.5, d / 3)
+        parts.append(f"[{k}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=duration={d:.2f},asetpts=PTS-STARTPTS,"
+                     f"afade=t=in:d={fin:.2f},afade=t=out:st={d - fout:.2f}:d={fout:.2f},"
+                     f"adelay={int(start * 1000)}|{int(start * 1000)}[c{k}]")
+        labels.append(f"[c{k}]")
+    graph = ";".join(parts) + ";" + "".join(labels) + f"amix=inputs={len(labels)}:duration=first:normalize=0[a]"
+    _run(cmd + ["-filter_complex", graph, "-map", "[a]", "-t", f"{total:.2f}", "-ar", "48000", "-ac", "2", out],
+         "building the score")
+
+
 def add_music(video: str, music: str, out: str, volume: float = 0.25) -> None:
     """Background music under the whole film, looped to length, faded in and
     out, and pushed down automatically whenever someone speaks (ducking).
