@@ -961,7 +961,20 @@ class FakeStudioAI:
         from PIL import Image
         w, h = (540, 960) if aspect_ratio == "9:16" else (960, 540)
         buf = io.BytesIO()
-        Image.new("RGB", (w, h), (40, 30, 90)).save(buf, "PNG")
+        img = Image.new("RGB", (w, h), (40, 30, 90))
+        if getattr(self, "varied_pictures", False):
+            # Opt-in (benchmarks): a different picture for every prompt, so the same prompt draws the same picture
+            # and different prompts don't look identical to the film report's fingerprints.
+            import hashlib
+            import random
+            from PIL import ImageDraw
+            rnd = random.Random(hashlib.sha256(prompt.encode()).hexdigest())
+            draw = ImageDraw.Draw(img)
+            for _ in range(8):
+                x, y = rnd.randrange(w), rnd.randrange(h)
+                draw.rectangle([x, y, x + rnd.randrange(60, w // 2), y + rnd.randrange(60, h // 2)],
+                               fill=tuple(rnd.randrange(256) for _ in range(3)))
+        img.save(buf, "PNG")
         return buf.getvalue(), "image/png", pricing.image_cost(1, 300, size)
 
     def voice(self, text, voice, style=""):
@@ -986,11 +999,21 @@ class FakeStudioAI:
         size = "720x1280" if aspect_ratio == "9:16" else "1280x720"
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "v.mp4")
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=24:duration=3",
-                            "-f", "lavfi", "-i", "sine=f=300:d=3", "-c:v", "libx264", "-preset", "ultrafast",
+            varied = getattr(self, "varied_pictures", False)
+            # Opt-in (benchmarks): a clip of the length asked for, continuing its first frame, like a real
+            # image-to-video model. Otherwise a fixed 3-second test pattern.
+            secs = max(1, int(seconds)) if varied else 3
+            source = ["-f", "lavfi", "-i", f"testsrc2=size={size}:rate=24:duration={secs}"]
+            if varied and first_frame:
+                with open(os.path.join(d, "first.png"), "wb") as f:
+                    f.write(first_frame)
+                source = ["-loop", "1", "-t", str(secs), "-i", os.path.join(d, "first.png")]
+            subprocess.run(["ffmpeg", "-y", "-v", "error", *source,
+                            "-f", "lavfi", "-i", f"sine=f=300:d={secs}", "-vf", f"scale={size.replace('x', ':')},format=yuv420p,fps=24",
+                            "-c:v", "libx264", "-preset", "ultrafast",
                             "-c:a", "aac", "-shortest", out], check=True)
             data = open(out, "rb").read()
-        return data, pricing.video_cost(3.0, 3 * 5792, 1000)
+        return data, pricing.video_cost(float(secs), secs * 5792, 1000)
 
 
 # Viyo makes adult fiction: violence, crime, death, dark themes and adult

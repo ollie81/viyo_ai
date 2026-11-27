@@ -25,6 +25,7 @@ import studio_identity as ident
 import studio_pricing as pricing
 import studio_render as render
 import film_qc
+import studio_film_report as film_report
 import studio_music as music_mod
 import studio_continuity as continuity
 import studio_inspect as inspect_mod
@@ -2001,7 +2002,7 @@ class StudioWorker:
                 "fade_in": 0.6 if first else 0.5 if c.get("transition") in ("time_jump", "flashback") else 0.0,
                 "fade_out": 0.8 if last else 0.0, "line_times": timings}
 
-    def _shot_scene_input(self, project, scene, shots, fetch, tmp):
+    def _shot_scene_input(self, project, scene, shots, fetch, tmp, segments=None):
         """A scene made of shots: each shot is rendered for its own length (its
         clip, or its picture with a slow push-in), then joined in order into
         one scene clip that goes through the normal film render."""
@@ -2013,12 +2014,16 @@ class StudioWorker:
         for k, sh in enumerate(shots):
             clip = os.path.join(tmp, f"s{n}_shot{k}.mp4")
             spoken = [d for d in sh.get("dialogue") or [] if (d.get("text") or "").strip()]
+            seconds = max(float(sh["duration_seconds"]),
+                          shots_mod.speech_seconds(spoken) if talking and spoken and sh.get("video_path") else 0)
+            image = None if sh.get("video_path") else fetch(sh["image_path"], f"s{n}_shot{k}.img")
+            video = fetch(sh["video_path"], f"s{n}_shot{k}_v.mp4") if sh.get("video_path") else None
+            if segments is not None:
+                segments.append(_segment(scene, sh, k, video or image, bool(video), seconds,
+                                         sh.get("video_path") or sh.get("image_path")))
             render.render_scene(render.SceneInput(
                 # A talking shot is never cut before its lines end.
-                duration=max(float(sh["duration_seconds"]),
-                             shots_mod.speech_seconds(spoken) if talking and spoken and sh.get("video_path") else 0),
-                image=None if sh.get("video_path") else fetch(sh["image_path"], f"s{n}_shot{k}.img"),
-                video=fetch(sh["video_path"], f"s{n}_shot{k}_v.mp4") if sh.get("video_path") else None,
+                duration=seconds, image=image, video=video,
                 lines=tuple(d["text"] for d in sh.get("dialogue") or [] if d.get("text")),
                 move=render.movement(sh.get("camera_movement") or "", sh.get("shot_type") or ""),
                 video_audio=bool(sh.get("video_path")) and (talking or not (sh.get("dialogue") or []))),
@@ -2301,6 +2306,7 @@ class StudioWorker:
                                          "dialogue isn't missing from the film.")
         with tempfile.TemporaryDirectory() as tmp:
             inputs = []
+            segments = []        # one free fingerprint per piece of the film, for the whole-film report
             for s in scenes:
                 def fetch(path, name):
                     if not path:
@@ -2310,7 +2316,7 @@ class StudioWorker:
                     return local
                 n = s["position"]
                 if s["id"] in shot_based:
-                    inputs.append(self._shot_scene_input(project, s, shot_rows[s["id"]], fetch, tmp))
+                    inputs.append(self._shot_scene_input(project, s, shot_rows[s["id"]], fetch, tmp, segments))
                     continue
                 synced = s.get("lipsync_path") if needs_lipsync(s, project) else None
                 use_video = synced or (s["mode"] == "video" and s.get("video_path"))
@@ -2325,6 +2331,9 @@ class StudioWorker:
                     lines=tuple(d["text"] for d in s["dialogue"] if d.get("text")),
                     video_audio=spoken_in_clip or not any((d.get("text") or "").strip() for d in s["dialogue"]),
                     sfx=tuple(x for x in (s.get("sfx") or []) if isinstance(x, str))))
+                piece = inputs[-1]
+                segments.append(_segment(s, None, None, piece.video or piece.image, bool(piece.video), piece.duration,
+                                         (synced or s["video_path"]) if use_video else s["image_path"]))
             music = None
             music_generated = False
             if project.get("music_path"):
@@ -2380,7 +2389,7 @@ class StudioWorker:
                                               "width": info["width"], "height": info["height"],
                                               "duration_seconds": info["duration"], "bytes": info["bytes"],
                                               "sha256": info["sha256"]}])
-        return {"path": path, "bunny_video_id": bunny_id, "version": version, **info}, \
+        return {"path": path, "bunny_video_id": bunny_id, "version": version, **info, "segments": segments}, \
             pricing.render_cost(info["duration"], info["bytes"], music_generated=music_generated)
 
     def _scene(self, job, project):
@@ -2388,6 +2397,13 @@ class StudioWorker:
         if not scene or scene["project_id"] != project["id"]:
             raise JobFailed("not_found", "That scene no longer exists.")
         return scene
+
+
+def _segment(scene, shot, k, local, video, seconds, path) -> dict:
+    """One piece of the rendered film and its frame fingerprint (ffmpeg only: free, never fails the render)."""
+    return {"scene": scene["position"] + 1, "shot": None if k is None else k + 1, "scene_id": scene["id"],
+            "shot_id": shot["id"] if shot else None, "path": path, "seconds": round(float(seconds or 0), 2),
+            "hash": film_report.frame_hash(local, video, seconds) if local else None}
 
 
 IMAGE_REFS = 4   # reference pictures sent with a scene picture

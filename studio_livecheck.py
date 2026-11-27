@@ -187,8 +187,28 @@ class LiveCheck:
                                               "talking-portrait.mp4"))
         self._step("10. Finished mini film (FFmpeg on our server)", 0.0,
                    lambda: self._film(scenes[:2], pictures, voices, talking, talk))
+        self._step("11. Whole-film report on the real mini film (free: ffmpeg fingerprints, no AI)", 0.0,
+                   lambda: self._film_report(scenes[:2], cast))
 
     # ------------------------------------------------------------ steps
+
+    def _film_report(self, scenes, cast):
+        """The free whole-film report on real pictures: are different scenes told apart (no false duplicates)?"""
+        import studio_film_report as film_report
+        segs = getattr(self, "_segments", None)
+        if not segs:
+            raise RuntimeError("the mini film wasn't made, so there is nothing to review")
+        rows, presence = _film_report_inputs(scenes[:len(segs)], cast)
+        rep = film_report.build({"target_seconds": self.brief.get("target_seconds")}, rows, {}, cast, presence,
+                                segments=segs)
+        hashes = [g["hash"] for g in segs if g.get("hash")]
+        pairs = [film_report.distance(a, b) for i, a in enumerate(hashes) for b in hashes[i + 1:]]
+        self.report["film_report"] = {"status": rep["status"], "problems": rep["problems"],
+                                      "fingerprinted": len(hashes), "pieces": len(segs),
+                                      "closest_pair_bits": min(pairs) if pairs else None,
+                                      "duplicate_threshold_bits": film_report.HASH_DUPLICATE}
+        return {}, 0.0, {"fingerprinted": len(hashes), "problems": len(rep["problems"]),
+                         "closest_pair_bits": min(pairs) if pairs else None}, []
 
     def _script(self, ai):
         develop = getattr(ai, "develop_script", None)
@@ -340,10 +360,26 @@ class LiveCheck:
                                                 lines=tuple(d["text"] for d in s["dialogue"])))
             if not inputs:
                 raise render.RenderError("nothing to put in the film")
+            import studio_film_report as film_report
+            # Fingerprints of the real pictures and clips, for the whole-film report (step 11).
+            self._segments = [{"scene": k + 1, "shot": None, "scene_id": f"scene{k + 1}", "shot_id": None,
+                               "path": f"piece{k + 1}", "seconds": float(x.duration),
+                               "hash": film_report.frame_hash(x.video or x.image, bool(x.video), float(x.duration))}
+                              for k, x in enumerate(inputs)]
             out = os.path.join(tmp, "film.mp4")
             info = render.render_film(inputs, "9:16", out, tmp, captions=True)
             self._put("mini-film.mp4", open(out, "rb").read(), "video/mp4")
         return {}, 0.0, {k: info.get(k) for k in ("duration", "width", "height", "bytes") if k in info}, ["mini-film.mp4"]
+
+
+def _film_report_inputs(scenes, cast):
+    rows = [{"id": f"scene{k + 1}", "position": k, "duration_seconds": s.get("duration_seconds") or 5,
+             "mode": "still", "image_path": f"piece{k + 1}", "dialogue": s.get("dialogue") or []}
+            for k, s in enumerate(scenes)]
+    names = [c["name"] for c in cast]
+    presence = {r["id"]: [n for n in names if n.lower() in (str(s.get("visual")) + str(s.get("dialogue"))).lower()]
+                for r, s in zip(rows, scenes)}
+    return rows, presence
 
 
 def speaker_of(line: dict) -> Optional[str]:
