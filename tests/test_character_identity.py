@@ -11,7 +11,7 @@ import studio_identity as ident
 import studio_pricing as pricing
 from conftest import make_user
 from test_creator_studio import H, balance, env, grant, studio_schema  # noqa: F401
-from test_creator_studio import run, start
+from test_creator_studio import post_job, run, start
 from test_video_drama import DAN, MAYA, TALK, detail, project, split
 
 pytestmark = pytest.mark.skipif(bool(os.environ.get("STUDIO_PREMIGRATION")),
@@ -25,8 +25,7 @@ FACE = {"heading": "INT. FLAT - NIGHT", "visual": "Close-up of Maya's face as sh
 
 
 def jobs(client, u, pid, kind, cid, views=None, outfit_id=None):
-    return client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
-                       json={"kind": kind, "target_ids": [cid], "request_id": uuid.uuid4().hex,
+    return post_job(client, u, pid, {"kind": kind, "target_ids": [cid], "request_id": uuid.uuid4().hex,
                              "views": views or [], "outfit_id": outfit_id})
 
 

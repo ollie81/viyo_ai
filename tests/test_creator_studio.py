@@ -42,6 +42,8 @@ def studio_schema(migrated):
         conn.execute((ROOT / "creator_studio_visual_audit.sql").read_text())
         conn.execute((ROOT / "creator_studio_shots.sql").read_text())
         conn.execute((ROOT / "creator_studio_shot_continuity.sql").read_text())
+        conn.execute((ROOT / "creator_studio_budget.sql").read_text())
+        conn.execute((ROOT / "creator_studio_budget.sql").read_text())     # safe to run again
     conn.execute("alter table public.profiles add column if not exists username text")
     conn.close()
     return migrated
@@ -117,8 +119,16 @@ def start(client, user, pid, kind, targets=None, rid=None, approve=True):
     # Creators approve an AI story before "Break into cast & scenes"; approve=False tests the gate itself.
     if kind == "breakdown" and approve:
         approve_story(client, user, pid)
-    return client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(user),
-                       json={"kind": kind, "target_ids": targets or [], "request_id": rid or uuid.uuid4().hex})
+    return post_job(client, user, pid, {"kind": kind, "target_ids": targets or [], "request_id": rid or uuid.uuid4().hex})
+
+
+def post_job(client, user, pid, body):
+    """POST /jobs; a remake is confirmed at the price the server shows (as the app does after asking the creator)."""
+    r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(user), json=body)
+    if r.status_code == 409 and isinstance(r.json().get("detail"), dict) and r.json()["detail"].get("code") == "confirm_remake":
+        r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(user),
+                        json={**body, "confirm_credits": r.json()["detail"]["total_credits"]})
+    return r
 
 
 def balance(client, user):

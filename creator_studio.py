@@ -286,6 +286,9 @@ class JobRequest(BaseModel):
     # confirmed: unchanged scenes keep their work, changed ones are set
     # aside (never deleted).
     confirm_replace: bool = False
+    # A remake (replacing a picture, clip or voice that already exists) is a paid creative change: the creator
+    # must confirm the exact total they were shown.
+    confirm_credits: Optional[int] = Field(None, ge=0)
 
 
 class EstimateRequest(BaseModel):
@@ -821,6 +824,12 @@ async def live_check_report(check_id: str):
     report["file_urls"] = {n: signed.get(f"livecheck/{check_id}/{n}") for n in names}
     report["spent_usd"] = round(check.budget.spent, 4) if check else report.get("spent_usd")
     return report
+
+
+@router.get("/terms")
+async def terms(user_id: str = Depends(creator)):
+    """Credits, budget, failures, revisions and publishing rules, before paying for anything."""
+    return studio_terms(user_id)
 
 
 @router.get("/credits")
@@ -1948,6 +1957,74 @@ async def approve_shot(shot_id: str, body: Approve, user_id: str = Depends(creat
     return {"ok": True, "approved": body.approved}
 
 
+FREE_FIXES_PER_SHOT = 1        # successful free corrections per shot and per output (picture, clip)
+FREE_FIX_CHECKS_PER_SHOT = 2   # checks per shot and output (each costs VIYO an AI check)
+
+
+class ShotFixIn(BaseModel):
+    target: Literal["picture", "clip"]
+    request_id: str = Field(..., min_length=8, max_length=80)
+
+
+def _fix_jobs(shot: dict, target: str) -> list[dict]:
+    shot_id = shot["id"]
+    return [j for j in get_store().select("studio_jobs", {"kind": "shot_fix", "project_id": shot["project_id"]})
+            if (j.get("idempotency_key") or "").startswith(f"fix:{shot_id}:{target}:")]
+
+
+@router.get("/shots/{shot_id}/fix")
+async def shot_fix_status(shot_id: str, user_id: str = Depends(creator)):
+    """Whether a free defect fix is still available for this shot's picture and clip."""
+    sh = _owned_shot(shot_id, user_id)
+    out = {}
+    for target in ("picture", "clip"):
+        jobs = _fix_jobs(sh, target)
+        out[target] = {"used": any(j["status"] == "succeeded" for j in jobs),
+                       "checks": len(jobs), "running": any(j["status"] in ("queued", "running") for j in jobs),
+                       "available": not any(j["status"] in ("succeeded", "queued", "running") for j in jobs)
+                       and len(jobs) < FREE_FIX_CHECKS_PER_SHOT}
+    return out
+
+
+@router.post("/shots/{shot_id}/fix")
+async def report_shot_defect(shot_id: str, body: ShotFixIn, user_id: str = Depends(creator)):
+    """The creator reports that a shot's picture or clip came out broken or doesn't match the approved characters,
+    storyboard or references. VIYO checks it first (free); if the check confirms a defect, the shot is remade for
+    free, once per shot and output. Creative changes are paid remakes."""
+    sh = _owned_shot(shot_id, user_id)
+    if sh.get("approved_at"):
+        raise HTTPException(status_code=409, detail="This shot is approved. Unapprove it to have it fixed.")
+    if body.target == "picture" and not sh.get("image_path"):
+        raise HTTPException(status_code=409, detail="This shot has no picture yet.")
+    if body.target == "picture" and sh.get("video_path"):
+        raise HTTPException(status_code=409, detail="This shot already has its clip: report the clip instead.")
+    if body.target == "clip" and not sh.get("video_path"):
+        raise HTTPException(status_code=409, detail="This shot has no clip yet.")
+    jobs = _fix_jobs(sh, body.target)
+    if any(j["status"] in ("queued", "running") for j in jobs):
+        raise HTTPException(status_code=409, detail="This shot is already being checked.")
+    if sum(1 for j in jobs if j["status"] == "succeeded") >= FREE_FIXES_PER_SHOT:
+        raise HTTPException(status_code=409, detail={"code": "free_fix_used", "message":
+                            "This shot's free fix has been used. Another change is a paid remake (its price is shown first)."})
+    if len(jobs) >= FREE_FIX_CHECKS_PER_SHOT:
+        raise HTTPException(status_code=409, detail={"code": "free_fix_checks_used", "message":
+                            "This shot has been checked twice already. Another change is a paid remake."})
+    _rate_limit(user_id)
+    st = get_store()
+    # The key numbers each check per shot and output, so two taps at once can't make two free fixes.
+    r = st.rpc("studio_create_job", {
+        "p_owner": user_id, "p_project": sh["project_id"], "p_kind": "shot_fix", "p_lane": "generation",
+        "p_key": f"fix:{sh['id']}:{body.target}:{len(jobs)}", "p_credits": 0,
+        "p_input": {"shot_id": sh["id"], "target": body.target}, "p_scene": sh["scene_id"], "p_character": None,
+        "p_max_open": 30})
+    if not r or not r.get("ok"):
+        raise HTTPException(status_code=400, detail={"too_many_jobs": "Too many jobs running. Wait for some to finish."}
+                            .get((r or {}).get("error"), "This shot couldn't be checked right now."))
+    return {"job_id": r["job_id"], "free": True, "duplicate": bool(r.get("duplicate")),
+            "note": "VIYO checks this shot against the approved characters, storyboard and references. If it finds a "
+                    "defect, the shot is remade for free. If not, nothing is charged."}
+
+
 class AcceptContinuity(BaseModel):
     accepted: bool
     note: str = Field("", max_length=300)
@@ -2098,6 +2175,19 @@ async def reorder_scenes(project_id: str, body: OrderIn, user_id: str = Depends(
 
 
 # ---------------------------------------------------------------- pricing + jobs
+
+REMAKE_OUTPUT = {"image": "image_path", "video": "video_path", "voice": "audio_path", "lipsync": "lipsync_path",
+                 "shot_image": "image_path", "shot_video": "video_path", "portrait": "reference_path",
+                 "element": "reference_path"}
+
+
+def _remakes(kind: str, p: dict, target_ids: list[str]) -> set:
+    """Targets that already have what this job makes: making them again is a (paid) creative remake."""
+    col = REMAKE_OUTPUT.get(kind)
+    if not col:
+        return set()
+    return {t["id"] for t in _targets(kind, p, target_ids) if t.get(col)}
+
 
 def _targets(kind: str, p: dict, target_ids: list[str]) -> list[dict]:
     st = get_store()
@@ -2400,6 +2490,9 @@ async def estimate(project_id: str, body: EstimateRequest, user_id: str = Depend
     opts = _portrait_opts(body.views, body.outfit_id, user_id) if body.kind == "portrait" else \
         {"auto_fix": body.auto_fix} if body.kind == "shot_image" else None
     items = _quote(body.kind, p, body.target_ids, opts)
+    remade = _remakes(body.kind, p, body.target_ids)
+    for i in items:
+        i["remake"] = i["target_id"] in remade
     ready = [i for i in items if not i["blocked"]]
     fix = sum(i.get("voice_fix_credits", 0) for i in ready)
     note = "Text steps hold a little extra and return what isn't used." if body.kind in ("script", "breakdown", "outfits") \
@@ -2409,8 +2502,13 @@ async def estimate(project_id: str, body: EstimateRequest, user_id: str = Depend
         else ("Each picture is checked against the shot before it and the approved references. The price includes "
               "one corrected picture if the check finds a real mistake; you're only charged for what is made."
               if body.kind == "shot_image" and p.get("auto_inspect") is not False and body.auto_fix else None)
+    remakes = sum(1 for i in ready if i["remake"])
     return {"kind": body.kind, "items": items, "total_credits": sum(i["credits"] for i in ready),
-            "ready_count": len(ready), "balance": _balance(user_id), "note": note}
+            "ready_count": len(ready), "balance": _balance(user_id), "note": note, "remakes": remakes,
+            "remake_note": (f"{remakes} of these already exist{'s' if remakes == 1 else ''}: making them again is a paid "
+                            "creative remake. If something came out broken or doesn't match the approved characters "
+                            "or storyboard, use “Report a defect” instead: VIYO checks it and fixes it for free.")
+            if remakes else None}
 
 
 @router.post("/projects/{project_id}/jobs")
@@ -2449,7 +2547,16 @@ async def start_jobs(project_id: str, body: JobRequest, user_id: str = Depends(c
         job_input = {"correction": body.correction.strip()[:600]}     # a fix from the picture check
     if body.kind == "shot_image":
         opts = {"auto_fix": body.auto_fix}
-    for item in _quote(body.kind, p, body.target_ids, opts):
+    quoted = _quote(body.kind, p, body.target_ids, opts)
+    remade = _remakes(body.kind, p, body.target_ids)
+    ready_total = sum(i["credits"] for i in quoted if not i["blocked"])
+    if any(i["target_id"] in remade for i in quoted if not i["blocked"]) and body.confirm_credits != ready_total:
+        raise HTTPException(status_code=409, detail={
+            "code": "confirm_remake", "total_credits": ready_total,
+            "remakes": sum(1 for i in quoted if not i["blocked"] and i["target_id"] in remade),
+            "message": f"This replaces work that already exists. It costs {ready_total} credits: confirm the price to "
+                       "continue."})
+    for item in quoted:
         if item["blocked"]:
             problems.append({"target_id": item["target_id"], "error": item["blocked"]})
             continue
@@ -3335,14 +3442,153 @@ class ProductionIn(ProductionQuoteIn):
     request_id: str = Field(..., min_length=8, max_length=80)
     # The total the creator saw; refused if the price changed since.
     confirm_credits: int = Field(..., ge=0)
+    # Stop before paid video so the creator can review and approve the storyboard. On unless the creator
+    # deliberately turns it off.
+    storyboard_review: bool = True
+
+
+SAFETY_SHARE = 0.10        # room in the approved maximum for small price changes during production
+SAFETY_MIN = 5
+
+
+def safety_credits(steps: int) -> int:
+    import math
+    return 0 if steps <= 0 else max(SAFETY_MIN, math.ceil(steps * SAFETY_SHARE))
+
+
+# The production cost categories the creator sees, and which steps fall in each.
+ESTIMATE_CATEGORIES = [
+    ("story", "Story development", ()),
+    ("characters", "Characters (reference sheets)", ("sheets",)),
+    ("storyboard", "Scenes and storyboard (directing, places, pictures)", ("places", "direct", "images")),
+    ("video", "Video clips", ("videos", "lipsync")),
+    ("voices", "Voices", ("voices",)),
+    ("music", "Music and sound effects", ()),
+    ("render", "Editing and final film", ("render",)),
+]
+STORY_KINDS = ("script", "breakdown", "chapter", "outfits", "elements", "cover")
+VARIABLE_STAGES = {"direct": "Directing is a text step: it holds a little extra and keeps only what it uses.",
+                   "images": "Shot pictures are reserved for the most shots the director may plan, plus one automatic "
+                             "correction each; you pay only for what is made.",
+                   "videos": "Clips include room for one automatic voice fix on talking shots; it's charged only if used."}
+
+
+def studio_terms(owner_id: Optional[str] = None) -> dict:
+    """What every creator should know before paying, in plain words (the same text in the app and on the web)."""
+    paid = None
+    if owner_id:
+        try:
+            rows = [r for r in get_store().select("studio_credit_purchases", {"user_id": owner_id}, order="created_at",
+                                                 desc=True, limit=1) if r.get("status") == "paid"]
+            if rows and int(rows[0]["credits"] or 0) > 0:
+                paid = {"credits": int(rows[0]["credits"]), "price_usd": float(rows[0]["gross_usd"] or 0)}
+        except Exception:
+            if hasattr(get_store(), "conn"):
+                get_store().conn.rollback()
+    return {
+        "credit_value_usd": pricing.USD_PER_CREDIT,
+        "credit_value_label": f"Estimated credit value: ${pricing.USD_PER_CREDIT:.2f} per credit. This is not cash value "
+                              "and not a guaranteed refund value.",
+        "last_purchase": paid,
+        "packs": [{**k, "price_usd": pricing.pack_price(k["credits"], LS_PCT, LS_FIXED)} for k in CREDIT_PACKS],
+        "currencies": [
+            "Studio credits pay for making films in VIYO Studio.",
+            "VIYO Coins are for watching (unlocking episodes, gifts). They can't be used in Studio, and credits can't be "
+            "used to watch.",
+            "Premium is an ad-free watching membership. It doesn't include Studio credits or free Studio generation.",
+        ],
+        "budget": [
+            "The total shown is the most this production can cost. It's reserved when you start.",
+            "The production can never spend more than you approved. If it needs more (for example, the director plans "
+            "more shots than expected), it stops and asks you; nothing continues until you approve the exact extra amount.",
+            "No credits are ever bought, and nothing is upgraded, automatically.",
+            "Each step keeps only what it really costs. Whatever isn't used comes back when the production ends.",
+        ],
+        "failures": [
+            "A step that fails is never charged: its credits come back straight away, and it's tried again once.",
+            "If the finished film fails VIYO's quality check, it isn't charged.",
+            "Every credit is listed in the production's history: reserved, charged, refunded and returned.",
+        ],
+        "revisions": [
+            "Each shot gets one free fix if its picture or clip comes out broken or doesn't match the approved "
+            "characters, storyboard or references. VIYO checks the report first; if it confirms the defect, the shot "
+            "is remade for free. If it finds none, nothing is charged.",
+            "Each scene picture already includes one automatic correction when VIYO's own check finds a mistake.",
+            "Changing something you'd simply like different is a paid creative remake. Its exact price is shown, and "
+            "you confirm it, before anything is made.",
+            "A defect VIYO has confirmed is never charged twice.",
+        ],
+        "publishing": [
+            "One finished episode or film can be published on its own. There's no minimum number of episodes.",
+            "A series is optional: later episodes are separate productions with their own estimate and budget.",
+            "You can download your finished films and post them anywhere. VIYO is non-exclusive.",
+        ],
+        "storyboard": [
+            "Before any video is made, the production stops so you can review the storyboard: the characters, framing, "
+            "actions, camera directions and scene details. Video starts only after you approve it.",
+            "You can turn this review off, but only on purpose.",
+        ],
+    }
+
+
+def _full_estimate(p: dict, q: dict) -> dict:
+    """The complete cost of this production by category: what's already spent and what the production will still
+    cost at most. Variable items are labelled; nothing is guessed."""
+    st = get_store()
+    by_stage = {x["stage"]: x for x in q["stages"]}
+    jobs = st.select("studio_jobs", {"project_id": p["id"]})
+    spent_story = sum(int(j.get("charged_credits") or 0) for j in jobs if j["status"] == "succeeded" and j["kind"] in STORY_KINDS)
+    spent_all = sum(int(j.get("charged_credits") or 0) for j in jobs if j["status"] == "succeeded")
+    cats = []
+    for key, label, stages in ESTIMATE_CATEGORIES:
+        mine = [by_stage[s] for s in stages if s in by_stage]
+        remaining = sum(x["credits"] for x in mine)
+        notes = [VARIABLE_STAGES[s] for s in stages if s in by_stage and s in VARIABLE_STAGES]
+        item = {"key": key, "label": label, "remaining_max": remaining,
+                "count": sum(len(x["items"]) for x in mine), "variable": bool(notes), "notes": notes}
+        if key == "story":
+            item.update(spent=spent_story, notes=["Already written: what it cost is shown as spent."]
+                        if (p.get("script") or "").strip() else
+                        ["Write the script first: its price is shown before it starts (text steps keep only what they use)."])
+        if key == "music":
+            item["notes"] = ["Included in the final film: an original score when you haven't added your own music, and "
+                             "sound effects at no extra cost."]
+        cats.append(item)
+    episodes_made = 0
+    if p.get("series_id"):
+        try:
+            episodes_made = len(st.select("studio_projects", {"series_id": p["series_id"], "owner_id": p["owner_id"]}))
+        except Exception:
+            episodes_made = 1
+    value = pricing.USD_PER_CREDIT
+    return {
+        "categories": cats,
+        "spent_so_far": spent_all,
+        "steps_max": q["steps_credits"], "safety_credits": q["safety_credits"], "max_credits": q["total_credits"],
+        "max_value_usd": round(q["total_credits"] * value, 2),
+        "episodes": {"in_this_production": 1, "series_episodes": episodes_made or 1,
+                     "note": "This production makes one finished episode (or film). Later episodes of a series are "
+                             "separate productions, each with its own estimate and budget."},
+        "uncertainty": "Prices of AI providers can vary. The maximum covers every step at its highest price plus a small "
+                       "safety margin; you're charged only what each step really costs, usually less.",
+    }
 
 
 def _production_quote(p: dict, body: ProductionQuoteIn) -> dict:
     import studio_production
     q = studio_production.plan(p, {"sheets": body.sheets, "direct": body.direct})
+    steps = q["total_credits"]
+    q["steps_credits"] = steps
+    q["safety_credits"] = safety_credits(steps)
+    # The maximum the creator approves (and what is reserved): every step at its highest price plus a small safety
+    # margin. Each step keeps only what it really costs; what isn't used comes back at the end.
+    q["total_credits"] = steps + q["safety_credits"]
     q["balance"] = _balance(p["owner_id"])
-    q["note"] = ("Credits for the whole production are reserved when you start. Each step keeps only what it really "
-                 "costs; failed steps are refunded and tried again once; what's left comes back at the end.")
+    q["note"] = ("This is the most this production can cost: it's reserved when you start, and the production can "
+                 "never spend more without asking you. Each step keeps only what it really costs; failed steps are "
+                 "refunded and tried again once; what's left comes back at the end.")
+    q["estimate"] = _full_estimate(p, q)
+    q["terms"] = studio_terms(p["owner_id"])
     return q
 
 
@@ -3407,7 +3653,9 @@ async def start_production(project_id: str, body: ProductionIn, user_id: str = D
     try:
         r = get_store().rpc("studio_run_reserve", {
             "p_owner": user_id, "p_project": p["id"], "p_credits": q["total_credits"],
-            "p_key": f"{user_id}:{body.request_id}:production", "p_options": {"sheets": body.sheets, "direct": body.direct, "round": 0},
+            "p_key": f"{user_id}:{body.request_id}:production",
+            "p_options": {"sheets": body.sheets, "direct": body.direct, "round": 0,
+                          "storyboard_review": body.storyboard_review},
             "p_plan": plan_})
     except Exception as e:
         if hasattr(get_store(), "conn"):
@@ -3457,6 +3705,9 @@ async def cancel_production(run_id: str, user_id: str = Depends(creator)):
     run = _owned_run(run_id, user_id)
     if run["status"] in ("done", "canceled"):
         raise HTTPException(status_code=409, detail="This production has already finished.")
+    if run["status"] != "running":
+        # Paused runs: make sure no worker picks a new step while it's being canceled.
+        get_store().update("studio_production_runs", {"id": run["id"]}, {"status": "needs_attention"})
     st = get_store()
     for j in studio_production._run_jobs(st, run):
         if j["status"] == "queued":
@@ -3464,6 +3715,53 @@ async def cancel_production(run_id: str, user_id: str = Depends(creator)):
     st.rpc("studio_run_finish", {"p_run": run["id"], "p_status": "canceled", "p_problem": None})
     return {"production": studio_production.progress(st, st.one("studio_production_runs", {"id": run["id"]})),
             "balance": _balance(user_id)}
+
+
+class BudgetApproveIn(BaseModel):
+    # The exact extra amount the run asked for (shown to the creator); refused if it changed.
+    credits: int = Field(..., ge=1, le=1_000_000)
+
+
+@router.post("/production/{run_id}/budget")
+async def approve_production_budget(run_id: str, body: BudgetApproveIn, user_id: str = Depends(creator)):
+    """The creator approves the extra credits the production asked for. They're reserved first; nothing is bought
+    or taken automatically."""
+    import studio_production
+    run = _owned_run(run_id, user_id)
+    r = get_store().rpc("studio_run_approve_budget", {"p_owner": user_id, "p_run": run["id"], "p_credits": body.credits}) or {}
+    if not r.get("ok"):
+        err = r.get("error")
+        if err == "insufficient_credits":
+            raise HTTPException(status_code=402, detail={"message": "Not enough credits for this increase. Add credits "
+                                                                    "first, then approve it.", "balance": _balance(user_id),
+                                                         "needed": body.credits})
+        if err == "amount_changed":
+            raise HTTPException(status_code=409, detail={"code": "amount_changed", "needed": r.get("needed"),
+                                                         "message": "The amount needed changed. Check it again."})
+        raise HTTPException(status_code=409, detail="This production isn't waiting for a budget approval.")
+    st = get_store()
+    return {"production": studio_production.progress(st, st.one("studio_production_runs", {"id": run["id"]})),
+            "balance": _balance(user_id)}
+
+
+@router.post("/production/{run_id}/storyboard/approve")
+async def approve_production_storyboard(run_id: str, user_id: str = Depends(creator)):
+    """The creator has reviewed the pictures (characters, framing, actions, camera, scene details): video can start."""
+    import studio_production
+    run = _owned_run(run_id, user_id)
+    r = get_store().rpc("studio_run_approve_storyboard", {"p_owner": user_id, "p_run": run["id"]}) or {}
+    if not r.get("ok"):
+        raise HTTPException(status_code=409, detail="This production isn't waiting for a storyboard review.")
+    st = get_store()
+    return {"production": studio_production.progress(st, st.one("studio_production_runs", {"id": run["id"]}))}
+
+
+@router.get("/production/{run_id}/history")
+async def production_history(run_id: str, user_id: str = Depends(creator)):
+    """Where every credit of this production went."""
+    import studio_production
+    run = _owned_run(run_id, user_id)
+    return studio_production.history(get_store(), run)
 
 
 # ---------------------------------------------------------------- publish

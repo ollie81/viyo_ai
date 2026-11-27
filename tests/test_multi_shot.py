@@ -13,7 +13,7 @@ import studio_ai
 import studio_shots
 from conftest import make_user
 from test_creator_studio import H, balance, env, grant, studio_schema  # noqa: F401
-from test_creator_studio import run, start
+from test_creator_studio import post_job, run, start
 from test_video_drama import DAN, MAYA, detail, project, split
 
 pytestmark = pytest.mark.skipif(bool(os.environ.get("STUDIO_PREMIGRATION")), reason="needs creator_studio_shots.sql")
@@ -59,8 +59,7 @@ def approve(client, u, sid, ok=True):
 
 
 def make(client, gen, u, pid, kind, shot_ids, rid=None):
-    r = client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u),
-                    json={"kind": kind, "target_ids": shot_ids, "request_id": rid or uuid.uuid4().hex})
+    r = post_job(client, u, pid, {"kind": kind, "target_ids": shot_ids, "request_id": rid or uuid.uuid4().hex})
     run(gen)
     return r
 
@@ -212,8 +211,8 @@ def test_the_same_request_never_makes_or_charges_twice(prod):
     talk = plan(client, gen, u, pid)[0]
     approve(client, u, talk["id"])
     rid = uuid.uuid4().hex
-    client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u), json={"kind": "shot_image", "target_ids": [talk["shots"][0]["id"]], "request_id": rid})
-    client.post(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u), json={"kind": "shot_image", "target_ids": [talk["shots"][0]["id"]], "request_id": rid})
+    post_job(client, u, pid, {"kind": "shot_image", "target_ids": [talk["shots"][0]["id"]], "request_id": rid})
+    post_job(client, u, pid, {"kind": "shot_image", "target_ids": [talk["shots"][0]["id"]], "request_id": rid})
     n = db.execute("select count(*) from public.studio_jobs where kind = 'shot_image'").fetchone()[0]
     assert n == 1
 
