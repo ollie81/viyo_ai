@@ -794,7 +794,7 @@ async def admin_live_check(body: LiveCheckIn):
     No creator data or credits are touched. Returns a results link."""
     import studio_livecheck
     if not body.confirm_spend:
-        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.35,
+        return {"would_spend_up_to_usd": body.cap_usd, "expected_usd": 2.65,
                 "note": "Send confirm_spend to run it. Costs real money on Viyo's Google and sync.so accounts."}
     with _live_lock:
         busy = [c for c in _live_running.values() if c.report.get("status") == "running"]
