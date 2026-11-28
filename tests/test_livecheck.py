@@ -10,12 +10,15 @@ from test_creator_studio import env, studio_schema  # noqa: F401
 
 def test_full_live_check_with_fakes(tmp_path):
     files = LocalFiles(str(tmp_path))
-    check = lc.LiveCheck(files, ai=studio_ai.FakeStudioAI(), lipsync=studio_lipsync.FakeLipSync(), cap_usd=5.0)
+    tone = str(tmp_path / "tone.mp3")
+    __import__("subprocess").run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=f=330:d=5", tone], check=True)
+    check = lc.LiveCheck(files, ai=studio_ai.FakeStudioAI(), lipsync=studio_lipsync.FakeLipSync(), cap_usd=5.0,
+                         make_music=lambda p, secs: open(tone, "rb").read())
     report = check.run()
     assert report["status"] == "finished", report
     steps = {s["step"].split(" ")[0]: s for s in report["steps"]}
     assert all(s["status"] == "ok" for s in report["steps"]), [(s["step"], s.get("error")) for s in report["steps"]]
-    for n in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10.", "11.", "12.", "13."):
+    for n in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10.", "11.", "12.", "13.", "14."):
         assert n in steps, n
     # Stage 2: the director's action plan and three real shot pictures (fake here).
     a = report["action"]
@@ -23,6 +26,7 @@ def test_full_live_check_with_fakes(tmp_path):
     assert a["spatial_problems"] == 0 and "multi_contact" in a["feasibility_flags"]
     assert a["instructions_most_similar_pair"] < 0.8 and steps["12."]["cost_usd"] < 1.0
     assert report["look"]["colour_distance"] is not None and steps["13."]["cost_usd"] < 0.5
+    assert [c["seconds"] for c in report["score"]["cues"]] == [5.0, 5.0] and steps["14."]["cost_usd"] == 0.16
     for f in ("action-shot-1.png", "action-shot-2.png", "action-shot-3.png", "look-scene-1.png", "look-scene-2.png"):
         assert f in set(files.list(f"livecheck/{check.id}")), f
     # The free whole-film report runs on the mini film's own pictures and clips; it costs nothing.

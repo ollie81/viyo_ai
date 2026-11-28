@@ -39,6 +39,8 @@ def _world_sound(project: dict) -> str:
 
 
 def music_prompt(project: dict, film_seconds: float = 0) -> str:
+    if project.get("_cue"):
+        return cue_music_prompt(project, project["_cue"])
     genre = (project.get("genre") or "cinematic drama").strip()[:80]
     logline = (project.get("logline") or project.get("title") or "an emotional story").strip()[:500]
     style = (project.get("visual_style") or "cinematic and emotionally expressive").strip()[:160]
@@ -55,6 +57,20 @@ def music_prompt(project: dict, film_seconds: float = 0) -> str:
         "rather than overpowering dialogue. Do not imitate any existing song, artist, film score, "
         "or recognizable melody. Create approximately two minutes of music."
     )
+
+
+def cue_music_prompt(project: dict, cue: dict) -> str:
+    """One cue of a planned score (studio_score): its mood, intensity and character themes, the story world's
+    instruments, and the same originality rules as a whole-film score."""
+    import studio_score
+    genre = (project.get("genre") or "cinematic drama").strip()[:80]
+    logline = (project.get("logline") or project.get("title") or "an emotional story").strip()[:400]
+    return ("Create an original, instrumental-only cinematic music cue for one part of a film. No vocals, no lyrics, "
+            "no speech, and no sound effects. "
+            f"Film genre: {genre}. Story: {logline}. " + studio_score.cue_prompt(project, cue) + " "
+            + _world_sound(project) +
+            "Start softly enough to fade in, keep a steady character so it can be trimmed to the scene, and leave room "
+            "for dialogue. Do not imitate any existing song, artist, film score, or recognizable melody.")
 
 
 def _audio_from_response(payload: dict) -> bytes:
