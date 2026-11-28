@@ -24,8 +24,13 @@ Settings (server only; the keys never reach the app):
   BUNNY_PUBLIC_ZONE / BUNNY_PUBLIC_KEY / BUNNY_PUBLIC_CDN
   BUNNY_PRIVATE_ZONE / BUNNY_PRIVATE_KEY / BUNNY_PRIVATE_CDN
   BUNNY_PRIVATE_TOKEN_KEY    the private pull zone's token authentication key
-If FILE_STORE=bunny but a setting is missing, files keep going to Supabase and
-a warning is logged: uploads never break because of a half-done setup.
+  FILE_STORE_STRICT          "true": files go to Bunny or nowhere. Never Supabase:
+                             if Bunny isn't switched on and complete, every file
+                             read/write stops with StorageNotConfigured (naming the
+                             missing settings, never their values) instead of
+                             falling back.
+Without FILE_STORE_STRICT, if FILE_STORE=bunny but a setting is missing, files keep
+going to Supabase and a warning is logged.
 """
 from __future__ import annotations
 
@@ -82,15 +87,42 @@ class Zone:
 _warned = False
 
 
+NEEDED = ["BUNNY_PUBLIC_ZONE", "BUNNY_PUBLIC_KEY", "BUNNY_PUBLIC_CDN", "BUNNY_PRIVATE_ZONE",
+          "BUNNY_PRIVATE_KEY", "BUNNY_PRIVATE_CDN", "BUNNY_PRIVATE_TOKEN_KEY"]
+
+
+class StorageNotConfigured(RuntimeError):
+    """Strict mode: Bunny isn't fully set up, so the file is refused rather than sent to Supabase."""
+
+
+def strict() -> bool:
+    return _env("FILE_STORE_STRICT").lower() in ("1", "true", "yes", "on")
+
+
+def missing_settings() -> list[str]:
+    """Names (never values) of what Bunny Storage still needs."""
+    out = [] if _env("FILE_STORE").lower() == "bunny" else ["FILE_STORE=bunny"]
+    return out + [n for n in NEEDED if not _env(n)]
+
+
+def status() -> dict:
+    """Where files go right now (for the admin check): no secrets, only names."""
+    import bunny_stream
+    files = "bunny" if settings() is not None else ("blocked" if strict() else "supabase")
+    films = "bunny_stream" if bunny_stream._configured() else files
+    return {"files": files, "films": films, "strict": strict(), "missing": missing_settings(),
+            "films_missing": [] if bunny_stream._configured() else
+            [n for n in ("BUNNY_STREAM_API_KEY", "BUNNY_STREAM_LIBRARY_ID", "BUNNY_STREAM_PULL_ZONE") if not _env(n)],
+            "supabase_receives_media": files == "supabase" or films == "supabase"}
+
+
 def settings(require_switch: bool = True) -> Optional[tuple[str, Zone, Zone]]:
     """(storage host, public zone, private zone) when Bunny is switched on and complete, else None.
     require_switch=False: the Bunny settings alone are enough (used to copy old files before switching)."""
     global _warned
     if require_switch and _env("FILE_STORE").lower() != "bunny":
         return None
-    needed = ["BUNNY_PUBLIC_ZONE", "BUNNY_PUBLIC_KEY", "BUNNY_PUBLIC_CDN", "BUNNY_PRIVATE_ZONE",
-              "BUNNY_PRIVATE_KEY", "BUNNY_PRIVATE_CDN", "BUNNY_PRIVATE_TOKEN_KEY"]
-    missing = [n for n in needed if not _env(n)]
+    missing = [n for n in NEEDED if not _env(n)]
     if missing:
         if not _warned:
             log.warning("FILE_STORE=bunny but %s not set: files stay on Supabase", ", ".join(missing))
@@ -280,6 +312,10 @@ def from_(client: Any, bucket: str):
     """The bucket to use: Bunny when switched on, else `client`'s Supabase bucket (unchanged behaviour)."""
     cfg = settings()
     if cfg is None:
+        if strict():
+            raise StorageNotConfigured("Files are stopped: Bunny Storage isn't fully set up (missing: "
+                                       + ", ".join(missing_settings()) + "), and FILE_STORE_STRICT keeps them off "
+                                       "Supabase.")
         return client.storage.from_(bucket)
     host, public, private = cfg
     return BunnyBucket(bucket, host, public, private)
