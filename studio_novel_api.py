@@ -762,8 +762,12 @@ async def make_episode_plan(story_id: str, body: EpisodePlanIn, user_id: str = D
         return (pl, probs), cost
 
     pl, probs = cs._paid_call(user_id, pricing.estimate_episode_plan(len(chapters), n).credits, plan, "the episode plan")
+    # The feature columns are written only when they matter (a feature plan, or a former feature re-planned as
+    # episodes), so episode planning keeps working even before creator_studio_feature.sql has been run.
+    fmt = ({"plan_format": "feature", "feature_minutes": body.minutes} if feature else
+           {"plan_format": "episodes", "feature_minutes": None} if story.get("plan_format") == "feature" else {})
     story = _save(story, {"episode_plan": pl, "episode_plan_problems": probs, "episodes": n, "episode_seconds": seconds,
-                          "plan_format": body.format, "feature_minutes": body.minutes if feature else None,
+                          **fmt,
                           "episode_plan_version": int(story.get("episode_plan_version") or 0) + 1,
                           "episode_plan_approved_version": None})
     return {**_plan_out(story), "balance": cs._balance(user_id)}

@@ -227,3 +227,22 @@ def test_parts_render_recover_from_a_failure_and_join_into_one_movie(nv, monkeyp
         first = StudioWorker._film_edit(scenes[0], scenes, False, p)
         last = StudioWorker._film_edit(scenes[-1], scenes, False, p)
         assert (first["fade_in"] > 0) is (k == 0) and (last["fade_out"] > 0) is (k == 2), k
+
+
+def test_episode_planning_works_without_the_feature_sql(nv):
+    """Deploying the code before running creator_studio_feature.sql must not break ordinary episode plans."""
+    client, db, store, files, ai, gen, ren, u = nv
+    sid = written_novel(client, ai, gen, u)
+    assert approve_novel(client, u, sid).status_code == 200
+    ai.novel_results = {"episode plan": good_plan(3)}
+    import studio_novel_api as api
+    saved = []
+    real = api._save
+    api_save = lambda story, fields: saved.append(set(fields)) or real(story, fields)      # noqa: E731
+    import unittest.mock as m
+    with m.patch.object(api, "_save", api_save):
+        r = client.post(f"/api/v1/studio/stories/{sid}/episodes/plan", headers=H(u),
+                        json={"request_id": uuid.uuid4().hex, "episodes": 3, "seconds": 60})
+    assert r.status_code == 200, r.text
+    assert saved and not any({"plan_format", "feature_minutes"} & f for f in saved), "episode plans never write them"
+    assert r.json()["format"] == "episodes"
