@@ -670,6 +670,9 @@ class EpisodePlanIn(BaseModel):
     episodes: int = Field(0, ge=0, le=200)          # 0 = the number chosen when the story started
     seconds: int = Field(0, ge=0, le=600)           # 0 = the production's episode length (or 90)
     note: str = Field("", max_length=1500)
+    # "feature": one continuous movie of `minutes`, made as parts of at most 10 minutes (studio_feature)
+    format: Literal["episodes", "feature"] = "episodes"
+    minutes: int = Field(0, ge=0, le=90)
 
 
 class EpisodePlanEditIn(BaseModel):
@@ -686,13 +689,15 @@ def _plan_out(story: dict) -> dict:
     if story.get("episodes_created_at"):
         rows = cs.get_store().select("studio_projects", {"story_id": story["id"], "owner_id": story["owner_id"]})
         created = sorted(({"number": r.get("episode_number"), "project_id": r["id"], "title": r.get("title") or ""}
-                          for r in rows), key=lambda x: x["number"] or 0)
+                          for r in rows if not ((r.get("story_bible") or {}).get("feature") or {}).get("master")),
+                         key=lambda x: x["number"] or 0)
     chapters = len((story.get("outline") or {}).get("chapters") or [])
     n = int(story.get("episodes") or 0) or len(plan) or max(1, chapters)
     return {"plan": plan, "problems": story.get("episode_plan_problems") or [],
             "version": story.get("episode_plan_version") or 0, "approved_version": story.get("episode_plan_approved_version"),
             "seconds": story.get("episode_seconds") or 90, "episodes_wanted": int(story.get("episodes") or 0),
             "created": created, "created_at": story.get("episodes_created_at"),
+            "format": story.get("plan_format") or "episodes", "feature_minutes": story.get("feature_minutes"),
             "price": pricing.estimate_episode_plan(chapters, n).credits, "stage": story.get("stage"),
             "chapters": len((story.get("outline") or {}).get("chapters") or [])}
 
@@ -717,17 +722,25 @@ async def make_episode_plan(story_id: str, body: EpisodePlanIn, user_id: str = D
         raise HTTPException(status_code=409, detail="Approve the novel first.")
     if story.get("episodes_created_at"):
         raise HTTPException(status_code=409, detail="The episodes have already been created from the approved plan.")
-    n = body.episodes or int(story.get("episodes") or 0)
+    import studio_feature
+    feature = body.format == "feature"
+    if feature:
+        if not studio_feature.MIN_MINUTES <= body.minutes <= studio_feature.MAX_MINUTES:
+            raise HTTPException(status_code=422, detail=f"A feature film is {studio_feature.MIN_MINUTES} to "
+                                                        f"{studio_feature.MAX_MINUTES} minutes long.")
+        n, part_seconds = studio_feature.parts_for(body.minutes)
+    else:
+        n = body.episodes or int(story.get("episodes") or 0)
     if n < 1:
         raise HTTPException(status_code=422, detail="Choose how many episodes the novel should become.")
     if body.note and not studio_ai.moderate_text(body.note):
         raise HTTPException(status_code=422, detail="This note can't be used on Viyo. Please change it.")
     p = cs._project(story["project_id"], user_id)
     seconds = body.seconds or int(story.get("episode_seconds") or 0) or int(p.get("target_seconds") or 90)
-    seconds = min(600, max(30, seconds))
+    seconds = part_seconds if feature else min(600, max(30, seconds))
     chapters = _approved_chapters(story)
     cs._rate_limit(user_id)
-    base = ad.plan_prompt(story, chapters, n, seconds, body.note)
+    base = ad.plan_prompt(story, chapters, n, seconds, body.note, feature=feature)
     ai = cs.get_ai()
 
     def plan():
@@ -749,6 +762,7 @@ async def make_episode_plan(story_id: str, body: EpisodePlanIn, user_id: str = D
 
     pl, probs = cs._paid_call(user_id, pricing.estimate_episode_plan(len(chapters), n).credits, plan, "the episode plan")
     story = _save(story, {"episode_plan": pl, "episode_plan_problems": probs, "episodes": n, "episode_seconds": seconds,
+                          "plan_format": body.format, "feature_minutes": body.minutes if feature else None,
                           "episode_plan_version": int(story.get("episode_plan_version") or 0) + 1,
                           "episode_plan_approved_version": None})
     return {**_plan_out(story), "balance": cs._balance(user_id)}
@@ -801,18 +815,34 @@ async def approve_episode_plan(story_id: str, body: ApprovePlanIn, user_id: str 
     title = (story.get("title") or src.get("title") or "Story")[:80]
     repo = CanonRepo(st, story["id"], user_id)
     made = []
+    feature = story.get("plan_format") == "feature"
+    master = None
+    if feature:
+        # The finished movie: a production of its own whose render joins the parts (studio_feature).
+        row = {k: src.get(k) for k in ("aspect_ratio", "genre", "visual_style", "language", "captions")}
+        row.update(owner_id=user_id, series_id=series, kind="film", title=title[:120],
+                   target_seconds=sum(int(story.get("episode_seconds") or 600) for _ in plan),
+                   logline=(src.get("logline") or "")[:1000], story_id=story["id"],
+                   story_bible={**keep, "feature": {"id": series, "master": True, "of": len(plan), "title": title}})
+        master = st.insert("studio_projects", [row])[0]
     for e in plan:
         row = {k: src.get(k) for k in ("aspect_ratio", "genre", "visual_style", "language", "captions")}
         for k in ("production_style", "image_quality"):
             if src.get(k):
                 row[k] = src[k]
-        row.update(owner_id=user_id, series_id=series, kind="episode", target_seconds=int(story.get("episode_seconds") or 90),
-                   title=f"{title} · Episode {e['number']}: {e['title']}"[:120], logline=e["summary"][:1000],
-                   story_bible=keep, story_id=story["id"], episode_number=e["number"])
+        row.update(owner_id=user_id, series_id=series, kind="film" if feature else "episode",
+                   target_seconds=int(story.get("episode_seconds") or 90),
+                   title=(f"{title} · Part {e['number']}: {e['title']}" if feature else
+                          f"{title} · Episode {e['number']}: {e['title']}")[:120], logline=e["summary"][:1000],
+                   story_bible={**keep, "feature": {"id": series, "part": e["number"], "of": len(plan),
+                                                    "master_id": master["id"], "title": title}} if feature else keep,
+                   story_id=story["id"], episode_number=e["number"])
         new = st.insert("studio_projects", [row])[0]
         cs.copy_cast_and_elements(src, new, user_id)
         repo.set_episode(e["number"], e["chapter_from"], e["chapter_to"], project_id=new["id"])
         made.append({"number": e["number"], "project_id": new["id"], "title": new["title"]})
     story = _save(story, {"episodes_created_at": _now(), "episode_series_id": series,
                           "episode_plan_approved_version": body.version})
-    return {**_plan_out(story), "created": made}
+    return {**_plan_out(story), "created": made, **({"feature": {"id": series, "master_id": master["id"],
+                                                                 "title": master["title"], "parts": len(made)}}
+                                                    if master else {})}

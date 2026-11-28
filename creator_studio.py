@@ -1087,6 +1087,43 @@ async def put_look(project_id: str, body: LookIn, user_id: str = Depends(creator
     return _look_state(p)
 
 
+@router.get("/features/{feature_id}")
+async def feature_overview(feature_id: str, user_id: str = Depends(creator)):
+    """A feature film: its parts in order, what each still needs and costs (the same quote as one production), which
+    are rendered, the total, and whether the movie can be joined. Free."""
+    import studio_feature
+    import studio_production
+    st = get_store()
+    rows = [r for r in st.select("studio_projects", {"series_id": feature_id, "owner_id": user_id})
+            if studio_feature.info(r).get("id") == feature_id]
+    master = next((r for r in rows if studio_feature.is_master(r)), None)
+    if not master:
+        raise HTTPException(status_code=404, detail="Feature not found.")
+    from studio_worker import StudioWorker
+    w = StudioWorker(st, get_files(), None, "render")
+    parts = w._feature_parts(master)
+    src = w.feature_sources(master)
+    out, total = [], 0
+    for part in parts:
+        try:
+            q = studio_production.plan(part, {"render": True})
+            credits = int(q["total_credits"])
+        except Exception:
+            credits = 0
+        total += credits
+        out.append({"part": int(studio_feature.info(part).get("part") or 0), "project_id": part["id"],
+                    "title": part.get("title"), "target_seconds": part.get("target_seconds"),
+                    "rendered": bool((src.get(part["id"]) or {}).get("source")),
+                    "seconds": (src.get(part["id"]) or {}).get("duration"), "credits_to_finish": credits})
+    missing = studio_feature.missing_parts(parts, src)
+    renders = st.select("studio_renders", {"project_id": master["id"]}, order="version", desc=True, limit=1)
+    return {"id": feature_id, "master_id": master["id"], "title": studio_feature.info(master).get("title") or master["title"],
+            "parts": out, "credits_to_finish": total, "ready_to_join": not missing and bool(parts),
+            "missing": missing, "film": _render_out(renders[0]) if renders else None,
+            "note": "Each part is made like one production (its own quote, budget and storyboard review). When every "
+                    "part is rendered, the movie is joined into one film."}
+
+
 @router.get("/projects/{project_id}/score")
 async def score_sheet(project_id: str, user_id: str = Depends(creator)):
     """The film's planned score (studio_score): each cue's scenes, mood, intensity and character themes, the planned
@@ -2484,6 +2521,18 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         if kind == "shot_video" and not target.get("image_path"):
             return cost, "Make this shot's picture first."
         return cost, None
+    if kind == "render" and __import__("studio_feature").is_master(p):
+        # The finished movie of a feature: its parts joined (no new music: each part has its own score).
+        import studio_feature
+        from studio_worker import StudioWorker
+        w = StudioWorker(get_store(), get_files(), None, "render")
+        parts = w._feature_parts(p)
+        src = w.feature_sources(p)
+        missing = studio_feature.missing_parts(parts, src)
+        secs = sum(x["duration"] for x in src.values()) or float(p.get("target_seconds") or 600)
+        reason = (f"Render part{'s' if len(missing) > 1 else ''} {', '.join(map(str, missing))} first." if missing
+                  else None if parts else "This feature has no parts yet.")
+        return pricing.render_cost(secs), reason
     if kind == "render":
         scenes = get_store().select("studio_scenes", {"project_id": p["id"]})
         secs = sum(max(float(s["duration_seconds"]), float(s.get("audio_seconds") or 0) + 0.5) for s in scenes)

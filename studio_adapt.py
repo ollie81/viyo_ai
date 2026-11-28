@@ -46,20 +46,25 @@ def _t(x, n: int = 600) -> str:
     return re.sub(r"\s+", " ", str(x or "")).strip()[:n]
 
 
-def plan_prompt(story: dict, chapters: list[dict], episodes: int, seconds: int, note: str = "") -> str:
+def plan_prompt(story: dict, chapters: list[dict], episodes: int, seconds: int, note: str = "",
+                feature: bool = False) -> str:
     outline = story.get("outline") or {}
     plans = {int(c.get("number") or 0): c for c in outline.get("chapters") or []}
     lines = [
-        f"Adapt the approved novel \"{story.get('title') or outline.get('title') or ''}\" into EXACTLY {episodes} "
-        f"short-drama episodes of about {seconds} seconds each.",
+        (f"Adapt the approved novel \"{story.get('title') or outline.get('title') or ''}\" into ONE feature film of "
+         f"about {round(episodes * seconds / 60)} minutes, planned as EXACTLY {episodes} parts of about {seconds} "
+         "seconds each (in the fields below, each 'episode' is one part)." if feature else
+         f"Adapt the approved novel \"{story.get('title') or outline.get('title') or ''}\" into EXACTLY {episodes} "
+         f"short-drama episodes of about {seconds} seconds each."),
         f"Premise: {outline.get('premise') or ''}",
         f"Genre and tone: {outline.get('genre') or ''}; {outline.get('tone') or ''}.",
         f"How it ends: {(outline.get('ending') or {}).get('description') or ''}",
         "",
-        "Split by dramatic shape, not by page count. Each episode needs: an opening hook (the first moment already "
-        "belongs to the conflict), a turn in the middle, and a cliffhanger that makes the viewer need the next "
-        "episode. The LAST episode resolves the story instead of a cliffhanger (its cliffhanger field says how it "
-        "ends).",
+        (__import__("studio_feature").PLAN_NOTE if feature else
+         "Split by dramatic shape, not by page count. Each episode needs: an opening hook (the first moment already "
+         "belongs to the conflict), a turn in the middle, and a cliffhanger that makes the viewer need the next "
+         "episode. The LAST episode resolves the story instead of a cliffhanger (its cliffhanger field says how it "
+         "ends)."),
         "Each episode covers chapter_from..chapter_to (inclusive). Episodes go in order and together cover every "
         f"chapter from 1 to {len(chapters)} with no gap and no going back. With more episodes than chapters, several "
         "episodes share a chapter (the next one starts at the same chapter the previous one ended in).",
@@ -182,6 +187,9 @@ def block(episode: dict, memory: str = "") -> str:
     """What the writers' room is told about the episode it is adapting (studio_story.plan_prompt / draft_prompt)."""
     if not episode:
         return ""
+    if episode.get("feature"):
+        import studio_feature
+        return _with_sources([studio_feature.writer_block(episode)], episode, memory)
     lines = [f"THIS EPISODE ADAPTS THE APPROVED NOVEL — episode {episode.get('number')} of {episode.get('of')}: "
              f"\"{episode.get('title') or ''}\" (chapters {episode.get('chapter_from')}-{episode.get('chapter_to')}).",
              f"What happens: {episode.get('summary') or ''}",
@@ -192,6 +200,10 @@ def block(episode: dict, memory: str = "") -> str:
     lines.append(("How it ends: " if episode.get("last") else "Cliffhanger: ") + (episode.get("cliffhanger") or ""))
     lines.append("Stay faithful to the novel: the same people, events, order of revelations and who knows what. "
                  "Compress and dramatise for the screen; don't add new main characters or reveal anything early.")
+    return _with_sources(lines, episode, memory)
+
+
+def _with_sources(lines: list, episode: dict, memory: str) -> str:
     if memory:
         lines += ["", memory[:5000]]
     passages = episode.get("passages") or []
