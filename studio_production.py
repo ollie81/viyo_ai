@@ -179,6 +179,14 @@ def plan(p: dict, options: Optional[dict] = None) -> dict:
     advice = [f"{len(single)} scene{'s' if len(single) != 1 else ''} ({', '.join(str(i) for i, _ in single[:12])}"
               f"{'...' if len(single) > 12 else ''}) would be filmed as one shot each. Plan their camera shots first "
               "(wide, over-the-shoulder, close-up, reaction) for real coverage."] if single else []
+    # A distinct cast: characters who look alike are pointed out before paying (studio_dna; advice, never a block).
+    try:
+        import studio_dna
+        for pr in studio_dna.cast_check(cast)["pairs"]:
+            if pr["severity"] in ("high", "medium"):
+                advice.append(f"{pr['problem']} {pr['fix']}")
+    except Exception:
+        pass
     directed = sum(1 for x in stages["direct"]) + len(pending)
     return {"stages": out, "total_credits": sum(x["credits"] for x in out), "blocked": blocked, "advice": advice,
             "single_shot_scenes": [s["id"] for _, s in single], "pending_plans": pending, "directed_scenes": directed,

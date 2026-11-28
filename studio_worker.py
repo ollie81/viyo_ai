@@ -26,6 +26,7 @@ import studio_pricing as pricing
 import studio_render as render
 import film_qc
 import studio_action as action_mod
+import studio_dna as dna_mod
 import studio_look as look_mod
 import studio_score as score_mod
 import studio_film_report as film_report
@@ -936,6 +937,10 @@ class StudioWorker:
             context = f"From the story plan: age {plan.get('age', '?')}; looks: {plan.get('look', '')}; role: {plan.get('role', '')}."
         if ch.get("age_category"):
             context += f" Age group: {casting.AGE_LABEL.get(ch['age_category'], ch['age_category'])}."
+        # A distinct cast: the new person is told who is already in this drama (studio_dna).
+        others = dna_mod.distinct_block(self.store.select("studio_characters", {"project_id": project["id"]}), ch["name"])
+        if others:
+            context += "\n" + others
         identity, cost = make(ch["name"], ch.get("description") or "", context.strip())
         if not ident.has_identity(identity):
             identity = ident.fallback_identity(ch.get("description") or "")
