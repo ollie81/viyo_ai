@@ -2529,7 +2529,7 @@ def _price(kind: str, p: dict, target: dict, cast: list[dict],
         parts = w._feature_parts(p)
         src = w.feature_sources(p)
         missing = studio_feature.missing_parts(parts, src)
-        secs = sum(x["duration"] for x in src.values()) or float(p.get("target_seconds") or 600)
+        secs = sum(x["duration"] for x in src.values()) or float(studio_feature.info(p).get("seconds") or 600)
         reason = (f"Render part{'s' if len(missing) > 1 else ''} {', '.join(map(str, missing))} first." if missing
                   else None if parts else "This feature has no parts yet.")
         return pricing.render_cost(secs), reason

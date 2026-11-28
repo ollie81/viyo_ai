@@ -125,7 +125,7 @@ def test_a_30_minute_feature_is_planned_as_one_movie_in_three_parts(nv):
     assert f["parts"] == 3 and [m["number"] for m in out["created"]] == [1, 2, 3]
     master = store.one("studio_projects", {"id": f["master_id"]})
     parts = [store.one("studio_projects", {"id": m["project_id"]}) for m in out["created"]]
-    assert master["kind"] == "film" and feat.is_master(master) and master["target_seconds"] == 1800
+    assert master["kind"] == "film" and feat.is_master(master) and feat.info(master)["seconds"] == 1800
     assert all(p["kind"] == "film" and p["series_id"] == master["series_id"] and feat.is_part(p) for p in parts)
     assert [p["title"].split(" · ")[1].split(":")[0] for p in parts] == ["Part 1", "Part 2", "Part 3"]
     assert client.get(f"/api/v1/studio/stories/{sid}/episodes", headers=H(u)).json()["created"] == out["created"], \
@@ -184,7 +184,7 @@ def test_parts_render_recover_from_a_failure_and_join_into_one_movie(nv, monkeyp
     parts = [m["project_id"] for m in out["created"]]
     # Nothing rendered yet: the join is refused before any credit is held, and says which parts are missing.
     est = client.post(f"/api/v1/studio/projects/{master_id}/estimate", headers=H(u), json={"kind": "render"}).json()
-    assert est["blocked"] and "Render parts 1, 2, 3 first" in str(est["items"][0]["blocked"])
+    assert "Render parts 1, 2, 3 first" in str(est["items"][0]["blocked"]) and est["total_credits"] == 0
     ov = client.get(f"/api/v1/studio/features/{feature_id}", headers=H(u)).json()
     assert ov["ready_to_join"] is False and ov["missing"] == [1, 2, 3] and ov["credits_to_finish"] > 0
     # Part 2's first render fails: refunded, retried by the run, and the part still finishes.

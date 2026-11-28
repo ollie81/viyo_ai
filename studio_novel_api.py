@@ -821,10 +821,12 @@ async def approve_episode_plan(story_id: str, body: ApprovePlanIn, user_id: str 
     if feature:
         # The finished movie: a production of its own whose render joins the parts (studio_feature).
         row = {k: src.get(k) for k in ("aspect_ratio", "genre", "visual_style", "language", "captions")}
+        # The movie's length lives in its feature record (a production's own length is capped at 10 minutes).
+        total = sum(int(story.get("episode_seconds") or 600) for _ in plan)
         row.update(owner_id=user_id, series_id=series, kind="film", title=title[:120],
-                   target_seconds=sum(int(story.get("episode_seconds") or 600) for _ in plan),
-                   logline=(src.get("logline") or "")[:1000], story_id=story["id"],
-                   story_bible={**keep, "feature": {"id": series, "master": True, "of": len(plan), "title": title}})
+                   target_seconds=min(600, total), logline=(src.get("logline") or "")[:1000], story_id=story["id"],
+                   story_bible={**keep, "feature": {"id": series, "master": True, "of": len(plan), "title": title,
+                                                    "seconds": total}})
         master = st.insert("studio_projects", [row])[0]
     for e in plan:
         row = {k: src.get(k) for k in ("aspect_ratio", "genre", "visual_style", "language", "captions")}
