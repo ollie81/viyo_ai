@@ -26,6 +26,7 @@ import studio_pricing as pricing
 import studio_render as render
 import film_qc
 import studio_action as action_mod
+import studio_feature as feature_mod
 import studio_look as look_mod
 import studio_score as score_mod
 import studio_film_report as film_report
@@ -205,8 +206,9 @@ class StudioWorker:
             bible = {k: v for k, v in bible.items() if k not in ("world", "saga", "look")}
             if world:
                 bible["world"] = world
-            if (project.get("story_bible") or {}).get("look"):
-                bible["look"] = project["story_bible"]["look"]      # the film keeps its look across rewrites
+            for keep in ("look", "feature"):                      # the film keeps its look and its place in a feature
+                if (project.get("story_bible") or {}).get(keep):
+                    bible[keep] = project["story_bible"][keep]
             if saga:
                 bible["saga"] = saga_mod.mark_revealed(saga, len(earlier) + 1)
             self._optional_update("studio_projects", {"id": project["id"]}, {"story_bible": bible})
@@ -530,7 +532,8 @@ class StudioWorker:
             memory = canon.render({"at": {"episode": n}, "limit": 60, "text": text})
         except Exception:
             memory = canon.render({"at": (int(e["chapter_from"]), 0), "limit": 60, "text": text})
-        return {**e, "of": len(plan), "last": n == len(plan), "memory": memory, "passages": passages}
+        return {**e, "of": len(plan), "last": n == len(plan), "memory": memory, "passages": passages,
+                "feature": feature_mod.is_part(project)}
 
     def earlier_episodes(self, project) -> list[dict]:
         """The story bibles of the episodes before this one in its series,
@@ -2056,7 +2059,7 @@ class StudioWorker:
         return {**out, "_billable": billable}, cost
 
     @staticmethod
-    def _film_edit(scene, scenes, spoken_in_clip) -> dict:
+    def _film_edit(scene, scenes, spoken_in_clip, project=None) -> dict:
         """Editing choices for one scene: how its still picture moves (its planned camera movement), a dip from
         black for the opening, a time jump or a flashback, a fade out at the very end, and the recorded timing
         of each line for the captions."""
@@ -2064,6 +2067,8 @@ class StudioWorker:
         ordered = sorted(scenes, key=lambda r: r["position"])
         first = bool(ordered) and ordered[0]["id"] == scene["id"]
         last = bool(ordered) and ordered[-1]["id"] == scene["id"]
+        # A feature's parts join into one movie: fade in only at its start and out only at its end.
+        first, last = feature_mod.fades(project, first, last)
         timings = () if spoken_in_clip else tuple(tuple(x) for x in ((scene.get("audio_voices") or {}).get("_timings") or []))
         return {"move": render.movement(" ".join(x for x in (c.get("camera_movement"), c.get("camera")) if x)),
                 # A time jump or flashback dissolves from the scene before (studio_look on), else dips from black.
@@ -2108,7 +2113,8 @@ class StudioWorker:
                     f"joining the shots of scene {n + 1}")
         has_lines = any((d.get("text") or "").strip() for d in scene.get("dialogue") or [])
         scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda r: r["position"])
-        film = {k: v for k, v in self._film_edit(scene, scenes, True).items() if k in ("fade_in", "fade_out", "dissolve_in")}
+        film = {k: v for k, v in self._film_edit(scene, scenes, True, project).items()
+                if k in ("fade_in", "fade_out", "dissolve_in")}
         return render.SceneInput(
             **film,
             duration=render.probe(joined)["duration"], video=joined,
@@ -2351,6 +2357,8 @@ class StudioWorker:
         return {"path": path, "sync_id": gid}, cost
 
     def do_render(self, job, project):
+        if feature_mod.is_master(project):
+            return self._render_feature(job, project)
         scenes = sorted(self.store.select("studio_scenes", {"project_id": project["id"]}), key=lambda s: s["position"])
         if not scenes:
             raise JobFailed("no_scenes", "Add scenes before rendering.")
@@ -2392,7 +2400,7 @@ class StudioWorker:
                 synced = s.get("lipsync_path") if needs_lipsync(s, project) else None
                 use_video = synced or (s["mode"] == "video" and s.get("video_path"))
                 spoken_in_clip = bool(synced) or (bool(use_video) and talks_in_video(s, project))
-                film = self._film_edit(s, scenes, spoken_in_clip)
+                film = self._film_edit(s, scenes, spoken_in_clip, project)
                 inputs.append(render.SceneInput(**film,
                     duration=float(s["duration_seconds"]),
                     image=None if use_video else fetch(s["image_path"], f"img{n}"),
@@ -2443,18 +2451,27 @@ class StudioWorker:
             if not qc["passed"]:
                 print(f"[INFO] studio render {job['id']}: final check failed: {qc['items']}")
                 raise JobFailed("quality_check", film_qc.explain(qc))
-            prev = self.store.select("studio_renders", {"project_id": project["id"]}, order="version", desc=True, limit=1)
-            version = (prev[0]["version"] + 1) if prev else 1
-            path, bunny_id = None, None
-            if self.bunny_upload is not None:
-                # Films go to Bunny Stream: no file-size limit, built for video.
-                try:
-                    bunny_id = self.bunny_upload(out, f"{project['title']} v{version}")
-                except Exception as e:
-                    raise JobFailed("storage_busy", "Couldn't save the film. Trying again.", retry=True) from e
-            else:
-                path = f"{job['owner_id']}/{project['id']}/render/v{version:03d}.mp4"
-                self.files.put_file(path, out, "video/mp4")
+            path, bunny_id, version = self._save_film(job, project, out, info)
+            # A feature's part keeps its exact original file too, so the movie can be joined without re-encoding.
+            source = self._keep_source(job, project, out, version) if feature_mod.is_part(project) else None
+        return {"path": path, "bunny_video_id": bunny_id, "version": version, **info, "segments": segments,
+                **({"source": source} if source else {})}, \
+            pricing.render_cost(info["duration"], info["bytes"], music_generated=music_generated, music_tracks=music_tracks)
+
+    def _save_film(self, job, project, out, info):
+        """Saves a finished, checked film (Bunny Stream, else the file store) and records it. (path, bunny id, version)."""
+        prev = self.store.select("studio_renders", {"project_id": project["id"]}, order="version", desc=True, limit=1)
+        version = (prev[0]["version"] + 1) if prev else 1
+        path, bunny_id = None, None
+        if self.bunny_upload is not None:
+            # Films go to Bunny Stream: no file-size limit, built for video.
+            try:
+                bunny_id = self.bunny_upload(out, f"{project['title']} v{version}")
+            except Exception as e:
+                raise JobFailed("storage_busy", "Couldn't save the film. Trying again.", retry=True) from e
+        else:
+            path = f"{job['owner_id']}/{project['id']}/render/v{version:03d}.mp4"
+            self.files.put_file(path, out, "video/mp4")
         self.store.insert("studio_assets", [{"owner_id": job["owner_id"], "project_id": project["id"], "job_id": job["id"],
                                              "kind": "render", "path": path or f"bunny:{bunny_id}", "bytes": info["bytes"],
                                              "duration_seconds": info["duration"], "width": info["width"], "height": info["height"]}])
@@ -2464,8 +2481,66 @@ class StudioWorker:
                                               "width": info["width"], "height": info["height"],
                                               "duration_seconds": info["duration"], "bytes": info["bytes"],
                                               "sha256": info["sha256"]}])
-        return {"path": path, "bunny_video_id": bunny_id, "version": version, **info, "segments": segments}, \
-            pricing.render_cost(info["duration"], info["bytes"], music_generated=music_generated, music_tracks=music_tracks)
+        return path, bunny_id, version
+
+    def _keep_source(self, job, project, out, version) -> str:
+        """Where the part's original render is: the saved file itself, or (when the film went to Bunny Stream, which
+        keeps a re-encoded copy) an extra copy of the original in the file store."""
+        base = f"{job['owner_id']}/{project['id']}/render/v{version:03d}"
+        if self.bunny_upload is None:
+            return f"{base}.mp4"
+        self.files.put_file(f"{base}-source.mp4", out, "video/mp4")
+        return f"{base}-source.mp4"
+
+    def _feature_parts(self, project) -> list:
+        f = feature_mod.info(project)
+        rows = self.store.select("studio_projects", {"series_id": project["series_id"], "owner_id": project["owner_id"]})
+        return sorted([r for r in rows if feature_mod.info(r).get("id") == f.get("id") and feature_mod.is_part(r)],
+                      key=lambda r: int(feature_mod.info(r).get("part") or 0))
+
+    def feature_sources(self, project) -> dict:
+        """part project id -> its latest render's {source, duration}, for the master's join."""
+        out = {}
+        for part in self._feature_parts(project):
+            r = self.store.select("studio_renders", {"project_id": part["id"]}, order="version", desc=True, limit=1)
+            if not r:
+                continue
+            job = self.store.one("studio_jobs", {"id": r[0]["job_id"]}) if r[0].get("job_id") else None
+            src = ((job or {}).get("output") or {}).get("source")
+            out[part["id"]] = {"source": src, "duration": float(r[0].get("duration_seconds") or 0)}
+        return out
+
+    def _render_feature(self, job, project):
+        """The master of a feature: its parts' original renders joined end to end, checked, saved like any film."""
+        parts = self._feature_parts(project)
+        if not parts:
+            raise JobFailed("not_ready", "This feature has no parts yet.")
+        sources = self.feature_sources(project)
+        missing = feature_mod.missing_parts(parts, sources)
+        if missing:
+            raise JobFailed("not_ready", f"Part{'s' if len(missing) > 1 else ''} {', '.join(map(str, missing))} "
+                                         "isn't rendered yet. Render every part first; your credits were returned.")
+        with tempfile.TemporaryDirectory() as tmp:
+            local = []
+            for k, part in enumerate(parts, start=1):
+                p = os.path.join(tmp, f"part{k:02d}.mp4")
+                self.files.get_to(sources[part["id"]]["source"], p)
+                local.append(p)
+            out = os.path.join(tmp, "feature.mp4")
+            feature_mod.join(local, out, tmp)
+            info = render.probe(out)
+            sha = __import__("hashlib").sha256(open(out, "rb").read()).hexdigest()
+            info = {"duration": round(info["duration"], 2), "width": info["width"], "height": info["height"],
+                    "bytes": os.path.getsize(out), "sha256": sha}
+            plan = [{"duration": sources[p["id"]]["duration"], "speaks": False,
+                     "fade_in": 0.6 if k == 0 else 0.0, "fade_out": 0.8 if k == len(parts) - 1 else 0.0}
+                    for k, p in enumerate(parts)]
+            qc = film_qc.inspect_film(out, plan, project["aspect_ratio"])
+            if not qc["passed"]:
+                raise JobFailed("quality_check", film_qc.explain(qc))
+            path, bunny_id, version = self._save_film(job, project, out, info)
+        return {"path": path, "bunny_video_id": bunny_id, "version": version, **info, "parts": len(parts),
+                "feature": True}, pricing.render_cost(info["duration"], info["bytes"])
 
     def _score(self, job, project, scenes, inputs, tmp):
         """The film's score from its cue sheet. Reuses every cue whose instructions haven't changed; makes the rest
