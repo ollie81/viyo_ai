@@ -688,6 +688,14 @@ def _clean_catalog(fields: dict) -> dict:
     return fields
 
 
+@router.get("/admin/storage", dependencies=[Depends(_require_admin)])
+async def admin_storage():
+    """Where pictures, clips, voices, music and films go right now (Bunny, Supabase, or blocked by strict mode),
+    and the names of any missing settings. Never shows a key or value."""
+    import viyo_files
+    return viyo_files.status()
+
+
 @router.get("/admin/voices", dependencies=[Depends(_require_admin)])
 async def admin_voices():
     """Internal voice gallery: every catalog voice, what has been verified

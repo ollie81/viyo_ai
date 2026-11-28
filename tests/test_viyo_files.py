@@ -371,3 +371,55 @@ def test_repurpose_downloads_accept_bunny_hosts(bunny):
         stream_url_to_file("https://evil.example/x.mp4", "/dev/null", 10, vf.file_hosts())
     with pytest.raises(SourceMissing, match="refusing"):
         stream_url_to_file("http://pub.b-cdn.net/x.mp4", "/dev/null", 10, vf.file_hosts())
+
+
+# ------------------------------------------------------------------ strict: Bunny or nowhere, never Supabase
+
+class _NoSupabase:
+    class storage:
+        @staticmethod
+        def from_(bucket):
+            raise AssertionError("strict mode must never reach Supabase storage")
+
+
+def test_strict_mode_never_falls_back_to_supabase(monkeypatch):
+    for k in list(BUNNY_ENV):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("FILE_STORE_STRICT", "true")
+    with pytest.raises(vf.StorageNotConfigured) as e:
+        vf.from_(_NoSupabase(), "studio")
+    assert "FILE_STORE=bunny" in str(e.value) and "BUNNY_PUBLIC_KEY" in str(e.value)
+    monkeypatch.setenv("FILE_STORE", "bunny")
+    monkeypatch.setenv("BUNNY_PUBLIC_ZONE", "z")
+    with pytest.raises(vf.StorageNotConfigured) as e:
+        vf.from_(_NoSupabase(), "studio")
+    assert "BUNNY_PRIVATE_TOKEN_KEY" in str(e.value) and "BUNNY_PUBLIC_ZONE" not in str(e.value)
+
+
+def test_strict_mode_with_bunny_set_up_uses_bunny(bunny, monkeypatch):
+    monkeypatch.setenv("FILE_STORE_STRICT", "true")
+    b = vf.from_(_NoSupabase(), "studio")
+    assert isinstance(b, vf.BunnyBucket)
+
+
+def test_without_strict_the_old_fallback_is_unchanged(monkeypatch):
+    for k in list(BUNNY_ENV):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("FILE_STORE_STRICT", raising=False)
+
+    class Sb:
+        class storage:
+            @staticmethod
+            def from_(bucket):
+                return ("supabase", bucket)
+    assert vf.from_(Sb(), "posts") == ("supabase", "posts")
+
+
+def test_the_storage_status_names_what_is_missing_and_never_a_value(bunny, monkeypatch):
+    st = vf.status()
+    assert st["files"] == "bunny" and st["missing"] == []
+    assert not any(v in str(st) for k, v in BUNNY_ENV.items() if k != "FILE_STORE"), "no setting values in the status"
+    monkeypatch.delenv("BUNNY_PRIVATE_KEY")
+    monkeypatch.setenv("FILE_STORE_STRICT", "true")
+    st = vf.status()
+    assert st["files"] == "blocked" and st["missing"] == ["BUNNY_PRIVATE_KEY"] and st["strict"] is True

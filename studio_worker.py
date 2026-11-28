@@ -26,6 +26,7 @@ import studio_pricing as pricing
 import studio_render as render
 import film_qc
 import studio_action as action_mod
+import viyo_files
 import studio_look as look_mod
 import studio_score as score_mod
 import studio_film_report as film_report
@@ -129,6 +130,11 @@ class StudioWorker:
         except ai_mod.PolicyBlocked as e:
             print(f"[INFO] studio job {job['id']} ({job['kind']}) blocked by the AI: {e}")
             self._fail(job, "content_blocked", str(e) or "The AI refused this content. Try rewording it.", False)
+        except viyo_files.StorageNotConfigured as e:
+            # Strict storage: nothing is ever written to Supabase; the job stops and its credits are returned.
+            print(f"[WARN] studio job {job['id']} stopped: {e}")
+            self._fail(job, "storage_not_configured", "File storage isn't set up yet, so nothing was saved. Your "
+                                                      "credits were returned.", False)
         except Exception as e:
             traceback.print_exc()
             self._fail(job, "failed", "Something went wrong making this. Your credits were returned.", False)
