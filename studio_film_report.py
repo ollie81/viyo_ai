@@ -244,6 +244,19 @@ def _camera(scenes, units, shots, add):
         if n / len(moved) > MOVE_SHARE_MAX:
             add("camera", "low", None, None, f"{round(100 * n / len(moved))}% of the shots use the same camera move "
                 f"({move}).", "Let the camera move with the story: still for tension, moving for action.", "edit")
+    patterns = [(i, tuple(x.get("shot_type") for x in shots.get(s["id"]) or [])) for i, s in enumerate(scenes, start=1)]
+    run_start = None
+    for k in range(len(patterns)):
+        same = k >= 2 and len(patterns[k][1]) >= 2 and patterns[k][1] == patterns[k - 1][1] == patterns[k - 2][1]
+        if same and run_start is None:
+            run_start = patterns[k - 2][0]
+        if run_start is not None and (not same or k == len(patterns) - 1):
+            end = patterns[k][0] if same else patterns[k - 1][0]
+            add("camera", "medium", run_start, None,
+                f"Scenes {run_start} to {end} are filmed with exactly the same shots in the same order "
+                f"({' -> '.join(_nice(t) for t in patterns[k if same else k - 1][1])}).",
+                "Film some of them differently: change the opening, the order or the sizes.", "edit")
+            run_start = None
     if len(scenes) >= 5:
         single = sum(1 for s in scenes if not shots.get(s["id"]))
         if single / len(scenes) > SINGLE_SHOT_SHARE_MAX:

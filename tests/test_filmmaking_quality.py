@@ -79,9 +79,11 @@ def test_edit_choices_follow_the_scene_record():
                "audio_voices": {"x": "Kore", "_timings": [[0.0, 1.2], [1.45, 3.0]]}}]
     a, b, c = (StudioWorker._film_edit(s, scenes, False) for s in scenes)
     assert (a["move"], a["fade_in"], a["fade_out"]) == ("pan_left", 0.6, 0.0), "the opening comes up from black"
-    assert b["fade_in"] == 0.5 and b["move"] == "push_in", "a time jump dips to black"
+    assert b["dissolve_in"] == 0.8 and b["fade_in"] == 0.0 and b["move"] == "push_in", \
+        "a time jump dissolves from the scene before (studio_look)"
     assert c["fade_out"] == 0.8 and c["move"] == "static" and c["line_times"] == ((0.0, 1.2), (1.45, 3.0))
     assert StudioWorker._film_edit(scenes[2], scenes, True)["line_times"] == (), "a talking clip has its own timing"
+    assert a["dissolve_in"] == 0.0 and c["dissolve_in"] == 0.0, "only time jumps and flashbacks dissolve"
 
 
 # ------------------------------------------------------------------ captions follow the voices

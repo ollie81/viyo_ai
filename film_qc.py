@@ -24,7 +24,9 @@ VOICE_SILENCE_SHARE = 0.9     # a speaking scene that is this silent has lost it
 
 def plan_from_inputs(inputs) -> list[dict]:
     """What the check needs from each rendered scene (studio_render.SceneInput)."""
-    return [{"duration": float(i.duration), "speaks": bool(getattr(i, "lines", ()) and (i.audio or i.video)),
+    # A dissolve overlaps a scene with the one before it: the film is that much shorter than the scenes added up.
+    return [{"duration": max(0.5, float(i.duration) - float(getattr(i, "dissolve_in", 0) or 0)),
+             "speaks": bool(getattr(i, "lines", ()) and (i.audio or i.video)),
              "fade_in": float(getattr(i, "fade_in", 0) or 0), "fade_out": float(getattr(i, "fade_out", 0) or 0)}
             for i in inputs]
 

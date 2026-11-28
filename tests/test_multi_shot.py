@@ -258,7 +258,8 @@ def test_the_film_joins_the_shots_in_order_and_old_scenes_still_work(prod):
     job = next(j for j in client.get(f"/api/v1/studio/projects/{pid}/jobs", headers=H(u)).json()["jobs"] if j["kind"] == "render")
     assert job["status"] == "succeeded", job
     dur = float(db.execute("select duration_seconds from public.studio_renders where project_id = %s", (pid,)).fetchone()[0])
-    assert dur >= 10 + 4 + 5 - 0.5, "every shot and every scene is in the film"
+    # A time jump dissolves (0.8 s overlap, studio_look); otherwise every second of every shot is in the film.
+    assert dur >= 10 + 4 + 5 - 0.5 - 0.8, "every shot and every scene is in the film"
 
 
 def test_breakdown_aims_for_about_8_scenes_a_minute():
