@@ -1087,6 +1087,66 @@ async def put_look(project_id: str, body: LookIn, user_id: str = Depends(creator
     return _look_state(p)
 
 
+def _cast_check(p: dict) -> dict:
+    import studio_dna
+    import studio_film_report as fr
+    st = get_store()
+    cast = st.select("studio_characters", {"project_id": p["id"]})
+    others = []
+    for q in st.select("studio_projects", {"owner_id": p["owner_id"]}):
+        if q["id"] != p["id"] and (not p.get("series_id") or q.get("series_id") != p.get("series_id")):
+            others += [{**c, "project_title": q.get("title")} for c in st.select("studio_characters", {"project_id": q["id"]})]
+    prints = {}
+    files = get_files()
+    for c in cast:
+        path = ((c.get("reference_views") or {}).get(ident.ANCHOR) or {}).get("path") or c.get("reference_path")
+        if path:
+            try:
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".png") as f:
+                    f.write(files.get(path))
+                    f.flush()
+                    prints[c["id"]] = fr.frame_hash(f.name)
+            except Exception:
+                pass
+    return studio_dna.cast_check(cast, others[:200], prints)
+
+
+@router.get("/projects/{project_id}/cast-check")
+async def cast_check(project_id: str, user_id: str = Depends(creator)):
+    """Characters who look alike (in this drama, or repeating one of the creator's other dramas), with what to change
+    first. Free: compares the written identities and the reference pictures' fingerprints; no AI call."""
+    return _cast_check(_project(project_id, user_id))
+
+
+@router.get("/characters/{character_id}/dna")
+async def character_dna(character_id: str, user_id: str = Depends(creator)):
+    """Everything that defines a character in one place: look, reference views, outfits, voice, personality, story,
+    relationships, emotional state, where they appear and how their pictures fared. Free."""
+    import studio_dna
+    st = get_store()
+    ch = st.one("studio_characters", {"id": character_id})
+    if not ch or ch["owner_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Character not found.")
+    p = _project(ch["project_id"], user_id)
+    from studio_worker import characters_in_scene
+    cast = st.select("studio_characters", {"project_id": p["id"]})
+    scenes = sorted(st.select("studio_scenes", {"project_id": p["id"]}), key=lambda s: s["position"])
+    appears = [s["position"] + 1 for s in scenes if any(c["id"] == ch["id"] for c in characters_in_scene(s, cast))]
+    try:
+        shots = st.select("studio_shots", {"project_id": p["id"]})
+    except Exception:
+        if hasattr(st, "conn"):
+            st.conn.rollback()
+        shots = []
+    views = ch.get("reference_views") or {}
+    paths = [(v or {}).get("path") for v in views.values() if (v or {}).get("path")]
+    urls = _sign(paths) if paths else {}
+    outfits = [o for o in _outfits(p["id"]) if o.get("character_id") == ch["id"]]
+    return studio_dna.dna(ch, urls=urls, outfits=outfits, bible=p.get("story_bible") or {}, scenes=scenes, shots=shots,
+                          appears_in=appears, check_pairs=_cast_check(p)["pairs"])
+
+
 @router.get("/projects/{project_id}/score")
 async def score_sheet(project_id: str, user_id: str = Depends(creator)):
     """The film's planned score (studio_score): each cue's scenes, mood, intensity and character themes, the planned
