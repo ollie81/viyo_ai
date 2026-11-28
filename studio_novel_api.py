@@ -698,6 +698,7 @@ def _plan_out(story: dict) -> dict:
             "seconds": story.get("episode_seconds") or 90, "episodes_wanted": int(story.get("episodes") or 0),
             "created": created, "created_at": story.get("episodes_created_at"),
             "format": story.get("plan_format") or "episodes", "feature_minutes": story.get("feature_minutes"),
+            "feature_id": story.get("episode_series_id") if story.get("plan_format") == "feature" else None,
             "price": pricing.estimate_episode_plan(chapters, n).credits, "stage": story.get("stage"),
             "chapters": len((story.get("outline") or {}).get("chapters") or [])}
 
